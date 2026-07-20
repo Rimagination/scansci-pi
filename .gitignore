@@ -1,0 +1,17 @@
+.venv/
+node_modules/
+.local/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+coverage/
+*.log
+*.sqlite-shm
+*.sqlite-wal
