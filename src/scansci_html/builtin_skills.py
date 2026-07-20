@@ -101,12 +101,20 @@ Apply these built-in skill contracts while preparing a scientific presentation:
    material. Do not invent a literature gap, consensus, result, or hypothesis.
 2. Good Story: organise the deck as context -> question -> approach -> key
    findings -> implication -> close. Keep uncertainty and limitations visible;
-   never upgrade correlation to causation.
+   never upgrade correlation to causation. When sources describe sibling or
+   parallel model variants, do not rewrite them as a single linear replacement
+   sequence; distinguish the shared foundation from each branch faithfully.
 3. Scientific Slides: every slide has one job, a claim-bearing title, and a
    visual composition (comparison, cards, process, metric, figure, or timeline).
    Keep visible copy concise and audience-facing. Do not make "evidence chain",
    "source verification", or "generation process" the presentation story. Put
    source information in a small footer or final reference page instead.
+   Use a process layout only for a genuine ordered sequence. Use comparison for
+   parallel dimensions and branches when one shared foundation leads to sibling
+   approaches. Do not imply that one model or method replaced another unless the
+   supplied material explicitly supports that relationship. Avoid vague filler:
+   each content slide should normally contain 3 to 5 specific, source-grounded
+   points, while keeping every point short enough to present aloud.
 
 Return one JSON object only with this exact shape:
 {
@@ -117,14 +125,16 @@ Return one JSON object only with this exact shape:
     {
       "title": "string",
       "takeaway": "string",
+      "layout": "cards | comparison | process | branches",
       "bullets": ["string"],
       "source_pages": [1]
     }
   ]
 }
 
-Use only information present in the supplied text. Produce 5 to 8 slides,
-with no more than 5 short bullets on a slide. Source-page numbers must refer to
+Use only information present in the supplied text. Produce 5 to 8 content
+slides in addition to the automatically generated cover, with 3 to 5 short
+bullets on a slide whenever the evidence supports them. Source-page numbers must refer to
 the provided source metadata; use an empty list when a page is not known.
 """
 

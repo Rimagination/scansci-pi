@@ -522,6 +522,16 @@ TERM_EXPANSIONS = {
 }
 
 PHRASE_TRANSLATIONS = [
+    ("自注意力", ["self-attention", "attention"]),
+    ("双向", ["bidirectional", "left", "right", "context"]),
+    ("左侧上下文", ["left-to-right", "previous", "tokens", "causal"]),
+    ("上下文", ["context"]),
+    ("掩码语言模型", ["masked", "language", "model", "mlm"]),
+    ("自回归", ["autoregressive", "left-to-right", "next", "token"]),
+    ("微调", ["fine-tuning", "finetuning"]),
+    ("少样本", ["few-shot", "in-context"]),
+    ("零样本", ["zero-shot"]),
+    ("训练目标", ["training", "objective"]),
     ("数据集", ["dataset", "benchmark", "corpus"]),
     ("语料", ["corpus", "dataset"]),
     ("方法", ["method", "approach"]),

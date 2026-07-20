@@ -319,11 +319,18 @@ def download_paper(
         raise ValueError("请输入有效 DOI 或 arXiv ID")
     normalized_strategy = strategy if strategy in {"legal_only", "oa_first", "gray_oa"} else "oa_first"
     executable = shutil.which("scansci-pdf")
-    if normalized_strategy == "gray_oa" or not executable:
+    # arXiv is itself the authoritative public archive.  Routing it through an
+    # optional account-aware downloader can produce a misleading zero exit
+    # status with only a login hint and no file.
+    if _ARXIV_PATTERN.fullmatch(clean) or normalized_strategy == "gray_oa" or not executable:
         return _download_from_public_archives(clean, workspace=workspace, strategy=normalized_strategy, timeout=timeout)
     output_dir = _download_directory(workspace)
     output_dir.mkdir(parents=True, exist_ok=True)
-    before = {path.resolve() for path in output_dir.glob("**/*") if path.is_file()}
+    before = {
+        path.resolve(): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in output_dir.glob("**/*")
+        if path.is_file()
+    }
     command = [executable, "get", clean, "--output", str(output_dir), "--strategy", normalized_strategy]
     completed = subprocess.run(
         command,
@@ -335,11 +342,35 @@ def download_paper(
         timeout=timeout,
         shell=False,
     )
-    after = {path.resolve() for path in output_dir.glob("**/*") if path.is_file()}
-    created = sorted(str(path) for path in after - before)
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "下载失败").strip()
-        raise RuntimeError(detail[-1200:])
+    changed_pdfs: list[Path] = []
+    for path in output_dir.glob("**/*"):
+        if not path.is_file() or path.suffix.casefold() != ".pdf":
+            continue
+        resolved = path.resolve()
+        signature = (path.stat().st_size, path.stat().st_mtime_ns)
+        if before.get(resolved) == signature:
+            continue
+        try:
+            valid_pdf = path.read_bytes()[:4] == b"%PDF"
+        except OSError:
+            valid_pdf = False
+        if valid_pdf:
+            changed_pdfs.append(resolved)
+    created = sorted(str(path) for path in changed_pdfs)
+    if completed.returncode != 0 or not created:
+        # A few optional downloader versions report success while printing a
+        # failure/login hint and creating no file.  Fall back to lawful public
+        # archives and only report success after an actual PDF is present.
+        try:
+            return _download_from_public_archives(
+                clean,
+                workspace=workspace,
+                strategy=normalized_strategy,
+                timeout=timeout,
+            )
+        except RuntimeError as fallback_error:
+            detail = (completed.stderr or completed.stdout or "下载器没有生成有效 PDF").strip()
+            raise RuntimeError(f"{detail[-800:]}；公开存档回退失败：{fallback_error}") from fallback_error
     return {
         "ok": True,
         "identifier": clean,

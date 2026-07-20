@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
 
@@ -34,9 +36,24 @@ def answer_question(
     quote_provider: str = "local",
     answer_provider: str = "local",
     verification_provider: str = "local",
+    query_rewrite_provider: str = "local",
     chat_client: ChatJsonClient | None = None,
 ) -> dict[str, Any]:
     query_plan = plan_query(question)
+    query_rewrite_generation = {"provider": "local", "fallback": False, "reason": ""}
+    model_retrieval_queries: list[str] = []
+    if _uses_llm(query_rewrite_provider):
+        if chat_client is None:
+            raise ValueError("chat_client is required when query_rewrite_provider is llm")
+        query_rewrite_generation = {"provider": "llm", "fallback": False, "reason": ""}
+        try:
+            model_retrieval_queries = _model_retrieval_queries(question, chat_client=chat_client)
+        except (RuntimeError, ValueError) as error:
+            query_rewrite_generation = {
+                "provider": "local",
+                "fallback": True,
+                "reason": f"{type(error).__name__}: {error}"[:300],
+            }
     agentic_controls = resolve_agentic_controls(
         query_plan,
         profile=agentic_profile,
@@ -54,7 +71,12 @@ def answer_question(
         min_documents=min_documents,
     )
     filters = dict(query_plan.get("filters", {}) or {})
-    initial_routes = _initial_retrieval_routes(question, query_plan, query_variants=query_variants)
+    initial_routes = _initial_retrieval_routes(
+        question,
+        query_plan,
+        query_variants=query_variants,
+        model_queries=model_retrieval_queries,
+    )
     retrieval_query_routes: list[dict[str, Any]] = [dict(route) for route in initial_routes]
     retrieval_queries = [str(route.get("query", "")) for route in initial_routes]
     hits = _search_rewrite_routes(
@@ -101,6 +123,8 @@ def answer_question(
         for followup_index, followup_query in enumerate(list(query_plan.get("followup_queries", []) or [])[:followup_budget], start=1):
             followup = str(followup_query).strip()
             if not followup or followup in retrieval_queries:
+                continue
+            if model_retrieval_queries and not _followup_preserves_query_identity(followup, model_retrieval_queries):
                 continue
             slow_path_triggered = True
             followup_route = {
@@ -157,6 +181,7 @@ def answer_question(
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
     evidence_table = build_evidence_table(quotes, evidence_by_id)
     answer_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
+    verification_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
     if not bool(adequacy.get("is_sufficient", False)):
         verified_answer = apply_verification_policy(_insufficient_adequacy_answer(question, adequacy))
     elif _uses_llm(answer_provider):
@@ -165,7 +190,7 @@ def answer_question(
         answer_generation = {"provider": "llm", "fallback": False, "reason": ""}
         try:
             answer = synthesize_answer_with_llm(question, evidence_table, chat_client=chat_client)
-        except ValueError as error:
+        except (RuntimeError, ValueError) as error:
             # A compatible provider may ignore response_format or emit prose
             # without stable quote IDs.  Never discard an otherwise valid
             # evidence task: synthesize directly from the already validated
@@ -179,7 +204,16 @@ def answer_question(
         if _uses_llm(verification_provider):
             if chat_client is None:
                 raise ValueError("chat_client is required when verification_provider is llm")
-            verified_answer = verify_answer_claims_with_llm(answer, evidence_table, chat_client=chat_client)
+            verification_generation = {"provider": "llm", "fallback": False, "reason": ""}
+            try:
+                verified_answer = verify_answer_claims_with_llm(answer, evidence_table, chat_client=chat_client)
+            except (RuntimeError, ValueError) as error:
+                verified_answer = verify_answer_claims(answer, evidence_table)
+                verification_generation = {
+                    "provider": "local-evidence",
+                    "fallback": True,
+                    "reason": f"{type(error).__name__}: {error}"[:300],
+                }
         else:
             verified_answer = verify_answer_claims(answer, evidence_table)
         verified_answer = apply_verification_policy(verified_answer)
@@ -189,7 +223,16 @@ def answer_question(
         if _uses_llm(verification_provider):
             if chat_client is None:
                 raise ValueError("chat_client is required when verification_provider is llm")
-            verified_answer = verify_answer_claims_with_llm(answer, evidence_table, chat_client=chat_client)
+            verification_generation = {"provider": "llm", "fallback": False, "reason": ""}
+            try:
+                verified_answer = verify_answer_claims_with_llm(answer, evidence_table, chat_client=chat_client)
+            except (RuntimeError, ValueError) as error:
+                verified_answer = verify_answer_claims(answer, evidence_table)
+                verification_generation = {
+                    "provider": "local-evidence",
+                    "fallback": True,
+                    "reason": f"{type(error).__name__}: {error}"[:300],
+                }
         else:
             verified_answer = verify_answer_claims(answer, evidence_table)
         verified_answer = apply_verification_policy(verified_answer)
@@ -232,6 +275,8 @@ def answer_question(
         "verification": verified_answer.get("verification", {}),
         "citation_verification": citation_verification,
         "answer_generation": answer_generation,
+        "verification_generation": verification_generation,
+        "query_rewrite_generation": query_rewrite_generation,
     }
 
 
@@ -445,21 +490,114 @@ def _initial_retrieval_routes(
     query_plan: dict[str, Any],
     *,
     query_variants: int,
+    model_queries: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     limit = max(1, int(query_variants))
     routes = query_routes(query_plan, max_routes=limit)
-    if routes:
-        return routes
-    return [
+    if not routes:
+        routes = [
+            {
+                "label": "original",
+                "query": question,
+                "weight": 1.0,
+                "retrieval": ["bm25", "dense"],
+                "purpose": "question_as_written",
+                "section_hints": [],
+            }
+        ]
+    seen = {" ".join(str(route.get("query", "")).split()).casefold() for route in routes}
+    for index, raw_query in enumerate(model_queries or [], start=1):
+        query = " ".join(str(raw_query).split())
+        if not query or query.casefold() in seen:
+            continue
+        seen.add(query.casefold())
+        routes.append(
+            {
+                "label": f"model_rewrite_{index}",
+                "query": query,
+                "weight": 0.92,
+                "retrieval": ["bm25", "dense"],
+                "purpose": "cross_language_model_query_rewrite",
+                "section_hints": list(query_plan.get("section_hints", []) or []),
+            }
+        )
+    return routes
+
+
+def _model_retrieval_queries(question: str, *, chat_client: ChatJsonClient) -> list[str]:
+    needs_english = bool(re.search(r"[\u4e00-\u9fff]", question))
+    messages = [
         {
-            "label": "original",
-            "query": question,
-            "weight": 1.0,
-            "retrieval": ["bm25", "dense"],
-            "purpose": "question_as_written",
-            "section_hints": [],
-        }
+            "role": "system",
+            "content": (
+                "Create search queries for a local scientific-document index. Documents may use a different language "
+                "from the question. Preserve model names, variables, dates and requested contrasts. "
+                + (
+                    "All query strings MUST be written in English; translate every Chinese scientific phrase into English. "
+                    if needs_english
+                    else "Keep the query language suitable for the source terminology. "
+                )
+                + "Do not answer."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {"question": question, "target_query_language": "English" if needs_english else "source terminology"},
+                ensure_ascii=False,
+            ),
+        },
     ]
+    payload = chat_client.complete_json(messages, schema_name="retrieval_queries") or {}
+    raw_queries = payload.get("queries", []) if isinstance(payload, dict) else []
+    if not isinstance(raw_queries, list):
+        raise ValueError("retrieval query rewrite returned a non-list")
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_queries:
+        query = " ".join(str(raw).split())
+        if not query or query.casefold() in seen:
+            continue
+        seen.add(query.casefold())
+        unique.append(query[:500])
+        if len(unique) >= 4:
+            break
+    if not unique:
+        raise ValueError("retrieval query rewrite returned no usable queries")
+    return unique
+
+
+def _followup_preserves_query_identity(followup: str, model_queries: list[str]) -> bool:
+    """Reject generic slow-path queries that drop every cross-language entity."""
+
+    generic = {
+        "analysis",
+        "data",
+        "document",
+        "evidence",
+        "finding",
+        "findings",
+        "model",
+        "paper",
+        "research",
+        "result",
+        "results",
+        "study",
+    }
+    counts: dict[str, int] = {}
+    for query in model_queries:
+        seen = {
+            token.casefold()
+            for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9.+-]*", str(query))
+            if token.casefold() not in generic and (len(token) >= 3 or any(character.isdigit() for character in token))
+        }
+        for token in seen:
+            counts[token] = counts.get(token, 0) + 1
+    identity_terms = {token for token, count in counts.items() if count >= 2 or any(character.isdigit() for character in token)}
+    if not identity_terms:
+        return True
+    followup_terms = {token.casefold() for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9.+-]*", str(followup))}
+    return bool(identity_terms & followup_terms)
 
 
 def _initial_retrieval_queries(

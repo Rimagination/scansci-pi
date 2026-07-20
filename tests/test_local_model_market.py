@@ -132,3 +132,50 @@ def test_paper_download_falls_back_to_public_archives_without_cli(tmp_path: Path
 
     assert result["source"] == "Institutional repository"
     assert result["files"] == [str(destination)]
+
+
+def test_arxiv_download_uses_the_authoritative_public_archive_even_when_cli_exists(tmp_path: Path, monkeypatch):
+    destination = tmp_path / "downloads" / "1706.03762.pdf"
+    monkeypatch.setattr(research_tools.shutil, "which", lambda _name: "scansci-pdf")
+    monkeypatch.setattr(
+        research_tools.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("arXiv must not use the optional CLI")),
+    )
+    monkeypatch.setattr(
+        research_tools,
+        "_download_public_pdf",
+        lambda _candidate, output_dir, identifier, timeout: destination,
+    )
+
+    result = research_tools.download_paper("1706.03762", workspace=tmp_path / "workspace.sqlite")
+
+    assert result["source"] == "arXiv"
+    assert result["files"] == [str(destination)]
+
+
+def test_cli_success_without_a_pdf_falls_back_to_public_archive(tmp_path: Path, monkeypatch):
+    destination = tmp_path / "downloads" / "paper.pdf"
+    monkeypatch.setattr(research_tools.shutil, "which", lambda _name: "scansci-pdf")
+    monkeypatch.setattr(
+        research_tools.subprocess,
+        "run",
+        lambda *_args, **_kwargs: research_tools.subprocess.CompletedProcess(
+            args=["scansci-pdf"], returncode=0, stdout="FAILED: login required", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        research_tools,
+        "_public_fulltext_candidates",
+        lambda _identifier, timeout: [{"url": "https://example.test/paper.pdf", "source": "Open archive"}],
+    )
+    monkeypatch.setattr(
+        research_tools,
+        "_download_public_pdf",
+        lambda _candidate, output_dir, identifier, timeout: destination,
+    )
+
+    result = research_tools.download_paper("10.1000/example", workspace=tmp_path / "workspace.sqlite")
+
+    assert result["source"] == "Open archive"
+    assert result["files"] == [str(destination)]

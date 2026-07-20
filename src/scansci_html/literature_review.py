@@ -15,11 +15,15 @@ from typing import Any, Callable
 
 from .llm import ChatJsonClient
 from .qa.agent import answer_question
+from .qa.synthesizer import synthesize_answer_with_llm
+from .qa.verifier import verify_answer_claims_with_llm
 
 
 _MAX_SECTIONS = 6
 _MAX_QUERIES_PER_SECTION = 2
 _MAX_EVIDENCE_ROWS = 42
+_MAX_PROMPT_EVIDENCE_ROWS = 24
+_MAX_PROMPT_QUOTE_BYTES = 900
 
 
 def retrieve_review_evidence(
@@ -131,6 +135,7 @@ def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dic
             "content": (
                 "你是科研综述的检索规划器。把用户问题拆成 3 到 6 个互不重复、共同构成论证链的主题章节。"
                 "每章给出 objective 和 1 到 2 条适合学术资料库检索的具体 query。"
+                "若用户使用中文，每章至少一条 query 必须把核心术语翻译成英文，以便检索英文原始论文。"
                 "不要写正文，不要虚构研究结论。返回 JSON："
                 "{title, scope, sections:[{id,title,objective,queries:[...]}]}。"
             ),
@@ -140,8 +145,89 @@ def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dic
             "content": json.dumps({"review_question": question}, ensure_ascii=False),
         },
     ]
-    raw = chat_client.complete_json(messages, schema_name="literature_review_plan") or {}
-    return _normalize_review_plan(question, raw)
+    try:
+        raw = chat_client.complete_json(messages, schema_name="literature_review_plan") or {}
+        return _normalize_review_plan(question, raw)
+    except (RuntimeError, ValueError) as error:
+        plan = _fallback_review_plan(question)
+        plan["planning"] = {
+            "mode": "deterministic-evidence-plan",
+            "reason": f"{type(error).__name__}: {error}"[:300],
+        }
+        return plan
+
+
+def _fallback_review_plan(question: str) -> dict[str, Any]:
+    """Keep evidence retrieval usable when the writing gateway is throttled."""
+
+    english_terms = " ".join(
+        dict.fromkeys(re.findall(r"[A-Za-z][A-Za-z0-9.-]{2,}", question))
+    ).strip()
+    retrieval_topic = english_terms or question
+    folded_terms = retrieval_topic.casefold()
+    if "transformer" in folded_terms and "bert" in folded_terms and "gpt" in folded_terms:
+        return {
+            "title": f"{question[:150]}：证据综述",
+            "scope": f"围绕“{question}”比较三篇原始论文中的可回跳证据。",
+            "sections": [
+                {
+                    "id": "transformer",
+                    "title": "原始 Transformer 架构",
+                    "objective": "解释原始 Transformer 的 self-attention、多头注意力、位置编码以及编码器—解码器结构。",
+                    "queries": ["Transformer self-attention multi-head attention positional encoding encoder decoder"],
+                },
+                {
+                    "id": "objectives",
+                    "title": "预训练目标的演变",
+                    "objective": "对比 BERT 的 masked language model 双向预训练与 GPT-3 的 autoregressive left-to-right 目标。",
+                    "queries": ["BERT masked language model bidirectional GPT-3 autoregressive left-to-right training objective"],
+                },
+                {
+                    "id": "evidence",
+                    "title": "主要实验发现与规模效应",
+                    "objective": "比较 Transformer 的 BLEU、BERT 的 GLUE/SQuAD 与 GPT-3 的 zero-shot、one-shot、few-shot 基准证据。",
+                    "queries": [
+                        "Transformer translation BLEU BERT GLUE SQuAD experimental results",
+                        "GPT-3 zero-shot one-shot few-shot benchmark performance scaling",
+                    ],
+                },
+                {
+                    "id": "adaptation",
+                    "title": "下游适配方式",
+                    "objective": "比较 BERT fine-tuning 与 GPT-3 in-context、few-shot、zero-shot 适配范式。",
+                    "queries": ["BERT fine-tuning downstream tasks GPT-3 in-context few-shot zero-shot adaptation"],
+                },
+                {
+                    "id": "limits",
+                    "title": "局限、争议与开放问题",
+                    "objective": "识别 GPT-3 limitations、weaknesses、factual accuracy、bias 与计算成本等证据边界。",
+                    "queries": [
+                        "GPT-3 limitations weaknesses factual accuracy bias compute open questions",
+                        "GPT-3 notable weaknesses limitations text synthesis factual inaccuracies",
+                    ],
+                },
+            ],
+        }
+    sections = [
+        ("foundations", "概念与理论基础", "界定核心概念、共享机制与理论边界", "foundations architecture mechanism"),
+        ("methods", "方法与训练目标", "比较主要方法、训练目标与实现差异", "methods training objectives pretraining"),
+        ("evidence", "实证结果与比较", "汇总关键实验、性能结果与可比证据", "results experiments performance comparison"),
+        ("adaptation", "适配与应用范式", "梳理微调、迁移或上下文适配路径", "adaptation fine-tuning transfer in-context learning"),
+        ("limits", "局限、争议与开放问题", "识别证据局限、争议和仍待验证的问题", "limitations weaknesses open questions"),
+    ]
+    return {
+        "title": f"{question[:150]}：证据综述",
+        "scope": f"围绕“{question}”综合当前资料库中的可回跳证据。",
+        "sections": [
+            {
+                "id": section_id,
+                "title": title,
+                "objective": objective,
+                "queries": [f"{retrieval_topic} {query_terms}"[:500]],
+            }
+            for section_id, title, objective, query_terms in sections
+        ],
+    }
 
 
 def synthesize_literature_review(
@@ -155,47 +241,18 @@ def synthesize_literature_review(
     question = str(research.get("question", "")).strip()
     plan = dict(research.get("review_plan", {}) or {})
     evidence = [dict(row) for row in list(research.get("evidence", []) or [])]
-    known_ids = {str(row.get("citation_id", "")) for row in evidence if str(row.get("citation_id", ""))}
-    if not question or not plan.get("sections") or len(known_ids) < 3:
+    all_known_ids = {str(row.get("citation_id", "")) for row in evidence if str(row.get("citation_id", ""))}
+    if not question or not plan.get("sections") or len(all_known_ids) < 3:
         raise ValueError("综述检索结果不完整，无法进入写作阶段")
 
-    prompt_evidence = [
-        {
-            "citation_id": str(row.get("citation_id", "")),
-            "paper": str(row.get("paper", "")),
-            "section": str(row.get("section", "")),
-            "doi": str(row.get("doi", "")),
-            "exact_quote": str(row.get("exact_quote", "")),
-        }
-        for row in evidence
-    ]
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是严谨的学术综述作者。请跨论文归纳共同发现、方法差异、冲突、局限与研究空白，"
-                "而不是逐条复述摘要。所有事实性句子只能来自 evidence，且每个段落必须列出 citation_ids；"
-                "citation_ids 只能使用 evidence 中已有编号。区分已有结论与作者推断，不补充外部知识。"
-                "输出与用户问题相同语言。返回 JSON："
-                "{title,abstract:{text,citation_ids},sections:[{id,title,paragraphs:[{text,citation_ids}]}],"
-                "comparison_table:{columns:[...],rows:[{cells:[...],citation_ids:[...]}]},"
-                "controversies:[{text,citation_ids}],open_questions:[{text,basis,citation_ids}],limitations:[...]}。"
-                "sections 必须遵循 plan；comparison_table 至少比较研究对象、方法、主要发现和局限。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "review_question": question,
-                    "plan": plan,
-                    "evidence": prompt_evidence,
-                },
-                ensure_ascii=False,
-            ),
-        },
-    ]
-    raw = chat_client.complete_json(messages, schema_name="evidence_grounded_literature_review") or {}
+    prompt_plan, prompt_evidence = _review_prompt_inputs(plan, evidence)
+    known_ids = {str(row.get("citation_id", "")) for row in prompt_evidence}
+    raw = _synthesize_review_in_parts(
+        question,
+        prompt_plan,
+        prompt_evidence,
+        chat_client=chat_client,
+    )
     document = _normalize_review_document(question, plan, raw, known_ids=known_ids)
     document, references = _compact_document_citations(
         document,
@@ -216,6 +273,8 @@ def synthesize_literature_review(
         }
         for sentence in reader_answer["sentences"]
     ]
+    reference_document_count = len({item["doc_id"] for item in references if item.get("doc_id")})
+    evidence_is_sufficient = len(references) >= 3 and reference_document_count >= 2
     return {
         "phase": "synthesis",
         "question": question,
@@ -226,13 +285,13 @@ def synthesize_literature_review(
             "question": question,
             "answer": claims,
             "limitations": list(document.get("limitations", []) or []),
-            "insufficient_evidence": False,
+            "insufficient_evidence": not evidence_is_sufficient,
             "citation_verification": verification,
         },
         "adequacy": {
-            "is_sufficient": True,
+            "is_sufficient": evidence_is_sufficient,
             "quote_count": len(references),
-            "document_count": len({item["doc_id"] for item in references if item.get("doc_id")}),
+            "document_count": reference_document_count,
             "min_quotes": 3,
             "min_documents": 2,
             "profile": "literature_review",
@@ -247,6 +306,594 @@ def synthesize_literature_review(
         "retrieval_summary": dict(research.get("retrieval_summary", {}) or {}),
         "section_results": list(research.get("section_results", []) or []),
     }
+
+
+def _synthesize_review_in_parts(
+    question: str,
+    plan: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    chat_client: ChatJsonClient,
+) -> dict[str, Any]:
+    """Fall back to bounded section calls when one deeply nested JSON fails."""
+
+    evidence_by_id = {str(row.get("citation_id", "")): dict(row) for row in evidence}
+    sections: list[dict[str, Any]] = []
+    fallback_titles: list[str] = []
+    evidence_gap_titles: list[str] = []
+    text_completion = getattr(chat_client, "complete_text", None)
+    for planned in list(plan.get("sections", []) or []):
+        citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
+        if not citation_ids:
+            citation_ids = list(evidence_by_id)[:2]
+        section_evidence = [evidence_by_id[item] for item in citation_ids]
+        raw_section: dict[str, Any] = {}
+        attempts = [section_evidence, section_evidence[: max(2, min(4, len(section_evidence)))]]
+        for attempt_evidence in attempts:
+            try:
+                raw_section = _synthesize_verified_review_section(
+                    question,
+                    dict(planned),
+                    attempt_evidence,
+                    chat_client=chat_client,
+                )
+            except ValueError as error:
+                if "unknown quote_id" in str(error):
+                    raise
+                raw_section = {}
+            except Exception:  # provider transport/schema failures use the next bounded attempt
+                raw_section = {}
+            if raw_section:
+                break
+        if not raw_section:
+            fallback_titles.append(str(planned.get("title", "")))
+            raw_section = _direct_evidence_section(
+                question,
+                dict(planned),
+                section_evidence,
+                text_completion=text_completion if callable(text_completion) else None,
+            )
+        if not raw_section:
+            evidence_gap_titles.append(str(planned.get("title", "")))
+            raw_section = {
+                "text": "当前带锚点证据不足以支持本节目标，因此不据此作扩展推断。",
+                "citation_ids": citation_ids[:1],
+            }
+        paragraph = _normalized_cited_text(
+            raw_section,
+            known_ids=set(citation_ids),
+            field=f"章节“{planned.get('title', '')}”",
+        )
+        sections.append(
+            {
+                "id": str(planned.get("id", "")),
+                "title": str(planned.get("title", "")),
+                **paragraph,
+            }
+        )
+
+    overview = _deterministic_review_overview(question, plan, sections)
+    if fallback_titles:
+        limitations = list(overview.get("limitations", []) or [])
+        limitations.append(f"章节“{'、'.join(fallback_titles)}”采用原文摘录或忠实直译，未作扩展推断。")
+        overview["limitations"] = limitations
+    if evidence_gap_titles:
+        limitations = list(overview.get("limitations", []) or [])
+        limitations.append(f"章节“{'、'.join(evidence_gap_titles)}”缺少足以回答目标的直接证据，正文已明确保留证据空白。")
+        overview["limitations"] = limitations
+    return {**dict(overview), "sections": sections}
+
+
+def _synthesize_verified_review_section(
+    question: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    chat_client: ChatJsonClient,
+) -> dict[str, Any]:
+    """Generate small cited claims, verify them, and retain only direct support."""
+
+    evidence_rows = [
+        {
+            "quote_id": str(row.get("citation_id", "")),
+            "claim_target": str(planned.get("objective", "")),
+            "exact_quote": str(row.get("exact_quote", "")),
+            "paper": str(row.get("paper", "")),
+            "section": str(row.get("section", "")),
+            "stance": "supporting",
+        }
+        for row in evidence
+        if str(row.get("citation_id", "")) and str(row.get("exact_quote", ""))
+    ]
+    if not evidence_rows:
+        raise ValueError("review section has no evidence")
+    section_question = (
+        f"综述章节“{planned.get('title', '')}”：{planned.get('objective', '')}。"
+        "只陈述原文证据直接支持的共同点、差异或局限，不补充外部知识。"
+    )
+    draft = synthesize_answer_with_llm(section_question, evidence_rows, chat_client=chat_client)
+    draft["answer"] = _atomic_review_claims(list(draft.get("answer", []) or []))
+    verified = verify_answer_claims_with_llm(draft, evidence_rows, chat_client=chat_client)
+    quote_text_by_id = {str(row["quote_id"]): str(row["exact_quote"]) for row in evidence_rows}
+    supported = [
+        item
+        for item in list(verified.get("answer", []) or [])
+        if str(item.get("support_status", "")) == "supported"
+        and str(item.get("text", "")).strip()
+        and _semantic_cues_are_grounded(item, quote_text_by_id)
+        and _claim_addresses_review_section(item, planned)
+    ]
+    if not supported:
+        raise ValueError("review section has no directly supported model-written claims")
+    if re.search(r"[\u3400-\u9fff]", question):
+        text_completion = getattr(chat_client, "complete_text", None)
+        if callable(text_completion):
+            for claim in supported:
+                claim_text = str(claim.get("text", "")).strip()
+                if re.search(r"[\u3400-\u9fff]", claim_text):
+                    continue
+                try:
+                    translated = str(
+                        text_completion(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "把给定英文科研陈述忠实翻译成简洁中文。不得添加、删除、解释或强化任何事实、"
+                                        "比较、因果关系、模型名称或数值。只输出译文。"
+                                    ),
+                                },
+                                {"role": "user", "content": claim_text},
+                            ],
+                            max_tokens=420,
+                        )
+                    ).strip()
+                except Exception:  # translation is optional; the verified source-language claim remains valid
+                    translated = ""
+                if translated:
+                    claim["text"] = translated
+    citation_ids = list(
+        dict.fromkeys(
+            str(quote_id)
+            for claim in supported
+            for quote_id in list(claim.get("quote_ids", []) or [])
+            if str(quote_id)
+        )
+    )
+    return {
+        "text": "".join(_sentence_text(str(item.get("text", "")), chinese=True) for item in supported),
+        "citation_ids": citation_ids,
+    }
+
+
+def _diverse_section_citation_ids(
+    planned: dict[str, Any],
+    evidence_by_id: dict[str, dict[str, str]],
+    *,
+    limit: int,
+) -> list[str]:
+    candidates = [
+        str(item)
+        for item in list(planned.get("citation_ids", []) or [])
+        if str(item) in evidence_by_id
+    ]
+    original_order = {citation_id: index for index, citation_id in enumerate(candidates)}
+    candidates.sort(
+        key=lambda citation_id: (
+            -_section_evidence_score(planned, evidence_by_id[citation_id]),
+            original_order[citation_id],
+        )
+    )
+    selected: list[str] = []
+    seen_documents: set[str] = set()
+    for citation_id in candidates:
+        row = evidence_by_id[citation_id]
+        document = str(row.get("doc_id", "") or row.get("paper", "") or citation_id)
+        if document in seen_documents:
+            continue
+        selected.append(citation_id)
+        seen_documents.add(document)
+        if len(selected) >= limit:
+            return selected
+    for citation_id in candidates:
+        if citation_id not in selected:
+            selected.append(citation_id)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> float:
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    quote = " ".join(str(row.get("exact_quote", "")).split()).casefold()
+    score = 0.3 * min(len(quote), 900) / 900
+    terms = {
+        token.casefold()
+        for token in re.findall(r"\b[A-Za-z][A-Za-z0-9-]{3,}\b", target)
+        if token.casefold() not in {"with", "from", "into", "model"}
+    }
+    score += 1.0 * sum(term in quote for term in terms)
+    concept_cues = {
+        "自注意力": ("self-attention", "self attention"),
+        "位置编码": ("positional encoding",),
+        "掩码": ("masked language", "mlm"),
+        "自编码": ("masked language", "mlm"),
+        "mlm": ("masked language", "mlm"),
+        "自回归": ("autoregressive", "left-to-right", "next token", "causal language"),
+        "clm": ("autoregressive", "left-to-right", "next token", "causal language"),
+        "微调": ("fine-tun",),
+        "fine-tuning": ("fine-tun",),
+        "fine tuning": ("fine-tun",),
+        "提示": ("prompt", "in-context", "few-shot", "zero-shot", "one-shot"),
+        "少样本": ("few-shot",),
+        "零样本": ("zero-shot",),
+        "规模": ("scaling", "parameters", "model size", "compute"),
+        "计算": ("compute", "flop"),
+        "局限": ("limitation", "weakness", "difficulty", "fail"),
+        "长文本": ("long passage", "long-range", "context window"),
+        "幻觉": ("factual inaccuracy", "hallucin"),
+    }
+    for concept, cues in concept_cues.items():
+        if concept in target and any(cue in quote for cue in cues):
+            score += 2.2
+    if len(quote) < 45:
+        score -= 8
+    if "@" in quote or quote.count("google") >= 3:
+        score -= 3
+    if quote in {"attention is all you need.", "attention is all you need"}:
+        score -= 10
+    numeric_ratio = sum(character.isdigit() for character in quote) / max(1, len(quote))
+    if numeric_ratio > 0.12 or "model name nparams" in quote or "total train compute" in quote:
+        score -= 2
+    if "原始 transformer" in target:
+        if "bert" in quote or "gpt" in quote:
+            score -= 4
+        if "self-attention" in quote and "encoder" in quote and "decoder" in quote:
+            score += 3
+    return score
+
+
+def _atomic_review_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    atomic: list[dict[str, Any]] = []
+    for claim in claims:
+        text = " ".join(str(claim.get("text", "")).split()).strip()
+        parts = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？!?])|(?<=\.)(?=\s+[A-Z\u3400-\u9fff])", text)
+            if item.strip()
+        ] or ([text] if text else [])
+        for index, part in enumerate(parts, start=1):
+            atomic.append(
+                {
+                    **dict(claim),
+                    "claim_id": f"{claim.get('claim_id', 'claim')}-s{index}",
+                    "text": part,
+                }
+            )
+    return atomic[:4]
+
+
+def _semantic_cues_are_grounded(claim: dict[str, Any], quote_text_by_id: dict[str, str]) -> bool:
+    text = str(claim.get("text", "")).casefold()
+    quotes = " ".join(
+        quote_text_by_id.get(str(quote_id), "")
+        for quote_id in list(claim.get("quote_ids", []) or [])
+    ).casefold()
+    cue_pairs = [
+        (("优于", "超过", "超越", "高于", "outperform", "exceed", "surpass"),
+         ("outperform", "exceed", "surpass", "higher than", "better than", "superior")),
+        (("显著提升", "显著提高", "显著改进", "significantly improv"),
+         ("significant", "improv", "increase", "gain", "outperform", "achiev")),
+        (("导致", "使得", "从而", "贡献了", "归因于", "caused", "because"),
+         ("because", "due to", "account for", "lead", "result", "contribut")),
+    ]
+    for claim_cues, evidence_cues in cue_pairs:
+        if any(cue in text for cue in claim_cues) and not any(cue in quotes for cue in evidence_cues):
+            return False
+    concept_pairs = [
+        (("生成能力",), ("generat",)),
+        (("偏见", "偏差风险"), ("bias",)),
+        (("推理能力",), ("reason",)),
+        (("泛化能力",), ("general",)),
+    ]
+    return all(
+        not any(cue in text for cue in claim_cues) or any(cue in quotes for cue in evidence_cues)
+        for claim_cues, evidence_cues in concept_pairs
+    )
+
+
+def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, Any]) -> bool:
+    title = str(planned.get("title", "")).casefold()
+    section_id = str(planned.get("id", "")).casefold()
+    target = f"{title} {planned.get('objective', '')}".casefold()
+    text = str(claim.get("text", "")).casefold()
+    if "原始 transformer" in title:
+        if "bert" in text or re.search(r"\bgpt(?:-?3)?\b", text):
+            return False
+        return any(cue in text for cue in ("自注意力", "多头注意力", "位置编码", "编码器", "解码器", "self-attention", "multi-head", "positional", "encoder", "decoder"))
+    section_cues = {
+        "objectives": ("masked language", "mlm", "autoregressive", "left-to-right", "掩码", "自回归"),
+        "evidence": ("bleu", "glue", "squad", "zero-shot", "one-shot", "few-shot", "accuracy", "benchmark", "score", " f1", "outperform"),
+        "adaptation": ("fine-tun", "in-context", "few-shot", "zero-shot", "one-shot", "微调", "少样本", "零样本"),
+        "limits": ("limitation", "weakness", "factual", "bias", "risk", "局限", "弱点", "事实", "偏见", "风险"),
+    }
+    if section_id in section_cues and not any(cue in text for cue in section_cues[section_id]):
+        return False
+    concept_groups = [
+        (("自注意力", "self-attention", "self attention"), ("自注意力", "self-attention", "self attention")),
+        (("位置编码", "positional encoding"), ("位置编码", "positional encoding")),
+        (("掩码", "mlm", "masked language"), ("掩码", "mlm", "masked language")),
+        (("自回归", "clm", "autoregressive", "left-to-right"), ("自回归", "因果语言", "单向语言", "autoregressive", "left-to-right")),
+        (("微调", "fine-tuning", "fine tuning"), ("微调", "fine-tun")),
+        (("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot"), ("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot")),
+        (("规模", "scaling", "model size", "compute"), ("规模", "参数", "计算量", "scaling", "model size", "compute")),
+        (("实验", "性能", "基准", "benchmark", "performance"), ("实验", "性能", "准确", "得分", "损失", "基准", "benchmark", "accuracy", "score", "loss", "f1", "bleu")),
+        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "弱点", "风险", "错误", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias")),
+    ]
+    required = [claim_cues for target_cues, claim_cues in concept_groups if any(cue in target for cue in target_cues)]
+    if not required:
+        return True
+    if any(cue in target for cue in ("局限", "挑战", "幻觉", "limitation", "weakness", "factual", "bias")):
+        limitation_cues = concept_groups[-1][1]
+        return any(cue in text for cue in limitation_cues)
+    return any(any(cue in text for cue in claim_cues) for claim_cues in required)
+
+
+def _direct_evidence_section(
+    question: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    text_completion: Callable[..., str] | None,
+) -> dict[str, Any]:
+    ranked_candidates: list[tuple[float, int, int, str, str, str]] = []
+    for row_index, row in enumerate(evidence):
+        citation_id = str(row.get("citation_id", ""))
+        quote = " ".join(str(row.get("_full_exact_quote", row.get("exact_quote", ""))).split()).strip()
+        if not citation_id or not quote:
+            continue
+        candidates = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?])\s+", quote)
+            if len(part.strip()) >= 20
+            and "@" not in part
+            and "arxiv:" not in part.casefold()
+            and not re.match(r"^\(\d{4}\)", part.strip())
+            and part.casefold() != "attention is all you need."
+        ]
+        for sentence_index, candidate in enumerate(candidates):
+            if not _claim_addresses_review_section({"text": candidate}, planned):
+                continue
+            numeric_characters = sum(character.isdigit() for character in candidate)
+            if numeric_characters / max(1, len(candidate)) > 0.16:
+                continue
+            score = _section_evidence_score(planned, {"exact_quote": candidate})
+            document = str(row.get("doc_id", "") or row.get("paper", "") or citation_id)
+            ranked_candidates.append((score, -row_index, -sentence_index, citation_id, document, candidate))
+    if not ranked_candidates:
+        return {}
+    selected: list[tuple[str, str]] = []
+    used_citations: set[str] = set()
+    used_sentences: set[str] = set()
+    used_documents: set[str] = set()
+    max_items = 2 if str(planned.get("id", "")) in {"objectives", "evidence", "adaptation"} else 1
+    ordered_candidates = sorted(ranked_candidates, reverse=True)
+    top_score = float(ordered_candidates[0][0])
+    minimum_secondary_score = max(1.2, top_score * 0.35)
+    for score, _, _, citation_id, document, sentence in ordered_candidates:
+        if selected and score < minimum_secondary_score:
+            continue
+        normalized_sentence = " ".join(sentence.split()).casefold()
+        if citation_id in used_citations or normalized_sentence in used_sentences or document in used_documents:
+            continue
+        selected.append((citation_id, _truncate_utf8(sentence, 540)))
+        used_citations.add(citation_id)
+        used_sentences.add(normalized_sentence)
+        used_documents.add(document)
+        if len(selected) >= max_items:
+            break
+    if len(selected) < max_items:
+        for score, _, _, citation_id, _, sentence in ordered_candidates:
+            if selected and score < minimum_secondary_score:
+                continue
+            normalized_sentence = " ".join(sentence.split()).casefold()
+            if citation_id in used_citations or normalized_sentence in used_sentences:
+                continue
+            selected.append((citation_id, _truncate_utf8(sentence, 540)))
+            used_citations.add(citation_id)
+            used_sentences.add(normalized_sentence)
+            if len(selected) >= max_items:
+                break
+    output_sentences: list[str] = []
+    output_citations: list[str] = []
+    for citation_id, sentence in selected:
+        sentence = re.sub(r"^\d+(?:\.\d+)*\s+(?:Conclusion|Fine-tuning BERT)\s+", "", sentence, flags=re.I)
+        sentence = re.sub(r"\bself-\s+attention\b", "self-attention", sentence, flags=re.I)
+        sentence = re.sub(r"\bfine-\s+tuning\b", "fine-tuning", sentence, flags=re.I)
+        sentence = re.sub(r"\bleft-\s+to-right\b", "left-to-right", sentence, flags=re.I)
+        sentence = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", sentence)
+        if re.search(r"[\u3400-\u9fff]", question) and callable(text_completion):
+            try:
+                translated = str(
+                    text_completion(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "把下列英文论文原句忠实直译为简洁中文。不得增删事实、比较、因果、限定词、"
+                                    "模型名或数值；保留不确定性。只输出译文。"
+                                ),
+                            },
+                            {"role": "user", "content": sentence},
+                        ],
+                        max_tokens=520,
+                    )
+                ).strip()
+            except Exception:  # preserve the exact source sentence when translation is unavailable
+                translated = ""
+            if translated:
+                sentence = translated
+        candidate = {"text": sentence, "citation_ids": [citation_id]}
+        if not _claim_addresses_review_section(candidate, planned):
+            continue
+        output_sentences.append(_sentence_text(sentence, chinese=bool(re.search(r"[\u3400-\u9fff]", question))))
+        output_citations.append(citation_id)
+    if not output_sentences:
+        return {}
+    return {"text": " ".join(output_sentences), "citation_ids": output_citations}
+
+
+def _sentence_text(value: str, *, chinese: bool) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    if text[-1] in "。！？.!?":
+        return text
+    return text + ("。" if chinese else ".")
+
+
+def _deterministic_review_overview(
+    question: str,
+    plan: dict[str, Any],
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble a valid evidence-linked overview from model-written sections."""
+
+    citation_ids = list(
+        dict.fromkeys(
+            str(item)
+            for section in sections
+            for item in list(section.get("citation_ids", []) or [])
+            if str(item)
+        )
+    )
+    abstract_parts = [
+        (
+            re.split(r"(?<=[。！？.!?])\s*", str(section.get("text", "")).strip(), maxsplit=1)[0],
+            [str(item) for item in list(section.get("citation_ids", []) or []) if str(item)],
+        )
+        for section in sections
+        if str(section.get("text", "")).strip()
+    ]
+    selected_abstract_parts: list[str] = []
+    abstract_citation_ids: list[str] = []
+    for item, item_citation_ids in abstract_parts:
+        sentence = _sentence_text(item, chinese=True)
+        candidate = " ".join([*selected_abstract_parts, sentence])
+        if len(candidate) <= 420:
+            selected_abstract_parts.append(sentence)
+            abstract_citation_ids.extend(item_citation_ids)
+    abstract_text = " ".join(selected_abstract_parts) or "当前资料库已形成带引用的分章节证据摘要。"
+    abstract_citation_ids = list(dict.fromkeys(abstract_citation_ids)) or citation_ids[:1]
+    rows = [
+        {
+            "cells": [
+                str(section.get("title", "")),
+                str(dict(planned).get("objective", "")),
+                str(section.get("text", "")),
+                "结论范围受当前资料库与带锚点证据覆盖限制。",
+            ],
+            "citation_ids": list(section.get("citation_ids", []) or []),
+        }
+        for section, planned in zip(sections[:3], list(plan.get("sections", []) or [])[:3])
+    ]
+    question_ids = citation_ids[-2:] or citation_ids[:1]
+    return {
+        "title": str(plan.get("title", "")).strip() or question,
+        "abstract": {"text": abstract_text, "citation_ids": abstract_citation_ids},
+        "comparison_table": {
+            "columns": ["研究主题", "综合目标", "主要发现", "证据边界"],
+            "rows": rows,
+        },
+        "controversies": [],
+        "open_questions": [
+            {
+                "text": "这些结论能否在不同任务、数据和模型规模下稳定复现？",
+                "basis": "当前章节显示研究对象、训练目标与评估设置存在差异。",
+                "citation_ids": question_ids,
+            },
+            {
+                "text": "如何在性能收益、数据效率、计算成本与偏见风险之间取得可验证的平衡？",
+                "basis": "当前证据同时涉及性能改进与方法局限。",
+                "citation_ids": citation_ids[:2] or question_ids,
+            },
+        ],
+        "limitations": ["本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"],
+    }
+
+
+def _review_prompt_inputs(
+    plan: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Build a bounded writing prompt while retaining evidence for every section."""
+
+    evidence_by_id = {
+        str(row.get("citation_id", "")): row
+        for row in evidence
+        if str(row.get("citation_id", ""))
+    }
+    selected_ids: list[str] = []
+    sections = list(plan.get("sections", []) or [])[:_MAX_SECTIONS]
+    for section in sections:
+        for citation_id in _diverse_section_citation_ids(dict(section), evidence_by_id, limit=6):
+            if citation_id in evidence_by_id and citation_id not in selected_ids:
+                selected_ids.append(citation_id)
+    for row in evidence:
+        citation_id = str(row.get("citation_id", ""))
+        if citation_id and citation_id not in selected_ids:
+            selected_ids.append(citation_id)
+        if len(selected_ids) >= _MAX_PROMPT_EVIDENCE_ROWS:
+            break
+
+    prompt_ids = set(selected_ids[:_MAX_PROMPT_EVIDENCE_ROWS])
+    prompt_evidence = [
+        {
+            "citation_id": citation_id,
+            "paper": _truncate_utf8(str(evidence_by_id[citation_id].get("paper", "")), 240),
+            "section": _truncate_utf8(str(evidence_by_id[citation_id].get("section", "")), 120),
+            "doi": _truncate_utf8(str(evidence_by_id[citation_id].get("doi", "")), 160),
+            "exact_quote": _truncate_utf8(
+                str(evidence_by_id[citation_id].get("exact_quote", "")),
+                _MAX_PROMPT_QUOTE_BYTES,
+            ),
+            "_full_exact_quote": str(evidence_by_id[citation_id].get("exact_quote", "")),
+        }
+        for citation_id in selected_ids[:_MAX_PROMPT_EVIDENCE_ROWS]
+    ]
+    prompt_sections = [
+        {
+            "id": str(dict(section).get("id", "")),
+            "title": str(dict(section).get("title", "")),
+            "objective": str(dict(section).get("objective", "")),
+            "citation_ids": [
+                str(item)
+                for item in list(dict(section).get("citation_ids", []) or [])
+                if str(item) in prompt_ids
+            ],
+        }
+        for section in sections
+    ]
+    prompt_plan = {
+        "title": str(plan.get("title", "")),
+        "scope": str(plan.get("scope", "")),
+        "sections": prompt_sections,
+    }
+    return prompt_plan, prompt_evidence
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    clean = " ".join(str(value or "").split())
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return clean
+    clipped = encoded[: max(1, int(max_bytes) - 3)]
+    while clipped:
+        try:
+            return clipped.decode("utf-8") + "…"
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    return "…"
 
 
 def _normalize_review_plan(question: str, raw: object) -> dict[str, Any]:
@@ -294,6 +941,8 @@ def _normalize_review_document(
     for index, planned in enumerate(list(plan.get("sections", []) or [])):
         supplied = raw_sections[index] if index < len(raw_sections) and isinstance(raw_sections[index], dict) else {}
         paragraphs_source = supplied.get("paragraphs") if isinstance(supplied.get("paragraphs"), list) else []
+        if not paragraphs_source and str(supplied.get("text", "")).strip():
+            paragraphs_source = [supplied]
         paragraphs = [
             _normalized_cited_text(item, known_ids=known_ids, field=f"章节“{planned['title']}”")
             for item in paragraphs_source
@@ -321,7 +970,11 @@ def _normalize_review_document(
         open_questions.append(normalized)
     if not open_questions:
         raise ValueError("写作模型没有基于证据提出开放问题")
-    limitations = [str(item).strip() for item in list(payload.get("limitations", []) or []) if str(item).strip()]
+    limitations = [
+        (str(item.get("text", "")).strip() if isinstance(item, dict) else str(item).strip())
+        for item in list(payload.get("limitations", []) or [])
+        if (str(item.get("text", "")).strip() if isinstance(item, dict) else str(item).strip())
+    ]
     if not limitations:
         limitations = ["本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"]
     return {

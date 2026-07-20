@@ -157,8 +157,11 @@ def test_apply_verification_policy_abstains_when_no_claim_is_supported():
 
 
 def test_verify_answer_claims_with_llm_updates_claim_statuses_and_summary():
+    captured = {}
+
     class FakeChatClient:
         def complete_json(self, messages, *, schema_name):
+            captured["messages"] = messages
             return {
                 "claims": [
                     {
@@ -193,6 +196,43 @@ def test_verify_answer_claims_with_llm_updates_claim_statuses_and_summary():
     ]
     assert verified["verification"]["supported_claims"] == ["c0001"]
     assert verified["verification"]["unsupported_claims"] == ["c0002"]
+    request_body = json.loads(captured["messages"][1]["content"])
+    assert request_body["answer"] == {
+        "claims": [
+            {"claim_id": "c0001", "text": "Supported claim.", "quote_ids": ["q0001"]},
+            {"claim_id": "c0002", "text": "Unsupported claim.", "quote_ids": ["q0001"]},
+        ]
+    }
+    assert request_body["evidence_table"] == [
+        {"quote_id": "q0001", "exact_quote": "Supported claim.", "paper": "", "section": ""}
+    ]
+    assert "different languages" in captured["messages"][0]["content"]
+
+
+def test_llm_verification_cannot_support_a_model_name_missing_from_its_quote():
+    class FakeChatClient:
+        def complete_json(self, messages, *, schema_name):
+            return {
+                "claims": [
+                    {"claim_id": "c0001", "support_status": "supported", "verification_score": 0.99}
+                ]
+            }
+
+    answer = {
+        "answer": [
+            {
+                "claim_id": "c0001",
+                "text": "GPT-3 使用零样本学习。",
+                "quote_ids": ["q0001"],
+            }
+        ]
+    }
+    evidence = [{"quote_id": "q0001", "exact_quote": "OpenAI GPT uses a left-to-right Transformer LM."}]
+
+    verified = verify_answer_claims_with_llm(answer, evidence, chat_client=FakeChatClient())
+
+    assert verified["answer"][0]["support_status"] == "unsupported"
+    assert verified["answer"][0]["verification_score"] == 0.0
 
 
 def test_cli_verify_writes_verified_report_json(tmp_path: Path, capsys):

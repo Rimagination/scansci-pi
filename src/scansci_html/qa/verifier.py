@@ -114,11 +114,15 @@ def verify_answer_claims_with_llm(
     chat_client: ChatJsonClient,
 ) -> dict[str, Any]:
     verified = deepcopy(answer)
+    compact_answer, compact_evidence = _compact_verification_payload(answer, evidence_table)
     messages = [
         {
             "role": "system",
             "content": (
-                "Judge whether each claim is supported by its cited quotes. "
+                "Judge whether each claim is semantically supported by its cited quotes, even when the claim and quote "
+                "use different languages. Require direct entailment: association or benchmark correlation does not prove "
+                "a causal explanation, and a quote must explicitly name every model, method, result or comparison asserted "
+                "by the claim. "
                 "Use only these statuses: supported, partially_supported, contradicted, "
                 "unsupported, not_enough_information."
             ),
@@ -127,8 +131,8 @@ def verify_answer_claims_with_llm(
             "role": "user",
             "content": json.dumps(
                 {
-                    "answer": answer,
-                    "evidence_table": evidence_table,
+                    "answer": compact_answer,
+                    "evidence_table": compact_evidence,
                 },
                 ensure_ascii=False,
             ),
@@ -144,6 +148,11 @@ def verify_answer_claims_with_llm(
         )
         for item in payload.claims
     }
+    quote_texts = {
+        str(row.get("quote_id", "")): str(row.get("exact_quote", ""))
+        for row in evidence_table
+        if str(row.get("quote_id", ""))
+    }
     summary = _empty_summary()
     claims = list(verified.get("answer", []) or [])
     for claim in claims:
@@ -151,12 +160,67 @@ def verify_answer_claims_with_llm(
         status, score = status_by_claim.get(claim_id, ("not_enough_information", 0.0))
         if status not in SUPPORT_STATUSES:
             raise ValueError(f"unsupported verification status for {claim_id}: {status}")
+        quote_ids = [str(item) for item in list(claim.get("quote_ids", []) or [])]
+        bound_quotes = [quote_texts[item] for item in quote_ids if item in quote_texts]
+        if status in {"supported", "partially_supported"} and not _claim_entities_present(
+            str(claim.get("text", "")), bound_quotes
+        ):
+            status, score = "unsupported", 0.0
         claim["support_status"] = status
         claim["verification_score"] = round(score, 2)
         summary[f"{status}_claims"].append(claim_id)
     verified["answer"] = claims
     verified["verification"] = summary
     return verified
+
+
+def _claim_entities_present(claim_text: str, quotes: list[str]) -> bool:
+    """Reject citations that do not name the model/acronym asserted by a claim."""
+
+    entities: set[str] = set()
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9._+/-]*\b", claim_text):
+        clean = token.strip("._+/-")
+        if not clean:
+            continue
+        if clean.casefold() == "transformer" or clean.isupper() or any(character.isdigit() for character in clean):
+            entities.add(clean.casefold())
+    if not entities:
+        return True
+    quoted = " ".join(quotes).casefold()
+    return all(entity in quoted for entity in entities)
+
+
+def _compact_verification_payload(
+    answer: dict[str, Any],
+    evidence_table: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Keep multilingual verification focused and free of local paths/context bulk."""
+
+    claims = [
+        {
+            "claim_id": str(claim.get("claim_id", "")),
+            "text": str(claim.get("text", "")),
+            "quote_ids": [str(item) for item in list(claim.get("quote_ids", []) or [])],
+        }
+        for claim in list(answer.get("answer", []) or [])[:4]
+    ]
+    used_quote_ids = {
+        quote_id
+        for claim in claims
+        for quote_id in list(claim.get("quote_ids", []) or [])
+        if quote_id
+    }
+    evidence = [
+        {
+            "quote_id": str(row.get("quote_id", "")),
+            "exact_quote": " ".join(str(row.get("exact_quote", "")).split())[:1200],
+            "paper": " ".join(str(row.get("paper", "")).split())[:240],
+            "section": " ".join(str(row.get("section", "")).split())[:120],
+        }
+        for row in evidence_table
+        if str(row.get("quote_id", "")) in used_quote_ids
+    ]
+    return {"claims": claims}, evidence
 
 
 def _support_score(claim_text: str, quotes: list[str]) -> float:

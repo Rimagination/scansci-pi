@@ -268,7 +268,13 @@ def test_research_runtime_uses_deep_agents_for_configured_provider(tmp_path: Pat
     monkeypatch.setattr(research_agent_module, "ScanSciDeepAgent", FakeDeepAgent)
 
     result = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db).answer_sync(
-        {"question": "What changed?", "limit": 6, "thread_id": "run-7", "thinking_level": "high"}
+        {
+            "question": "What changed?",
+            "limit": 6,
+            "thread_id": "run-7",
+            "thinking_level": "high",
+            "agent_harness": "deep",
+        }
     )
 
     assert calls["model"] == {"model": "research-model"}

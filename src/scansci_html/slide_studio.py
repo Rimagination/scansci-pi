@@ -19,7 +19,7 @@ from pypdf import PdfReader
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
 from .builtin_skills import SCIENTIFIC_SLIDES_CONTRACT
@@ -148,6 +148,7 @@ def create_source_slide_deck(
         "slide_plan_path": str(slide_plan_path),
         "renderer": "python-pptx",
         "enhanced_renderer": "pptxgenjs-browser",
+        "slide_count": len(list(outline.get("slides", []) or [])) + 1,
         "source_count": len(extracted),
         "sources": [
             {
@@ -339,11 +340,14 @@ def _normalise_model_outline(candidate: Any, *, fallback: dict[str, Any], source
         if not isinstance(raw, dict):
             continue
         title = _short_text(raw.get("title"), 72)
-        takeaway = _short_text(raw.get("takeaway"), 120)
-        bullets = [_short_text(item, 150) for item in list(raw.get("bullets", []) or []) if _short_text(item, 150)][:5]
+        takeaway = _slide_excerpt(raw.get("takeaway"), limit=118)
+        layout = str(raw.get("layout", "")).strip().lower()
+        if layout not in {"cards", "comparison", "process", "branches"}:
+            layout = "cards"
+        bullets = [_slide_excerpt(item, limit=108) for item in list(raw.get("bullets", []) or []) if _slide_excerpt(item, limit=108)][:5]
         pages = [int(item) for item in list(raw.get("source_pages", []) or []) if str(item).isdigit() and 1 <= int(item) <= max_pages][:6]
         if title and (takeaway or bullets):
-            slides.append({"title": title, "takeaway": takeaway, "bullets": bullets, "source_pages": pages})
+            slides.append({"title": title, "takeaway": takeaway, "layout": layout, "bullets": bullets, "source_pages": pages})
     if len(slides) < 3:
         raise ValueError("演示模型返回的页面内容不完整")
     return {
@@ -358,50 +362,140 @@ def _normalise_model_outline(candidate: Any, *, fallback: dict[str, Any], source
 
 def _fallback_outline(sources: list[dict[str, Any]], topic: str) -> dict[str, Any]:
     title = _short_text(topic, 96) or Path(str(sources[0]["name"])).stem.replace("_", " ") or "研究材料汇报"
-    sentences = _sentences("\n".join(item["text"] for item in sources))
-    if not sentences:
-        sentences = ["材料已成功导入，但正文可提炼句子较少。"]
-    pages = list(range(1, min(4, max(item["page_count"] for item in sources)) + 1))
-    first = sentences[:5]
-    middle = sentences[5:10] or first[1:]
-    later = sentences[10:15] or middle[:3]
-    source_names = [item["name"] for item in sources]
+    source_slides: list[dict[str, Any]] = []
+    comparison_bullets: list[str] = []
+    for source in sources[:5]:
+        key_sentences = _source_key_sentences(source, topic=title)
+        if not key_sentences:
+            key_sentences = [f"{_display_source_name(source['name'])} 已导入，但未提取到适合直接展示的完整句子。"]
+        source_title = _display_source_name(source["name"])
+        source_slides.append(
+            {
+                "title": source_title,
+                "takeaway": _slide_excerpt(key_sentences[0], limit=118),
+                "layout": "cards",
+                "bullets": [_slide_excerpt(item, limit=104) for item in (key_sentences[1:4] or key_sentences[:1])],
+                "source_pages": list(range(1, min(3, int(source.get("page_count", 1))) + 1)),
+            }
+        )
+        comparison_bullets.append(f"{source_title}：{_slide_excerpt(key_sentences[0], limit=78)}")
     slides = [
-        {"title": title, "takeaway": "基于用户提供材料生成的第一版研究汇报", "bullets": source_names, "source_pages": []},
-        {"title": "这份材料要回答什么问题？", "takeaway": "先明确材料中的研究对象、目标与边界", "bullets": first[:4], "source_pages": pages[:2]},
-        {"title": "核心信息集中在哪里", "takeaway": "把材料中的关键事实、数据与观点组织成听众易理解的内容", "bullets": middle[:5], "source_pages": pages},
-        {"title": "方法、过程与核心发现", "takeaway": "用清晰的结构呈现材料中的过程、结果与适用范围", "bullets": later[:5], "source_pages": pages},
-        {"title": "结论、启示与下一步", "takeaway": "概括可用于汇报和讨论的结论，并明确下一步工作", "bullets": ["请在使用前复核原文中的关键数字、因果表述和结论范围。", "如需正式汇报，可补充图表、方法细节与外部文献交叉验证。"], "source_pages": []},
-        {"title": "来源材料", "takeaway": "本演示仅基于本次上传内容", "bullets": source_names, "source_pages": []},
+        {
+            "title": "研究范围与材料构成",
+            "takeaway": f"本次演示围绕“{title}”整理 {len(sources)} 份上传材料。",
+            "layout": "cards",
+            "bullets": [
+                f"{item['title']}：{_slide_excerpt(item['takeaway'], limit=68)}"
+                for item in source_slides[:5]
+            ],
+            "source_pages": [],
+        },
+        *source_slides,
+        {
+            "title": "材料之间可以直接比较什么",
+            "takeaway": "以下对比只复述各材料中已经出现的陈述，不把并列路线改写为单线替代关系。",
+            "layout": "cards",
+            "bullets": comparison_bullets[:5],
+            "source_pages": [],
+        },
+        {
+            "title": "证据边界与下一步",
+            "takeaway": "离线初稿保留来源边界；正式汇报前应复核关键数字与结论范围。",
+            "layout": "cards",
+            "bullets": [
+                "所有要点均来自本次上传材料的可提取正文。",
+                "图表、公式和被截断的长句需要回到原 PDF 复核。",
+                "如需更强的跨文献叙事，可在模型服务恢复后重新生成大纲。",
+            ],
+            "source_pages": [],
+        },
     ]
-    presentation_titles = [
-        title,
-        "研究问题与演示目标",
-        "关键信息与核心发现",
-        "方法、过程与逻辑",
-        "结论、启示与下一步",
-        "来源材料",
-    ]
-    presentation_takeaways = [
-        "围绕材料的核心主题，建立清晰的汇报主线。",
-        "先说明这份材料试图回答的问题，以及汇报希望达成的判断。",
-        "把最重要的信息组织成便于理解与讨论的关键结论。",
-        "用清晰的过程、关系或比较解释内容如何展开。",
-        "收束可得出的结论，并明确下一步需要讨论或补充的内容。",
-        "本演示基于本次上传材料整理。",
-    ]
-    for index, slide in enumerate(slides):
-        if index < len(presentation_titles):
-            slide["title"] = presentation_titles[index]
-            slide["takeaway"] = presentation_takeaways[index]
     return {
         "title": title,
-        "central_question": "这份材料希望帮助听众理解和判断的核心问题是什么？",
-        "story": "从研究对象与问题出发，依次呈现关键信息、方法或过程、核心发现，以及可讨论的结论与下一步。",
+        "central_question": f"围绕“{title}”，这些材料分别提供了哪些可核验的架构、训练目标、实验与适配证据？",
+        "story": "先逐篇呈现可核验要点，再比较材料之间的共同基础与差异，最后明确证据边界。",
         "slides": slides,
         "evidence_linked": True,
         "source_first": True,
     }
+
+
+def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
+    name = _display_source_name(source.get("name", ""))
+    keywords = {
+        token.casefold()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", f"{name} {topic}")
+        if token.casefold() not in {"the", "and", "from", "with", "pdf"}
+    }
+    lower_name = name.casefold()
+    if "attention" in lower_name or "transformer" in lower_name:
+        keywords.update({"attention", "transformer", "encoder", "decoder", "translation", "bleu"})
+    if "bert" in lower_name:
+        keywords.update({"bert", "bidirectional", "masked", "fine-tun", "glue", "squad"})
+    if "gpt" in lower_name:
+        keywords.update({"gpt-3", "few-shot", "zero-shot", "one-shot", "in-context", "language model"})
+    candidates: list[tuple[float, int, str]] = []
+    raw_sentences = re.split(r"(?<=[。！？.!?])\s+|\n+", str(source.get("text", "")))
+    for index, sentence in enumerate(raw_sentences):
+        clean = " ".join(sentence.split()).strip()
+        had_page_marker = bool(re.match(r"^\[第\s*\d+\s*页\]", clean))
+        clean = re.sub(r"^\[第\s*\d+\s*页\]\s*", "", clean)
+        if len(clean) > 260:
+            boundaries = [
+                position + 1
+                for position, character in enumerate(clean[:260])
+                if position >= 70 and character in "，,；;。.!?！？"
+            ]
+            if not boundaries:
+                continue
+            clean = clean[: boundaries[-1]].strip()
+        folded = clean.casefold()
+        if not 35 <= len(clean) <= 260:
+            continue
+        if "@" in clean or any(
+            noise in folded
+            for noise in (
+                "provided proper attribution",
+                "listing order is random",
+                "google brain",
+                "google research",
+                "university of toronto",
+                "proposed replacing",
+                "designed and implemented",
+                "was responsible for",
+                "we organize the appendix",
+                "figure 1:",
+            )
+        ):
+            continue
+        score = sum(keyword in folded for keyword in keywords)
+        score += 0.8 if any(cue in folded for cue in ("we propose", "we introduce", "we show", "achieves", "outperform", "uses", "model")) else 0
+        if had_page_marker and "question:" not in folded and "研究问题" not in folded:
+            score -= 4
+        if score <= 0:
+            continue
+        candidates.append((float(score), index, clean))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    if not candidates:
+        for index, sentence in enumerate(raw_sentences):
+            clean = " ".join(sentence.split()).strip()
+            if 35 <= len(clean) <= 260 and "@" not in clean:
+                excerpt = _slide_excerpt(clean, limit=155)
+                if excerpt:
+                    candidates.append((0.1, index, excerpt))
+            if len(candidates) >= 5:
+                break
+    output: list[str] = []
+    seen: set[str] = set()
+    for _, _, sentence in candidates:
+        key = sentence.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(_slide_excerpt(sentence, limit=155))
+        if len(output) >= 5:
+            break
+    return output
 
 
 def _render_pptx(path: Path, outline: dict[str, Any], sources: list[dict[str, Any]], *, theme: dict[str, Any]) -> None:
@@ -411,12 +505,12 @@ def _render_pptx(path: Path, outline: dict[str, Any], sources: list[dict[str, An
     slides = list(outline.get("slides", []) or [])
     if not slides:
         raise ValueError("幻灯片大纲为空")
-    for index, slide_data in enumerate(slides, start=1):
+    cover = presentation.slides.add_slide(presentation.slide_layouts[6])
+    _render_cover(cover, outline, sources, theme=theme)
+    total = len(slides) + 1
+    for index, slide_data in enumerate(slides, start=2):
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
-        if index == 1:
-            _render_cover(slide, outline, sources, theme=theme)
-        else:
-            _render_content_slide(slide, slide_data, index=index, total=len(slides), sources=sources, theme=theme)
+        _render_content_slide(slide, slide_data, index=index, total=total, sources=sources, theme=theme)
     path.parent.mkdir(parents=True, exist_ok=True)
     presentation.save(str(path))
 
@@ -438,8 +532,8 @@ def _render_cover(slide: Any, outline: dict[str, Any], sources: list[dict[str, A
         size=16 if len(central_question) > 150 else 18 if len(central_question) > 110 else 21,
         color=theme["cover_muted"],
     )
-    _add_text(slide, "基于上传材料自动生成 · 生成前请复核原文中的关键结论与数据", 0.94, 5.95, 10.7, 0.35, size=12, color=(167, 190, 199))
-    _add_text(slide, " / ".join(item["name"] for item in sources), 0.94, 6.35, 10.8, 0.38, size=12, color=(207, 232, 230))
+    _add_text(slide, f"基于 {len(sources)} 份上传材料生成", 0.94, 5.95, 10.7, 0.35, size=12, color=(167, 190, 199))
+    _add_text(slide, " · ".join(_display_source_name(item["name"]) for item in sources), 0.94, 6.35, 10.8, 0.38, size=12, color=(207, 232, 230))
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.9), Inches(0.88), Inches(1.65), Inches(0.08))
     bar.fill.solid()
     bar.fill.fore_color.rgb = RGBColor(*theme["accent"])
@@ -473,14 +567,28 @@ def _render_content_slide(
     if takeaway:
         _add_text(slide, takeaway, content_left, takeaway_top, content_width - 0.2, takeaway_height, size=17, color=theme["body"])
     bullets = list(data.get("bullets", []) or [])[:5]
+    module_top = takeaway_top + takeaway_height + 0.25
+    if str(theme.get("chrome", "header")) == "header":
+        divider = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(0),
+            Inches(module_top - 0.12),
+            Inches(13.333),
+            Inches(0.05),
+        )
+        divider.fill.solid()
+        divider.fill.fore_color.rgb = RGBColor(*theme["accent"])
+        divider.line.fill.background()
+        module_top += 0.08
     _render_content_modules(
         slide,
         bullets,
+        layout=str(data.get("layout", "")),
         index=index,
         theme=theme,
         left=content_left,
         width=content_width - 0.2,
-        top=takeaway_top + takeaway_height + 0.25,
+        top=module_top,
     )
     pages = [str(item) for item in list(data.get("source_pages", []) or []) if str(item).strip()]
     source_label = "本次上传材料"
@@ -564,8 +672,6 @@ def _render_template_chrome(slide: Any, *, theme: dict[str, Any], index: int, to
     else:
         header = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.46))
         header.fill.solid(); header.fill.fore_color.rgb = primary; header.line.fill.background()
-        key = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(1.55), Inches(13.333), Inches(0.08))
-        key.fill.solid(); key.fill.fore_color.rgb = accent; key.line.fill.background()
     _add_text(slide, f"{index}/{total}", 12.1, 7.0, 0.55, 0.2, size=10, color=theme["muted"], alignment=PP_ALIGN.RIGHT)
 
 
@@ -573,6 +679,7 @@ def _render_content_modules(
     slide: Any,
     bullets: list[str],
     *,
+    layout: str,
     index: int,
     theme: dict[str, Any],
     left: float,
@@ -580,7 +687,8 @@ def _render_content_modules(
     top: float,
 ) -> None:
     items = bullets or ["根据材料提炼本页要点"]
-    kind = (index - 2) % 3
+    layout_kinds = {"cards": 0, "comparison": 1, "process": 2, "branches": 3}
+    kind = layout_kinds.get(str(layout).strip().lower(), (index - 2) % 3)
     gap = 0.22
     surface = RGBColor(*theme["surface"])
     border = RGBColor(*theme["border"])
@@ -588,25 +696,31 @@ def _render_content_modules(
     if kind == 0:
         count = min(3, len(items))
         card_width = (width - gap * (count - 1)) / count
-        for position, item in enumerate(items[:count]):
+        groups = _balanced_item_groups(items, count)
+        for position, group in enumerate(groups):
             x = left + position * (card_width + gap)
-            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top), Inches(card_width), Inches(2.35))
+            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top), Inches(card_width), Inches(3.28))
             card.fill.solid(); card.fill.fore_color.rgb = surface; card.line.color.rgb = border
             marker = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x + 0.22), Inches(top + 0.24), Inches(0.42), Inches(0.42))
             marker.fill.solid(); marker.fill.fore_color.rgb = accent; marker.line.fill.background()
             _add_text(slide, str(position + 1), x + 0.22, top + 0.29, 0.42, 0.14, size=10, color=(255, 255, 255), bold=True, alignment=PP_ALIGN.CENTER)
-            _add_text(slide, item, x + 0.22, top + 0.82, card_width - 0.44, 1.15, size=16, color=theme["body"])
+            text = _group_text(group)
+            font_size = 14 if len(text) > 150 else 15 if len(text) > 100 else 16
+            _add_text(slide, text, x + 0.22, top + 0.82, card_width - 0.44, 2.12, size=font_size, color=theme["body"])
     elif kind == 1:
         midpoint = left + (width - gap) / 2
-        for position, item in enumerate(items[:2] or items):
+        groups = _balanced_item_groups(items, min(2, len(items)))
+        for position, group in enumerate(groups):
             x = left if position == 0 else midpoint + gap
-            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top), Inches((width - gap) / 2), Inches(2.55))
+            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top), Inches((width - gap) / 2), Inches(3.28))
             card.fill.solid(); card.fill.fore_color.rgb = surface; card.line.color.rgb = border
             _add_text(slide, "要点" if position == 0 else "解读", x + 0.28, top + 0.28, 1.0, 0.28, size=13, color=theme["accent"], bold=True)
-            _add_text(slide, item, x + 0.28, top + 0.82, (width - gap) / 2 - 0.55, 1.3, size=17, color=theme["body"])
-    else:
+            text = _group_text(group)
+            font_size = 14 if len(text) > 190 else 15 if len(text) > 125 else 17
+            _add_text(slide, text, x + 0.28, top + 0.82, (width - gap) / 2 - 0.55, 2.18, size=font_size, color=theme["body"])
+    elif kind == 2:
         count = min(4, len(items))
-        node_width = min(2.0, (width - 0.4) / count)
+        node_width = (width - 0.4) / count
         line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left + 0.55), Inches(top + 1.18), Inches(max(0.5, node_width * (count - 1))), Inches(0.05))
         line.fill.solid(); line.fill.fore_color.rgb = accent; line.line.fill.background()
         for position, item in enumerate(items[:count]):
@@ -615,6 +729,51 @@ def _render_content_modules(
             node.fill.solid(); node.fill.fore_color.rgb = accent; node.line.fill.background()
             _add_text(slide, str(position + 1), x + 0.38, top + 1.08, 0.62, 0.16, size=11, color=(255, 255, 255), bold=True, alignment=PP_ALIGN.CENTER)
             _add_text(slide, item, x, top + 1.78, node_width - 0.12, 1.15, size=15, color=theme["body"], alignment=PP_ALIGN.CENTER)
+    else:
+        groups = _balanced_item_groups(items, 2)
+        root_width = min(3.1, width * 0.34)
+        root_left = left + (width - root_width) / 2
+        root = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(root_left), Inches(top + 0.05), Inches(root_width), Inches(0.78))
+        root.fill.solid(); root.fill.fore_color.rgb = accent; root.line.fill.background()
+        _add_text(slide, "共享基础", root_left + 0.18, top + 0.28, root_width - 0.36, 0.24, size=16, color=(255, 255, 255), bold=True, alignment=PP_ALIGN.CENTER)
+        branch_width = (width - gap) / 2
+        junction_left = left + branch_width / 2
+        junction_width = branch_width + gap
+        trunk = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(root_left + root_width / 2 - 0.025), Inches(top + 0.83), Inches(0.05), Inches(0.31))
+        trunk.fill.solid(); trunk.fill.fore_color.rgb = accent; trunk.line.fill.background()
+        crossbar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(junction_left), Inches(top + 1.11), Inches(junction_width), Inches(0.05))
+        crossbar.fill.solid(); crossbar.fill.fore_color.rgb = accent; crossbar.line.fill.background()
+        for position, group in enumerate(groups):
+            x = left + position * (branch_width + gap)
+            connector = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x + branch_width / 2 - 0.025), Inches(top + 1.11), Inches(0.05), Inches(0.16))
+            connector.fill.solid(); connector.fill.fore_color.rgb = accent; connector.line.fill.background()
+            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top + 1.22), Inches(branch_width), Inches(2.15))
+            card.fill.solid(); card.fill.fore_color.rgb = surface; card.line.color.rgb = border
+            _add_text(slide, f"分支 {position + 1}", x + 0.25, top + 1.47, branch_width - 0.5, 0.28, size=13, color=theme["accent"], bold=True)
+            _add_text(slide, _group_text(group), x + 0.25, top + 1.92, branch_width - 0.5, 1.15, size=16, color=theme["body"])
+
+
+def _balanced_item_groups(items: list[str], group_count: int) -> list[list[str]]:
+    count = max(1, min(int(group_count), len(items)))
+    base_size, remainder = divmod(len(items), count)
+    groups: list[list[str]] = []
+    cursor = 0
+    for index in range(count):
+        size = base_size + (1 if index < remainder else 0)
+        groups.append([str(item) for item in items[cursor : cursor + size]])
+        cursor += size
+    return groups
+
+
+def _group_text(items: list[str]) -> str:
+    if len(items) <= 1:
+        return str(items[0]) if items else ""
+    return "\n".join(f"• {item}" for item in items)
+
+
+def _display_source_name(value: object) -> str:
+    name = Path(str(value or "")).stem
+    return " ".join(name.replace("_", " ").replace("-", "-").split()) or "上传材料"
 
 
 def _add_text(
@@ -634,6 +793,7 @@ def _add_text(
     frame = box.text_frame
     frame.clear()
     frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     paragraph = frame.paragraphs[0]
     paragraph.text = _short_text(text, 900)
     if alignment is not None:
@@ -674,9 +834,9 @@ def _cover_title_metrics(title: str) -> tuple[int, float, float]:
 
     length = len(title.strip())
     if length > 78:
-        return 30, 2.2, 3.85
+        return 26, 2.7, 4.3
     if length > 48:
-        return 34, 1.75, 3.45
+        return 30, 2.35, 4.05
     return 42, 1.35, 3.05
 
 
@@ -714,3 +874,20 @@ def _compact_text(value: str, *, limit: int) -> str:
 
 def _short_text(value: Any, limit: int) -> str:
     return _compact_text(str(value or ""), limit=limit)
+
+
+def _slide_excerpt(value: Any, *, limit: int) -> str:
+    """Return a visibly bounded excerpt without silently cutting a word in half."""
+
+    text = " ".join(str(value or "").split()).strip(" •")
+    if len(text) <= limit:
+        return text
+    window = text[: limit + 1]
+    boundaries = [
+        position + 1
+        for position, character in enumerate(window)
+        if position >= max(36, int(limit * 0.55)) and (character.isspace() or character in "，,；;：:。.!?！？")
+    ]
+    if not boundaries:
+        return ""
+    return f"{window[: boundaries[-1]].rstrip(' ，,；;：:')}…"

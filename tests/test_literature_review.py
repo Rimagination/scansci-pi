@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from scansci_html.app_settings import load_settings, save_settings
-from scansci_html.literature_review import plan_literature_review, synthesize_literature_review
+from scansci_html.literature_review import (
+    _atomic_review_claims,
+    _claim_addresses_review_section,
+    _direct_evidence_section,
+    _diverse_section_citation_ids,
+    _semantic_cues_are_grounded,
+    plan_literature_review,
+    synthesize_literature_review,
+)
 from scansci_html.research_agent import ResearchAgentRuntime
 
 
@@ -24,40 +33,41 @@ class FakeReviewClient:
                     {"id": "translation", "title": "转化边界", "objective": "识别局限和转化条件", "queries": ["免疫治疗 转化 局限"]},
                 ],
             }
-        if schema_name == "evidence_grounded_literature_review":
+        if schema_name == "literature_review_section":
             citation = "99" if self.bad_citation else "2"
+            return {"text": "当前证据显示干预机制与疗效存在差异。", "citation_ids": [citation]}
+        if schema_name == "answer_claims":
+            payload = json.loads(messages[1]["content"])
+            quote_id = "99" if self.bad_citation else payload["evidence_table"][0]["quote_id"]
             return {
-                "title": "免疫治疗的机制、疗效与转化边界",
-                "abstract": {"text": "现有证据显示不同干预通过互补机制影响免疫反应。", "citation_ids": [citation, "4"]},
-                "sections": [
-                    {
-                        "id": "ignored-by-normalizer",
-                        "title": "ignored",
-                        "paragraphs": [{"text": "两项研究分别观察到调节性 T 细胞下降和树突细胞活化。", "citation_ids": ["2", "4"]}],
-                    },
-                    {
-                        "paragraphs": [{"text": "动物模型中的生存获益尚不能直接外推到临床。", "citation_ids": ["4"]}],
-                    },
-                    {
-                        "paragraphs": [{"text": "研究设计和对象差异限制了效应量的直接比较。", "citation_ids": ["1", "2"]}],
-                    },
+                "answer": [
+                    {"claim_id": "c0001", "text": payload["question"], "quote_ids": [quote_id]}
                 ],
-                "comparison_table": {
-                    "columns": ["代表工作", "研究对象", "方法", "主要发现", "局限"],
-                    "rows": [
-                        {"cells": ["研究 A", "患者", "药物干预", "T 细胞下降", "样本较小"], "citation_ids": ["2"]},
-                        {"cells": ["研究 B", "动物模型", "细胞干预", "生存改善", "外推有限"], "citation_ids": ["4"]},
-                    ],
-                },
-                "controversies": [{"text": "不同模型中的获益是否可直接比较仍有争议。", "citation_ids": ["2", "4"]}],
-                "open_questions": [{"text": "哪些人群最可能获益？", "basis": "现有研究对象差异较大。", "citation_ids": ["1", "2"]}],
-                "limitations": ["仅纳入当前资料库中带原文锚点的证据。"],
+                "limitations": [],
+            }
+        if schema_name == "claim_verification":
+            payload = json.loads(messages[1]["content"])
+            return {
+                "claims": [
+                    {"claim_id": item["claim_id"], "support_status": "supported", "verification_score": 0.95}
+                    for item in payload["answer"]["claims"]
+                ]
             }
         raise AssertionError(schema_name)
+
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        if self.bad_citation:
+            raise ValueError("force structured citation validation")
+        if "综述主编" in messages[0]["content"]:
+            return "现有证据从机制、疗效与转化边界三个方面刻画了免疫治疗，但研究对象和设计差异限制了直接外推。"
+        payload = json.loads(messages[1]["content"])
+        return f"围绕{payload['section']['title']}，当前证据显示不同研究的对象、方法和结论需要结合证据边界综合解释。"
 
 
 def _research_payload() -> dict[str, object]:
     plan = plan_literature_review("免疫治疗有哪些证据？", chat_client=FakeReviewClient())
+    for section, citation_ids in zip(plan["sections"], (["2", "4"], ["4"], ["1", "2"])):
+        section["citation_ids"] = citation_ids
     evidence = [
         {
             "citation_id": str(index),
@@ -92,17 +102,95 @@ def test_synthesis_builds_real_review_structure_and_compacts_citations():
 
     document = result["review_document"]
     assert [section["title"] for section in document["sections"]] == ["作用机制", "疗效证据", "转化边界"]
-    assert len(document["comparison_table"]["rows"]) == 2
+    assert len(document["comparison_table"]["rows"]) == 3
     assert document["open_questions"][0]["basis"]
     assert [item["citation_id"] for item in document["references"]] == ["1", "2", "3"]
     assert document["references"][0]["reader_url"].startswith("/reader/")
     assert result["citation_verification"]["passed"] is True
     assert result["adequacy"]["document_count"] == 2
+    assert result["adequacy"]["is_sufficient"] is (
+        result["adequacy"]["quote_count"] >= 3 and result["adequacy"]["document_count"] >= 2
+    )
 
 
 def test_synthesis_rejects_hallucinated_citation_ids():
-    with pytest.raises(ValueError, match="不存在的证据编号"):
+    with pytest.raises(ValueError, match="99"):
         synthesize_literature_review(_research_payload(), chat_client=FakeReviewClient(bad_citation=True))
+
+
+def test_synthesis_falls_back_to_bounded_section_calls_when_nested_json_is_invalid():
+    calls = []
+
+    class SplitReviewClient:
+        def complete_json(self, messages, *, schema_name):
+            calls.append(schema_name)
+            if schema_name == "evidence_grounded_literature_review":
+                raise ValueError("invalid nested JSON")
+            if schema_name == "answer_claims":
+                payload = json.loads(messages[1]["content"])
+                quote_id = payload["evidence_table"][0]["quote_id"]
+                return {
+                    "answer": [{"claim_id": "c0001", "text": payload["question"], "quote_ids": [quote_id]}],
+                    "limitations": [],
+                }
+            if schema_name == "literature_review_section":
+                payload = json.loads(messages[1]["content"])
+                citation_ids = [item["citation_id"] for item in payload["evidence"]]
+                return {"text": f"围绕{payload['section']['title']}综合了当前证据。", "citation_ids": citation_ids[:1]}
+            if schema_name == "literature_review_overview":
+                return {
+                    "title": "分段生成的证据综述",
+                    "abstract": {"text": "三个章节共同刻画了当前证据边界。", "citation_ids": ["1"]},
+                    "comparison_table": {
+                        "columns": ["对象", "方法", "发现", "局限"],
+                        "rows": [{"cells": ["研究", "综合", "有差异", "资料有限"], "citation_ids": ["1"]}],
+                    },
+                    "controversies": [],
+                    "open_questions": [{"text": "如何外推？", "basis": "对象不同", "citation_ids": ["1"]}],
+                    "limitations": ["仅覆盖当前资料库。"],
+                }
+            if schema_name == "claim_verification":
+                payload = json.loads(messages[1]["content"])
+                return {
+                    "claims": [
+                        {"claim_id": item["claim_id"], "support_status": "supported", "verification_score": 0.95}
+                        for item in payload["answer"]["claims"]
+                    ]
+                }
+            raise AssertionError(schema_name)
+
+    result = synthesize_literature_review(_research_payload(), chat_client=SplitReviewClient())
+
+    assert len(result["review_document"]["sections"]) == 3
+    assert calls.count("answer_claims") >= 3
+    assert calls.count("claim_verification") >= 3
+    assert set(calls) == {"answer_claims", "claim_verification"}
+    assert result["citation_verification"]["passed"] is True
+
+
+def test_synthesis_compacts_large_evidence_before_calling_the_writer():
+    captured = {}
+
+    class CapturingClient(FakeReviewClient):
+        def complete_json(self, messages, *, schema_name):
+            if schema_name == "answer_claims" and "body" not in captured:
+                captured["body"] = messages[1]["content"]
+            return super().complete_json(messages, schema_name=schema_name)
+
+    research = _research_payload()
+    for row in research["evidence"]:
+        row["exact_quote"] = "Very long exact evidence. " * 2000
+        row["context_text"] = "Private parent context. " * 5000
+        row["html_path"] = "D:/private/library/paper.html"
+
+    synthesize_literature_review(research, chat_client=CapturingClient())
+
+    body = captured["body"]
+    parsed = json.loads(body)
+    assert len(body.encode("utf-8")) < 32_000
+    assert "Private parent context" not in body
+    assert "private/library" not in body
+    assert all(len(item["exact_quote"].encode("utf-8")) <= 903 for item in parsed["evidence_table"])
 
 
 def test_default_local_evidence_role_cannot_pretend_to_be_review_writer(tmp_path: Path):
@@ -115,3 +203,107 @@ def test_default_local_evidence_role_cannot_pretend_to_be_review_writer(tmp_path
 
     with pytest.raises(ValueError, match="真正的文献综述需要生成模型"):
         runtime._writing_chat_client()
+
+
+def test_managed_writing_client_disables_hidden_reasoning_for_bounded_workflows(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    client = runtime._writing_chat_client()
+
+    assert client.thinking_mode == "disabled"
+
+
+def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():
+    class RateLimitedClient:
+        def complete_json(self, messages, *, schema_name):
+            raise RuntimeError("HTTP 429")
+
+    plan = plan_literature_review(
+        "比较 Transformer、BERT 与 GPT-3 的训练和适配",
+        chat_client=RateLimitedClient(),
+    )
+
+    assert len(plan["sections"]) == 5
+    assert plan["planning"]["mode"] == "deterministic-evidence-plan"
+    assert all(section["queries"] for section in plan["sections"])
+    assert plan["sections"][0]["title"] == "原始 Transformer 架构"
+    assert "self-attention" in plan["sections"][0]["queries"][0]
+    assert "GPT-3" in plan["sections"][2]["queries"][1]
+
+
+def test_review_section_evidence_is_diverse_before_filling_remaining_slots():
+    evidence = {
+        "1": {"doc_id": "paper-a"},
+        "2": {"doc_id": "paper-a"},
+        "3": {"doc_id": "paper-b"},
+        "4": {"doc_id": "paper-c"},
+    }
+
+    selected = _diverse_section_citation_ids({"citation_ids": ["1", "2", "3", "4"]}, evidence, limit=4)
+
+    assert selected == ["1", "3", "4", "2"]
+
+
+def test_review_claims_are_split_before_semantic_verification():
+    claims = _atomic_review_claims(
+        [{"claim_id": "c1", "text": "第一项有依据。第二项需要单独核验。", "quote_ids": ["1"]}]
+    )
+
+    assert [item["claim_id"] for item in claims] == ["c1-s1", "c1-s2"]
+
+
+def test_review_semantic_cue_gate_rejects_unsupported_superiority():
+    claim = {"text": "该模型的生成文本长度超越人类。", "quote_ids": ["1"]}
+
+    assert _semantic_cues_are_grounded(claim, {"1": "Human and model articles both averaged 216 words."}) is False
+
+
+def test_review_claim_must_answer_the_planned_section_not_merely_have_a_citation():
+    planned = {
+        "title": "预训练目标的演变",
+        "objective": "对比 BERT 的掩码语言模型与 GPT 的自回归训练目标。",
+    }
+
+    assert _claim_addresses_review_section({"text": "两者每参数每 token 的 FLOPs 都是 6。"}, planned) is False
+    assert _claim_addresses_review_section({"text": "BERT 使用掩码语言模型，GPT 使用自回归目标。"}, planned) is True
+
+
+def test_original_transformer_section_rejects_a_bert_subject_claim():
+    planned = {
+        "title": "原始 Transformer 架构",
+        "objective": "解释原始 Transformer 的自注意力和位置编码。",
+    }
+
+    assert _claim_addresses_review_section({"text": "BERT 的模型架构基于 Transformer。"}, planned) is False
+
+
+def test_direct_review_fallback_scores_relevant_sentences_across_sources():
+    planned = {
+        "title": "原始 Transformer 架构",
+        "objective": "解释原始 Transformer 的 self-attention、多头注意力和编码器—解码器结构。",
+    }
+    evidence = [
+        {
+            "citation_id": "1",
+            "exact_quote": "BERT uses a masked language model and bidirectional attention. " * 8,
+        },
+        {
+            "citation_id": "2",
+            "exact_quote": (
+                "The Transformer follows an encoder-decoder architecture. "
+                "The encoder and decoder use stacked self-attention and position-wise feed-forward layers."
+            ),
+        },
+    ]
+
+    section = _direct_evidence_section(
+        "原始 Transformer 使用什么架构？",
+        planned,
+        evidence,
+        text_completion=None,
+    )
+
+    assert section["citation_ids"] == ["2"]
+    assert "encoder and decoder" in section["text"]
+    assert "BERT" not in section["text"]

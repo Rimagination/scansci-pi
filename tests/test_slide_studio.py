@@ -11,7 +11,9 @@ import fitz
 from pptx import Presentation
 
 from scansci_html.slide_studio import (
+    _display_source_name,
     _normalise_model_outline,
+    _source_key_sentences,
     create_source_slide_deck,
     persist_slide_sources,
     save_browser_rendered_deck,
@@ -48,6 +50,7 @@ def test_pdf_source_creates_editable_pptx_without_a_library(tmp_path: Path):
     assert deck_path.is_file()
     assert deck_path.parent == tmp_path / "presentations"
     assert len(presentation.slides) >= 5
+    assert len(presentation.slides) == len(output["outline"]["slides"]) + 1 == output["slide_count"]
     assert presentation.slide_width > presentation.slide_height
     assert output["source_count"] == 1
     assert output["planning"]["mode"] == "source-grounded"
@@ -183,9 +186,9 @@ def test_slide_planner_preserves_a_long_research_question():
         "central_question": question,
         "story": "Question to evidence.",
         "slides": [
-            {"title": "Question", "takeaway": "Frame it.", "bullets": ["Evidence."], "source_pages": [1]},
-            {"title": "Evidence", "takeaway": "Show it.", "bullets": ["Evidence."], "source_pages": [1]},
-            {"title": "Boundary", "takeaway": "Limit it.", "bullets": ["Evidence."], "source_pages": [1]},
+            {"title": "Question", "takeaway": "Frame it.", "layout": "comparison", "bullets": ["Evidence."], "source_pages": [1]},
+            {"title": "Evidence", "takeaway": "Show it.", "layout": "process", "bullets": ["Evidence."], "source_pages": [1]},
+            {"title": "Boundary", "takeaway": "Limit it.", "layout": "branches", "bullets": ["Evidence."], "source_pages": [1]},
         ],
     }
     fallback = {"title": "Fallback", "central_question": "Fallback", "story": "Fallback", "slides": []}
@@ -193,3 +196,25 @@ def test_slide_planner_preserves_a_long_research_question():
     outline = _normalise_model_outline(candidate, fallback=fallback, sources=[{"page_count": 1}])
 
     assert outline["central_question"] == question
+    assert [slide["layout"] for slide in outline["slides"]] == ["comparison", "process", "branches"]
+
+
+def test_source_names_are_presentable_on_the_cover():
+    assert _display_source_name("Attention_Is_All_You_Need.pdf") == "Attention Is All You Need"
+
+
+def test_offline_slide_fallback_filters_front_matter_and_author_contributions():
+    source = {
+        "name": "Attention_Is_All_You_Need.pdf",
+        "text": (
+            "Provided proper attribution is provided, Google hereby grants permission. "
+            "Ashish Vaswani Google Brain author@example.com. "
+            "The Transformer uses multi-head attention in its encoder and decoder. "
+            "Our model achieves 28.4 BLEU on the WMT 2014 translation task."
+        ),
+    }
+
+    sentences = _source_key_sentences(source, topic="Transformer architecture")
+
+    assert any("multi-head attention" in item for item in sentences)
+    assert all("@" not in item and "proper attribution" not in item for item in sentences)

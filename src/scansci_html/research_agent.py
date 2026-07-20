@@ -12,6 +12,7 @@ from urllib.parse import quote
 from .agent_context import build_agent_system_context, runtime_self_description, selected_skill_ids
 from .agent_reasoning import evidence_budget_for_thinking, managed_glm_thinking_mode, normalize_thinking_level
 from .app_settings import get_provider_api_key, load_settings
+from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
 from .image_attachments import persist_image_attachments, vision_image_blocks
 from .ingestion import ingest_sources, ingestion_context
 from .library_manager import notebook_evidence_db
@@ -287,16 +288,39 @@ class ResearchAgentRuntime:
                 }
             else:
                 harness = str(payload.get("agent_harness", "pi")).strip().lower()
+                tool_calls: list[dict[str, Any]] = []
                 # ScanSci's managed gateway intentionally exposes the portable
                 # chat-completions subset.  Tool-call wire formats vary between
                 # providers, so managed models use the same provider-neutral
                 # pattern as OpenCode: the application executes typed tools and
                 # sends their normalized text results back to the model.
                 use_native_tool_loop = harness not in {"legacy", "fixed-workflow"} and not managed
-                if use_native_tool_loop:
+                if harness in {"deep", "deep-agent", "deep-agents"}:
+                    try:
+                        model = build_deep_agent_model(
+                            provider_id=str(provider.get("id", "")),
+                            provider_kind=str(provider.get("kind", "")),
+                            base_url=str(provider.get("base_url", "")),
+                            api_key=api_key,
+                            model=str(active.get("model_id", "")),
+                            thinking_level=thinking_level,
+                        )
+                        result = ScanSciDeepAgent(
+                            evidence_db=evidence_db,
+                            workspace=self.workspace,
+                            model=model,
+                        ).answer(
+                            question,
+                            limit=limit,
+                            thread_id=str(payload.get("thread_id", "")),
+                            task_mode=str(payload.get("task_mode", "auto")),
+                        )
+                        agent_harness = "deep-agents"
+                    except Exception as error:  # optional compatibility harness
+                        agent_fallback_error = f"{type(error).__name__}: {error}"
+                elif use_native_tool_loop:
                     task_mode = str(payload.get("task_mode", "evidence")).strip().lower() or "evidence"
                     try:
-                        tool_calls: list[dict[str, Any]] = []
                         pi_events = PiAgentClient(workspace=self.workspace, evidence_db=evidence_db).stream_chat(
                             provider_kind=str(provider.get("kind", "")),
                             base_url=str(provider.get("base_url", "")),
@@ -331,17 +355,19 @@ class ResearchAgentRuntime:
                         # below retains the same retrieval and citation gates.
                         agent_fallback_error = f"{type(error).__name__}: {error}"
                 if result is None:
+                    rag_client = build_chat_json_client(
+                        str(provider.get("kind", "")),
+                        base_url=str(provider.get("base_url", "")),
+                        api_key=api_key,
+                        model=str(active.get("model_id", "")),
+                        session=managed_gateway_session() if managed else None,
+                        thinking_mode="disabled" if managed else None,
+                    )
                     answer_options = {
                         "answer_provider": "llm",
-                        "verification_provider": "local",
-                        "chat_client": build_chat_json_client(
-                            str(provider.get("kind", "")),
-                            base_url=str(provider.get("base_url", "")),
-                            api_key=api_key,
-                            model=str(active.get("model_id", "")),
-                            session=managed_gateway_session() if managed else None,
-                            thinking_mode="disabled" if managed else None,
-                        ),
+                        "verification_provider": "llm",
+                        "query_rewrite_provider": "llm",
+                        "chat_client": rag_client,
                     }
                     agent_harness = "provider-neutral-workflow"
         if result is None:
@@ -354,7 +380,7 @@ class ResearchAgentRuntime:
                 max_quotes=min(8, limit),
                 adequacy_profile="manual",
                 agentic_profile="custom",
-                query_variants=1,
+                query_variants=2,
                 max_followup_queries=1,
                 **answer_options,
             )
@@ -1069,7 +1095,8 @@ class ResearchAgentRuntime:
         workflow = str(run["workflow_type"])
         if workflow == "pdf_to_ppt":
             slides = list(dict(result.get("outline", {}) or {}).get("slides", []) or [])
-            return f"已从 {int(result.get('source_count', 0) or 0)} 份材料生成 {len(slides)} 页可编辑 PPTX"
+            slide_count = int(result.get("slide_count", 0) or 0) or len(slides) + 1
+            return f"已从 {int(result.get('source_count', 0) or 0)} 份材料生成 {slide_count} 页可编辑 PPTX"
         if workflow == "literature_review" and result.get("phase") == "retrieval":
             summary = dict(result.get("retrieval_summary", {}) or {})
             return (
@@ -1203,6 +1230,7 @@ class ResearchAgentRuntime:
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
                 model=model_id,
+                thinking_mode="disabled" if str(provider.get("auth_mode", "")) == "managed" else None,
             )
         if reference.startswith("local:"):
             local_id = reference.removeprefix("local:")

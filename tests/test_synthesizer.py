@@ -51,6 +51,41 @@ def test_synthesize_answer_refuses_when_evidence_table_is_empty():
     assert answer["limitations"] == ["No validated evidence quotes were available for this question."]
 
 
+def test_local_fallback_selects_one_directly_relevant_sentence_for_a_direct_question():
+    evidence_table = [
+        {
+            "quote_id": "q0001",
+            "claim_target": "A large compute table contains BERT and GPT-3 rows.",
+            "exact_quote": "Model Total train compute Params BERT-Base GPT-3 Small.",
+            "confidence": 0.9,
+        },
+        {
+            "quote_id": "q0002",
+            "claim_target": "BERT uses bidirectional self-attention.",
+            "exact_quote": (
+                "Critically, however, the BERT Transformer uses bidirectional self-attention, "
+                "while the GPT Transformer uses constrained self-attention where every token can only attend to previous tokens.4 "
+                "1https://example.test/footnote"
+            ),
+            "confidence": 0.82,
+        },
+        {
+            "quote_id": "q0003",
+            "claim_target": "BERT fine-tuning is straightforward.",
+            "exact_quote": "Fine-tuning BERT is straightforward for many downstream tasks.",
+            "confidence": 0.8,
+        },
+    ]
+
+    answer = synthesize_answer("BERT 的自注意力是双向还是只能看左侧上下文？", evidence_table)
+
+    assert len(answer["answer"]) == 1
+    assert answer["answer"][0]["quote_ids"] == ["q0002"]
+    assert "bidirectional self-attention" in answer["answer"][0]["text"]
+    assert "Total train compute" not in answer["answer"][0]["text"]
+    assert "https://" not in answer["answer"][0]["text"]
+
+
 def test_synthesize_answer_groups_conflict_evidence_into_contrast_claim():
     evidence_table = [
         {
@@ -146,6 +181,29 @@ def test_synthesize_answer_with_llm_rejects_quote_ids_outside_evidence_table():
             [{"quote_id": "q0001", "exact_quote": "quote"}],
             chat_client=FakeChatClient(),
         )
+
+
+def test_synthesize_answer_with_llm_deduplicates_and_caps_claims():
+    class FakeChatClient:
+        def complete_json(self, messages, *, schema_name):
+            claims = [
+                {"claim_id": "c0001", "text": "BERT 使用双向自注意力。", "quote_ids": ["q0001"]},
+                {"claim_id": "c0002", "text": "BERT 使用双向自注意力。", "quote_ids": ["q0001"]},
+            ]
+            claims.extend(
+                {"claim_id": f"c{index:04d}", "text": f"补充结论 {index}", "quote_ids": ["q0001"]}
+                for index in range(3, 9)
+            )
+            return {"answer": claims, "limitations": []}
+
+    answer = synthesize_answer_with_llm(
+        "BERT 的注意力方向是什么？",
+        [{"quote_id": "q0001", "exact_quote": "BERT uses bidirectional self-attention."}],
+        chat_client=FakeChatClient(),
+    )
+
+    assert len(answer["answer"]) == 4
+    assert [item["text"] for item in answer["answer"]].count("BERT 使用双向自注意力。") == 1
 
 
 def test_synthesize_answer_with_llm_compacts_large_tool_rows_before_provider_call():

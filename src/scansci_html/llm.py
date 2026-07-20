@@ -42,6 +42,9 @@ class ChatJsonClient(Protocol):
     def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
         ...
 
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        ...
+
 
 class OpenAICompatibleChatJsonClient:
     def __init__(
@@ -66,8 +69,11 @@ class OpenAICompatibleChatJsonClient:
         self.timeout = float(timeout)
         self.session = session or requests.Session()
         self.thinking_mode = thinking_mode if thinking_mode in {"enabled", "disabled"} else None
+        self._rate_limited_until = 0.0
 
     def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
+        if time.monotonic() < self._rate_limited_until:
+            raise RuntimeError("模型结构化响应暂时受限，已立即切换到本地证据流程。")
         structured_messages = _with_structured_output_instruction(messages, schema_name=schema_name)
         request_body: dict[str, Any] = {
             "model": self.model,
@@ -76,29 +82,125 @@ class OpenAICompatibleChatJsonClient:
             # Structured workflows need enough visible completion budget. Some
             # reasoning models otherwise spend their default budget on hidden
             # analysis and return an empty JSON message.
-            "max_tokens": 4096,
-            "temperature": 0.2,
+            # A bounded answer-claim budget prevents compatible models from
+            # repeating a valid claim until the response is truncated, which
+            # would turn otherwise useful RAG output into invalid JSON.
+            "max_tokens": (
+                768
+                if schema_name in {"answer_claims", "claim_verification", "retrieval_queries"}
+                else 512 if schema_name == "literature_review_section"
+                else 1024 if schema_name == "literature_review_overview"
+                else 3072 if schema_name == "evidence_grounded_literature_review" else 4096
+            ),
+            "temperature": (
+                0
+                if schema_name in {
+                    "evidence_grounded_literature_review",
+                    "literature_review_section",
+                    "literature_review_overview",
+                }
+                else 0.2
+            ),
         }
         if self.thinking_mode:
             request_body["thinking"] = {"type": self.thinking_mode}
-        response = self.session.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=request_body,
+        retryable_schemas = {
+            "answer_claims",
+            "claim_verification",
+            "retrieval_queries",
+            "evidence_grounded_literature_review",
+            "literature_review_section",
+            "literature_review_overview",
+            "scansci_scientific_slides",
+        }
+        attempts = 3 if schema_name == "literature_review_section" else 2 if schema_name in retryable_schemas else 1
+        for attempt in range(attempts):
+            active_body = dict(request_body)
+            if attempt:
+                active_body["temperature"] = 0
+                retry_instruction = (
+                    "The previous structured response was invalid or truncated. Produce a fresh result now. "
+                    "Return no more than three non-repeating items, output one complete JSON object only, "
+                    "and stop immediately after its closing brace."
+                )
+                if schema_name == "evidence_grounded_literature_review":
+                    retry_instruction = (
+                        "The previous literature-review JSON was invalid or truncated. Produce a fresh compact result now. "
+                        "Keep every planned section, use exactly one concise paragraph per section, at most three comparison "
+                        "rows, at most two controversies, and exactly two open questions. Output one complete JSON object "
+                        "only and stop immediately after its closing brace."
+                    )
+                active_body["messages"] = [
+                    {
+                        "role": "system",
+                        "content": retry_instruction,
+                    },
+                    *structured_messages,
+                ]
+            response: Any | None = None
+            for retry_index in range(3):
+                try:
+                    response = self.session.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=active_body,
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    self._rate_limited_until = 0.0
+                    break
+                except requests.RequestException as error:
+                    status = getattr(getattr(error, "response", None), "status_code", None)
+                    if status not in {429, 502, 503, 504} or retry_index >= 2:
+                        raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
+                    headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
+                    try:
+                        requested_delay = float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)
+                    except (TypeError, ValueError):
+                        requested_delay = 0
+                    if status == 429:
+                        self._rate_limited_until = time.monotonic() + min(120.0, max(30.0, requested_delay))
+                        if requested_delay > 8 or retry_index >= 1:
+                            raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
+                        delay = min(8.0, max(requested_delay, 2.0))
+                    else:
+                        delay = min(12.0, max(requested_delay, float(2 ** (retry_index + 1))))
+                    if response is not None:
+                        close = getattr(response, "close", None)
+                        if callable(close):
+                            close()
+                        response = None
+                    time.sleep(delay)
+            if response is None:
+                raise RuntimeError("模型结构化响应暂时不可用，请稍后重试。")
+            content = response.json()["choices"][0]["message"]["content"]
+            try:
+                return _parse_json_content(content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                recovered = _recover_structured_content(content, schema_name=schema_name)
+                if recovered is not None:
+                    return recovered
+        raise ValueError(f"Model did not return valid {schema_name} JSON") from None
+
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        if time.monotonic() < self._rate_limited_until:
+            raise RuntimeError("模型文本响应暂时受限，已立即保留原文证据。")
+        result = complete_chat_text(
+            "openai-compatible",
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            messages=messages,
             timeout=self.timeout,
+            session=self.session,
+            thinking_mode=self.thinking_mode,
+            max_tokens=max_tokens,
+            temperature=0.1,
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        try:
-            return _parse_json_content(content)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            recovered = _recover_structured_content(content, schema_name=schema_name)
-            if recovered is not None:
-                return recovered
-            raise ValueError(f"Model did not return valid {schema_name} JSON") from None
+        return str(result)
 
 
 class AnthropicCompatibleChatJsonClient:
@@ -145,6 +247,20 @@ class AnthropicCompatibleChatJsonClient:
         blocks = response.json().get("content", [])
         content = "".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict))
         return _parse_json_content(content)
+
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        result = complete_chat_text(
+            "anthropic-compatible",
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            messages=messages,
+            timeout=self.timeout,
+            session=self.session,
+            max_tokens=max_tokens,
+            temperature=0.1,
+        )
+        return str(result)
 
 
 def build_chat_json_client(
@@ -195,6 +311,8 @@ def complete_chat_text(
     session: Any | None = None,
     thinking_mode: str | None = None,
     include_usage: bool = False,
+    max_tokens: int = 8192,
+    temperature: float = 0.4,
 ) -> str | tuple[str, dict[str, int]]:
     """Return a plain conversational response without requiring a research library."""
 
@@ -226,19 +344,35 @@ def complete_chat_text(
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
-                "max_tokens": 8192,
-                "temperature": 0.4,
+                "max_tokens": max(64, int(max_tokens)),
+                "temperature": float(temperature),
                 "stream": False,
             }
             if thinking_mode in {"enabled", "disabled"}:
                 request_body["thinking"] = {"type": thinking_mode}
-            response = client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=request_body,
-                timeout=timeout,
-            )
-            response.raise_for_status()
+            response = None
+            for retry_index in range(3):
+                try:
+                    response = client.post(
+                        f"{base_url.rstrip('/')}/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json=request_body,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.RequestException as error:
+                    status = getattr(getattr(error, "response", None), "status_code", None)
+                    if status not in {429, 502, 503, 504} or retry_index >= 2:
+                        raise
+                    headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
+                    try:
+                        requested_delay = float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)
+                    except (TypeError, ValueError):
+                        requested_delay = 0
+                    time.sleep(min(30.0, max(requested_delay, float(2 ** (retry_index + 1)))))
+            if response is None:
+                raise RuntimeError("模型服务暂时不可用，请稍后重试。")
             response_payload = response.json()
             content = response_payload["choices"][0]["message"].get("content", "")
             if isinstance(content, list):
@@ -255,7 +389,7 @@ def complete_chat_text(
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
                 },
-                json={"model": model, "max_tokens": 4096, "system": system, "messages": conversation},
+                json={"model": model, "max_tokens": max(64, int(max_tokens)), "system": system, "messages": conversation},
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -852,7 +986,50 @@ def _parse_json_content(content: object) -> Any:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        balanced = _first_balanced_json_object(text)
+        if balanced is None:
+            raise
+        return json.loads(balanced)
+
+
+def _first_balanced_json_object(text: str) -> str | None:
+    """Return one complete leading JSON object while rejecting truncation.
+
+    Some compatible models append a Markdown note or one stray closing brace
+    after an otherwise valid object. A quote-aware balance scan can discard
+    only that suffix; it never invents missing braces for incomplete output.
+    """
+
+    start = str(text or "").find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+            if depth < 0:
+                return None
+    return None
 
 
 def _with_structured_output_instruction(
@@ -866,7 +1043,43 @@ def _with_structured_output_instruction(
         "answer_claims": (
             'Return only JSON in this exact shape: {"answer":[{"claim_id":"c0001",'
             '"text":"claim text","quote_ids":["q0001"]}],"limitations":[]}. '
-            "Use only quote_ids present in the evidence table. Do not return Markdown."
+            "Return 1 to at most 4 non-overlapping claims, ordered by importance. "
+            "Never repeat a claim. Use only quote_ids present in the evidence table. "
+            "Stop immediately after the JSON object and do not return Markdown."
+        ),
+        "claim_verification": (
+            'Return only JSON in this exact shape: {"claims":[{"claim_id":"c0001",'
+            '"support_status":"supported","verification_score":0.95}]}. '
+            "Return exactly one verdict for every supplied claim_id, never repeat a claim_id, "
+            "and stop immediately after the JSON object."
+        ),
+        "retrieval_queries": (
+            'Return only JSON in this exact shape: {"queries":["query one","query two"]}. '
+            "Return 2 to 4 short, keyword-rich search queries, include one English query when the question is not English, "
+            "preserve named entities and numbers, do not answer the question, and do not return Markdown."
+        ),
+        "evidence_grounded_literature_review": (
+            "Return one complete JSON object only, without Markdown fences, using this section shape exactly: "
+            '{"sections":[{"id":"...","title":"...","text":"one paragraph","citation_ids":["1"]}]}. '
+            "Do not create a paragraphs array. Keep every section from the supplied plan and write exactly one concise "
+            "paragraph per section. Keep each Chinese paragraph within 220 Chinese characters "
+            "or each English paragraph within 140 words. Use at most three comparison rows, at most two controversies, "
+            "and exactly two open questions. Every factual paragraph or row must cite only supplied citation_ids. "
+            "Stop immediately after the closing brace."
+        ),
+        "literature_review_section": (
+            'Return only JSON in this exact shape: {"text":"one concise synthesis paragraph",'
+            '"citation_ids":["1"]}. Do not add arrays of paragraphs or any other keys. Cite only supplied '
+            "citation_ids and stop immediately after the closing brace."
+        ),
+        "literature_review_overview": (
+            'Return only JSON with keys "title", "abstract", "comparison_table", "controversies", '
+            '"open_questions", and "limitations". Use abstract {"text":"...","citation_ids":["1"]}; '
+            'comparison_table {"columns":["研究对象","方法","主要发现","局限"],"rows":'
+            '[{"cells":["...","...","...","..."],"citation_ids":["1"]}]}; controversies as at most two '
+            'objects {"text":"...","citation_ids":["1"]}; open_questions as exactly two objects '
+            '{"text":"...","basis":"...","citation_ids":["1"]}; and limitations as short strings. '
+            "Use only supplied citation_ids, output one complete JSON object, and do not return Markdown."
         ),
     }.get(str(schema_name or ""))
     copied = [dict(item) for item in messages]
@@ -882,6 +1095,15 @@ def _with_structured_output_instruction(
 def _recover_structured_content(content: object, *, schema_name: str) -> dict[str, Any] | None:
     """Recover the one safe contract emitted as cited Markdown by some models."""
 
+    if schema_name == "literature_review_section":
+        return _recover_known_object_keys(content, ("text", "citation_ids"))
+    if schema_name == "literature_review_overview":
+        return _recover_known_object_keys(
+            content,
+            ("title", "abstract", "comparison_table", "controversies", "open_questions", "limitations"),
+        )
+    if schema_name == "evidence_grounded_literature_review":
+        return _recover_review_json(content)
     if schema_name != "answer_claims":
         return None
     text = str(content or "").strip()
@@ -913,3 +1135,89 @@ def _recover_structured_content(content: object, *, schema_name: str) -> dict[st
     if not claims:
         return None
     return {"answer": claims, "limitations": []}
+
+
+def _recover_known_object_keys(content: object, keys: tuple[str, ...]) -> dict[str, Any] | None:
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    candidate = text
+    for key in keys:
+        candidate = re.sub(rf'(?<=[,{{])\s*{re.escape(key)}"\s*:', f'"{key}":', candidate)
+    try:
+        recovered = _parse_json_content(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return recovered if isinstance(recovered, dict) else None
+
+
+def _recover_review_json(content: object) -> dict[str, Any] | None:
+    """Repair two bounded punctuation omissions in the fixed review schema.
+
+    The model sometimes omits either the sections array terminator or the
+    opening quote on one of the known top-level keys. Repairs are limited to
+    those literal schema keys. The candidate must then pass the regular JSON
+    parser; no missing terminal content is invented.
+    """
+
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    candidate = text
+    for key in ("comparison_table", "controversies", "open_questions", "limitations"):
+        candidate = re.sub(rf'(?<=[,{{])\s*{re.escape(key)}"\s*:', f'"{key}":', candidate)
+    try:
+        repaired = _parse_json_content(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        repaired = None
+    if isinstance(repaired, dict):
+        return repaired
+
+    marker = '"comparison_table"'
+    marker_index = candidate.find(marker)
+    if marker_index < 0 or '"sections"' not in candidate[:marker_index]:
+        return None
+    separator_index = candidate.rfind(",", 0, marker_index)
+    if separator_index < 0 or _open_json_delimiters(candidate[:separator_index]) != ["{", "["]:
+        return None
+    candidate = f"{candidate[:separator_index]}]{candidate[separator_index:]}"
+    try:
+        repaired = _parse_json_content(candidate)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return repaired if isinstance(repaired, dict) else None
+
+
+def _open_json_delimiters(text: str) -> list[str]:
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in str(text or ""):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            expected = "{" if char == "}" else "["
+            if not stack or stack[-1] != expected:
+                return []
+            stack.pop()
+    return stack

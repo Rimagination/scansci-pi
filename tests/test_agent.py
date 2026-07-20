@@ -4,6 +4,8 @@ import sqlite3
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.qa import agent
 from scansci_html.qa.agent import (
+    _followup_preserves_query_identity,
+    _model_retrieval_queries,
     answer_question,
     assess_evidence_adequacy,
     build_reader_answer,
@@ -33,6 +35,87 @@ def test_plan_query_identifies_comparison_and_core_terms():
     ]
 
 
+def test_model_retrieval_queries_preserve_cross_language_search_terms():
+    class FakeChatClient:
+        def complete_json(self, messages, *, schema_name):
+            assert schema_name == "retrieval_queries"
+            assert "Do not answer" in messages[0]["content"]
+            assert "MUST be written in English" in messages[0]["content"]
+            return {
+                "queries": [
+                    "BERT masked language modeling bidirectional attention",
+                    "GPT-3 autoregressive in-context few-shot learning",
+                    "BERT masked language modeling bidirectional attention",
+                ]
+            }
+
+    assert _model_retrieval_queries("比较 BERT 与 GPT-3", chat_client=FakeChatClient()) == [
+        "BERT masked language modeling bidirectional attention",
+        "GPT-3 autoregressive in-context few-shot learning",
+    ]
+
+
+def test_generic_followup_cannot_drop_all_cross_language_entities():
+    model_queries = [
+        "Mars surface liquid ocean 2025",
+        "Mars liquid water ocean 2025",
+        "Mars surface ocean discovery 2025",
+    ]
+
+    assert _followup_preserves_query_identity("paper study", model_queries) is False
+    assert _followup_preserves_query_identity("Mars ocean evidence", model_queries) is True
+
+
+def test_answer_question_falls_back_to_local_evidence_when_model_is_rate_limited(monkeypatch):
+    def fake_search_evidence_store(
+        db_path,
+        query,
+        *,
+        limit,
+        per_document_limit,
+        filters,
+        embedding_provider,
+        reranker,
+        context_mode,
+    ):
+        return [
+            {
+                "evidence_id": "bert.s0001",
+                "doc_id": "bert",
+                "title": "BERT",
+                "doi": "",
+                "html_path": "bert.html",
+                "html_anchor": "results-p1-s0001",
+                "section": "Results",
+                "section_kind": "results",
+                "text": "BERT uses bidirectional self-attention to fuse left and right context.",
+                "score": 4.0,
+                "matched_terms": ["bert", "bidirectional", "attention"],
+            }
+        ]
+
+    monkeypatch.setattr(agent, "search_evidence_store", fake_search_evidence_store)
+    monkeypatch.setattr(
+        agent,
+        "synthesize_answer_with_llm",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 429")),
+    )
+
+    result = answer_question(
+        "unused.sqlite",
+        "Does BERT use bidirectional attention?",
+        answer_provider="llm",
+        verification_provider="local",
+        chat_client=object(),
+        max_followup_queries=0,
+    )
+
+    assert result["reader_answer"]["citation_count"] == 1
+    assert result["citation_verification"]["passed"] is True
+    assert result["answer_generation"]["fallback"] is True
+    assert "HTTP 429" in result["answer_generation"]["reason"]
+
+
 def test_plan_query_adds_methods_filter_for_explicit_method_questions():
     plan = plan_query("What method was used to randomize samples since 2020?")
 
@@ -51,6 +134,16 @@ def test_plan_query_builds_chinese_rewrite_routes():
     assert "characteristics" in plan["core_terms"]
     assert [route["label"] for route in plan["routes"][:2]] == ["original", "keywords"]
     assert any(route["query"] == "enabling characteristics features paper study" for route in plan["routes"])
+
+
+def test_plan_query_translates_transformer_attention_direction_without_a_model():
+    plan = plan_query("BERT 的自注意力是双向还是只能看左侧上下文？")
+
+    assert {"bert", "self-attention", "bidirectional", "left-to-right", "context"}.issubset(
+        set(plan["core_terms"])
+    )
+    assert "self-attention" in plan["query_variants"][0]
+    assert "bidirectional" in plan["query_variants"][0]
 
 
 def test_plan_query_identifies_conflict_and_synthesis_questions():

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .quote_extractor import ChatJsonClient
 from .schemas import AnswerPayloadSchema
+from ..text_tokenization import lexical_tokens
 
 
 def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> dict[str, object]:
@@ -28,8 +30,16 @@ def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> di
 
     claims: list[dict[str, object]] = []
     seen_claims: dict[str, list[str]] = {}
-    for row in evidence_table:
-        claim_text = str(row.get("claim_target", "")).strip()
+    ranked_rows = _rank_local_evidence(question, evidence_table)
+    if len(evidence_table) > 1:
+        ranked_rows = ranked_rows[: 1 if _is_direct_question(question) else 3]
+    for row in ranked_rows:
+        claim_text = (
+            _best_local_excerpt(question, str(row.get("exact_quote", "")))
+            if len(evidence_table) > 1
+            else str(row.get("claim_target", "")).strip()
+        )
+        claim_text = claim_text or str(row.get("claim_target", "")).strip()
         quote_id = str(row.get("quote_id", "")).strip()
         if not claim_text or not quote_id:
             continue
@@ -53,6 +63,79 @@ def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> di
         "limitations": [],
         "insufficient_evidence": False if claims else True,
     }
+
+
+def _rank_local_evidence(question: str, evidence_table: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    terms = _question_evidence_terms(question)
+    indexed = list(enumerate(evidence_table))
+
+    def score(item: tuple[int, dict[str, Any]]) -> tuple[float, int]:
+        index, row = item
+        quote = " ".join(str(row.get("exact_quote", "")).split()).casefold()
+        matched = sum(1.0 for term in terms if term in quote)
+        confidence = float(row.get("confidence", 0.0) or 0.0)
+        length_penalty = max(0.0, (len(quote) - 420) / 700)
+        return (matched + confidence - length_penalty, -index)
+
+    return [row for _, row in sorted(indexed, key=score, reverse=True)]
+
+
+def _question_evidence_terms(question: str) -> set[str]:
+    terms = {
+        token.casefold()
+        for token in lexical_tokens(question)
+        if re.fullmatch(r"[a-z0-9][a-z0-9.-]*", token) and len(token) >= 3
+    }
+    mappings = {
+        "双向": {"bidirectional", "left and right", "both directions"},
+        "左侧": {"left-to-right", "previous tokens", "left context"},
+        "自注意力": {"self-attention", "self attention"},
+        "掩码": {"masked language", "mlm"},
+        "微调": {"fine-tuning", "fine tuning"},
+        "少样本": {"few-shot", "few shot"},
+        "零样本": {"zero-shot", "zero shot"},
+        "自回归": {"autoregressive", "left-to-right", "next token"},
+    }
+    folded = question.casefold()
+    for cue, values in mappings.items():
+        if cue in folded:
+            terms.update(values)
+    return terms
+
+
+def _best_local_excerpt(question: str, exact_quote: str) -> str:
+    clean = " ".join(str(exact_quote or "").split()).strip()
+    if not clean:
+        return ""
+    terms = _question_evidence_terms(question)
+    segments = [
+        segment.strip(" •")
+        for segment in re.split(r"(?<=[.!?。！？])\s+|\s*[•]\s*", clean)
+        if segment.strip(" •")
+    ]
+    if not segments:
+        segments = [clean]
+    best = max(
+        enumerate(segments),
+        key=lambda item: (
+            sum(term in item[1].casefold() for term in terms),
+            -abs(len(item[1]) - 180),
+            -item[0],
+        ),
+    )[1]
+    best = re.split(r"\s+\d+(?:https?://|www\.)", best, maxsplit=1, flags=re.I)[0]
+    best = re.sub(r"(?<=[.!?。！？])\d+$", "", best).strip()
+    best = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", best)
+    if len(best) <= 360:
+        return best
+    clipped = best[:360]
+    boundary = clipped.rfind(" ")
+    return clipped[:boundary].rstrip(" ,;:") if boundary >= 120 else ""
+
+
+def _is_direct_question(question: str) -> bool:
+    value = question.strip().casefold()
+    return any(marker in value for marker in ("？", "?", "是否", "还是", "吗", "does ", "is ", "are ", "can "))
 
 
 def _is_conflict_question(question: str) -> bool:
@@ -99,8 +182,10 @@ def synthesize_answer_with_llm(
         {
             "role": "system",
             "content": (
-                "Write concise answer claims using only the provided evidence table. "
-                "Every claim must include quote_ids from the table. Do not cite any other source."
+                "Answer in the same language as the question. Use only relevant rows from the evidence table. "
+                "Return 1 to at most 4 concise, non-overlapping claims ordered by importance; never repeat a claim. "
+                "Every claim must be directly entailed by its exact supporting quote_ids. Do not infer the objective, "
+                "architecture or result of an entity that the cited quote does not name. Do not cite any other source."
             ),
         },
         {
@@ -118,19 +203,26 @@ def synthesize_answer_with_llm(
     answer_claims = payload.answer
     known_quote_ids = {str(row.get("quote_id", "")) for row in evidence_table}
     claims: list[dict[str, object]] = []
-    for index, claim in enumerate(answer_claims, start=1):
+    seen_claim_texts: set[str] = set()
+    for claim in answer_claims:
+        normalized_text = " ".join(claim.text.split()).casefold()
+        if not normalized_text or normalized_text in seen_claim_texts:
+            continue
+        seen_claim_texts.add(normalized_text)
         quote_ids = [str(quote_id) for quote_id in claim.quote_ids]
         for quote_id in quote_ids:
             if quote_id not in known_quote_ids:
                 raise ValueError(f"answer claim references unknown quote_id: {quote_id}")
         claims.append(
             {
-                "claim_id": claim.claim_id or f"c{index:04d}",
+                "claim_id": claim.claim_id or f"c{len(claims) + 1:04d}",
                 "text": claim.text,
                 "quote_ids": quote_ids,
                 "support_status": "pending_verification",
             }
         )
+        if len(claims) >= 4:
+            break
     return {
         "question": question,
         "answer": claims,
