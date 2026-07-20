@@ -5,6 +5,7 @@ import {
   defineTool,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -83,8 +84,8 @@ function bridgeTool(
   });
 }
 
-function tools() {
-  return [
+function tools(taskMode: string) {
+  const available = [
     bridgeTool(
       "inspect_workspace",
       "Inspect workspace",
@@ -156,6 +157,12 @@ function tools() {
       }),
     ),
   ];
+  const namesByMode: Record<string, Set<string>> = {
+    knowledge: new Set(["inspect_workspace", "inspect_available_tools", "search_local_evidence", "build_verified_answer"]),
+    slides: new Set(["inspect_workspace", "build_presentation_outline"]),
+  };
+  const enabled = namesByMode[taskMode];
+  return enabled ? available.filter((tool) => enabled.has(tool.name)) : [];
 }
 
 function systemPrompt(request: RunStart): string {
@@ -179,6 +186,7 @@ async function run(request: RunStart): Promise<void> {
   }
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  let lastRetryError = "";
   try {
     const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
     runtime.registerProvider("scansci-pi", {
@@ -207,16 +215,26 @@ async function run(request: RunStart): Promise<void> {
       appendSystemPromptOverride: () => [],
     });
     await loader.reload();
+    const customTools = tools(String(request.task_mode || "general"));
     const created = await createAgentSession({
       cwd: request.cwd,
       agentDir: request.agent_dir,
       modelRuntime: runtime,
       model,
       thinkingLevel: thinkingLevel(request.thinking_level),
-      noTools: "builtin",
-      customTools: tools(),
+      noTools: customTools.length ? "builtin" : "all",
+      customTools,
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(request.cwd),
+      settingsManager: SettingsManager.inMemory({
+        httpIdleTimeoutMs: 120000,
+        retry: {
+          enabled: true,
+          maxRetries: 1,
+          baseDelayMs: 1000,
+          provider: { timeoutMs: 120000, maxRetries: 1, maxRetryDelayMs: 5000 },
+        },
+      }),
     });
     session = created.session;
     session.subscribe((event) => {
@@ -227,15 +245,27 @@ async function run(request: RunStart): Promise<void> {
       } else if (event.type === "tool_execution_end") {
         emit({ type: "status.update", request_id: request.request_id, status: event.isError ? "tool_failed" : "tool_completed", name: event.toolName });
       } else if (event.type === "auto_retry_start") {
-        emit({ type: "status.update", request_id: request.request_id, status: "retry", attempt: event.attempt, delay_ms: event.delayMs });
+        lastRetryError = event.errorMessage;
+        emit({
+          type: "status.update",
+          request_id: request.request_id,
+          status: "retry",
+          attempt: event.attempt,
+          delay_ms: event.delayMs,
+          error: event.errorMessage,
+        });
       }
     });
     emit({ type: "run.ready", request_id: request.request_id });
     await session.prompt(request.prompt);
+    const finalText = session.getLastAssistantText();
+    if (!finalText.trim()) {
+      throw new Error(lastRetryError || "Pi model returned an empty response");
+    }
     emit({
       type: "run.completed",
       request_id: request.request_id,
-      text: session.getLastAssistantText(),
+      text: finalText,
       stats: session.getSessionStats(),
     });
   } catch (error) {

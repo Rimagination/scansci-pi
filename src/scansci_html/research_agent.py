@@ -567,21 +567,25 @@ class ResearchAgentRuntime:
                 )
 
             chat_request = self._direct_chat_request(payload, attachment_context=attachment_context)
-            trace = self._direct_process_trace(chat_request, had_attachments=bool(ingestion))
             local_facts = self._runtime_fact_answer(payload, chat_request)
-            if local_facts:
-                trace[-1] = {"title": "读取运行时事实", "detail": "已从当前安装状态读取版本、模型、模式与 Skill，避免模型猜测。"}
-            yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
-            yield run_event(TEXT_MESSAGE_START, run_id=run_id, messageId=message_id, role="assistant")
-            fragments: list[str] = []
-            usage: dict[str, int] = {}
-            truncated = False
             pi_eligible = (
                 not local_facts
                 and chat_request.provider_kind != "local"
                 and chat_request.session is None
                 and all(isinstance(item.get("content"), str) for item in chat_request.messages)
             )
+            trace = self._direct_process_trace(chat_request, had_attachments=bool(ingestion))
+            if local_facts:
+                trace[-1] = {"title": "读取运行时事实", "detail": "已从当前安装状态读取版本、模型、模式与 Skill，避免模型猜测。"}
+            elif pi_eligible:
+                trace.append({"title": "启动 Pi Agent", "detail": "本轮由 Pi AgentSession 负责模型会话与工具循环。"})
+            else:
+                trace.append({"title": "使用兼容传输", "detail": "托管网关、本地引擎或视觉消息保留直接传输，避免不兼容的工具协议。"})
+            yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+            yield run_event(TEXT_MESSAGE_START, run_id=run_id, messageId=message_id, role="assistant")
+            fragments: list[str] = []
+            usage: dict[str, int] = {}
+            truncated = False
             if local_facts:
                 model_events = [{"type": "delta", "content": local_facts}, {"type": "done", "truncated": False}]
             elif pi_eligible:

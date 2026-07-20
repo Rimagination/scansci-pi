@@ -137,7 +137,7 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
                     {"role": "user", "content": "Confirm the bridge."},
                 ],
                 thinking_level="off",
-                task_mode="general",
+                task_mode="knowledge",
                 timeout_seconds=30,
             )
         )
@@ -168,7 +168,7 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
                 model_id="fixture-model",
                 messages=[{"role": "user", "content": "Inspect the available tools."}],
                 thinking_level="off",
-                task_mode="general",
+                task_mode="knowledge",
                 timeout_seconds=30,
             )
         )

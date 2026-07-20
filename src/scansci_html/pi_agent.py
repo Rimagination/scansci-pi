@@ -256,6 +256,7 @@ class PiAgentClient:
                         "status": str(event.get("status", "")),
                         "name": str(event.get("name", "")),
                         "attempt": event.get("attempt"),
+                        "error": str(event.get("error", "")),
                     }
                 elif event_type == "run.completed":
                     yield {"type": "done", "stats": dict(event.get("stats", {}) or {}), "truncated": False}

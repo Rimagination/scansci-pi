@@ -14,7 +14,7 @@ ScanSci-Pi 不是对现有 ScanSci 的完整重写，也不是 Pi 终端界面�
 3. 由 Python 主进程持有业务真相；Pi 运行在 Node.js sidecar 中，通过版本化 JSONL 协议通信。
 4. 先完成最小研究闭环和同模型评测，达到切换门槛后才迁移更多工具或考虑替代原项目。
 
-当前实现进度：现有桌面 UI 已复用；Pi SDK sidecar、JSONL 双向工具回调、Python 白名单 dispatcher、独立桌面数据目录、Node runtime 捆绑和 `scanscipi.exe` 构建链已经落地。仍需在真实生产模型上完成 A/B 质量评测、长会话取消/恢复和发布签名。
+当前实现进度：现有桌面 UI 已复用；Pi SDK sidecar、JSONL 双向工具回调、Python 白名单 dispatcher、独立桌面数据目录、Node runtime 捆绑和 `scanscipi.exe` 构建链已经落地。用户配置的 OpenAI/Anthropic 兼容文本模型已走 Pi；托管网关、视觉消息和本地引擎保留明确标识的兼容传输。仍需在真实生产模型上完成 A/B 质量评测、长会话取消/恢复和发布签名。
 
 最小闭环定义：
 

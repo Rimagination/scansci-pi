@@ -28,6 +28,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build_desktop.ps1 -Mode onedir 
 
 Pi 只获得 `inspect_workspace`、本地证据检索、引用验证、DOI/期刊/论文发现、参考文献审计和演示大纲等 ScanSci 白名单工具；Pi 自带的 shell 与文件修改工具默认关闭。
 
+当前兼容边界：用户配置的 OpenAI/Anthropic 兼容文本模型进入 Pi AgentSession；“知识库”模式开放证据工具，“幻灯片”模式开放大纲工具。ScanSci 托管网关、视觉消息和纯本地引擎暂时保留现有直连传输，并会在过程轨迹中明确标识，避免伪装成 Pi 工具调用。
+
 ## 文档
 
 - [迁移实施计划](docs/implementation-plan.md)
