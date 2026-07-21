@@ -35,8 +35,12 @@ class FakeReviewClient:
                 ],
             }
         if schema_name == "literature_review_section":
-            citation = "99" if self.bad_citation else "2"
-            return {"text": "当前证据显示干预机制与疗效存在差异。", "citation_ids": [citation]}
+            payload = json.loads(messages[1]["content"])
+            citation = "99" if self.bad_citation else payload["evidence"][0]["citation_id"]
+            return {
+                "text": "当前证据显示，不同研究从作用机制、疗效指标、局限与转化条件三个层面描述干预结果；这些结论需要结合具体研究对象、方法设计和证据边界进行比较。",
+                "citation_ids": [citation],
+            }
         if schema_name == "answer_claims":
             payload = json.loads(messages[1]["content"])
             quote_id = "99" if self.bad_citation else payload["evidence_table"][0]["quote_id"]
@@ -137,7 +141,10 @@ def test_synthesis_falls_back_to_bounded_section_calls_when_nested_json_is_inval
             if schema_name == "literature_review_section":
                 payload = json.loads(messages[1]["content"])
                 citation_ids = [item["citation_id"] for item in payload["evidence"]]
-                return {"text": f"围绕{payload['section']['title']}综合了当前证据。", "citation_ids": citation_ids[:1]}
+                return {
+                    "text": f"围绕{payload['section']['title']}，当前资料提供了作用机制、疗效指标、局限与转化条件方面的可回跳原文证据；综合时需要保留研究对象、方法设计和适用边界，避免把不同研究条件下的结论直接等同。",
+                    "citation_ids": citation_ids[:1],
+                }
             if schema_name == "literature_review_overview":
                 return {
                     "title": "分段生成的证据综述",
@@ -163,9 +170,8 @@ def test_synthesis_falls_back_to_bounded_section_calls_when_nested_json_is_inval
     result = synthesize_literature_review(_research_payload(), chat_client=SplitReviewClient())
 
     assert len(result["review_document"]["sections"]) == 3
-    assert calls.count("answer_claims") >= 3
-    assert calls.count("claim_verification") >= 3
-    assert set(calls) == {"answer_claims", "claim_verification"}
+    assert calls.count("literature_review_section") >= 3
+    assert set(calls) == {"literature_review_section"}
     assert result["citation_verification"]["passed"] is True
 
 
@@ -174,7 +180,7 @@ def test_synthesis_compacts_large_evidence_before_calling_the_writer():
 
     class CapturingClient(FakeReviewClient):
         def complete_json(self, messages, *, schema_name):
-            if schema_name == "answer_claims" and "body" not in captured:
+            if schema_name == "literature_review_section" and "body" not in captured:
                 captured["body"] = messages[1]["content"]
             return super().complete_json(messages, schema_name=schema_name)
 
@@ -191,7 +197,7 @@ def test_synthesis_compacts_large_evidence_before_calling_the_writer():
     assert len(body.encode("utf-8")) < 32_000
     assert "Private parent context" not in body
     assert "private/library" not in body
-    assert all(len(item["exact_quote"].encode("utf-8")) <= 903 for item in parsed["evidence_table"])
+    assert all(len(item["exact_quote"].encode("utf-8")) <= 903 for item in parsed["evidence"])
 
 
 def test_default_local_evidence_role_cannot_pretend_to_be_review_writer(tmp_path: Path):
@@ -277,6 +283,22 @@ def test_original_transformer_section_rejects_a_bert_subject_claim():
     }
 
     assert _claim_addresses_review_section({"text": "BERT 的模型架构基于 Transformer。"}, planned) is False
+
+
+def test_model_specific_section_rejects_a_different_paper_subject():
+    planned = {
+        "title": "GPT-3 的单向解码与大规模预训练范式",
+        "objective": "解释 GPT-3 的自回归训练与规模化设置。",
+    }
+
+    assert _claim_addresses_review_section(
+        {"text": "Transformer 是完全依赖自注意力的序列转换模型。"},
+        planned,
+    ) is False
+    assert _claim_addresses_review_section(
+        {"text": "GPT-3 是一个自回归语言模型。"},
+        planned,
+    ) is True
 
 
 def test_direct_review_fallback_scores_relevant_sentences_across_sources():

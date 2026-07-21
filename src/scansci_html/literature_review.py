@@ -339,14 +339,14 @@ def _synthesize_review_in_parts(
         attempts = [section_evidence, section_evidence[: max(2, min(4, len(section_evidence)))]]
         for attempt_evidence in attempts:
             try:
-                raw_section = _synthesize_verified_review_section(
+                raw_section = _synthesize_structured_review_section(
                     question,
                     dict(planned),
                     attempt_evidence,
                     chat_client=chat_client,
                 )
             except ValueError as error:
-                if "unknown quote_id" in str(error):
+                if "unknown quote_id" in str(error) or "不存在的证据编号" in str(error):
                     raise
                 raw_section = {}
             except Exception:  # provider transport/schema failures use the next bounded attempt
@@ -415,6 +415,75 @@ def _synthesize_review_in_parts(
         )
         overview["limitations"] = limitations
     return {**dict(overview), "sections": sections}
+
+
+def _synthesize_structured_review_section(
+    question: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    chat_client: ChatJsonClient,
+) -> dict[str, Any]:
+    """Generate one concise cited paragraph with one bounded model request."""
+
+    evidence_rows = [
+        {
+            "citation_id": str(row.get("citation_id", "")),
+            "paper": str(row.get("paper", "")),
+            "section": str(row.get("section", "")),
+            "exact_quote": str(row.get("exact_quote", "")),
+        }
+        for row in evidence
+        if str(row.get("citation_id", "")) and str(row.get("exact_quote", ""))
+    ]
+    if not evidence_rows:
+        raise ValueError("review section has no evidence")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是证据约束的中文文献综述写作者。只使用给定 exact_quote 直接支持的事实，"
+                "围绕指定章节写一个 100 到 220 字的连贯中文段落。必须明确写出章节讨论的模型或方法名称；"
+                "比较并行路线时不得改写成先后替代关系。不得引入外部知识、因果推断或证据中没有的评价。"
+                "citation_ids 只能使用输入中的编号，并应覆盖段落全部实质性陈述。"
+                "返回 JSON：{text, citation_ids:[...]}。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "review_question": question,
+                    "section": {
+                        "title": str(planned.get("title", "")),
+                        "objective": str(planned.get("objective", "")),
+                    },
+                    "evidence": evidence_rows,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    raw = chat_client.complete_json(messages, schema_name="literature_review_section") or {}
+    known_ids = {str(row["citation_id"]) for row in evidence_rows}
+    paragraph = _normalized_cited_text(raw, known_ids=known_ids, field=f"章节“{planned.get('title', '')}”")
+    text = str(paragraph.get("text", "")).strip()
+    if re.search(r"[\u3400-\u9fff]", question):
+        chinese_characters = len(re.findall(r"[\u3400-\u9fff]", text))
+        if chinese_characters < 45:
+            raise ValueError("review section is not a substantive Chinese paragraph")
+    if not _claim_addresses_review_section({"text": text}, planned):
+        raise ValueError("review section does not address its planned subject")
+    quote_text_by_id = {
+        str(row["citation_id"]): str(row["exact_quote"])
+        for row in evidence_rows
+    }
+    if not _semantic_cues_are_grounded(
+        {"text": text, "quote_ids": list(paragraph.get("citation_ids", []) or [])},
+        quote_text_by_id,
+    ):
+        raise ValueError("review section adds unsupported semantic claims")
+    return paragraph
 
 
 def _synthesize_verified_review_section(
@@ -810,6 +879,14 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
         if "bert" in text or re.search(r"\bgpt(?:-?3)?\b", text):
             return False
         return any(cue in text for cue in ("自注意力", "多头注意力", "位置编码", "编码器", "解码器", "self-attention", "multi-head", "positional", "encoder", "decoder"))
+    title_has_bert = "bert" in title
+    title_has_gpt = bool(re.search(r"\bgpt(?:-?3)?\b", title))
+    if title_has_bert and not title_has_gpt and "bert" not in text:
+        return False
+    if title_has_gpt and not title_has_bert and not re.search(r"\bgpt(?:-?3)?\b", text):
+        return False
+    if title_has_bert and title_has_gpt and not ("bert" in text or re.search(r"\bgpt(?:-?3)?\b", text)):
+        return False
     section_cues = {
         "objectives": ("masked language", "mlm", "autoregressive", "left-to-right", "掩码", "自回归"),
         "evidence": ("bleu", "glue", "squad", "zero-shot", "one-shot", "few-shot", "accuracy", "benchmark", "score", " f1", "outperform"),
