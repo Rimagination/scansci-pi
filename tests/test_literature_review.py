@@ -6,17 +6,23 @@ from pathlib import Path
 import pytest
 
 from scansci_html.app_settings import load_settings, save_settings
+from scansci_html.llm import managed_gateway_session
 from scansci_html.literature_review import (
     _atomic_review_claims,
+    _balanced_review_queries,
     _claim_addresses_review_section,
     _direct_evidence_section,
+    _deterministic_review_overview,
+    _deterministic_grounded_review_section,
     _diverse_section_citation_ids,
     _exclusive_section_citation_ids,
     _has_unrequested_model_detour,
     _required_review_subjects,
     _review_subject_coverage_complete,
+    _review_text_is_readable,
     _strip_unrequested_model_detours,
     _semantic_cues_are_grounded,
+    _subject_balanced_section_citation_ids,
     _strip_inline_citation_markers,
     _verify_review_document,
     plan_literature_review,
@@ -67,12 +73,13 @@ class FakeReviewClient:
         raise AssertionError(schema_name)
 
     def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
-        if self.bad_citation:
-            raise ValueError("force structured citation validation")
         if "综述主编" in messages[0]["content"]:
             return "现有证据从机制、疗效与转化边界三个方面刻画了免疫治疗，但研究对象和设计差异限制了直接外推。"
         payload = json.loads(messages[1]["content"])
-        return f"围绕{payload['section']['title']}，当前证据显示不同研究的对象、方法和结论需要结合证据边界综合解释。"
+        return (
+            f"围绕{payload['section']['title']}，当前证据显示不同研究的对象、方法和结论需要结合证据边界综合解释；"
+            "资料覆盖局限意味着不得将研究条件不同的发现直接合并成统一结论，也不能把资料库之外的推断写成已有证据。"
+        )
 
 
 def _research_payload() -> dict[str, object]:
@@ -124,9 +131,17 @@ def test_synthesis_builds_real_review_structure_and_compacts_citations():
     )
 
 
-def test_synthesis_rejects_hallucinated_citation_ids():
-    with pytest.raises(ValueError, match="99"):
-        synthesize_literature_review(_research_payload(), chat_client=FakeReviewClient(bad_citation=True))
+def test_synthesis_discards_hallucinated_citation_ids_before_safe_fallback():
+    result = synthesize_literature_review(_research_payload(), chat_client=FakeReviewClient(bad_citation=True))
+
+    used = {
+        citation_id
+        for section in result["review_document"]["sections"]
+        for paragraph in section["paragraphs"]
+        for citation_id in paragraph["citation_ids"]
+    }
+    assert "99" not in used
+    assert used <= {"1", "2", "3", "4"}
 
 
 def test_synthesis_falls_back_to_bounded_section_calls_when_nested_json_is_invalid():
@@ -225,6 +240,8 @@ def test_managed_writing_client_disables_hidden_reasoning_for_bounded_workflows(
     client = runtime._writing_chat_client()
 
     assert client.thinking_mode == "disabled"
+    assert client.session is managed_gateway_session()
+    assert runtime._writing_chat_client() is client
 
 
 def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():
@@ -243,6 +260,14 @@ def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():
     assert plan["sections"][0]["title"] == "原始 Transformer 架构"
     assert "self-attention" in plan["sections"][0]["queries"][0]
     assert "GPT-3" in plan["sections"][2]["queries"][1]
+    assert _required_review_subjects(
+        "比较原始 Transformer、BERT 与 GPT-3。",
+        plan["sections"][2],
+    ) == ["原始 Transformer", "BERT", "GPT-3"]
+    assert _required_review_subjects(
+        "比较原始 Transformer、BERT 与 GPT-3。",
+        plan["sections"][3],
+    ) == ["原始 Transformer", "BERT", "GPT-3"]
 
 
 def test_review_section_evidence_is_diverse_before_filling_remaining_slots():
@@ -256,6 +281,98 @@ def test_review_section_evidence_is_diverse_before_filling_remaining_slots():
     selected = _diverse_section_citation_ids({"citation_ids": ["1", "2", "3", "4"]}, evidence, limit=4)
 
     assert selected == ["1", "3", "4", "2"]
+
+
+def test_three_way_evaluation_uses_subject_balanced_queries_and_evidence():
+    question = "比较原始 Transformer、BERT 与 GPT-3。"
+    planned = {
+        "title": "三者的实验评价与适配方式",
+        "objective": "比较三种模型的实验基准与下游适配。",
+        "queries": ["too broad"],
+    }
+    evidence = {
+        "1": {"paper": "1706.03762", "exact_quote": "The Transformer achieved 28.4 BLEU on WMT."},
+        "2": {"paper": "1810.04805", "exact_quote": "BERT is fine-tuned on GLUE tasks."},
+        "3": {"paper": "2005.14165", "exact_quote": "GPT-3 is evaluated in zero-shot and few-shot settings."},
+        "4": {"paper": "2005.14165", "exact_quote": "GPT-3 unrelated appendix material."},
+    }
+
+    queries = _balanced_review_queries(question, planned)
+    selected = _subject_balanced_section_citation_ids(
+        question,
+        planned,
+        ["4"],
+        evidence,
+        limit=4,
+    )
+
+    assert "WMT BLEU" in queries[0]
+    assert "BERT GLUE" in queries[1]
+    assert selected[:3] == ["1", "2", "3"]
+
+
+def test_pretraining_objective_retrieval_separates_bert_from_gpt3():
+    queries = _balanced_review_queries(
+        "比较原始 Transformer、BERT 与 GPT-3。",
+        {
+            "title": "预训练目标的演变",
+            "objective": "对比 BERT 的掩码语言模型与 GPT-3 的自回归训练目标。",
+            "queries": ["too broad"],
+        },
+    )
+
+    assert len(queries) == 2
+    assert "BERT masked language model" in queries[0]
+    assert queries[1] == "autoregressive language model 175 billion"
+
+
+def test_review_overview_keeps_decimals_and_deduplicates_repeated_openers():
+    overview = _deterministic_review_overview(
+        "比较模型。",
+        {"sections": [{"objective": "a"}, {"objective": "b"}, {"objective": "c"}]},
+        [
+            {"title": "A", "text": "模型报告 28.4 BLEU；这是实验结果。", "citation_ids": ["1"]},
+            {"title": "B", "text": "模型报告 28.4 BLEU；这是实验结果。", "citation_ids": ["1"]},
+            {"title": "C", "text": "GPT-3 使用上下文示例。", "citation_ids": ["2"]},
+        ],
+    )
+
+    abstract = overview["abstract"]["text"]
+    assert "28.4 BLEU" in abstract
+    assert abstract.count("模型报告 28.4 BLEU") == 1
+    assert "GPT-3 使用上下文示例" in abstract
+
+
+def test_three_way_deterministic_fallback_stays_grounded_and_readable():
+    question = "比较原始 Transformer、BERT 与 GPT-3。"
+    planned = {
+        "title": "三者的实验评价与适配方式",
+        "objective": "比较三种模型的实验评价、微调与下游适配。",
+    }
+    evidence = [
+        {
+            "citation_id": "1",
+            "paper": "1706.03762",
+            "exact_quote": "On the WMT 2014 task, the Transformer achieves 28.4 BLEU.",
+        },
+        {
+            "citation_id": "2",
+            "paper": "1810.04805",
+            "exact_quote": "BERT chooses a task-specific fine-tuning learning rate on the development set.",
+        },
+        {
+            "citation_id": "3",
+            "paper": "2005.14165",
+            "exact_quote": "GPT-3 Zero-shot, One-shot, and Few-shot results are reported for all tasks.",
+        },
+    ]
+
+    result = _deterministic_grounded_review_section(question, planned, evidence)
+
+    assert _review_subject_coverage_complete(question, planned, result["text"])
+    assert result["citation_ids"] == ["1", "2", "3"]
+    assert "28.4" in result["text"]
+    assert _review_text_is_readable(result["text"])
 
 
 def test_single_model_section_filters_out_other_papers_before_writing():
@@ -311,6 +428,28 @@ def test_review_semantic_gate_requires_the_subject_of_human_detection_accuracy()
         {"text": "人类识别机器生成文本的准确率随模型规模增大而下降。", "quote_ids": ["1"]},
         quotes,
     ) is True
+
+
+def test_review_semantic_gate_rejects_reversing_human_detection_result():
+    quotes = {
+        "1": "Human accuracy in identifying whether GPT-3 news articles are model generated was 52%, near chance.",
+    }
+
+    assert _semantic_cues_are_grounded(
+        {"text": "GPT-3 的生成文本仍容易被察觉。", "quote_ids": ["1"]},
+        quotes,
+    ) is False
+    assert _semantic_cues_are_grounded(
+        {"text": "GPT-3 的生成文本让人类难以区分。", "quote_ids": ["1"]},
+        quotes,
+    ) is True
+
+
+def test_review_semantic_gate_requires_direct_support_for_bert_generation_limit():
+    assert _semantic_cues_are_grounded(
+        {"text": "BERT 的生成能力受限。", "quote_ids": ["1"]},
+        {"1": "BERT uses bidirectional self-attention for language understanding."},
+    ) is False
 
 
 def test_review_claim_must_answer_the_planned_section_not_merely_have_a_citation():
@@ -431,6 +570,15 @@ def test_three_model_comparison_requires_every_named_subject():
         planned,
         "原始 Transformer 以任务训练评估，BERT 采用微调。",
     ) is False
+
+
+def test_review_readability_gate_rejects_corruption_and_runaway_repetition():
+    assert _review_text_is_readable("BERT 使用掩码语言模型进行双向预训练，并通过微调适配下游任务。") is True
+    assert _review_text_is_readable("GPT-3 G G G G G G G G G G") is False
+    assert _review_text_is_readable("模型表现也也也也也也更强。") is False
+    assert _review_text_is_readable("开发集集数据上上 上出现异常。") is False
+    assert _review_text_is_readable(r"权重 \\ \\ \\times H 在微调中引入。") is False
+    assert _review_text_is_readable("参数量从 1B �长到 10B。") is False
 
 
 def test_three_model_comparison_rejects_side_model_substitution():

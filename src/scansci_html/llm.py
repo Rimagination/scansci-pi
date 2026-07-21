@@ -46,6 +46,55 @@ class ChatJsonClient(Protocol):
         ...
 
 
+class CascadingChatJsonClient:
+    """Latch onto the first healthy configured client for a bounded workflow."""
+
+    def __init__(self, clients: list[ChatJsonClient]) -> None:
+        if not clients:
+            raise ValueError("at least one chat client is required")
+        self.clients = list(clients)
+        self._active_index = 0
+        primary = self.clients[0]
+        self.session = getattr(primary, "session", None)
+        self.thinking_mode = getattr(primary, "thinking_mode", None)
+        self.model = getattr(primary, "model", "")
+
+    @property
+    def active_model(self) -> str:
+        return str(getattr(self.clients[self._active_index], "model", ""))
+
+    def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
+        return self._complete("complete_json", messages, schema_name=schema_name)
+
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        return str(self._complete("complete_text", messages, max_tokens=max_tokens))
+
+    def _complete(self, method_name: str, messages: list[dict[str, str]], **kwargs: Any) -> Any:
+        last_error: Exception | None = None
+        for index in range(self._active_index, len(self.clients)):
+            client = self.clients[index]
+            try:
+                result = getattr(client, method_name)(messages, **kwargs)
+            except ValueError as error:
+                last_error = error
+                # A structured-output parse failure proves that the provider
+                # answered even though it did not honor the JSON contract.
+                # When a previous provider was unavailable, keep this
+                # reachable fallback latched so a subsequent plain-text
+                # recovery does not wait on the dead primary again.
+                if method_name == "complete_json" and index > self._active_index:
+                    self._active_index = index
+                continue
+            except RuntimeError as error:
+                last_error = error
+                continue
+            self._active_index = index
+            return result
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no chat client completed the request")
+
+
 class OpenAICompatibleChatJsonClient:
     def __init__(
         self,
@@ -88,7 +137,7 @@ class OpenAICompatibleChatJsonClient:
             "max_tokens": (
                 768
                 if schema_name in {"answer_claims", "claim_verification", "retrieval_queries"}
-                else 512 if schema_name == "literature_review_section"
+                else 320 if schema_name == "literature_review_section"
                 else 1024 if schema_name == "literature_review_overview"
                 else 3072 if schema_name == "evidence_grounded_literature_review" else 4096
             ),
@@ -113,7 +162,11 @@ class OpenAICompatibleChatJsonClient:
             "literature_review_overview",
             "scansci_scientific_slides",
         }
-        attempts = 3 if schema_name == "literature_review_section" else 2 if schema_name in retryable_schemas else 1
+        # Review synthesis already validates every paragraph and has a
+        # grounded evidence fallback. Retrying malformed section JSON here,
+        # and then retrying the same section again at the workflow layer,
+        # multiplies a slow gateway call without improving the accepted text.
+        attempts = 1 if schema_name == "literature_review_section" else 2 if schema_name in retryable_schemas else 1
         for attempt in range(attempts):
             active_body = dict(request_body)
             if attempt:

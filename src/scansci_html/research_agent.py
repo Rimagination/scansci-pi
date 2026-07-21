@@ -17,7 +17,7 @@ from .image_attachments import persist_image_attachments, vision_image_blocks
 from .ingestion import ingest_sources, ingestion_context
 from .library_manager import notebook_evidence_db
 from .literature_review import retrieve_review_evidence, synthesize_literature_review
-from .llm import analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
+from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .pi_agent import PiAgentClient
 from .qa.agent import answer_question
@@ -172,6 +172,7 @@ class ResearchAgentRuntime:
         self.store.recover_interrupted_runs()
         self._threads: dict[str, threading.Thread] = {}
         self._thread_lock = threading.Lock()
+        self._managed_writing_clients: dict[tuple[str, str, str], Any] = {}
 
     def workflow_catalog(self) -> list[dict[str, Any]]:
         return [
@@ -1225,13 +1226,44 @@ class ResearchAgentRuntime:
             api_key = "scansci-managed-gateway" if str(provider.get("auth_mode", "")) == "managed" else get_provider_api_key(self.workspace, provider_id)
             if not api_key:
                 raise ValueError(f"写作模型 {provider.get('name', provider_id)} 尚未配置 API Key")
-            return build_chat_json_client(
+            managed = str(provider.get("auth_mode", "")) == "managed"
+            cache_key = (provider_id, model_id, str(provider.get("base_url", "")))
+            if managed and cache_key in self._managed_writing_clients:
+                return self._managed_writing_clients[cache_key]
+            primary_client = build_chat_json_client(
                 str(provider.get("kind", "")),
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
                 model=model_id,
-                thinking_mode="disabled" if str(provider.get("auth_mode", "")) == "managed" else None,
+                timeout=20.0 if managed else 60.0,
+                session=managed_gateway_session() if managed else None,
+                thinking_mode="disabled" if managed else None,
             )
+            if not managed:
+                return primary_client
+            fallback_model = next(
+                (
+                    str(item.get("id", ""))
+                    for item in list(provider.get("models", []) or [])
+                    if str(item.get("id", "")) and str(item.get("id", "")) != model_id
+                ),
+                "",
+            )
+            if not fallback_model:
+                self._managed_writing_clients[cache_key] = primary_client
+                return primary_client
+            fallback_client = build_chat_json_client(
+                str(provider.get("kind", "")),
+                base_url=str(provider.get("base_url", "")),
+                api_key=api_key,
+                model=fallback_model,
+                timeout=35.0,
+                session=managed_gateway_session(),
+                thinking_mode="disabled",
+            )
+            client = CascadingChatJsonClient([primary_client, fallback_client])
+            self._managed_writing_clients[cache_key] = client
+            return client
         if reference.startswith("local:"):
             local_id = reference.removeprefix("local:")
             local_model = next(

@@ -1,7 +1,79 @@
 import pytest
 import requests
 
-from scansci_html.llm import AnthropicCompatibleChatJsonClient, OpenAICompatibleChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, stream_chat_text
+from scansci_html.llm import AnthropicCompatibleChatJsonClient, CascadingChatJsonClient, OpenAICompatibleChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, stream_chat_text
+
+
+def test_cascading_chat_client_latches_onto_healthy_fallback():
+    class Client:
+        def __init__(self, model, *, fail=False):
+            self.model = model
+            self.fail = fail
+            self.calls = 0
+
+        def complete_json(self, messages, *, schema_name):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("unavailable")
+            return {"model": self.model}
+
+        def complete_text(self, messages, *, max_tokens=700):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("unavailable")
+            return self.model
+
+    primary = Client("primary", fail=True)
+    fallback = Client("fallback")
+    client = CascadingChatJsonClient([primary, fallback])
+
+    assert client.complete_json([], schema_name="demo") == {"model": "fallback"}
+    assert client.complete_text([]) == "fallback"
+    assert client.active_model == "fallback"
+    assert primary.calls == 1
+    assert fallback.calls == 2
+
+
+def test_cascading_chat_client_keeps_reachable_fallback_after_invalid_json():
+    class Primary:
+        model = "primary"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, messages, *, schema_name):
+            self.calls += 1
+            raise RuntimeError("unavailable")
+
+        def complete_text(self, messages, *, max_tokens=700):
+            self.calls += 1
+            raise RuntimeError("unavailable")
+
+    class Fallback:
+        model = "fallback"
+
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, messages, *, schema_name):
+            self.calls += 1
+            raise ValueError("invalid structured response")
+
+        def complete_text(self, messages, *, max_tokens=700):
+            self.calls += 1
+            return "可用的纯文本响应"
+
+    primary = Primary()
+    fallback = Fallback()
+    client = CascadingChatJsonClient([primary, fallback])
+
+    with pytest.raises(ValueError, match="invalid structured response"):
+        client.complete_json([], schema_name="demo")
+
+    assert client.active_model == "fallback"
+    assert client.complete_text([]) == "可用的纯文本响应"
+    assert primary.calls == 1
+    assert fallback.calls == 2
 
 
 def test_openai_compatible_chat_json_client_parses_json_content():
@@ -134,6 +206,31 @@ def test_openai_compatible_chat_json_client_repairs_unquoted_known_review_keys()
 
     assert result["comparison_table"] == {}
     assert result["open_questions"] == []
+
+
+def test_review_section_invalid_json_is_not_retried_by_the_transport_client():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout):
+            calls.append(json)
+            return FakeResponse()
+
+    client = OpenAICompatibleChatJsonClient(
+        base_url="https://example.test/v1", api_key="secret", model="chat-model", session=FakeSession()
+    )
+
+    with pytest.raises(ValueError, match="literature_review_section"):
+        client.complete_json([{"role": "user", "content": "review"}], schema_name="literature_review_section")
+
+    assert len(calls) == 1
 
 
 def test_build_chat_json_client_requires_openai_compatible_config():

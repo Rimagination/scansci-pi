@@ -21,8 +21,8 @@ from .qa.verifier import verify_answer_claims_with_llm
 
 _MAX_SECTIONS = 6
 _MAX_QUERIES_PER_SECTION = 2
-_MAX_EVIDENCE_ROWS = 42
-_MAX_PROMPT_EVIDENCE_ROWS = 24
+_MAX_EVIDENCE_ROWS = 70
+_MAX_PROMPT_EVIDENCE_ROWS = 30
 _MAX_PROMPT_QUOTE_BYTES = 900
 
 
@@ -43,7 +43,9 @@ def retrieve_review_evidence(
     evidence_index: dict[tuple[str, str], str] = {}
     section_results: list[dict[str, Any]] = []
 
-    for section in list(plan["sections"]):
+    for raw_section in list(plan["sections"]):
+        section = dict(raw_section)
+        section["queries"] = _balanced_review_queries(topic, section)
         section_citations: list[str] = []
         query_traces: list[dict[str, Any]] = []
         for query in list(section["queries"])[:_MAX_QUERIES_PER_SECTION]:
@@ -185,7 +187,7 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
                 {
                     "id": "evidence",
                     "title": "主要实验发现与规模效应",
-                    "objective": "比较 Transformer 的 BLEU、BERT 的 GLUE/SQuAD 与 GPT-3 的 zero-shot、one-shot、few-shot 基准证据。",
+                    "objective": "比较原始 Transformer 的 BLEU、BERT 的 GLUE/SQuAD 与 GPT-3 的 zero-shot、one-shot、few-shot 基准证据。",
                     "queries": [
                         "Transformer translation BLEU BERT GLUE SQuAD experimental results",
                         "GPT-3 zero-shot one-shot few-shot benchmark performance scaling",
@@ -194,8 +196,11 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
                 {
                     "id": "adaptation",
                     "title": "下游适配方式",
-                    "objective": "比较 BERT fine-tuning 与 GPT-3 in-context、few-shot、zero-shot 适配范式。",
-                    "queries": ["BERT fine-tuning downstream tasks GPT-3 in-context few-shot zero-shot adaptation"],
+                    "objective": "比较原始 Transformer 的任务级训练、BERT fine-tuning 与 GPT-3 in-context、few-shot、zero-shot 适配范式。",
+                    "queries": [
+                        "Transformer supervised machine translation training WMT BERT fine-tuning downstream tasks",
+                        "GPT-3 in-context few-shot zero-shot adaptation",
+                    ],
                 },
                 {
                     "id": "limits",
@@ -245,7 +250,7 @@ def synthesize_literature_review(
     if not question or not plan.get("sections") or len(all_known_ids) < 3:
         raise ValueError("综述检索结果不完整，无法进入写作阶段")
 
-    prompt_plan, prompt_evidence = _review_prompt_inputs(plan, evidence)
+    prompt_plan, prompt_evidence = _review_prompt_inputs(question, plan, evidence)
     known_ids = {str(row.get("citation_id", "")) for row in prompt_evidence}
     raw = _synthesize_review_in_parts(
         question,
@@ -333,29 +338,39 @@ def _synthesize_review_in_parts(
     for planned in list(plan.get("sections", []) or []):
         citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
         citation_ids = _exclusive_section_citation_ids(dict(planned), citation_ids, evidence_by_id)
+        citation_ids = _subject_balanced_section_citation_ids(
+            question,
+            dict(planned),
+            citation_ids,
+            evidence_by_id,
+            limit=6,
+        )
         if not citation_ids:
             citation_ids = list(evidence_by_id)[:2]
         section_evidence = [evidence_by_id[item] for item in citation_ids]
         raw_section: dict[str, Any] = {}
-        attempts = [section_evidence, section_evidence[: max(2, min(4, len(section_evidence)))]]
-        for attempt_evidence in attempts:
-            try:
-                raw_section = _synthesize_structured_review_section(
-                    question,
-                    dict(planned),
-                    attempt_evidence,
-                    chat_client=chat_client,
-                )
-            except ValueError as error:
-                if "unknown quote_id" in str(error) or "不存在的证据编号" in str(error):
-                    raise
-                raw_section = {}
-            except Exception:  # provider transport/schema failures use the next bounded attempt
-                raw_section = {}
-            if raw_section:
-                break
+        try:
+            raw_section = _synthesize_structured_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+                chat_client=chat_client,
+            )
+        except ValueError:
+            # A model-supplied citation outside the current whitelist is never
+            # accepted; the grounded fallback below is safer than asking the
+            # same slow provider to regenerate the whole paragraph.
+            raw_section = {}
+        except Exception:  # provider transport/schema failures use grounded fallback
+            raw_section = {}
         if not raw_section:
             fallback_titles.append(str(planned.get("title", "")))
+            raw_section = _deterministic_grounded_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+            )
+        if not raw_section:
             if callable(text_completion):
                 raw_section = _synthesize_plain_review_section(
                     question,
@@ -370,6 +385,17 @@ def _synthesize_review_in_parts(
                 section_evidence,
                 text_completion=text_completion if callable(text_completion) else None,
             )
+        if (
+            (not raw_section or len(re.findall(r"[\u3400-\u9fff]", str(raw_section.get("text", "")))) < 45)
+            and re.search(r"[\u3400-\u9fff]", question)
+        ):
+            deterministic_section = _deterministic_grounded_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+            )
+            if deterministic_section:
+                raw_section = deterministic_section
         if not raw_section:
             raise ValueError(
                 f"当前带锚点证据不足以支持章节“{planned.get('title', '')}”，"
@@ -390,6 +416,22 @@ def _synthesize_review_in_parts(
             chat_client=chat_client,
         )
         coverage_complete = coverage_complete and subject_coverage_complete
+        required_subjects = _required_review_subjects(question, dict(planned))
+        # Treat dedicated three-way comparison sections as a hard contract.
+        # Two-subject mentions often appear as local context inside a focused
+        # BERT or GPT-3 section; failing the whole review there would discard
+        # a grounded focal explanation merely because the contextual contrast
+        # could not be stated from the selected excerpt.
+        if len(required_subjects) >= 3 and not subject_coverage_complete:
+            missing_subjects = [
+                subject
+                for subject in required_subjects
+                if not _subject_is_present(subject, str(raw_section.get("text", "")))
+            ]
+            raise ValueError(
+                f"章节“{planned.get('title', '')}”没有覆盖全部指定比较对象"
+                f"（缺少：{'、'.join(missing_subjects)}），已停止写作，避免用偏题证据代替主体比较"
+            )
         if not coverage_complete:
             coverage_gap_titles.append(str(planned.get("title", "")))
         paragraph = _normalized_cited_text(
@@ -397,6 +439,21 @@ def _synthesize_review_in_parts(
             known_ids=set(citation_ids),
             field=f"章节“{planned.get('title', '')}”",
         )
+        if not _review_text_is_readable(str(paragraph.get("text", ""))):
+            deterministic_section = _deterministic_grounded_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+            )
+            if not deterministic_section:
+                raise ValueError(
+                    f"章节“{planned.get('title', '')}”的模型输出出现乱码或异常重复，已停止交付"
+                )
+            paragraph = _normalized_cited_text(
+                deterministic_section,
+                known_ids=set(citation_ids),
+                field=f"章节“{planned.get('title', '')}”",
+            )
         if re.search(r"[\u3400-\u9fff]", question):
             chinese_characters = len(re.findall(r"[\u3400-\u9fff]", str(paragraph.get("text", ""))))
             if chinese_characters < 45:
@@ -501,6 +558,18 @@ def _synthesize_structured_review_section(
     if not _claim_addresses_review_section({"text": text}, planned):
         raise ValueError("review section does not address its planned subject")
     text = _strip_review_excerpt_artifacts(_strip_unrequested_model_detours(question, planned, text))
+    if not _review_text_is_readable(text):
+        raise ValueError("review section contains corrupted or repetitive text")
+    required_subjects = _required_review_subjects(question, planned)
+    if len(required_subjects) >= 2:
+        parts = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？!?])\s*|(?<=\.)\s+", text)
+            if item.strip()
+        ]
+        text = " ".join(
+            item for item in parts if _claim_addresses_review_section({"text": item}, planned)
+        ).strip()
     if not text:
         raise ValueError("review comparison section contains only unrelated model detours")
     paragraph["text"] = text
@@ -609,6 +678,7 @@ def _diverse_section_citation_ids(
         for item in list(planned.get("citation_ids", []) or [])
         if str(item) in evidence_by_id
     ]
+    candidates = _exclusive_section_citation_ids(planned, candidates, evidence_by_id)
     original_order = {citation_id: index for index, citation_id in enumerate(candidates)}
     candidates.sort(
         key=lambda citation_id: (
@@ -635,6 +705,142 @@ def _diverse_section_citation_ids(
     return selected
 
 
+def _balanced_review_queries(question: str, planned: dict[str, Any]) -> list[str]:
+    """Use subject-specific retrieval for an explicit Transformer/BERT/GPT-3 comparison."""
+
+    required = _required_review_subjects(question, planned)
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    comparison_dimension = any(
+        cue in target
+        for cue in (
+            "实验", "评价", "基准", "适配", "微调", "下游",
+            "experiment", "evaluation", "benchmark", "adaptation", "fine-tun", "downstream",
+        )
+    )
+    limitation_dimension = any(
+        cue in target for cue in ("局限", "边界", "不足", "limitation", "weakness", "risk")
+    )
+    question_scope = str(question or "").casefold()
+    transformer_comparison = (
+        "transformer" in question_scope
+        and "bert" in question_scope
+        and bool(re.search(r"\bgpt-?3\b", question_scope))
+    )
+    if transformer_comparison and limitation_dimension:
+        return [
+            "factual inaccuracies",
+            "human detection close to chance",
+        ]
+    objective_dimension = any(
+        cue in target
+        for cue in (
+            "预训练", "训练目标", "掩码", "自回归",
+            "pre-train", "training objective", "masked language", "autoregressive", "left-to-right",
+        )
+    )
+    if transformer_comparison and objective_dimension and "BERT" in required and "GPT-3" in required:
+        return [
+            "BERT masked language model deep bidirectional pre-training objective",
+            "autoregressive language model 175 billion",
+        ]
+    if required == ["原始 Transformer"] and any(
+        cue in target for cue in ("位置编码", "positional encoding", "架构", "architecture")
+    ):
+        return [
+            "original Transformer encoder decoder self-attention architecture",
+            "Attention Is All You Need sinusoidal positional encoding sine cosine",
+        ]
+    if required == ["原始 Transformer", "BERT", "GPT-3"] and comparison_dimension:
+        return [
+            "original Transformer WMT BLEU supervised machine translation training results",
+            "BERT GLUE SQuAD fine-tuning GPT-3 zero-shot one-shot few-shot in-context learning",
+        ]
+    return [str(item) for item in list(planned.get("queries", []) or []) if str(item).strip()]
+
+
+def _subject_balanced_section_citation_ids(
+    question: str,
+    planned: dict[str, Any],
+    citation_ids: list[str],
+    evidence_by_id: dict[str, dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    """Reserve one clean, relevant quotation for each named comparison subject."""
+
+    required = _required_review_subjects(question, planned)
+    if len(required) < 2:
+        return citation_ids[:limit]
+    selected: list[str] = []
+    for subject in required:
+        candidates = [
+            (citation_id, row)
+            for citation_id, row in evidence_by_id.items()
+            if _evidence_matches_review_subject(subject, row)
+        ]
+        if not candidates:
+            continue
+        citation_id, _ = max(
+            candidates,
+            key=lambda item: _subject_comparison_evidence_score(subject, planned, item[1]),
+        )
+        if citation_id not in selected:
+            selected.append(citation_id)
+    for citation_id in citation_ids:
+        if citation_id not in selected:
+            selected.append(citation_id)
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def _subject_comparison_evidence_score(
+    subject: str,
+    planned: dict[str, Any],
+    row: dict[str, Any],
+) -> float:
+    score = _subject_evidence_selection_score(planned, row)
+    quote = str(row.get("exact_quote", "")).casefold()
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    objective_dimension = any(
+        cue in target for cue in ("预训练", "训练目标", "掩码", "自回归", "pre-train", "objective", "autoregressive")
+    )
+    limitation_dimension = any(
+        cue in target for cue in ("局限", "边界", "不足", "limitation", "weakness", "risk")
+    )
+    if subject == "原始 Transformer" and "wmt" in quote and "bleu" in quote:
+        score += 8.0
+    elif subject == "BERT":
+        if objective_dimension and "masked language model" in quote:
+            score += 10.0
+        elif "bert" in quote and "fine-tun" in quote:
+            score += 8.0
+    elif subject == "GPT-3":
+        if objective_dimension and "autoregressive language model" in quote:
+            score += 10.0
+        elif limitation_dimension and any(cue in quote for cue in ("factual inaccuracies", "close to chance", "barely above chance")):
+            score += 10.0
+        elif any(cue in quote for cue in ("zero-shot", "one-shot", "few-shot")):
+            score += 8.0
+    return score
+
+
+def _subject_evidence_selection_score(planned: dict[str, Any], row: dict[str, Any]) -> float:
+    quote = " ".join(str(row.get("exact_quote", "")).split())
+    score = _section_evidence_score(planned, {"exact_quote": quote})
+    folded = quote.casefold()
+    if len(quote) > 1200:
+        score -= 6.0
+    if len(quote) > 3000:
+        score -= 3.0
+    if re.match(r"^(?:table|setting|system\s+mnli|model name)\b", folded):
+        score -= 4.0
+    numeric_ratio = sum(character.isdigit() for character in quote) / max(1, len(quote))
+    if numeric_ratio > 0.1:
+        score -= 2.0
+    return score
+
+
 def _exclusive_section_citation_ids(
     planned: dict[str, Any],
     citation_ids: list[str],
@@ -654,12 +860,11 @@ def _exclusive_section_citation_ids(
     matched: list[str] = []
     for citation_id in citation_ids:
         row = evidence_by_id.get(citation_id, {})
-        quote = str(row.get("exact_quote", "")).casefold()
-        if original_transformer and "bert" not in quote and not re.search(r"\bgpt(?:-?3)?\b", quote):
+        if original_transformer and _evidence_matches_review_subject("原始 Transformer", row):
             matched.append(citation_id)
-        elif has_bert and "bert" in quote:
+        elif has_bert and _evidence_matches_review_subject("BERT", row):
             matched.append(citation_id)
-        elif has_gpt3 and re.search(r"\bgpt-?3\b", quote):
+        elif has_gpt3 and _evidence_matches_review_subject("GPT-3", row):
             matched.append(citation_id)
     return matched or citation_ids
 
@@ -781,7 +986,7 @@ def _synthesize_plain_review_section(
                         ),
                     },
                 ],
-                max_tokens=700,
+                max_tokens=420,
             )
         ).strip()
     except Exception:
@@ -791,6 +996,9 @@ def _synthesize_plain_review_section(
         planned,
         _strip_inline_citation_markers(text),
     )
+    text = _strip_review_excerpt_artifacts(text)
+    if not _review_text_is_readable(text):
+        return {}
     if len(re.findall(r"[\u3400-\u9fff]", text)) < 45:
         return {}
     if not _claim_addresses_review_section({"text": text}, planned):
@@ -840,13 +1048,225 @@ def _supplement_review_subject_coverage(
             )
         except Exception:
             extension = {}
+        text_completion = getattr(chat_client, "complete_text", None)
+        if not extension and callable(text_completion):
+            extension = _synthesize_plain_review_section(
+                question,
+                targeted,
+                subject_evidence[:4],
+                text_completion=text_completion,
+            )
+        if not extension:
+            extension = _direct_evidence_section(
+                question,
+                targeted,
+                subject_evidence[:4],
+                text_completion=text_completion if callable(text_completion) else None,
+            )
+        if not extension or not _review_text_is_readable(str(extension.get("text", ""))):
+            extension = _deterministic_grounded_subject_sentence(
+                subject,
+                planned,
+                subject_evidence,
+            )
         extension_text = str(extension.get("text", "")).strip()
+        if extension_text and not _subject_is_present(subject, extension_text):
+            extension_text = f"{subject}：{extension_text}"
+            extension = {**extension, "text": extension_text}
         if not extension_text or not _subject_is_present(subject, extension_text):
             continue
         text = " ".join(item for item in (text, extension_text) if item)
         citations.extend(str(item) for item in list(extension.get("citation_ids", []) or []) if str(item))
     raw_section = {**raw_section, "text": text, "citation_ids": list(dict.fromkeys(citations))}
     return raw_section, _review_subject_coverage_complete(question, planned, text)
+
+
+def _deterministic_grounded_review_section(
+    question: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Build a concise Chinese fallback only from recognized source cues."""
+
+    sentences: list[str] = []
+    citation_ids: list[str] = []
+    for subject in _required_review_subjects(question, planned):
+        subject_evidence = [row for row in evidence if _evidence_matches_review_subject(subject, row)]
+        grounded = _deterministic_grounded_subject_sentence(subject, planned, subject_evidence)
+        text = str(grounded.get("text", "")).strip()
+        if not text:
+            continue
+        sentences.append(text)
+        citation_ids.extend(str(item) for item in grounded.get("citation_ids", []) if str(item))
+    output = " ".join(sentences).strip()
+    if not output or not _review_text_is_readable(output):
+        return {}
+    return {"text": output, "citation_ids": list(dict.fromkeys(citation_ids))}
+
+
+def _deterministic_grounded_subject_sentence(
+    subject: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Express a small set of literal model-paper facts without free inference."""
+
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    experimental = any(cue in target for cue in ("实验", "评价", "基准", "适配", "下游", "微调"))
+    limitations = any(cue in target for cue in ("局限", "边界", "不足", "limitation", "weakness"))
+    ranked = sorted(
+        evidence,
+        key=lambda row: _subject_evidence_selection_score(planned, row),
+        reverse=True,
+    )
+    if not experimental and not limitations:
+        literal_sentences: list[str] = []
+        literal_citations: list[str] = []
+
+        def add_literal(text: str, row: dict[str, str]) -> None:
+            citation_id = str(row.get("citation_id", ""))
+            if text and citation_id and text not in literal_sentences:
+                literal_sentences.append(text)
+                literal_citations.append(citation_id)
+
+        if subject == "原始 Transformer":
+            architecture = next(
+                (
+                    row for row in ranked
+                    if "encoder" in str(row.get("exact_quote", "")).casefold()
+                    and "decoder" in str(row.get("exact_quote", "")).casefold()
+                    and "self-attention" in str(row.get("exact_quote", "")).casefold()
+                ),
+                None,
+            )
+            positional = next(
+                (
+                    row for row in ranked
+                    if "positional encoding" in str(row.get("exact_quote", "")).casefold()
+                    and any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("sine", "cosine", "sinusoid"))
+                ),
+                None,
+            )
+            if architecture:
+                add_literal(
+                    "原始 Transformer 的编码器与解码器都使用自注意力：编码器位置可关注前一层全部位置，解码器位置只关注当前位置及此前位置。",
+                    architecture,
+                )
+            if positional:
+                add_literal(
+                    "原始 Transformer 以不同频率的正弦和余弦函数构造位置编码，并将其加入输入表示，使模型能够利用序列中的位置信息。",
+                    positional,
+                )
+        elif subject == "BERT":
+            masked = next(
+                (row for row in ranked if "masked language model" in str(row.get("exact_quote", "")).casefold()),
+                None,
+            )
+            bidirectional = next(
+                (
+                    row for row in ranked
+                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("bidirectional", "bi-directionality"))
+                ),
+                None,
+            )
+            if masked:
+                add_literal(
+                    "BERT 使用掩码语言模型进行预训练，通过遮蔽输入词并预测被遮蔽内容来学习上下文相关表示。",
+                    masked,
+                )
+            if bidirectional:
+                add_literal(
+                    "BERT 使用多层双向 Transformer 编码器；论文将深层双向性作为其实证改进的重要来源进行评估。",
+                    bidirectional,
+                )
+        elif subject == "GPT-3":
+            autoregressive = next(
+                (
+                    row for row in ranked
+                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("autoregressive", "left-to-right"))
+                ),
+                None,
+            )
+            scaling = next(
+                (
+                    row for row in ranked
+                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("175b", "175 billion", "model capacity", "parameters"))
+                ),
+                None,
+            )
+            context = next(
+                (
+                    row for row in ranked
+                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("zero-shot", "one-shot", "few-shot", "in-context"))
+                ),
+                None,
+            )
+            if autoregressive:
+                add_literal(
+                    "GPT-3 使用自回归、从左到右的语言建模目标进行预训练，并依据已有上下文预测后续标记。",
+                    autoregressive,
+                )
+            if scaling:
+                add_literal(
+                    "GPT-3 论文比较多个参数规模，并将完整模型扩展到 1750 亿参数，以检验模型容量变化下的任务表现。",
+                    scaling,
+                )
+            if context:
+                add_literal(
+                    "GPT-3 论文报告零样本、单样本和少样本设置下的结果，用不同数量的上下文示例比较模型的任务表现。",
+                    context,
+                )
+        literal_text = " ".join(literal_sentences).strip()
+        if literal_text and _review_text_is_readable(literal_text):
+            return {"text": literal_text, "citation_ids": list(dict.fromkeys(literal_citations))}
+
+    for row in ranked:
+        citation_id = str(row.get("citation_id", ""))
+        quote = " ".join(str(row.get("exact_quote", "")).split()).strip()
+        folded = quote.casefold()
+        if not citation_id or not quote:
+            continue
+        text = ""
+        if subject == "原始 Transformer":
+            if experimental and "wmt" in folded and "bleu" in folded:
+                score = re.search(
+                    r"(?:bleu\s+score\s+of|score\s+of|achieves)\s+(\d+(?:\.\d+)?)(?:\s+bleu)?",
+                    folded,
+                )
+                value = score.group(1) if score else ""
+                suffix = f"，引文报告的 BLEU 为 {value}" if value else ""
+                text = f"原始 Transformer 在 WMT 机器翻译任务上以 BLEU 评价模型表现{suffix}；该引文直接报告了该任务上的实验结果。"
+            elif "encoder" in folded and "decoder" in folded and "self-attention" in folded:
+                text = "原始 Transformer 的编码器与解码器都使用自注意力：编码器位置可关注前一层全部位置，解码器位置只关注当前位置及此前位置。"
+            elif "positional encoding" in folded and ("sine" in folded or "cosine" in folded):
+                text = "原始 Transformer 以不同频率的正弦和余弦函数构造位置编码，并将其加入输入表示，使模型能够利用序列中的位置信息。"
+        elif subject == "BERT":
+            if limitations:
+                continue
+            if experimental and "bert" in folded and "fine-tun" in folded:
+                text = "BERT 采用预训练后微调的下游适配方式；引文说明其会针对具体任务选择微调学习率，并以开发集表现确定相应配置。"
+            elif "bert" in folded and "masked language model" in folded:
+                text = "BERT 使用掩码语言模型进行预训练，通过遮蔽输入词并结合双向上下文预测被遮蔽内容，从而学习深层双向表示。"
+            elif "bert" in folded and ("bidirectional" in folded or "bi-directionality" in folded):
+                text = "BERT 的核心设计包括双向 Transformer 编码与预训练任务；论文将深层双向性作为其实证改进的重要来源进行评估。"
+        elif subject == "GPT-3":
+            if limitations and "factual" in folded and any(cue in folded for cue in ("inaccur", "incorrect", "false")):
+                text = "GPT-3 论文指出，模型生成的文本可能出现事实不准确；因此流畅输出并不等同于对具体事实具有可靠访问或核验能力。"
+            elif limitations and "human accuracy" in folded and any(cue in folded for cue in ("identifying", "detecting", "distinguish")):
+                text = "GPT-3 论文以人类识别者区分模型文本与人类文本的准确率评估可辨识性；接近随机水平的结果意味着生成文本较难被区分。"
+            elif limitations and any(cue in folded for cue in ("misuse", "malicious", "difficult to anticipate")):
+                text = "GPT-3 论文指出，语言模型可能被重新用于研究者原本未预期的环境或目的，因此恶意使用方式难以被事先完整预判。"
+            elif limitations:
+                continue
+            elif experimental and any(cue in folded for cue in ("zero-shot", "one-shot", "few-shot")):
+                text = "GPT-3 论文分别报告零样本、单样本和少样本设置下的基准结果，并以这些不同设置比较模型在任务示例数量变化时的表现。"
+            elif re.search(r"\bgpt-?3\b", folded) and ("autoregressive" in folded or "left-to-right" in folded):
+                text = "GPT-3 使用自回归、从左到右的语言建模目标进行预训练，并在推理时依据已有上下文继续预测后续标记。"
+            elif re.search(r"\bgpt-?3\b", folded) and any(cue in folded for cue in ("175b", "parameters", "model capacity")):
+                text = "GPT-3 论文比较了多个参数规模，并将完整模型扩展到 1750 亿参数；实验同时报告不同规模下的零样本、单样本与少样本表现。"
+        if text and _review_text_is_readable(text):
+            return {"text": text, "citation_ids": [citation_id]}
+    return {}
 
 
 def _review_document_key(row: dict[str, Any]) -> str:
@@ -956,7 +1376,7 @@ def _required_review_subjects(question: str, planned: dict[str, Any]) -> list[st
     target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
     multi_subject = any(
         cue in target
-        for cue in ("三者", "三种模型", "三个模型", "all three", "three models")
+        for cue in ("三者", "三种模型", "三个模型", "三篇论文", "all three", "three models", "three papers")
     )
     scope = f"{target} {question}".casefold() if multi_subject else target
     subjects: list[str] = []
@@ -988,11 +1408,37 @@ def _subject_is_present(subject: str, text: str) -> bool:
 
 def _evidence_matches_review_subject(subject: str, row: dict[str, Any]) -> bool:
     quote = str(row.get("exact_quote", "")).casefold()
+    source = f"{row.get('paper', '')} {row.get('doc_id', '')}".casefold()
+    original_source = "1706.03762" in source or "attention is all you need" in source
+    bert_source = "1810.04805" in source or bool(re.search(r"(?:^|\W)bert(?:\W|$)", source))
+    gpt3_source = "2005.14165" in source or bool(re.search(r"\bgpt-?3\b", source))
     if subject == "原始 Transformer":
+        if original_source:
+            return (
+                "transformer" in quote
+                or ("encoder" in quote and "decoder" in quote and "self-attention" in quote)
+                or "positional encoding" in quote
+            )
+        if bert_source or gpt3_source:
+            return False
         return "transformer" in quote and "bert" not in quote and not re.search(r"\bgpt-?3\b", quote)
     if subject == "BERT":
+        if bert_source:
+            return "bert" in quote or "masked language model" in quote
+        if original_source or gpt3_source:
+            return False
         return "bert" in quote
     if subject == "GPT-3":
+        if gpt3_source:
+            return bool(re.search(r"\bgpt-?3\b", quote)) or any(
+                cue in quote
+                for cue in (
+                    "in-context learning", "zero-shot", "one-shot", "few-shot", "175b",
+                    "misuse", "malicious", "factual", "human accuracy",
+                )
+            )
+        if original_source or bert_source:
+            return False
         return bool(re.search(r"\bgpt-?3\b", quote))
     return subject.casefold() in quote
 
@@ -1037,6 +1483,7 @@ def _strip_review_excerpt_artifacts(text: str) -> str:
         re.compile(r"^(?:表|table)\s*\d+\s*[:：]", re.I),
         re.compile(r"^(?:请注意|note that)[，,:：]", re.I),
         re.compile(r"^\d+(?:\.\d+)+\s+"),
+        re.compile(r"^\d+\s+(?:结果|results?)\b", re.I),
     )
     kept = [
         item
@@ -1044,8 +1491,38 @@ def _strip_review_excerpt_artifacts(text: str) -> str:
         if not any(pattern.search(item) for pattern in rejected)
         and "解析器训练 wsj" not in item.casefold()
         and "participants:" not in item.casefold()
+        and "∂params" not in item
+        and "∂acts" not in item
+        and "乘数以考虑反向传播" not in item
     ]
     return " ".join(kept).strip()
+
+
+def _review_text_is_readable(text: str) -> bool:
+    """Reject visibly corrupted, runaway, or excerpt-heading prose."""
+
+    value = " ".join(str(text or "").split()).strip()
+    if not value or len(value) > 700:
+        return False
+    if any(marker in value for marker in ("�", "nâ", "â€", "ï¬")):
+        return False
+    if re.search(r"([\u3400-\u9fff])\1{2,}", value):
+        return False
+    if re.search(r"([\u3400-\u9fff])(?:\s*\1){2,}", value):
+        return False
+    if any(fragment in value for fragment in ("集集", "的的", "和和", "性性", "中中", "了了")):
+        return False
+    if value.count("\\") >= 3:
+        return False
+    if re.search(r"\b([A-Za-z][A-Za-z0-9-]*)\b(?:\s+\1\b){3,}", value, flags=re.I):
+        return False
+    if re.search(r"(?:\b也\b\s*){4,}|(?:\balso\b\s*){3,}", value, flags=re.I):
+        return False
+    if re.search(r"[，,]{2,}|[。.!?！？]{3,}", value):
+        return False
+    if re.match(r"^\d+(?:\.\d+)+\s+", value):
+        return False
+    return True
 
 
 def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> float:
@@ -1077,6 +1554,10 @@ def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> flo
         "局限": ("limitation", "weakness", "difficulty", "difficult", "struggl", "fail", "inaccur"),
         "长文本": ("long passage", "long-range", "context window"),
         "幻觉": ("factual inaccuracy", "hallucin"),
+        "实验": ("result", "performance", "benchmark", "bleu", "accuracy", "score", " f1"),
+        "评价": ("result", "performance", "benchmark", "bleu", "accuracy", "score", " f1"),
+        "适配": ("fine-tun", "zero-shot", "one-shot", "few-shot", "in-context", "supervised"),
+        "下游": ("fine-tun", "downstream", "zero-shot", "one-shot", "few-shot", "in-context"),
     }
     for concept, cues in concept_cues.items():
         if concept in target and any(cue in quote for cue in cues):
@@ -1139,6 +1620,19 @@ def _semantic_cues_are_grounded(claim: dict[str, Any], quote_text_by_id: dict[st
         and not ("人类" in text and any(cue in text for cue in ("识别", "检测", "区分")))
     ):
         return False
+    if (
+        "human accuracy" in quotes
+        and any(cue in quotes for cue in ("identifying whether", "detecting", "distinguish"))
+        and any(cue in text for cue in ("易被察觉", "容易识别", "容易检测", "easy to detect"))
+    ):
+        return False
+    if (
+        "bert" in text
+        and any(cue in text for cue in ("生成任务", "生成能力", "生成质量"))
+        and any(cue in text for cue in ("局限", "受限", "不足", "有限"))
+        and not any("bert" in quote.casefold() and "generat" in quote.casefold() for quote in cited_quotes)
+    ):
+        return False
     cue_pairs = [
         (("优于", "超过", "超越", "高于", "outperform", "exceed", "surpass"),
          ("outperform", "exceed", "surpass", "higher than", "better than", "superior")),
@@ -1170,7 +1664,15 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
     if "原始 transformer" in title:
         if "bert" in text or re.search(r"\bgpt(?:-?3)?\b", text):
             return False
-        return any(cue in text for cue in ("自注意力", "多头注意力", "位置编码", "编码器", "解码器", "self-attention", "multi-head", "positional", "encoder", "decoder"))
+        architecture_scope = section_id == "transformer" or any(
+            cue in target
+            for cue in (
+                "架构", "自注意力", "多头注意力", "位置编码", "编码器", "解码器",
+                "architecture", "self-attention", "multi-head", "positional", "encoder", "decoder",
+            )
+        )
+        if architecture_scope:
+            return any(cue in text for cue in ("自注意力", "多头注意力", "位置编码", "编码器", "解码器", "self-attention", "multi-head", "positional", "encoder", "decoder"))
     title_has_bert = "bert" in title
     title_has_gpt = bool(re.search(r"\bgpt(?:-?3)?\b", title))
     if title_has_bert and not title_has_gpt and "bert" not in text:
@@ -1196,7 +1698,7 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
         (("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot"), ("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot")),
         (("规模", "scaling", "model size", "compute"), ("规模", "参数", "计算量", "scaling", "model size", "compute")),
         (("实验", "性能", "基准", "benchmark", "performance"), ("实验", "性能", "准确", "得分", "损失", "基准", "benchmark", "accuracy", "score", "loss", "f1", "bleu")),
-        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "不足", "受限", "弱点", "风险", "错误", "失败", "挣扎", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias", "struggl", "fail", "difficult", "inaccur")),
+        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "很难", "难以", "不足", "受限", "弱点", "风险", "错误", "事实", "不准确", "准确性", "失败", "挣扎", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias", "struggl", "fail", "difficult", "inaccur")),
     ]
     required = [claim_cues for target_cues, claim_cues in concept_groups if any(cue in target for cue in target_cues)]
     if not required:
@@ -1227,6 +1729,7 @@ def _direct_evidence_section(
             and "@" not in part
             and "arxiv:" not in part.casefold()
             and not re.match(r"^\(\d{4}\)", part.strip())
+            and not re.match(r"^\d+(?:\.\d+)+\s+", part.strip())
             and part.casefold() != "attention is all you need."
         ]
         for sentence_index, candidate in enumerate(candidates):
@@ -1244,10 +1747,7 @@ def _direct_evidence_section(
     used_citations: set[str] = set()
     used_sentences: set[str] = set()
     used_documents: set[str] = set()
-    max_items = max(
-        2 if str(planned.get("id", "")) in {"objectives", "evidence", "adaptation"} else 1,
-        _desired_section_document_count(planned, evidence),
-    )
+    max_items = max(2, _desired_section_document_count(planned, evidence))
     ordered_candidates = sorted(ranked_candidates, reverse=True)
     top_score = float(ordered_candidates[0][0])
     minimum_secondary_score = -100.0 if max_items > 1 else max(1.2, top_score * 0.35)
@@ -1297,13 +1797,18 @@ def _direct_evidence_section(
                             },
                             {"role": "user", "content": sentence},
                         ],
-                        max_tokens=520,
+                        max_tokens=260,
                     )
                 ).strip()
             except Exception:  # preserve the exact source sentence when translation is unavailable
                 translated = ""
             if translated:
-                sentence = translated
+                translated = re.sub(r"[^。！？.!?]+[，,:：]\s*。$", "", translated).strip() or translated
+                translated = _strip_review_excerpt_artifacts(translated)
+                if _review_text_is_readable(translated):
+                    sentence = translated
+                else:
+                    continue
         candidate = {"text": sentence, "citation_ids": [citation_id]}
         if not _claim_addresses_review_section(candidate, planned):
             continue
@@ -1311,7 +1816,10 @@ def _direct_evidence_section(
         output_citations.append(citation_id)
     if not output_sentences:
         return {}
-    return {"text": " ".join(output_sentences), "citation_ids": output_citations}
+    output_text = " ".join(output_sentences)
+    if not _review_text_is_readable(output_text):
+        return {}
+    return {"text": output_text, "citation_ids": output_citations}
 
 
 def _sentence_text(value: str, *, chinese: bool) -> str:
@@ -1340,19 +1848,24 @@ def _deterministic_review_overview(
     )
     abstract_parts = [
         (
-            re.split(r"(?<=[。！？.!?])\s*", str(section.get("text", "")).strip(), maxsplit=1)[0],
+            _first_review_sentence(str(section.get("text", ""))),
             [str(item) for item in list(section.get("citation_ids", []) or []) if str(item)],
         )
         for section in sections
         if str(section.get("text", "")).strip()
     ]
     selected_abstract_parts: list[str] = []
+    selected_abstract_keys: set[str] = set()
     abstract_citation_ids: list[str] = []
     for item, item_citation_ids in abstract_parts:
         sentence = _sentence_text(item, chinese=True)
+        sentence_key = re.sub(r"\s+", "", sentence).casefold()
+        if not sentence_key or sentence_key in selected_abstract_keys:
+            continue
         candidate = " ".join([*selected_abstract_parts, sentence])
         if len(candidate) <= 420:
             selected_abstract_parts.append(sentence)
+            selected_abstract_keys.add(sentence_key)
             abstract_citation_ids.extend(item_citation_ids)
     abstract_text = " ".join(selected_abstract_parts) or "当前资料库已形成带引用的分章节证据摘要。"
     abstract_citation_ids = list(dict.fromkeys(abstract_citation_ids)) or citation_ids[:1]
@@ -1393,7 +1906,18 @@ def _deterministic_review_overview(
     }
 
 
+def _first_review_sentence(value: str) -> str:
+    """Split prose without treating a decimal point such as 28.4 as a boundary."""
+
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    match = re.search(r"[。！？!?]|(?<!\d)\.(?=\s|$)", text)
+    return text[: match.end()].strip() if match else text
+
+
 def _review_prompt_inputs(
+    question: str,
     plan: dict[str, Any],
     evidence: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -1407,7 +1931,16 @@ def _review_prompt_inputs(
     selected_ids: list[str] = []
     sections = list(plan.get("sections", []) or [])[:_MAX_SECTIONS]
     for section in sections:
-        for citation_id in _diverse_section_citation_ids(dict(section), evidence_by_id, limit=6):
+        section_ids = _diverse_section_citation_ids(dict(section), evidence_by_id, limit=6)
+        section_ids = _exclusive_section_citation_ids(dict(section), section_ids, evidence_by_id)
+        section_ids = _subject_balanced_section_citation_ids(
+            question,
+            dict(section),
+            section_ids,
+            evidence_by_id,
+            limit=6,
+        )
+        for citation_id in section_ids:
             if citation_id in evidence_by_id and citation_id not in selected_ids:
                 selected_ids.append(citation_id)
     for row in evidence:
