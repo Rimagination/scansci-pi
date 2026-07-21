@@ -11,7 +11,9 @@ import fitz
 from pptx import Presentation
 
 from scansci_html.slide_studio import (
+    _balanced_cover_lines,
     _display_source_name,
+    _ground_model_adaptation_claim,
     _normalise_model_outline,
     _source_key_sentences,
     create_source_slide_deck,
@@ -197,6 +199,72 @@ def test_slide_planner_preserves_a_long_research_question():
 
     assert outline["central_question"] == question
     assert [slide["layout"] for slide in outline["slides"]] == ["comparison", "process", "branches"]
+
+
+def test_slide_planner_rebalances_a_repetitive_model_layout():
+    titles = [
+        "背景：Transformer 架构",
+        "BERT：双向编码",
+        "GPT-3：自回归生成",
+        "训练范式对比",
+        "实证结果",
+        "规模与效率",
+        "三条路线的总结与边界",
+    ]
+    candidate = {
+        "title": "Transformer 到 BERT 与 GPT-3",
+        "central_question": "三条路线如何比较？",
+        "story": "从基础到分支。",
+        "slides": [
+            {
+                "title": title,
+                "takeaway": "材料支持的结论。",
+                "layout": "comparison",
+                "bullets": ["第一项", "第二项", "第三项", "第四项"],
+                "source_pages": [1],
+            }
+            for title in titles
+        ],
+    }
+
+    outline = _normalise_model_outline(
+        candidate,
+        fallback={"title": "Fallback", "central_question": "Fallback", "story": "Fallback", "slides": []},
+        sources=[{"page_count": 3}],
+    )
+
+    assert [slide["layout"] for slide in outline["slides"]] == [
+        "process",
+        "cards",
+        "process",
+        "comparison",
+        "cards",
+        "process",
+        "branches",
+    ]
+
+
+def test_cover_line_balancing_avoids_a_single_word_orphan():
+    title = "Transformer 到 BERT 与 GPT-3：架构、训练范式与实证边界"
+
+    lines = _balanced_cover_lines(title).splitlines()
+
+    assert len(lines) == 2
+    assert min(len(line) for line in lines) >= 12
+
+
+def test_slide_claims_do_not_conflate_output_layers_or_gpt3_context_learning():
+    corpus = (
+        "During fine-tuning, all parameters are fine-tuned. "
+        "We evaluate GPT-3 without any gradient updates or fine-tuning."
+    ).casefold()
+
+    assert _ground_model_adaptation_claim("BERT 仅需微调一层输出层。", corpus) == (
+        "BERT 在下游任务中新增任务输出层，并联合微调全部预训练参数。"
+    )
+    assert _ground_model_adaptation_claim("GPT-3 在部分任务仍需微调才能达到最优。", corpus) == (
+        "GPT-3 论文的零样本、单样本与少样本评估通过上下文示例适配，不进行梯度更新或微调。"
+    )
 
 
 def test_source_names_are_presentable_on_the_cover():

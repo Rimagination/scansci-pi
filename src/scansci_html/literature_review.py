@@ -1318,11 +1318,20 @@ def _normalize_review_document(
 def _normalized_cited_text(value: object, *, known_ids: set[str], field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field}必须包含正文和 citation_ids")
-    text = str(value.get("text", "")).strip()
+    text = _strip_inline_citation_markers(str(value.get("text", "")))
     citation_ids = _validated_citation_ids(value.get("citation_ids"), known_ids=known_ids, field=field)
     if not text:
         raise ValueError(f"{field}正文为空")
     return {"text": text, "citation_ids": citation_ids}
+
+
+def _strip_inline_citation_markers(value: str) -> str:
+    """Remove model-authored citation labels; verified IDs are rendered separately."""
+
+    text = re.sub(r"[（(]\s*citation[_ ]?id\s*[:：]\s*\d+\s*[)）]", "", str(value), flags=re.I)
+    text = re.sub(r"(?:\[\s*\d+\s*\]|【\s*\d+\s*】)+", "", text)
+    text = re.sub(r"[ \t]+(?=[。！？；，,.!?;])", "", text)
+    return " ".join(text.split()).strip()
 
 
 def _validated_citation_ids(value: object, *, known_ids: set[str], field: str) -> list[str]:

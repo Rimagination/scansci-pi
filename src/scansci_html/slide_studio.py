@@ -335,21 +335,30 @@ def _normalise_model_outline(candidate: Any, *, fallback: dict[str, Any], source
     if not isinstance(raw_slides, list) or len(raw_slides) < 3:
         raise ValueError("演示模型返回的大纲页数不足")
     max_pages = max(item["page_count"] for item in sources)
+    source_corpus = " ".join(str(item.get("text", "")) for item in sources).casefold()
     slides: list[dict[str, Any]] = []
     for raw in raw_slides[:8]:
         if not isinstance(raw, dict):
             continue
         title = _short_text(raw.get("title"), 72)
-        takeaway = _slide_excerpt(raw.get("takeaway"), limit=118)
+        takeaway = _ground_model_adaptation_claim(
+            _slide_excerpt(raw.get("takeaway"), limit=118),
+            source_corpus,
+        )
         layout = str(raw.get("layout", "")).strip().lower()
         if layout not in {"cards", "comparison", "process", "branches"}:
             layout = "cards"
-        bullets = [_slide_excerpt(item, limit=108) for item in list(raw.get("bullets", []) or []) if _slide_excerpt(item, limit=108)][:5]
+        bullets = [
+            _ground_model_adaptation_claim(_slide_excerpt(item, limit=108), source_corpus)
+            for item in list(raw.get("bullets", []) or [])
+            if _slide_excerpt(item, limit=108)
+        ][:5]
         pages = [int(item) for item in list(raw.get("source_pages", []) or []) if str(item).isdigit() and 1 <= int(item) <= max_pages][:6]
         if title and (takeaway or bullets):
             slides.append({"title": title, "takeaway": takeaway, "layout": layout, "bullets": bullets, "source_pages": pages})
     if len(slides) < 3:
         raise ValueError("演示模型返回的页面内容不完整")
+    slides = _rebalance_repetitive_layouts(slides)
     return {
         "title": _short_text(candidate.get("title"), 96) or str(fallback["title"]),
         "central_question": _short_text(candidate.get("central_question"), 300) or str(fallback["central_question"]),
@@ -358,6 +367,55 @@ def _normalise_model_outline(candidate: Any, *, fallback: dict[str, Any], source
         "evidence_linked": True,
         "source_first": True,
     }
+
+
+def _ground_model_adaptation_claim(text: str, source_corpus: str) -> str:
+    """Correct two common adaptation conflations when the supplied papers disprove them."""
+
+    value = str(text or "").strip()
+    folded = value.casefold()
+    corpus = str(source_corpus or "").casefold()
+    bert_output_only = (
+        "bert" in folded
+        and any(cue in value for cue in ("仅需微调一层输出层", "只需微调输出层", "仅微调输出层"))
+        and "all parameters are fine-tuned" in corpus
+    )
+    if bert_output_only:
+        return "BERT 在下游任务中新增任务输出层，并联合微调全部预训练参数。"
+    gpt3_finetuning = (
+        "gpt-3" in folded
+        and "微调" in value
+        and not any(cue in value for cue in ("无需微调", "不需微调", "不进行微调", "没有微调"))
+        and "without any gradient updates or fine-tuning" in corpus
+    )
+    if gpt3_finetuning:
+        return "GPT-3 论文的零样本、单样本与少样本评估通过上下文示例适配，不进行梯度更新或微调。"
+    return value
+
+
+def _rebalance_repetitive_layouts(slides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn a one-layout model outline into a small visual story."""
+
+    if len(slides) < 4 or len({str(item.get("layout", "")) for item in slides}) >= 3:
+        return slides
+    balanced: list[dict[str, Any]] = []
+    last_index = len(slides) - 1
+    for index, source in enumerate(slides):
+        item = dict(source)
+        title = str(item.get("title", "")).casefold()
+        if index == last_index or any(cue in title for cue in ("总结", "结论", "路线", "分支", "展望")):
+            layout = "branches"
+        elif any(cue in title for cue in ("对比", "比较", "差异", " vs ", "versus")):
+            layout = "comparison"
+        elif any(cue in title for cue in ("过程", "演变", "规模", "效率", "阶段", "路径", "从 ")):
+            layout = "process"
+        elif index in {0, 2, 5} and 3 <= len(list(item.get("bullets", []) or [])) <= 4:
+            layout = "process"
+        else:
+            layout = "cards"
+        item["layout"] = layout
+        balanced.append(item)
+    return balanced
 
 
 def _fallback_outline(sources: list[dict[str, Any]], topic: str) -> dict[str, Any]:
@@ -502,7 +560,7 @@ def _render_pptx(path: Path, outline: dict[str, Any], sources: list[dict[str, An
     presentation = Presentation()
     presentation.slide_width = Inches(13.333)
     presentation.slide_height = Inches(7.5)
-    slides = list(outline.get("slides", []) or [])
+    slides = _rebalance_repetitive_layouts([dict(item) for item in list(outline.get("slides", []) or [])])
     if not slides:
         raise ValueError("幻灯片大纲为空")
     cover = presentation.slides.add_slide(presentation.slide_layouts[6])
@@ -520,17 +578,29 @@ def _render_cover(slide: Any, outline: dict[str, Any], sources: list[dict[str, A
     slide.background.fill.fore_color.rgb = RGBColor(*theme["cover_bg"])
     title = str(outline.get("title", "研究汇报"))
     title_size, title_height, question_top = _cover_title_metrics(title)
-    _add_text(slide, title, 0.9, 1.35, 11.4, title_height, size=title_size, color=theme["cover_text"], bold=True)
+    _add_text(
+        slide,
+        _balanced_cover_lines(title),
+        0.9,
+        1.35,
+        11.4,
+        title_height,
+        size=title_size,
+        color=theme["cover_text"],
+        bold=True,
+        preserve_newlines=True,
+    )
     central_question = str(outline.get("central_question", ""))
     _add_text(
         slide,
-        central_question,
+        _balanced_cover_lines(central_question),
         0.94,
         question_top,
         10.8,
         1.55,
-        size=16 if len(central_question) > 150 else 18 if len(central_question) > 110 else 21,
+        size=16 if len(central_question) > 110 else 18 if len(central_question) > 72 else 21,
         color=theme["cover_muted"],
+        preserve_newlines=True,
     )
     _add_text(slide, f"基于 {len(sources)} 份上传材料生成", 0.94, 5.95, 10.7, 0.35, size=12, color=(167, 190, 199))
     _add_text(slide, " · ".join(_display_source_name(item["name"]) for item in sources), 0.94, 6.35, 10.8, 0.38, size=12, color=(207, 232, 230))
@@ -591,10 +661,11 @@ def _render_content_slide(
         top=module_top,
     )
     pages = [str(item) for item in list(data.get("source_pages", []) or []) if str(item).strip()]
-    source_label = "本次上传材料"
+    source_names = " · ".join(_display_source_name(item.get("name", "")) for item in sources[:3])
+    source_label = source_names or "本次上传材料"
     if pages:
-        source_label += f" · 原文第 {', '.join(pages)} 页"
-    _add_text(slide, source_label, content_left, 6.72, content_width - 1.0, 0.25, size=11, color=theme["muted"])
+        source_label += f" | 涉及原文页码 {', '.join(pages)}"
+    _add_text(slide, source_label, content_left, 6.57, content_width - 1.0, 0.38, size=11, color=theme["muted"])
 
 
 def _template_theme(template: dict[str, Any] | None) -> dict[str, Any]:
@@ -672,7 +743,7 @@ def _render_template_chrome(slide: Any, *, theme: dict[str, Any], index: int, to
     else:
         header = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.46))
         header.fill.solid(); header.fill.fore_color.rgb = primary; header.line.fill.background()
-    _add_text(slide, f"{index}/{total}", 12.1, 7.0, 0.55, 0.2, size=10, color=theme["muted"], alignment=PP_ALIGN.RIGHT)
+    _add_text(slide, f"{index}/{total}", 11.86, 6.76, 0.55, 0.3, size=10, color=theme["muted"], alignment=PP_ALIGN.RIGHT)
 
 
 def _render_content_modules(
@@ -706,7 +777,7 @@ def _render_content_modules(
             _add_text(slide, str(position + 1), x + 0.22, top + 0.29, 0.42, 0.14, size=10, color=(255, 255, 255), bold=True, alignment=PP_ALIGN.CENTER)
             text = _group_text(group)
             font_size = 14 if len(text) > 150 else 15 if len(text) > 100 else 16
-            _add_text(slide, text, x + 0.22, top + 0.82, card_width - 0.44, 2.12, size=font_size, color=theme["body"])
+            _add_group_text(slide, group, x + 0.22, top + 0.82, card_width - 0.44, 2.12, size=font_size, color=theme["body"])
     elif kind == 1:
         midpoint = left + (width - gap) / 2
         groups = _balanced_item_groups(items, min(2, len(items)))
@@ -714,10 +785,10 @@ def _render_content_modules(
             x = left if position == 0 else midpoint + gap
             card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top), Inches((width - gap) / 2), Inches(3.28))
             card.fill.solid(); card.fill.fore_color.rgb = surface; card.line.color.rgb = border
-            _add_text(slide, "要点" if position == 0 else "解读", x + 0.28, top + 0.28, 1.0, 0.28, size=13, color=theme["accent"], bold=True)
+            _add_text(slide, "证据" if position == 0 else "比较", x + 0.28, top + 0.28, 1.0, 0.28, size=13, color=theme["accent"], bold=True)
             text = _group_text(group)
             font_size = 14 if len(text) > 190 else 15 if len(text) > 125 else 17
-            _add_text(slide, text, x + 0.28, top + 0.82, (width - gap) / 2 - 0.55, 2.18, size=font_size, color=theme["body"])
+            _add_group_text(slide, group, x + 0.28, top + 0.82, (width - gap) / 2 - 0.55, 2.18, size=font_size, color=theme["body"])
     elif kind == 2:
         count = min(4, len(items))
         node_width = (width - 0.4) / count
@@ -750,7 +821,7 @@ def _render_content_modules(
             card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(top + 1.22), Inches(branch_width), Inches(2.15))
             card.fill.solid(); card.fill.fore_color.rgb = surface; card.line.color.rgb = border
             _add_text(slide, f"分支 {position + 1}", x + 0.25, top + 1.47, branch_width - 0.5, 0.28, size=13, color=theme["accent"], bold=True)
-            _add_text(slide, _group_text(group), x + 0.25, top + 1.92, branch_width - 0.5, 1.15, size=16, color=theme["body"])
+            _add_group_text(slide, group, x + 0.25, top + 1.92, branch_width - 0.5, 1.15, size=16, color=theme["body"])
 
 
 def _balanced_item_groups(items: list[str], group_count: int) -> list[list[str]]:
@@ -776,6 +847,58 @@ def _display_source_name(value: object) -> str:
     return " ".join(name.replace("_", " ").replace("-", "-").split()) or "上传材料"
 
 
+def _balanced_cover_lines(value: object) -> str:
+    """Insert one deliberate line break instead of leaving a one-word orphan."""
+
+    text = " ".join(str(value or "").split()).strip()
+    if len(text) < 34:
+        return text
+    midpoint = len(text) / 2
+    candidates = [
+        index + 1
+        for index, character in enumerate(text)
+        if character in "：:；;，,？?" or (character.isspace() and index > 8)
+    ]
+    if not candidates:
+        return text
+    split = min(candidates, key=lambda index: abs(index - midpoint))
+    if split < len(text) * 0.28 or split > len(text) * 0.72:
+        return text
+    return f"{text[:split].rstrip()}\n{text[split:].lstrip()}"
+
+
+def _add_group_text(
+    slide: Any,
+    items: list[str],
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    *,
+    size: int,
+    color: tuple[int, int, int],
+) -> None:
+    """Render each item as its own paragraph so bullets never collapse inline."""
+
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    frame = box.text_frame
+    frame.clear()
+    frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    frame.margin_left = 0
+    frame.margin_right = 0
+    frame.margin_top = 0
+    frame.margin_bottom = 0
+    rows = [str(item).strip() for item in items if str(item).strip()] or ["根据材料提炼本页要点"]
+    for index, value in enumerate(rows):
+        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+        paragraph.text = f"• {_short_text(value, 180)}" if len(rows) > 1 else _short_text(value, 180)
+        paragraph.space_after = Pt(9)
+        paragraph.font.name = "Microsoft YaHei"
+        paragraph.font.size = Pt(size)
+        paragraph.font.color.rgb = RGBColor(*color)
+
+
 def _add_text(
     slide: Any,
     text: str,
@@ -788,6 +911,7 @@ def _add_text(
     color: tuple[int, int, int],
     bold: bool = False,
     alignment: Any | None = None,
+    preserve_newlines: bool = False,
 ) -> None:
     box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
     frame = box.text_frame
@@ -795,14 +919,17 @@ def _add_text(
     frame.word_wrap = True
     frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     paragraph = frame.paragraphs[0]
-    paragraph.text = _short_text(text, 900)
+    if preserve_newlines:
+        paragraph.text = "\n".join(" ".join(line.split()) for line in str(text).splitlines())[:900]
+    else:
+        paragraph.text = _short_text(text, 900)
     if alignment is not None:
         paragraph.alignment = alignment
-    run = paragraph.runs[0]
-    run.font.name = "Aptos"
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    run.font.color.rgb = RGBColor(*color)
+    for run in paragraph.runs:
+        run.font.name = "Microsoft YaHei"
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = RGBColor(*color)
     frame.margin_left = 0
     frame.margin_right = 0
     frame.margin_top = 0
@@ -836,7 +963,9 @@ def _cover_title_metrics(title: str) -> tuple[int, float, float]:
     if length > 78:
         return 26, 2.7, 4.3
     if length > 48:
-        return 30, 2.35, 4.05
+        return 27, 2.35, 4.05
+    if length > 36:
+        return 30, 2.05, 3.85
     return 42, 1.35, 3.05
 
 

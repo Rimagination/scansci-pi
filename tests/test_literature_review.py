@@ -13,6 +13,7 @@ from scansci_html.literature_review import (
     _diverse_section_citation_ids,
     _exclusive_section_citation_ids,
     _semantic_cues_are_grounded,
+    _strip_inline_citation_markers,
     _verify_review_document,
     plan_literature_review,
     synthesize_literature_review,
@@ -436,6 +437,12 @@ def test_cited_evidence_gap_placeholder_fails_review_verification():
 
     assert result["passed"] is False
     assert result["unsupported_cited_claim_ids"] == ["review-0001"]
+
+
+def test_model_authored_inline_citation_labels_are_removed_before_remapping():
+    text = "BERT 使用掩码语言模型【20】，并在下游任务微调 [15]（citation_id: 7）。"
+
+    assert _strip_inline_citation_markers(text) == "BERT 使用掩码语言模型，并在下游任务微调。"
 
 
 def test_three_retrieved_documents_require_three_cited_documents():
