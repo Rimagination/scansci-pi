@@ -98,6 +98,7 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     assert "function restoreTask" in script
     assert "function deleteTask" in script
     assert "function positionTaskMenu" in script
+    assert "window.setTimeout(positionTaskMenu, 0)" in script
     assert 'data-action="delete-task"' in script
     assert "function requestConfirmation" in script
     assert "function settleConfirmation" in script

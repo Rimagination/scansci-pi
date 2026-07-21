@@ -1445,7 +1445,11 @@ function toggleHistoryView() {
 function toggleTaskMenu(runId) {
   state.historyMenuRunId = state.historyMenuRunId === runId ? "" : runId;
   renderTasks();
-  if (state.historyMenuRunId) window.requestAnimationFrame(() => positionTaskMenu());
+  if (state.historyMenuRunId) {
+    positionTaskMenu();
+    window.requestAnimationFrame(positionTaskMenu);
+    window.setTimeout(positionTaskMenu, 0);
+  }
 }
 
 function positionTaskMenu() {
@@ -1457,8 +1461,7 @@ function positionTaskMenu() {
   const rowRect = row.getBoundingClientRect();
   const neededHeight = menu.offsetHeight + 8;
   const roomAbove = rowRect.top - listRect.top;
-  const roomBelow = listRect.bottom - rowRect.bottom;
-  menu.classList.toggle("opens-downward", roomAbove < neededHeight && roomBelow >= neededHeight);
+  menu.classList.toggle("opens-downward", roomAbove < neededHeight);
 }
 
 async function archiveTask(runId) {
