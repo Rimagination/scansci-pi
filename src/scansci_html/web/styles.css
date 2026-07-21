@@ -1645,6 +1645,27 @@ textarea::placeholder { color: #b6b7bd; }
 .mode-run > ol strong { color: #55565b; font-size: 13px; font-weight: 500; line-height: 18px; }
 .mode-run > ol small { overflow: hidden; color: #96979d; font-size: 12px; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; }
 .mode-run-error { margin: 0 17px 14px; padding: 9px 10px; border-radius: 7px; color: #944747; background: #fff1f1; font-size: 10px; }
+.confirm-dialog-backdrop { position: fixed; z-index: 140; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(37, 38, 43, .20); backdrop-filter: blur(3px); animation: confirm-backdrop-in .16s ease-out both; }
+.confirm-dialog-card { display: grid; width: min(448px, calc(100vw - 32px)); grid-template-columns: 42px minmax(0, 1fr); gap: 0 15px; padding: 24px; overflow: hidden; border: 1px solid rgba(218, 219, 223, .95); border-radius: 16px; color: var(--ink); background: #fff; box-shadow: 0 28px 78px rgba(31, 32, 36, .18), 0 5px 18px rgba(31, 32, 36, .08); animation: confirm-card-in .18s cubic-bezier(.2, .78, .25, 1) both; }
+.confirm-dialog-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; color: #5f6269; background: #f2f2f4; }
+.confirm-dialog-icon.is-danger { color: var(--danger); background: #fff0f0; }
+.confirm-dialog-icon .ui-icon { --icon-size: 20px; }
+.confirm-dialog-copy { min-width: 0; padding-top: 1px; }
+.confirm-dialog-eyebrow { margin: 0 0 2px; color: #9a9ba1; font-size: 10px; font-weight: 690; line-height: 16px; letter-spacing: .09em; }
+.confirm-dialog-copy h2 { margin: 0; color: #292a2f; font-size: 19px; font-weight: 630; line-height: 27px; letter-spacing: -.2px; }
+.confirm-dialog-subject { max-width: 100%; margin: 13px 0 0; padding: 9px 11px; overflow: hidden; border: 1px solid #ececef; border-radius: 9px; color: #505158; background: #f8f8f9; font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.confirm-dialog-message { margin: 11px 0 0; color: #777980; font-size: 12px; line-height: 20px; }
+.confirm-dialog-actions { display: flex; grid-column: 1 / -1; justify-content: flex-end; gap: 8px; margin-top: 23px; }
+.confirm-dialog-button { min-width: 82px; min-height: 38px; padding: 7px 15px; border: 1px solid transparent; border-radius: 10px; font-size: 13px; font-weight: 590; line-height: 20px; transition: border-color .14s ease, background .14s ease, box-shadow .14s ease, transform .1s ease; }
+.confirm-dialog-button:active { transform: translateY(1px); }
+.confirm-dialog-button.is-cancel { border-color: #dedee2; color: #55575e; background: #fff; }
+.confirm-dialog-button.is-cancel:hover { border-color: #d2d2d7; background: #f7f7f8; }
+.confirm-dialog-button.is-primary { color: #fff; background: #303137; box-shadow: 0 3px 9px rgba(35, 36, 40, .13); }
+.confirm-dialog-button.is-primary:hover { background: #242529; }
+.confirm-dialog-button.is-danger { color: #fff; background: var(--danger); box-shadow: 0 3px 9px rgba(180, 73, 73, .18); }
+.confirm-dialog-button.is-danger:hover { background: #a33f3f; }
+@keyframes confirm-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes confirm-card-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .toast { position: fixed; z-index: 20; right: 24px; bottom: 22px; max-width: min(380px, calc(100vw - 40px)); padding: 10px 13px; border-radius: 9px; color: #fff; background: #333439; box-shadow: 0 9px 28px rgba(0, 0, 0, .16); font-size: 13px; opacity: 0; pointer-events: none; transform: translateY(8px); transition: opacity .18s ease, transform .18s ease; }
 .toast.is-visible { opacity: 1; transform: translateY(0); }
 .toast.is-error { background: #9e4646; }
@@ -1735,6 +1756,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 @media (max-width: 960px) { .workbench { grid-template-columns: 242px minmax(0, 1fr); } .conversation-layout { grid-template-columns: minmax(0, 1fr); } .reference-panel { display: none; } .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); } .conversation-layout.is-review-workbench .conversation-main { display: none; } .conversation-layout.is-review-workbench .reference-panel { display: flex; border-left: 0; } .settings-view { grid-template-columns: 210px minmax(0, 1fr); } .model-grid { grid-template-columns: 215px minmax(0, 1fr); } }
 @media (max-width: 700px) {
+  .confirm-dialog-backdrop { padding: 16px; }
+  .confirm-dialog-card { grid-template-columns: 38px minmax(0, 1fr); gap: 0 12px; padding: 20px; }
+  .confirm-dialog-icon { width: 38px; height: 38px; border-radius: 11px; }
+  .confirm-dialog-actions { margin-top: 20px; }
+  .confirm-dialog-button { flex: 1; }
   body { overflow: auto; }
   .workbench { display: block; height: auto; min-height: 100dvh; }
   .desktop-titlebar { display: none; }

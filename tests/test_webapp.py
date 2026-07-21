@@ -91,15 +91,23 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
 
     assert 'id="historyArchiveTrigger"' in page
+    assert 'id="confirmDialogHost"' in page
     assert 'data-action="toggle-history-view"' in page
     assert "function toggleTaskMenu" in script
     assert "function archiveTask" in script
     assert "function restoreTask" in script
     assert "function deleteTask" in script
     assert 'data-action="delete-task"' in script
+    assert "function requestConfirmation" in script
+    assert "function settleConfirmation" in script
+    assert 'role="dialog"' in script
+    assert "window.confirm(" not in script
     assert "已经导出的 PPTX、Markdown 和下载的论文文件会保留" in script
     assert ".task-menu" in styles
     assert ".task-more:focus-visible" in styles
+    assert ".confirm-dialog-card" in styles
+    assert "border-radius: 16px" in styles
+    assert "background: #fff" in styles
 
 
 def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):

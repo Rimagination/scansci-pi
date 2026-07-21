@@ -75,6 +75,8 @@ const byId = (id) => document.getElementById(id);
 const sourceList = byId("sourceList");
 let directConversationRenderFrame = 0;
 let activeDirectChatController = null;
+let confirmDialogResolve = null;
+let confirmDialogPreviousFocus = null;
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -503,6 +505,71 @@ function toast(message, isError = false) {
   target.classList.add("is-visible");
   window.clearTimeout(toast.timer);
   toast.timer = window.setTimeout(() => target.classList.remove("is-visible"), 2800);
+}
+
+function settleConfirmation(confirmed) {
+  if (!confirmDialogResolve) return;
+  const resolve = confirmDialogResolve;
+  const previousFocus = confirmDialogPreviousFocus;
+  confirmDialogResolve = null;
+  confirmDialogPreviousFocus = null;
+  byId("confirmDialogHost")?.replaceChildren();
+  document.body.classList.remove("has-confirm-dialog");
+  resolve(Boolean(confirmed));
+  window.requestAnimationFrame(() => previousFocus?.focus?.({ preventScroll: true }));
+}
+
+function requestConfirmation({
+  eyebrow = "请确认操作",
+  title = "继续此操作？",
+  subject = "",
+  message = "",
+  confirmLabel = "确认",
+  cancelLabel = "取消",
+  danger = false,
+} = {}) {
+  if (confirmDialogResolve) settleConfirmation(false);
+  const host = byId("confirmDialogHost");
+  if (!host) return Promise.resolve(false);
+  confirmDialogPreviousFocus = document.activeElement;
+  host.innerHTML = `
+    <div class="confirm-dialog-backdrop" data-action="cancel-confirm-dialog">
+      <section class="confirm-dialog-card" data-action="confirm-dialog-content" role="dialog" aria-modal="true" aria-labelledby="confirmDialogTitle" aria-describedby="confirmDialogMessage">
+        <div class="confirm-dialog-icon${danger ? " is-danger" : ""}" aria-hidden="true">${uiIcon(danger ? "trash" : "info")}</div>
+        <div class="confirm-dialog-copy">
+          <p class="confirm-dialog-eyebrow">${escapeHtml(eyebrow)}</p>
+          <h2 id="confirmDialogTitle">${escapeHtml(title)}</h2>
+          ${subject ? `<p class="confirm-dialog-subject">${escapeHtml(subject)}</p>` : ""}
+          ${message ? `<p class="confirm-dialog-message" id="confirmDialogMessage">${escapeHtml(message)}</p>` : '<p class="visually-hidden" id="confirmDialogMessage">请确认是否继续。</p>'}
+        </div>
+        <footer class="confirm-dialog-actions">
+          <button type="button" class="confirm-dialog-button is-cancel" data-action="cancel-confirm-dialog">${escapeHtml(cancelLabel)}</button>
+          <button type="button" class="confirm-dialog-button${danger ? " is-danger" : " is-primary"}" data-action="accept-confirm-dialog">${escapeHtml(confirmLabel)}</button>
+        </footer>
+      </section>
+    </div>`;
+  document.body.classList.add("has-confirm-dialog");
+  return new Promise((resolve) => {
+    confirmDialogResolve = resolve;
+    window.requestAnimationFrame(() => host.querySelector('[data-action="cancel-confirm-dialog"]')?.focus());
+  });
+}
+
+function trapConfirmationFocus(event) {
+  const dialog = byId("confirmDialogHost")?.querySelector(".confirm-dialog-card");
+  if (!dialog || event.key !== "Tab") return false;
+  const controls = [...dialog.querySelectorAll("button:not(:disabled)")];
+  if (!controls.length) return false;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+  return true;
 }
 
 function updateNoteMarkup(sections = []) {
@@ -1398,7 +1465,15 @@ async function restoreTask(runId) {
 async function deleteTask(runId) {
   const run = state.runs.find((item) => item.run_id === runId);
   const title = compact(runDisplayTitle(run || {}), 36);
-  if (!window.confirm(`永久删除“${title}”？\n\n此操作不可撤销，但已经导出的 PPTX、Markdown 和下载的论文文件会保留。`)) return;
+  const confirmed = await requestConfirmation({
+    eyebrow: "永久删除",
+    title: "删除这条对话？",
+    subject: title,
+    message: "此操作不可撤销，但已经导出的 PPTX、Markdown 和下载的论文文件会保留。",
+    confirmLabel: "删除对话",
+    danger: true,
+  });
+  if (!confirmed) return;
   state.historyMenuRunId = "";
   await request(`/api/runs/${encodeURIComponent(runId)}/delete`, { method: "POST", body: "{}" });
   state.runs = state.runs.filter((item) => item.run_id !== runId);
@@ -3274,7 +3349,13 @@ async function handleSettingsAction(action, element) {
     const provider = selectedProvider();
     const preset = (state.presets?.providers || []).find((item) => item.id === provider?.id);
     if (!provider || !preset) return;
-    if (!window.confirm(`恢复 ${provider.name} 的默认地址、模型与能力标签？已保存的 API 密钥不会被删除。`)) return;
+    const confirmed = await requestConfirmation({
+      eyebrow: "恢复默认配置",
+      title: `恢复 ${provider.name} 的默认配置？`,
+      message: "默认地址、模型与能力标签将被恢复，已保存的 API 密钥不会被删除。",
+      confirmLabel: "恢复默认",
+    });
+    if (!confirmed) return;
     const index = state.settings.providers.findIndex((item) => item.id === provider.id);
     if (index < 0) return;
     state.settings.providers[index] = { ...structuredClone(preset), enabled: false, api_key_configured: Boolean(provider.api_key_configured) };
@@ -3526,7 +3607,10 @@ document.addEventListener("click", (event) => {
   const element = event.target.closest("[data-action]");
   if (!element) return;
   const action = element.dataset.action;
-  if (action === "minimize-window") controlDesktopWindow("minimize_window").catch((error) => toast(error.message, true));
+  if (action === "confirm-dialog-content") return;
+  if (action === "cancel-confirm-dialog") settleConfirmation(false);
+  else if (action === "accept-confirm-dialog") settleConfirmation(true);
+  else if (action === "minimize-window") controlDesktopWindow("minimize_window").catch((error) => toast(error.message, true));
   else if (action === "toggle-maximize-window") controlDesktopWindow("toggle_maximize_window").catch((error) => toast(error.message, true));
   else if (action === "close-window") controlDesktopWindow("close_window").catch((error) => toast(error.message, true));
   else if (action === "toggle-app-update") toggleAppUpdateCard();
@@ -3843,6 +3927,14 @@ document.addEventListener("drop", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (confirmDialogResolve) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      settleConfirmation(false);
+      return;
+    }
+    if (trapConfirmationFocus(event)) return;
+  }
   const composer = event.target.closest("#homeQuestionInput, #chatQuestionInput, #reviewQuestionInput");
   if (composer && document.querySelector(".skill-suggestions")) {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
