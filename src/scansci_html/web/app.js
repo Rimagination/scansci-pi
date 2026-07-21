@@ -1392,7 +1392,7 @@ function renderTasks() {
     const organizeAction = archived ? "restore-task" : "archive-task";
     const organizeLabel = archived ? "恢复到历史对话" : "归档对话";
     const organizeIcon = archived ? "archive-restore" : "archive";
-    return `<div class="task-row ${open ? "has-open-menu" : ""}"><button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(runDisplayTitle(run), 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button><button type="button" class="task-more" data-action="toggle-task-menu" data-task-id="${escapeHtml(run.run_id)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-task" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon("trash")}<span>删除对话</span></button>${manageDisabled ? '<small>运行结束后可整理</small>' : ""}</div>` : ""}</div>`;
+    return `<div class="task-row ${open ? "has-open-menu" : ""}" data-task-id="${escapeHtml(run.run_id)}"><button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(runDisplayTitle(run), 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button><button type="button" class="task-more" data-action="toggle-task-menu" data-task-id="${escapeHtml(run.run_id)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-task" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon("trash")}<span>删除对话</span></button>${manageDisabled ? '<small>运行结束后可整理</small>' : ""}</div>` : ""}</div>`;
   }).join("");
 }
 
@@ -1445,6 +1445,20 @@ function toggleHistoryView() {
 function toggleTaskMenu(runId) {
   state.historyMenuRunId = state.historyMenuRunId === runId ? "" : runId;
   renderTasks();
+  if (state.historyMenuRunId) window.requestAnimationFrame(() => positionTaskMenu());
+}
+
+function positionTaskMenu() {
+  const list = byId("taskList");
+  const row = list?.querySelector(".task-row.has-open-menu");
+  const menu = row?.querySelector(".task-menu");
+  if (!list || !row || !menu) return;
+  const listRect = list.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const neededHeight = menu.offsetHeight + 8;
+  const roomAbove = rowRect.top - listRect.top;
+  const roomBelow = listRect.bottom - rowRect.bottom;
+  menu.classList.toggle("opens-downward", roomAbove < neededHeight && roomBelow >= neededHeight);
 }
 
 async function archiveTask(runId) {
