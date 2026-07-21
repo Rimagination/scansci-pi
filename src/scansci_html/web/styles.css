@@ -1735,7 +1735,10 @@ textarea::placeholder { color: #b6b7bd; }
 
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid rgba(65, 66, 72, .34); outline-offset: 2px; }
 
-@media (max-width: 1280px) { .workbench { grid-template-columns: 286px minmax(0, 1fr); } .conversation-layout { grid-template-columns: minmax(0, 1fr) 292px; } .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); } }
+/* Keep the user-selected sidebar width active at every desktop breakpoint.
+   Fixed responsive tracks here previously overrode --sidebar-width, making
+   the drag handle appear to work without any visible resize. */
+@media (max-width: 1280px) { .workbench { grid-template-columns: var(--sidebar-width) minmax(0, 1fr); } .conversation-layout { grid-template-columns: minmax(0, 1fr) 292px; } .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1100px) { .market-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .extension-form { grid-template-columns: repeat(2, minmax(0, 1fr)); } .extension-form-wide { grid-column: auto; } }
 @media (max-width: 1100px) {
   .settings-content { padding-right: 48px; padding-left: 48px; }
@@ -1754,7 +1757,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .knowledge-books { grid-template-columns: repeat(auto-fill, minmax(106px, 1fr)); }
   .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); }
 }
-@media (max-width: 960px) { .workbench { grid-template-columns: 242px minmax(0, 1fr); } .conversation-layout { grid-template-columns: minmax(0, 1fr); } .reference-panel { display: none; } .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); } .conversation-layout.is-review-workbench .conversation-main { display: none; } .conversation-layout.is-review-workbench .reference-panel { display: flex; border-left: 0; } .settings-view { grid-template-columns: 210px minmax(0, 1fr); } .model-grid { grid-template-columns: 215px minmax(0, 1fr); } }
+@media (max-width: 960px) { .workbench { grid-template-columns: var(--sidebar-width) minmax(0, 1fr); } .conversation-layout { grid-template-columns: minmax(0, 1fr); } .reference-panel { display: none; } .conversation-layout.is-review-workbench { grid-template-columns: minmax(0, 1fr); } .conversation-layout.is-review-workbench .conversation-main { display: none; } .conversation-layout.is-review-workbench .reference-panel { display: flex; border-left: 0; } .settings-view { grid-template-columns: 210px minmax(0, 1fr); } .model-grid { grid-template-columns: 215px minmax(0, 1fr); } }
 @media (max-width: 700px) {
   .confirm-dialog-backdrop { padding: 16px; }
   .confirm-dialog-card { grid-template-columns: 38px minmax(0, 1fr); gap: 0 12px; padding: 20px; }

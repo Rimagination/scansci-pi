@@ -110,6 +110,19 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     assert "background: #fff" in styles
 
 
+def test_sidebar_resizer_keeps_the_saved_width_at_desktop_breakpoints(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "function installSidebarResizer" in script
+    assert 'workbench.style.setProperty("--sidebar-width"' in script
+    assert 'window.localStorage.setItem("scansci.sidebar.width"' in script
+    assert styles.count("grid-template-columns: var(--sidebar-width) minmax(0, 1fr)") >= 3
+    assert "grid-template-columns: 286px minmax(0, 1fr)" not in styles
+    assert "grid-template-columns: 242px minmax(0, 1fr)" not in styles
+
+
 def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):
     app, workspace, _evidence = _build_app(tmp_path)
 
