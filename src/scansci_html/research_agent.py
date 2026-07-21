@@ -101,12 +101,90 @@ def _validate_direct_chat_output(text: str, selected_skills: list[dict[str, Any]
         missing.append("完整卡片正文")
     if "�" in text:
         missing.append("无乱码正文")
+    if "基于用户信息的暂定判断：" not in text:
+        missing.append("显式的证据边界")
+    if re.search(r"(?:[A-Za-z][A-Za-z0-9_]*\s*[=~]\s*|[α-ωΑ-Ω]|系数)", text):
+        missing.append("不含未审定公式的判别规则")
     if missing:
         labels = "、".join(dict.fromkeys(item.replace("**", "") for item in missing))
         raise RuntimeError(
             f"科学问题卡未通过完整性校验（缺少：{labels}）。"
             "ScanSci 没有把不完整草稿标记为完成，请重试或切换内置 GLM 模型。"
         )
+
+
+def _merge_usage(primary: dict[str, int], secondary: dict[str, int]) -> dict[str, int]:
+    keys = set(primary) | set(secondary)
+    return {
+        key: int(primary.get(key, 0)) + int(secondary.get(key, 0))
+        for key in keys
+        if isinstance(primary.get(key, 0), int) and isinstance(secondary.get(key, 0), int)
+    }
+
+
+def _card_value(text: str, label: str, fallback: str) -> str:
+    match = re.search(
+        rf"\*\*{re.escape(label)}：\*\*\s*(.+?)(?=\n\s*\n?\*\*|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return fallback
+    value = re.sub(r"\s+", " ", match.group(1)).strip(" -*\n")
+    if re.search(r"(?:[A-Za-z][A-Za-z0-9_]*\s*[=~]\s*|[α-ωΑ-Ω]|系数)", value):
+        return fallback
+    return value[:320] if value else fallback
+
+
+def _safe_good_question_fallback(chat_request: _DirectChatRequest, draft: str) -> str:
+    """Keep a model-shaped card useful when its statistical notation is unsafe.
+
+    The model still supplies the topic and core question.  The application
+    replaces only the untrusted hypothesis/test scaffold with a conservative,
+    domain-neutral strong-inference design that makes its assumptions explicit.
+    """
+
+    title = _card_value(draft, "暂定题目", "可证伪研究问题（待用户确认）")
+    core = _card_value(
+        draft,
+        "核心研究问题",
+        "在用户描述的对象、时间与条件下，主要暴露与主要结局是否存在达到预设最小有意义效应的稳定关系？",
+    )
+    user_request = next(
+        (
+            str(item.get("content", ""))
+            for item in reversed(chat_request.messages)
+            if item.get("role") == "user" and item.get("content")
+        ),
+        "用户已提供初步研究方向，具体变量名待确认。",
+    )
+    user_request = re.sub(r"(?<!\S)\$good-question\b", "", user_request, flags=re.IGNORECASE)
+    user_request = re.sub(r"\s+", " ", user_request).strip()[:260]
+    if re.search(r"(?:[A-Za-z][A-Za-z0-9_]*\s*[=~]\s*|[α-ωΑ-Ω]|系数)", user_request):
+        user_request = "用户已提供初步研究方向；原始描述中的统计表达式需在后续分析方案中单独审定。"
+    return f"""## 好问题卡
+**暂定题目：** {title}
+
+**核心研究问题：** {core}
+
+**为什么值得做：** 基于用户信息的暂定判断：回答这一问题将决定是否值得进入完整研究，并明确下一步应优先补数据、控制混杂还是检验目标关系；当前没有把任何文献空白当作既定事实。
+
+**它挑战了什么默认假设：** 用户提出的主要关系在不同时间、地点或样本层中都稳定存在，而且不是由共同变化的背景因素或测量方式造成。
+
+**竞争性解释：** H1（目标解释）：对核心问题的回答为“是”，目标关系在预先划分的样本层和留出数据中方向一致；H2（替代解释）：表面关系主要由共同变化的背景因素解释，匹配或分层后明显减弱；H3（零效应或测量解释）：目标关系小于最小有意义效应，或在重复测量、负对照与留出数据中不能复现。
+
+**关键判别证据或实验：** 先固定研究对象、主要暴露、主要结局、关键对照和最小有意义效应，再预先划分探索集与留出集。H1 预期目标模式跨样本层复现且明显强于负对照；H2 预期加入关键背景因素或匹配对照后目标模式大幅减弱；H3 预期重复测量不稳定、留出集不复现，或负对照出现同等强度的模式。观察性数据只解释为关联，不直接声称因果。
+
+**什么结果会推翻它：** 若留出数据中的效应方向与探索集相反，至少半数预设样本层不能复现，效应低于事先定义的最小有意义门槛，或负对照达到与目标关系相近的强度，则推翻目标解释。
+
+**两周内可做的 pilot：** 第1—2天完成变量字典、纳入标准和最小有意义效应预设；第3—5天检查缺失、异常值、时间与空间对齐；第6—9天在不超过全量20%的分层样本上完成探索；第10—12天做留出集、负对照和敏感性检查；第13—14天形成决策记录。继续门槛：关键变量缺失低于10%、至少70%的预设样本层方向一致、目标效应超过预设门槛且负对照小于目标效应的三分之一；数据质量合格但只满足两项则修改问题，少于两项则停止当前路线。
+
+**所需数据与资源：** 已有信息：{user_request or '用户已提供初步研究方向。'} 待补内容：主要暴露、主要结局、分析单位、对照、最小有意义效应及负对照的精确定义。最大依赖是数据在时间、空间和测量口径上的可比性。
+
+**最强评审质疑：** 这是观察性关联，选择偏差、混杂或测量误差足以产生同样模式。最低成本应对是预先固定变量与排除规则，保留独立留出集，并加入一个结果负对照或暴露负对照；若这些检查失败，就降低主张而不是补写因果故事。
+
+**下一步：** 现在填写一行变量字典：研究对象｜主要暴露｜主要结局｜分析单位｜关键对照｜最小有意义效应。
+""".strip()
 
 
 _WORKFLOWS: dict[str, dict[str, Any]] = {
@@ -507,10 +585,13 @@ class ResearchAgentRuntime:
             else:
                 text, usage = completion, {}
         text = _normalize_direct_chat_output(text, chat_request.selected_skills)
-        _validate_direct_chat_output(text, chat_request.selected_skills)
+        text, repair_usage, repaired = self._repair_good_question_if_needed(chat_request, text)
+        usage = _merge_usage(usage, repair_usage)
         trace = self._direct_process_trace(chat_request, had_attachments=bool(ingestion))
         if local_facts:
             trace[-1] = {"title": "读取运行时事实", "detail": "已从当前安装状态读取版本、模型、模式与 Skill，避免模型猜测。"}
+        if repaired:
+            trace.append({"title": "校正科学问题卡", "detail": "首稿未通过科学问题卡门控；已完成一次受控修复并重新核验。"})
         trace.append({"title": "完成回答", "detail": "模型已返回完整内容并完成响应收束。"})
         message: dict[str, Any] = {
             "role": "assistant",
@@ -758,7 +839,20 @@ class ResearchAgentRuntime:
                 raise RuntimeError("The model returned an empty response")
             if truncated:
                 raise RuntimeError("模型连续达到输出上限，ScanSci 没有把不完整内容标记为完成；请缩小问题范围后重试。")
-            _validate_direct_chat_output(text, chat_request.selected_skills)
+            try:
+                _validate_direct_chat_output(text, chat_request.selected_skills)
+            except RuntimeError:
+                if not _has_selected_skill(chat_request.selected_skills, "good-question"):
+                    raise
+                trace.append(
+                    {
+                        "title": "校正科学问题卡",
+                        "detail": "首稿未通过格式或逻辑门控，正在进行一次受控修复。",
+                    }
+                )
+                yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                text, repair_usage, _ = self._repair_good_question_if_needed(chat_request, text)
+                usage = _merge_usage(usage, repair_usage)
             if buffer_skill_output:
                 yield run_event(
                     TEXT_MESSAGE_CONTENT,
@@ -793,6 +887,24 @@ class ResearchAgentRuntime:
             )
         except Exception as error:  # terminal events prevent a permanently spinning UI
             yield run_event(RUN_ERROR, run_id=run_id, message=str(error), code="chat_failed")
+
+    @staticmethod
+    def _repair_good_question_if_needed(
+        chat_request: _DirectChatRequest,
+        text: str,
+    ) -> tuple[str, dict[str, int], bool]:
+        """Replace an unsafe statistical scaffold while preserving model framing."""
+
+        try:
+            _validate_direct_chat_output(text, chat_request.selected_skills)
+            return text, {}, False
+        except RuntimeError:
+            if not _has_selected_skill(chat_request.selected_skills, "good-question"):
+                raise
+        repaired_text = _safe_good_question_fallback(chat_request, text)
+        repaired_text = _normalize_direct_chat_output(repaired_text, chat_request.selected_skills)
+        _validate_direct_chat_output(repaired_text, chat_request.selected_skills)
+        return repaired_text, {}, True
 
     def _runtime_fact_answer(self, payload: dict[str, Any], chat_request: _DirectChatRequest) -> str:
         raw_messages = [item for item in list(payload.get("messages", []) or []) if isinstance(item, dict)]

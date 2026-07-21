@@ -14,6 +14,7 @@ from scansci_html.webapp import NotebookWebApp, create_notebook_server, serve_no
 from scansci_html.research_agent import (
     ResearchAgentRuntime,
     _normalize_direct_chat_output,
+    _safe_good_question_fallback,
     _validate_direct_chat_output,
 )
 from scansci_html.workspace import attach_annotation_layers_to_notebook, sync_sources_from_evidence_store
@@ -192,6 +193,11 @@ def test_direct_chat_knows_scansci_identity_and_loads_an_explicit_skill(tmp_path
     assert "分别写 H1、H2、H3" in system
     assert "必须能在 14 天内完成" in system
     assert "一年、季度或完整项目" in system
+    assert "不要写回归公式" in system
+    assert "可观察数据图形或结果模式" in system
+    assert "零效应、混杂、反向关系或测量偏差" in system
+    assert "观察性数据不得被写成已识别的因果效应" in system
+    assert "不得只靠 p 值" in system
     assert "references/platt-strong-inference.md" not in system
     assert len(system) < 8_000
     assert chat_request.chat_mode == "writing"
@@ -224,6 +230,36 @@ def test_good_question_output_is_cleaned_and_must_be_a_complete_card():
 
     with pytest.raises(RuntimeError, match="未通过完整性校验"):
         _validate_direct_chat_output("## 好问题卡", selected)
+
+    with pytest.raises(RuntimeError, match="未审定公式"):
+        _validate_direct_chat_output(complete + "\n判别模型：LST = a + b * CC", selected)
+
+
+def test_good_question_unsafe_model_notation_gets_a_safe_actionable_fallback(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    chat_request = runtime._direct_chat_request({
+        "chat_mode": "writing",
+        "skills": ["good-question"],
+        "messages": [{"role": "user", "content": "$good-question 我有城市树冠与地表温度数据。"}],
+    })
+    draft = """## 好问题卡
+**暂定题目：** 城市树冠降温
+
+**核心研究问题：** 树冠覆盖与地表温度的关系能否在留出城市中复现？
+
+**为什么值得做：** 临时草稿。
+
+判别模型：LST = a + b * CC
+"""
+
+    fallback = _safe_good_question_fallback(chat_request, draft)
+
+    _validate_direct_chat_output(fallback, chat_request.selected_skills)
+    assert "城市树冠降温" in fallback
+    assert "留出城市中复现" in fallback
+    assert "LST =" not in fallback
+    assert "至少70%的预设样本层方向一致" in fallback
+    assert "观察性数据只解释为关联" in fallback
 
 
 def test_runtime_answers_version_and_capabilities_without_model_guessing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
