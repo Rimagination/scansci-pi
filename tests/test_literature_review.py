@@ -12,6 +12,9 @@ from scansci_html.literature_review import (
     _direct_evidence_section,
     _diverse_section_citation_ids,
     _exclusive_section_citation_ids,
+    _has_unrequested_model_detour,
+    _required_review_subjects,
+    _review_subject_coverage_complete,
     _semantic_cues_are_grounded,
     _strip_inline_citation_markers,
     _verify_review_document,
@@ -407,6 +410,45 @@ def test_three_model_architecture_section_keeps_three_source_documents():
     )
 
     assert set(section["citation_ids"]) == {"1", "2", "3"}
+
+
+def test_three_model_comparison_requires_every_named_subject():
+    question = "比较原始 Transformer、BERT 与 GPT-3。"
+    planned = {
+        "title": "三者的实验评价与适配方式",
+        "objective": "对比原始 Transformer、BERT 和 GPT-3 的实验评价与适配方式。",
+    }
+
+    assert _required_review_subjects(question, planned) == ["原始 Transformer", "BERT", "GPT-3"]
+    assert _review_subject_coverage_complete(
+        question,
+        planned,
+        "原始 Transformer 以任务训练评估，BERT 采用微调，GPT-3 采用上下文学习。",
+    ) is True
+    assert _review_subject_coverage_complete(
+        question,
+        planned,
+        "原始 Transformer 以任务训练评估，BERT 采用微调。",
+    ) is False
+
+
+def test_three_model_comparison_rejects_side_model_substitution():
+    question = "比较原始 Transformer、BERT 与 GPT-3。"
+    planned = {
+        "title": "三者的实验评价与适配方式",
+        "objective": "对比原始 Transformer、BERT 和 GPT-3。",
+    }
+
+    assert _has_unrequested_model_detour(
+        question,
+        planned,
+        "原始 Transformer、BERT、GPT-3 与 T5-Small 的训练计算不同。",
+    ) is True
+    assert _has_unrequested_model_detour(
+        question,
+        planned,
+        "原始 Transformer、BERT 与 GPT-3 采用不同适配方式。",
+    ) is False
 
 
 def test_review_limitation_section_accepts_direct_failure_evidence():

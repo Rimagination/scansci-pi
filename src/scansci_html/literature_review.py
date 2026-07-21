@@ -439,6 +439,7 @@ def _synthesize_structured_review_section(
     ]
     if not evidence_rows:
         raise ValueError("review section has no evidence")
+    required_subjects = _required_review_subjects(question, planned)
     messages = [
         {
             "role": "system",
@@ -448,6 +449,7 @@ def _synthesize_structured_review_section(
                 "比较并行路线时不得改写成先后替代关系。不得引入外部知识、因果推断或证据中没有的评价。"
                 "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
                 "若证据指标是人类识别机器文本的准确率，必须明确写出识别者和识别任务，不得改写成模型生成准确率。"
+                "如果输入给出 required_subjects，正文必须逐一明确讨论其中每个对象；聚焦比较这些对象，不要用 T5、ELMo 或 OpenAI GPT 等旁支模型替代。"
                 "citation_ids 只能使用输入中的编号，并应覆盖段落全部实质性陈述。"
                 "返回 JSON：{text, citation_ids:[...]}。"
             ),
@@ -460,6 +462,7 @@ def _synthesize_structured_review_section(
                     "section": {
                         "title": str(planned.get("title", "")),
                         "objective": str(planned.get("objective", "")),
+                        "required_subjects": required_subjects,
                     },
                     "evidence": evidence_rows,
                 },
@@ -477,6 +480,10 @@ def _synthesize_structured_review_section(
             raise ValueError("review section is not a substantive Chinese paragraph")
     if not _claim_addresses_review_section({"text": text}, planned):
         raise ValueError("review section does not address its planned subject")
+    if not _review_subject_coverage_complete(question, planned, text):
+        raise ValueError("review comparison section does not cover every required subject")
+    if _has_unrequested_model_detour(question, planned, text):
+        raise ValueError("review comparison section replaces a required subject with an unrelated model")
     quote_text_by_id = {
         str(row["citation_id"]): str(row["exact_quote"])
         for row in evidence_rows
@@ -785,8 +792,10 @@ def _desired_section_document_count(
         return max(1, available)
     target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
     desired = 1
+    if any(cue in target for cue in ("三者", "三种模型", "三个模型", "all three", "three models")):
+        desired = 3
     if "bert" in target and re.search(r"\bgpt(?:-?3)?\b", target):
-        desired = 2
+        desired = max(desired, 2)
     original_transformer = any(
         cue in target
         for cue in (
@@ -801,6 +810,54 @@ def _desired_section_document_count(
     elif any(cue in target for cue in ("比较", "对比", "差异", "comparison", " versus ", " vs ")):
         desired = max(desired, 2)
     return min(available, desired)
+
+
+def _required_review_subjects(question: str, planned: dict[str, Any]) -> list[str]:
+    """Return explicitly required model subjects for a focused comparison section."""
+
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    multi_subject = any(
+        cue in target
+        for cue in ("三者", "三种模型", "三个模型", "all three", "three models")
+    )
+    subject_scope = f"{question} {target}".casefold() if multi_subject else target
+    subjects: list[str] = []
+    if any(cue in subject_scope for cue in ("原始 transformer", "original transformer")):
+        subjects.append("原始 Transformer")
+    if "bert" in subject_scope:
+        subjects.append("BERT")
+    if re.search(r"\bgpt-?3\b", subject_scope):
+        subjects.append("GPT-3")
+    return subjects
+
+
+def _review_subject_coverage_complete(question: str, planned: dict[str, Any], text: str) -> bool:
+    folded = str(text or "").casefold()
+    for subject in _required_review_subjects(question, planned):
+        if subject == "原始 Transformer":
+            if not any(cue in folded for cue in ("原始 transformer", "original transformer")):
+                return False
+        elif subject == "BERT" and "bert" not in folded:
+            return False
+        elif subject == "GPT-3" and not re.search(r"\bgpt-?3\b", folded):
+            return False
+    return True
+
+
+def _has_unrequested_model_detour(question: str, planned: dict[str, Any], text: str) -> bool:
+    """Reject side-model substitutions only in tightly scoped multi-model comparisons."""
+
+    required = _required_review_subjects(question, planned)
+    if len(required) < 3:
+        return False
+    scope = f"{question} {planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    folded = str(text or "").casefold()
+    detours = (
+        (r"\bt5(?:-[a-z0-9]+)?\b", "t5"),
+        (r"\belmo\b", "elmo"),
+        (r"\bopenai gpt\b", "openai gpt"),
+    )
+    return any(re.search(pattern, folded) and label not in scope for pattern, label in detours)
 
 
 def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> float:
