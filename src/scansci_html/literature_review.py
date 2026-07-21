@@ -332,6 +332,7 @@ def _synthesize_review_in_parts(
     text_completion = getattr(chat_client, "complete_text", None)
     for planned in list(plan.get("sections", []) or []):
         citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
+        citation_ids = _exclusive_section_citation_ids(dict(planned), citation_ids, evidence_by_id)
         if not citation_ids:
             citation_ids = list(evidence_by_id)[:2]
         section_evidence = [evidence_by_id[item] for item in citation_ids]
@@ -445,6 +446,8 @@ def _synthesize_structured_review_section(
                 "你是证据约束的中文文献综述写作者。只使用给定 exact_quote 直接支持的事实，"
                 "围绕指定章节写一个 100 到 220 字的连贯中文段落。必须明确写出章节讨论的模型或方法名称；"
                 "比较并行路线时不得改写成先后替代关系。不得引入外部知识、因果推断或证据中没有的评价。"
+                "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
+                "若证据指标是人类识别机器文本的准确率，必须明确写出识别者和识别任务，不得改写成模型生成准确率。"
                 "citation_ids 只能使用输入中的编号，并应覆盖段落全部实质性陈述。"
                 "返回 JSON：{text, citation_ids:[...]}。"
             ),
@@ -603,6 +606,35 @@ def _diverse_section_citation_ids(
         if len(selected) >= limit:
             break
     return selected
+
+
+def _exclusive_section_citation_ids(
+    planned: dict[str, Any],
+    citation_ids: list[str],
+    evidence_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Keep single-model sections from receiving evidence about a different paper."""
+
+    title = str(planned.get("title", "")).casefold()
+    has_bert = "bert" in title
+    has_gpt3 = bool(re.search(r"\bgpt-?3\b", title))
+    original_transformer = "原始 transformer" in title or "original transformer" in title
+    if not (original_transformer or has_bert or has_gpt3):
+        return citation_ids
+    if sum((original_transformer, has_bert, has_gpt3)) != 1:
+        return citation_ids
+
+    matched: list[str] = []
+    for citation_id in citation_ids:
+        row = evidence_by_id.get(citation_id, {})
+        quote = str(row.get("exact_quote", "")).casefold()
+        if original_transformer and "bert" not in quote and not re.search(r"\bgpt(?:-?3)?\b", quote):
+            matched.append(citation_id)
+        elif has_bert and "bert" in quote:
+            matched.append(citation_id)
+        elif has_gpt3 and re.search(r"\bgpt-?3\b", quote):
+            matched.append(citation_id)
+    return matched or citation_ids
 
 
 def _supplement_review_section_coverage(
@@ -843,10 +875,25 @@ def _atomic_review_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _semantic_cues_are_grounded(claim: dict[str, Any], quote_text_by_id: dict[str, str]) -> bool:
     text = str(claim.get("text", "")).casefold()
-    quotes = " ".join(
+    cited_quotes = [
         quote_text_by_id.get(str(quote_id), "")
         for quote_id in list(claim.get("quote_ids", []) or [])
-    ).casefold()
+    ]
+    quotes = " ".join(cited_quotes).casefold()
+    if re.search(r"\bgpt-?3\b", text) and "微调" in text:
+        directly_supported = any(
+            re.search(r"\bgpt-?3\b", quote.casefold()) and "fine-tun" in quote.casefold()
+            for quote in cited_quotes
+        )
+        if not directly_supported:
+            return False
+    if (
+        any(cue in text for cue in ("准确率下降", "准确率降低", "准确率随模型规模增大而下降"))
+        and "human accuracy" in quotes
+        and any(cue in quotes for cue in ("identifying whether", "detecting", "distinguish"))
+        and not ("人类" in text and any(cue in text for cue in ("识别", "检测", "区分")))
+    ):
+        return False
     cue_pairs = [
         (("优于", "超过", "超越", "高于", "outperform", "exceed", "surpass"),
          ("outperform", "exceed", "surpass", "higher than", "better than", "superior")),

@@ -11,6 +11,7 @@ from scansci_html.literature_review import (
     _claim_addresses_review_section,
     _direct_evidence_section,
     _diverse_section_citation_ids,
+    _exclusive_section_citation_ids,
     _semantic_cues_are_grounded,
     _verify_review_document,
     plan_literature_review,
@@ -252,6 +253,22 @@ def test_review_section_evidence_is_diverse_before_filling_remaining_slots():
     assert selected == ["1", "3", "4", "2"]
 
 
+def test_single_model_section_filters_out_other_papers_before_writing():
+    evidence = {
+        "1": {"exact_quote": "BERT uses masked language modeling."},
+        "2": {"exact_quote": "OpenAI GPT is a left-to-right Transformer language model."},
+        "3": {"exact_quote": "GPT-3 is evaluated in the few-shot setting."},
+    }
+
+    selected = _exclusive_section_citation_ids(
+        {"title": "GPT-3 的自回归训练与上下文学习"},
+        ["1", "2", "3"],
+        evidence,
+    )
+
+    assert selected == ["3"]
+
+
 def test_review_claims_are_split_before_semantic_verification():
     claims = _atomic_review_claims(
         [{"claim_id": "c1", "text": "第一项有依据。第二项需要单独核验。", "quote_ids": ["1"]}]
@@ -264,6 +281,31 @@ def test_review_semantic_cue_gate_rejects_unsupported_superiority():
     claim = {"text": "该模型的生成文本长度超越人类。", "quote_ids": ["1"]}
 
     assert _semantic_cues_are_grounded(claim, {"1": "Human and model articles both averaged 216 words."}) is False
+
+
+def test_review_semantic_gate_rejects_conflating_openai_gpt_with_gpt3_fine_tuning():
+    claim = {"text": "GPT-3 同样采用微调方法。", "quote_ids": ["1", "2"]}
+    quotes = {
+        "1": "BERT and OpenAI GPT are fine-tuning approaches.",
+        "2": "GPT-3 is an autoregressive language model evaluated without gradient updates.",
+    }
+
+    assert _semantic_cues_are_grounded(claim, quotes) is False
+
+
+def test_review_semantic_gate_requires_the_subject_of_human_detection_accuracy():
+    quotes = {
+        "1": "Human accuracy in identifying whether news articles are model generated decreased to 52%.",
+    }
+
+    assert _semantic_cues_are_grounded(
+        {"text": "生成文本的准确率随模型规模增大而下降。", "quote_ids": ["1"]},
+        quotes,
+    ) is False
+    assert _semantic_cues_are_grounded(
+        {"text": "人类识别机器生成文本的准确率随模型规模增大而下降。", "quote_ids": ["1"]},
+        quotes,
+    ) is True
 
 
 def test_review_claim_must_answer_the_planned_section_not_merely_have_a_citation():
