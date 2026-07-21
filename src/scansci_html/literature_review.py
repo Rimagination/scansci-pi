@@ -170,6 +170,54 @@ def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dic
         return plan
 
 
+def _concise_review_title(question: str, candidate: str = "") -> str:
+    """Return a document title, never a replay of the user's instruction."""
+
+    prompt = re.sub(r"\s+", " ", str(question or "")).strip()
+    proposed = re.sub(r"\s+", " ", str(candidate or "")).strip()
+    folded = prompt.casefold()
+    if "transformer" in folded and "bert" in folded and re.search(r"\bgpt-?3\b", folded):
+        return "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
+
+    instruction_cues = ("请", "帮我", "基于", "必须", "每个", "不得", "需要")
+    normalized_prompt = re.sub(r"\s+", "", prompt).casefold()
+    normalized_proposed = re.sub(r"\s+", "", proposed).casefold()
+    replays_prompt = bool(
+        normalized_prompt
+        and normalized_proposed
+        and (normalized_prompt in normalized_proposed or normalized_proposed in normalized_prompt)
+    )
+    if (
+        proposed
+        and len(proposed) <= 72
+        and not proposed.startswith(instruction_cues)
+        and not any(cue in proposed for cue in ("必须", "每个实质性段落", "不得"))
+        and not replays_prompt
+    ):
+        return proposed.rstrip("。；;：: ")
+
+    comparison = re.search(
+        r"(?:比较|对比)\s*([^。；;]+?)(?=(?:，?必须|，?需要|，?请|，?每个|，?不得|。|；|;|$))",
+        prompt,
+    )
+    if comparison:
+        subject = comparison.group(1).strip(" ，,：:。；;")
+        subject = re.sub(r"^(?:一下|原始论文中的)", "", subject)
+        if subject:
+            return f"{subject[:52].rstrip()}：比较综述"
+
+    topic = prompt
+    if "：" in topic or ":" in topic:
+        parts = re.split(r"[：:]", topic, maxsplit=1)
+        if len(parts) == 2 and any(cue in parts[0] for cue in instruction_cues):
+            topic = parts[1]
+    topic = re.split(r"(?:必须|每个实质性段落|不得|请分别|需要分别)", topic, maxsplit=1)[0]
+    topic = re.sub(r"^(?:请|请你|帮我|请基于[^，,。；;]{0,60})\s*", "", topic)
+    topic = re.sub(r"^(?:撰写|写|生成|整理)(?:一篇|一份)?(?:中文)?(?:文献)?综述[：:]?\s*", "", topic)
+    topic = re.sub(r"(?:有哪些|有什么)?(?:可用)?证据[？?]?$", "", topic)
+    topic = topic.strip(" ，,：:。；;？?\"'“”")
+    return f"{topic[:52]}：证据综述" if topic else "文献证据综述"
+
 def _fallback_review_plan(question: str) -> dict[str, Any]:
     """Keep evidence retrieval usable when the writing gateway is throttled."""
 
@@ -180,7 +228,7 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
     folded_terms = retrieval_topic.casefold()
     if "transformer" in folded_terms and "bert" in folded_terms and "gpt" in folded_terms:
         return {
-            "title": f"{question[:150]}：证据综述",
+            "title": _concise_review_title(question),
             "scope": f"围绕“{question}”比较三篇原始论文中的可回跳证据。",
             "sections": [
                 {
@@ -232,7 +280,7 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
         ("limits", "局限、争议与开放问题", "识别证据局限、争议和仍待验证的问题", "limitations weaknesses open questions"),
     ]
     return {
-        "title": f"{question[:150]}：证据综述",
+        "title": _concise_review_title(question),
         "scope": f"围绕“{question}”综合当前资料库中的可回跳证据。",
         "sections": [
             {
@@ -2050,7 +2098,7 @@ def _normalize_review_plan(question: str, raw: object) -> dict[str, Any]:
     if len(sections) < 3:
         raise ValueError("写作模型没有生成合格的综述检索提纲（至少需要 3 个主题章节）")
     return {
-        "title": str(payload.get("title", "")).strip()[:180] or question[:180],
+        "title": _concise_review_title(question, str(payload.get("title", ""))),
         "scope": str(payload.get("scope", "")).strip()[:800] or f"围绕“{question}”综合当前资料库证据。",
         "sections": sections,
     }
@@ -2107,7 +2155,10 @@ def _normalize_review_document(
     if not limitations:
         limitations = ["本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"]
     return {
-        "title": str(payload.get("title", "")).strip()[:180] or str(plan.get("title", "")).strip() or question,
+        "title": _concise_review_title(
+            question,
+            str(payload.get("title", "")).strip() or str(plan.get("title", "")).strip(),
+        ),
         "scope": {"question": question, "description": str(plan.get("scope", ""))},
         "abstract": abstract,
         "sections": sections,

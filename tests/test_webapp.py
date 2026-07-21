@@ -68,6 +68,21 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     assert "/api/sources/" in answer["reader_answer"]["citations"][0]["reader_url"]
 
 
+def test_review_document_ui_does_not_replay_the_user_instruction(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "function reviewDisplayTitle" in script
+    assert "Transformer、BERT 与 GPT-3：架构、训练与能力边界" in script
+    assert 'class="review-request"' not in script
+    assert 'if (model.scope) lines.push("", "> 研究范围"' not in script
+    assert 'const scope = model.scope ?' not in script
+    assert 'const title = ready ? "综述稿件"' in script
+    assert ".review-request" not in styles
+    assert "font-size: clamp(23px, 1.7vw, 28px)" in styles
+
+
 def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):
     app, workspace, _evidence = _build_app(tmp_path)
 

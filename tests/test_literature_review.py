@@ -11,6 +11,7 @@ from scansci_html.literature_review import (
     _atomic_review_claims,
     _balanced_review_queries,
     _claim_addresses_review_section,
+    _concise_review_title,
     _direct_evidence_section,
     _deterministic_review_overview,
     _deterministic_grounded_review_section,
@@ -80,6 +81,21 @@ class FakeReviewClient:
             f"围绕{payload['section']['title']}，当前证据显示不同研究的对象、方法和结论需要结合证据边界综合解释；"
             "资料覆盖局限意味着不得将研究条件不同的发现直接合并成统一结论，也不能把资料库之外的推断写成已有证据。"
         )
+
+
+def test_review_title_is_content_focused_instead_of_replaying_the_instruction():
+    question = (
+        "请基于当前三篇论文撰写中文综述：比较原始 Transformer、BERT 与 GPT-3。"
+        "必须分别讨论架构、训练、实验评价与能力边界，每个段落都要引用证据。"
+    )
+
+    assert _concise_review_title(question, f"{question}：证据综述") == (
+        "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
+    )
+    assert _concise_review_title("免疫治疗有哪些证据？", "免疫治疗证据综述") == "免疫治疗证据综述"
+    assert ResearchAgentRuntime._run_title("literature_review", {"question": question}) == (
+        "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
+    )
 
 
 def _research_payload() -> dict[str, object]:

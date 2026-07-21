@@ -17,7 +17,7 @@ from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
 from .image_attachments import persist_image_attachments, vision_image_blocks
 from .ingestion import ingest_sources, ingestion_context
 from .library_manager import notebook_evidence_db
-from .literature_review import retrieve_review_evidence, synthesize_literature_review
+from .literature_review import _concise_review_title, retrieve_review_evidence, synthesize_literature_review
 from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .pi_agent import PiAgentClient
@@ -1377,6 +1377,8 @@ class ResearchAgentRuntime:
             or _WORKFLOWS[workflow_type]["label"]
         )
         title = " ".join(str(source).split())
+        if workflow_type == "literature_review":
+            return _concise_review_title(title)
         return title[:96] + ("…" if len(title) > 96 else "")
 
     @staticmethod

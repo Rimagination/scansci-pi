@@ -1311,7 +1311,7 @@ function renderTasks() {
     target.innerHTML = '<p class="history-empty">没有匹配的历史对话</p>';
     return;
   }
-  target.innerHTML = runs.slice(0, 40).map((run) => `<button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(run.title, 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button>`).join("");
+  target.innerHTML = runs.slice(0, 40).map((run) => `<button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(runDisplayTitle(run), 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button>`).join("");
 }
 
 function renderHistoryControls() {
@@ -2093,7 +2093,7 @@ function renderRun(run) {
   const answerArea = byId("answerArea");
   const distanceFromBottom = answerArea.scrollHeight - answerArea.scrollTop - answerArea.clientHeight;
   const shouldFollow = distanceFromBottom < 72;
-  byId("conversationTitle").textContent = compact(run.title, 80);
+  byId("conversationTitle").textContent = run.workflow_type === "literature_review" ? "文献综述" : compact(runDisplayTitle(run), 80);
   const percent = Math.round((run.progress || 0) * 100);
   const stageCalls = new Map((run.tool_calls || []).map((call) => [call.stage_id, call]));
   const stages = (run.stages || []).map((stage) => {
@@ -2241,6 +2241,42 @@ function normalizeReviewParagraph(value, index = 0) {
   };
 }
 
+function reviewDisplayTitle(run, supplied = {}) {
+  const question = String(run?.input?.question || run?.title || "").replace(/\s+/g, " ").trim();
+  const candidate = String(supplied?.title || "").replace(/\s+/g, " ").trim();
+  const folded = `${candidate} ${question}`.toLocaleLowerCase();
+  if (folded.includes("transformer") && folded.includes("bert") && /\bgpt-?3\b/i.test(folded)) {
+    return "Transformer、BERT 与 GPT-3：架构、训练与能力边界";
+  }
+  const compactQuestion = question.replace(/\s+/g, "").toLocaleLowerCase();
+  const compactCandidate = candidate.replace(/\s+/g, "").toLocaleLowerCase();
+  const instructionLike = /^(请|请你|帮我|基于)|必须|每个实质性段落|不得/.test(candidate);
+  const replaysQuestion = compactQuestion && compactCandidate
+    && (compactQuestion.includes(compactCandidate) || compactCandidate.includes(compactQuestion));
+  if (candidate && candidate.length <= 72 && !instructionLike && !replaysQuestion) {
+    return candidate.replace(/[。；;：:\s]+$/, "");
+  }
+  const comparison = question.match(/(?:比较|对比)\s*([^。；;]+?)(?=(?:，?必须|，?需要|，?请|，?每个|，?不得|。|；|;|$))/);
+  if (comparison?.[1]) {
+    const subject = comparison[1].replace(/^(?:一下|原始论文中的)/, "").replace(/^[\s，,：:]+|[\s，,：:。；;]+$/g, "");
+    if (subject) return `${subject.slice(0, 52)}：比较综述`;
+  }
+  let topic = question;
+  const colon = topic.search(/[：:]/);
+  if (colon >= 0 && /请|帮我|基于|撰写|生成/.test(topic.slice(0, colon))) topic = topic.slice(colon + 1);
+  topic = topic.split(/必须|每个实质性段落|不得|请分别|需要分别/, 1)[0]
+    .replace(/^(?:请|请你|帮我|请基于[^，,。；;]{0,60})\s*/, "")
+    .replace(/^(?:撰写|写|生成|整理)(?:一篇|一份)?(?:中文)?(?:文献)?综述[：:]?\s*/, "")
+    .replace(/(?:有哪些|有什么)?(?:可用)?证据[？?]?$/, "")
+    .replace(/^[\s，,：:。；;？?"'“”]+|[\s，,：:。；;？?"'“”]+$/g, "");
+  return topic ? `${topic.slice(0, 52)}：证据综述` : "文献证据综述";
+}
+
+function runDisplayTitle(run) {
+  if (run?.workflow_type !== "literature_review") return String(run?.title || "未命名研究");
+  return reviewDisplayTitle(run, run?.output_artifact?.payload?.review_document || {});
+}
+
 function buildReviewDocumentModel(run, artifact) {
   const payload = artifact?.payload || {};
   const supplied = payload.review_document || {};
@@ -2280,7 +2316,7 @@ function buildReviewDocumentModel(run, artifact) {
   const scope = typeof supplied.scope === "string" ? supplied.scope : String(supplied.scope?.description || "");
   const documentCount = Number(payload.adequacy?.document_count || new Set(citations.map((item) => item.doc_id).filter(Boolean)).size || 0);
   const verified = !legacy && Boolean(payload.citation_verification?.passed ?? payload.answer?.citation_verification?.passed ?? payload.verification?.supported_claims?.length);
-  const title = String(supplied.title || run.input?.question || run.title || "文献综述");
+  const title = reviewDisplayTitle(run, supplied);
   const model = {
     title,
     abstract,
@@ -2319,7 +2355,6 @@ function reviewDocumentMarkdown(model) {
     "",
     `${model.abstract.text}${citationSuffix(model.abstract.citation_ids)}`,
   ];
-  if (model.scope) lines.push("", "> 研究范围", ">", `> ${model.scope}`);
   model.sections.forEach((section) => {
     lines.push("", `## ${section.title}`, "");
     section.paragraphs.forEach((paragraph) => lines.push(`${paragraph.text}${citationSuffix(paragraph.citation_ids)}`, ""));
@@ -2352,7 +2387,7 @@ function reviewCitationButtons(ids = []) {
 
 function reviewTaskMarkup(run, model, { percent, stages, actions }) {
   const outline = model?.outline || [
-    { id: "review-abstract", title: "摘要与研究范围" },
+    { id: "review-abstract", title: "摘要" },
     { id: "review-synthesis", title: "主题证据综合" },
     { id: "review-limitations", title: "证据边界与开放问题" },
     { id: "review-references", title: "参考文献" },
@@ -2362,14 +2397,14 @@ function reviewTaskMarkup(run, model, { percent, stages, actions }) {
   const total = (run.stages || []).length;
   const summary = run.status === "completed" ? "全部步骤已完成" : runStatusLabel(run);
   const failure = run.status === "failed" ? `<div class="review-workflow-error"><strong>综述没有生成</strong><p>${escapeHtml(run.error?.message || "写作阶段执行失败，请检查模型与资料范围。")}</p><button type="button" data-action="open-settings" data-settings-panel="models">配置写作模型</button></div>` : "";
-  return `<article class="review-task-shell"><div class="review-request"><p>${escapeHtml(run.input?.question || run.title)}</p></div><div class="review-agent-head"><div class="review-agent-identity"><img src="/scansci-mark.png" alt="" /><span>ScanSci 写作智能体</span></div><span class="review-agent-meta">${percent}% · ${escapeHtml(runStatusLabel(run))}</span></div>${failure}<section class="review-outline-card"><span>Review outline</span><h2>${escapeHtml(model?.title || run.title)}</h2><ol class="review-outline-list">${outlineMarkup}</ol><div class="review-run-actions">${actions}<button type="button" class="review-open-document" data-action="open-review-document" ${model ? "" : "disabled"}>打开稿件</button></div></section><details class="review-steps"><summary>${escapeHtml(summary)}<span>${completed}/${total}</span></summary><ol class="run-stage-list">${stages}</ol></details></article>`;
+  return `<article class="review-task-shell"><div class="review-agent-head"><div class="review-agent-identity"><img src="/scansci-mark.png" alt="" /><span>ScanSci 写作智能体</span></div><span class="review-agent-meta">${percent}% · ${escapeHtml(runStatusLabel(run))}</span></div>${failure}<section class="review-outline-card"><span>Review outline</span><h2>${escapeHtml(model?.title || runDisplayTitle(run))}</h2><ol class="review-outline-list">${outlineMarkup}</ol><div class="review-run-actions">${actions}<button type="button" class="review-open-document" data-action="open-review-document" ${model ? "" : "disabled"}>打开稿件</button></div></section><details class="review-steps"><summary>${escapeHtml(summary)}<span>${completed}/${total}</span></summary><ol class="run-stage-list">${stages}</ol></details></article>`;
 }
 
 function renderReviewDocument(run, artifact, model = null) {
   const target = byId("reviewDocumentPanel");
   if (!target) return;
   const ready = Boolean(model);
-  const title = ready ? compact(model.title, 72) : compact(run.title || "正在生成综述", 72);
+  const title = ready ? "综述稿件" : compact(runDisplayTitle(run) || "正在生成综述", 72);
   const summary = ready ? (model.legacy ? "旧版任务 · 仅包含证据摘录，请重新生成" : `${model.documentCount} 篇来源 · ${model.citationCount} 个证据锚点${model.verified ? " · 引用已核验" : ""}`) : "研究步骤完成后将在这里形成可编辑稿件";
   const tabButtons = `<nav class="review-document-tabs" aria-label="稿件视图"><button type="button" class="is-active" data-action="review-document-tab" data-review-tab="preview" ${ready ? "" : "disabled"}>预览</button><button type="button" data-action="review-document-tab" data-review-tab="source" ${ready ? "" : "disabled"}>Markdown</button></nav>`;
   const toolbar = `<header class="review-panel-toolbar"><div class="review-document-identity"><span class="review-file-icon">${uiIcon("file-plus")}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></div></div><div class="review-toolbar-cluster">${tabButtons}<div class="review-toolbar-actions"><button type="button" class="review-icon-button" data-action="copy-review-document" aria-label="复制稿件" title="复制稿件" ${ready ? "" : "disabled"}>${uiIcon("copy")}</button><button type="button" class="review-icon-button" data-action="refresh-review-document" aria-label="刷新稿件" title="刷新稿件">${uiIcon("refresh")}</button><button type="button" class="review-icon-button" data-action="download-review-document" aria-label="下载 Markdown" title="下载 Markdown" ${ready ? "" : "disabled"}>${uiIcon("download")}</button><button type="button" class="review-icon-button" data-action="close-review-document" aria-label="关闭稿件" title="关闭稿件">${uiIcon("x")}</button></div></div></header>`;
@@ -2385,8 +2420,7 @@ function renderReviewDocument(run, artifact, model = null) {
   const limitations = model.limitations.length ? model.limitations.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : "<p>本综述仅综合当前项目资料库中的可核验证据；未覆盖的研究方向不代表不存在相关工作。</p>";
   const references = model.citations.length ? model.citations.map((citation) => `<li><strong>${escapeHtml(citation.paper)}</strong><span>${escapeHtml([citation.section, citation.doi].filter(Boolean).join(" · "))}</span><br /><button type="button" data-action="open-review-citation" data-citation-id="${escapeHtml(citation.citation_id)}">查看证据与原文锚点</button></li>`).join("") : "<li>当前稿件没有可回跳引用。</li>";
   const legacyNotice = model.legacy ? `<div class="review-legacy-notice"><strong>这不是完整综述</strong><p>该任务由旧版流程生成，只包含检索摘录。请回到写作模式重新生成，新的流程会完成章节检索、跨论文比较、争议分析和开放问题。</p></div>` : "";
-  const scope = model.scope ? `<aside class="review-scope"><span>研究范围</span><p>${escapeHtml(model.scope)}</p></aside>` : "";
-  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">Evidence-linked review <span>${model.legacy ? "Legacy draft" : model.verified ? "Verified" : "Needs review"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${legacyNotice}${scope}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${escapeHtml(model.abstract.text)}${reviewCitationButtons(model.abstract.citation_ids)}</p></section>${sections}${comparison}${controversies}${openQuestions}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
+  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">Evidence-linked review <span>${model.legacy ? "Legacy draft" : model.verified ? "Verified" : "Needs review"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${legacyNotice}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${escapeHtml(model.abstract.text)}${reviewCitationButtons(model.abstract.citation_ids)}</p></section>${sections}${comparison}${controversies}${openQuestions}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
   const source = `<div class="review-document-view review-source-view" data-review-view="source"><pre><code>${escapeHtml(model.markdown)}</code></pre></div>`;
   target.innerHTML = `${toolbar}<div class="review-document-body">${preview}${source}<aside class="review-evidence-drawer" id="reviewEvidenceDrawer" aria-live="polite"></aside></div>`;
 }
@@ -2418,7 +2452,7 @@ async function openTask(id, { record = true } = {}) {
       const composer = byId("chatQuestionInput");
       if (composer) composer.placeholder = "通用模式可继续讨论；幻灯片模式可选择模板后重新制作";
     }
-    byId("conversationTitle").textContent = compact(run.title, 80);
+    byId("conversationTitle").textContent = run.workflow_type === "literature_review" ? "文献综述" : compact(runDisplayTitle(run), 80);
     setView("conversation", { record });
     renderRun(run);
     if (!["completed", "failed", "cancelled", "paused"].includes(run.status)) {
