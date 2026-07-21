@@ -274,7 +274,11 @@ def synthesize_literature_review(
         for sentence in reader_answer["sentences"]
     ]
     reference_document_count = len({item["doc_id"] for item in references if item.get("doc_id")})
-    evidence_is_sufficient = len(references) >= 3 and reference_document_count >= 2
+    retrieved_document_count = int(
+        dict(research.get("retrieval_summary", {}) or {}).get("document_count", 0) or 0
+    ) or len({str(item.get("doc_id", "")) for item in evidence if str(item.get("doc_id", ""))})
+    minimum_document_count = min(3, max(2, retrieved_document_count))
+    evidence_is_sufficient = len(references) >= 3 and reference_document_count >= minimum_document_count
     return {
         "phase": "synthesis",
         "question": question,
@@ -293,9 +297,13 @@ def synthesize_literature_review(
             "quote_count": len(references),
             "document_count": reference_document_count,
             "min_quotes": 3,
-            "min_documents": 2,
+            "min_documents": minimum_document_count,
             "profile": "literature_review",
-            "followup_reason": "",
+            "followup_reason": (
+                "最终正文没有覆盖检索阶段可用的足够多来源。"
+                if reference_document_count < minimum_document_count
+                else ""
+            ),
         },
         "citation_verification": verification,
         "verification": {
@@ -320,7 +328,7 @@ def _synthesize_review_in_parts(
     evidence_by_id = {str(row.get("citation_id", "")): dict(row) for row in evidence}
     sections: list[dict[str, Any]] = []
     fallback_titles: list[str] = []
-    evidence_gap_titles: list[str] = []
+    coverage_gap_titles: list[str] = []
     text_completion = getattr(chat_client, "complete_text", None)
     for planned in list(plan.get("sections", []) or []):
         citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
@@ -354,11 +362,19 @@ def _synthesize_review_in_parts(
                 text_completion=text_completion if callable(text_completion) else None,
             )
         if not raw_section:
-            evidence_gap_titles.append(str(planned.get("title", "")))
-            raw_section = {
-                "text": "当前带锚点证据不足以支持本节目标，因此不据此作扩展推断。",
-                "citation_ids": citation_ids[:1],
-            }
+            raise ValueError(
+                f"当前带锚点证据不足以支持章节“{planned.get('title', '')}”，"
+                "已停止写作，避免给证据空白附上误导性引用。"
+            )
+        raw_section, coverage_complete = _supplement_review_section_coverage(
+            question,
+            dict(planned),
+            raw_section,
+            section_evidence,
+            text_completion=text_completion if callable(text_completion) else None,
+        )
+        if not coverage_complete:
+            coverage_gap_titles.append(str(planned.get("title", "")))
         paragraph = _normalized_cited_text(
             raw_section,
             known_ids=set(citation_ids),
@@ -372,14 +388,31 @@ def _synthesize_review_in_parts(
             }
         )
 
+    sections, uncovered_documents = _supplement_review_source_coverage(
+        question,
+        plan,
+        sections,
+        evidence,
+        text_completion=text_completion if callable(text_completion) else None,
+    )
     overview = _deterministic_review_overview(question, plan, sections)
     if fallback_titles:
         limitations = list(overview.get("limitations", []) or [])
         limitations.append(f"章节“{'、'.join(fallback_titles)}”采用原文摘录或忠实直译，未作扩展推断。")
         overview["limitations"] = limitations
-    if evidence_gap_titles:
+    if coverage_gap_titles:
         limitations = list(overview.get("limitations", []) or [])
-        limitations.append(f"章节“{'、'.join(evidence_gap_titles)}”缺少足以回答目标的直接证据，正文已明确保留证据空白。")
+        limitations.append(
+            f"章节“{'、'.join(coverage_gap_titles)}”没有覆盖计划中全部比较对象；"
+            "正文只保留已有来源直接支持的部分。"
+        )
+        overview["limitations"] = limitations
+    if uncovered_documents:
+        limitations = list(overview.get("limitations", []) or [])
+        limitations.append(
+            f"最终正文仍有 {len(uncovered_documents)} 个检索来源未形成与章节目标直接匹配的陈述，"
+            "这些来源不计入综述充分性。"
+        )
         overview["limitations"] = limitations
     return {**dict(overview), "sections": sections}
 
@@ -503,6 +536,172 @@ def _diverse_section_citation_ids(
     return selected
 
 
+def _supplement_review_section_coverage(
+    question: str,
+    planned: dict[str, Any],
+    raw_section: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    text_completion: Callable[..., str] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Add grounded sentences when a comparison section cites too few source documents."""
+
+    evidence_by_id = {
+        str(row.get("citation_id", "")): row
+        for row in evidence
+        if str(row.get("citation_id", ""))
+    }
+    desired = _desired_section_document_count(planned, evidence)
+    citations = [
+        str(item)
+        for item in list(raw_section.get("citation_ids", []) or [])
+        if str(item) in evidence_by_id
+    ]
+    used_documents = {
+        _review_document_key(evidence_by_id[citation_id])
+        for citation_id in citations
+    }
+    if len(used_documents) >= desired:
+        return raw_section, True
+
+    remaining = [
+        row
+        for row in evidence
+        if _review_document_key(row) not in used_documents
+    ]
+    extension = _direct_evidence_section(
+        question,
+        planned,
+        remaining,
+        text_completion=text_completion,
+    )
+    if extension:
+        extension_text = str(extension.get("text", "")).strip()
+        original_text = str(raw_section.get("text", "")).strip()
+        if extension_text and extension_text.casefold() not in original_text.casefold():
+            raw_section = {
+                **raw_section,
+                "text": " ".join(item for item in (original_text, extension_text) if item),
+                "citation_ids": list(
+                    dict.fromkeys(
+                        [
+                            *citations,
+                            *[
+                                str(item)
+                                for item in list(extension.get("citation_ids", []) or [])
+                                if str(item) in evidence_by_id
+                            ],
+                        ]
+                    )
+                ),
+            }
+    final_documents = {
+        _review_document_key(evidence_by_id[citation_id])
+        for citation_id in list(raw_section.get("citation_ids", []) or [])
+        if citation_id in evidence_by_id
+    }
+    return raw_section, len(final_documents) >= desired
+
+
+def _review_document_key(row: dict[str, Any]) -> str:
+    return str(row.get("doc_id", "") or row.get("paper", "") or row.get("citation_id", ""))
+
+
+def _supplement_review_source_coverage(
+    question: str,
+    plan: dict[str, Any],
+    sections: list[dict[str, Any]],
+    evidence: list[dict[str, str]],
+    *,
+    text_completion: Callable[..., str] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Use a directly grounded sentence from up to three retrieved source documents."""
+
+    evidence_by_id = {
+        str(row.get("citation_id", "")): row
+        for row in evidence
+        if str(row.get("citation_id", ""))
+    }
+    available_documents = list(
+        dict.fromkeys(_review_document_key(row) for row in evidence if _review_document_key(row))
+    )
+    minimum_documents = min(3, len(available_documents))
+    used_documents = {
+        _review_document_key(evidence_by_id[citation_id])
+        for section in sections
+        for citation_id in list(section.get("citation_ids", []) or [])
+        if citation_id in evidence_by_id
+    }
+    missing_documents = [item for item in available_documents if item not in used_documents]
+    planned_sections = list(plan.get("sections", []) or [])
+    for document in missing_documents:
+        if len(used_documents) >= minimum_documents:
+            break
+        document_rows = [row for row in evidence if _review_document_key(row) == document]
+        candidates: list[tuple[float, int, dict[str, Any]]] = []
+        for index, planned in enumerate(planned_sections[: len(sections)]):
+            extension = _direct_evidence_section(
+                question,
+                dict(planned),
+                document_rows,
+                text_completion=text_completion,
+            )
+            if not extension:
+                continue
+            score = max(
+                (_section_evidence_score(dict(planned), row) for row in document_rows),
+                default=-100.0,
+            )
+            candidates.append((score, -index, extension))
+        if not candidates:
+            continue
+        _, negative_index, extension = max(candidates, key=lambda item: (item[0], item[1]))
+        index = -negative_index
+        section = sections[index]
+        extension_text = str(extension.get("text", "")).strip()
+        original_text = str(section.get("text", "")).strip()
+        if extension_text and extension_text.casefold() not in original_text.casefold():
+            section["text"] = " ".join(item for item in (original_text, extension_text) if item)
+        section["citation_ids"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in list(section.get("citation_ids", []) or []) if str(item)],
+                    *[str(item) for item in list(extension.get("citation_ids", []) or []) if str(item)],
+                ]
+            )
+        )
+        used_documents.add(document)
+    remaining = [item for item in available_documents if item not in used_documents]
+    return sections, remaining
+
+
+def _desired_section_document_count(
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+) -> int:
+    available = len({_review_document_key(row) for row in evidence if _review_document_key(row)})
+    if available <= 1:
+        return max(1, available)
+    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    desired = 1
+    if "bert" in target and re.search(r"\bgpt(?:-?3)?\b", target):
+        desired = 2
+    original_transformer = any(
+        cue in target
+        for cue in (
+            "原始 transformer",
+            "transformer 的核心",
+            "transformer核心",
+            "transformer architecture",
+        )
+    )
+    if original_transformer and "bert" in target and re.search(r"\bgpt(?:-?3)?\b", target):
+        desired = 3
+    elif any(cue in target for cue in ("比较", "对比", "差异", "comparison", " versus ", " vs ")):
+        desired = max(desired, 2)
+    return min(available, desired)
+
+
 def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> float:
     target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
     quote = " ".join(str(row.get("exact_quote", "")).split()).casefold()
@@ -529,7 +728,7 @@ def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> flo
         "零样本": ("zero-shot",),
         "规模": ("scaling", "parameters", "model size", "compute"),
         "计算": ("compute", "flop"),
-        "局限": ("limitation", "weakness", "difficulty", "fail"),
+        "局限": ("limitation", "weakness", "difficulty", "difficult", "struggl", "fail", "inaccur"),
         "长文本": ("long passage", "long-range", "context window"),
         "幻觉": ("factual inaccuracy", "hallucin"),
     }
@@ -615,7 +814,7 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
         "objectives": ("masked language", "mlm", "autoregressive", "left-to-right", "掩码", "自回归"),
         "evidence": ("bleu", "glue", "squad", "zero-shot", "one-shot", "few-shot", "accuracy", "benchmark", "score", " f1", "outperform"),
         "adaptation": ("fine-tun", "in-context", "few-shot", "zero-shot", "one-shot", "微调", "少样本", "零样本"),
-        "limits": ("limitation", "weakness", "factual", "bias", "risk", "局限", "弱点", "事实", "偏见", "风险"),
+        "limits": ("limitation", "weakness", "factual", "bias", "risk", "struggl", "fail", "difficult", "inaccur", "局限", "弱点", "事实", "偏见", "风险", "失败", "困难", "不足"),
     }
     if section_id in section_cues and not any(cue in text for cue in section_cues[section_id]):
         return False
@@ -628,7 +827,7 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
         (("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot"), ("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot")),
         (("规模", "scaling", "model size", "compute"), ("规模", "参数", "计算量", "scaling", "model size", "compute")),
         (("实验", "性能", "基准", "benchmark", "performance"), ("实验", "性能", "准确", "得分", "损失", "基准", "benchmark", "accuracy", "score", "loss", "f1", "bleu")),
-        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "弱点", "风险", "错误", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias")),
+        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "不足", "受限", "弱点", "风险", "错误", "失败", "挣扎", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias", "struggl", "fail", "difficult", "inaccur")),
     ]
     required = [claim_cues for target_cues, claim_cues in concept_groups if any(cue in target for cue in target_cues)]
     if not required:
@@ -676,10 +875,13 @@ def _direct_evidence_section(
     used_citations: set[str] = set()
     used_sentences: set[str] = set()
     used_documents: set[str] = set()
-    max_items = 2 if str(planned.get("id", "")) in {"objectives", "evidence", "adaptation"} else 1
+    max_items = max(
+        2 if str(planned.get("id", "")) in {"objectives", "evidence", "adaptation"} else 1,
+        _desired_section_document_count(planned, evidence),
+    )
     ordered_candidates = sorted(ranked_candidates, reverse=True)
     top_score = float(ordered_candidates[0][0])
-    minimum_secondary_score = max(1.2, top_score * 0.35)
+    minimum_secondary_score = -100.0 if max_items > 1 else max(1.2, top_score * 0.35)
     for score, _, _, citation_id, document, sentence in ordered_candidates:
         if selected and score < minimum_secondary_score:
             continue
@@ -1122,6 +1324,16 @@ def _verify_review_document(document: dict[str, Any], references: list[dict[str,
     items.extend(document["controversies"])
     items.extend(document["open_questions"])
     uncited = [index + 1 for index, item in enumerate(items) if not item.get("citation_ids")]
+    gap_markers = (
+        "当前带锚点证据不足",
+        "证据不足以支持本节",
+        "不据此作扩展推断",
+    )
+    unsupported_cited = [
+        index + 1
+        for index, item in enumerate(items)
+        if item.get("citation_ids") and any(marker in str(item.get("text", "")) for marker in gap_markers)
+    ]
     missing_anchors = [
         str(item.get("citation_id", ""))
         for item in references
@@ -1130,16 +1342,23 @@ def _verify_review_document(document: dict[str, Any], references: list[dict[str,
     missing_exact_quotes = [
         str(item.get("citation_id", "")) for item in references if not str(item.get("exact_quote", "")).strip()
     ]
-    passed = bool(items) and bool(references) and not uncited and not missing_anchors and not missing_exact_quotes
+    passed = (
+        bool(items)
+        and bool(references)
+        and not uncited
+        and not unsupported_cited
+        and not missing_anchors
+        and not missing_exact_quotes
+    )
     return {
         "passed": passed,
         "claim_count": len(items),
-        "supported_claim_count": len(items) - len(uncited),
+        "supported_claim_count": len(items) - len(uncited) - len(unsupported_cited),
         "cited_quote_count": len(references),
         "cited_evidence_rows": len(references),
         "available_quote_count": len(references),
         "uncited_claim_ids": [f"review-{item:04d}" for item in uncited],
-        "unsupported_cited_claim_ids": [],
+        "unsupported_cited_claim_ids": [f"review-{item:04d}" for item in unsupported_cited],
         "missing_quote_ids": [],
         "missing_source_anchor_evidence_ids": missing_anchors,
         "missing_exact_quote_evidence_ids": missing_exact_quotes,

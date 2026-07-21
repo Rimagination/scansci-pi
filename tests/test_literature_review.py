@@ -12,6 +12,7 @@ from scansci_html.literature_review import (
     _direct_evidence_section,
     _diverse_section_citation_ids,
     _semantic_cues_are_grounded,
+    _verify_review_document,
     plan_literature_review,
     synthesize_literature_review,
 )
@@ -307,3 +308,80 @@ def test_direct_review_fallback_scores_relevant_sentences_across_sources():
     assert section["citation_ids"] == ["2"]
     assert "encoder and decoder" in section["text"]
     assert "BERT" not in section["text"]
+
+
+def test_three_model_architecture_section_keeps_three_source_documents():
+    planned = {
+        "id": "architecture",
+        "title": "基础架构与并行路线的构建差异",
+        "objective": "比较 Transformer 的核心组件如何被 BERT 和 GPT-3 继承与改造。",
+    }
+    evidence = [
+        {
+            "citation_id": "1",
+            "doc_id": "transformer",
+            "exact_quote": "The Transformer follows an encoder-decoder architecture using stacked self-attention layers.",
+        },
+        {
+            "citation_id": "2",
+            "doc_id": "bert",
+            "exact_quote": "BERT uses a multi-layer bidirectional Transformer encoder with bidirectional self-attention.",
+        },
+        {
+            "citation_id": "3",
+            "doc_id": "gpt3",
+            "exact_quote": "GPT-3 is an autoregressive language model trained with a left-to-right objective.",
+        },
+    ]
+
+    section = _direct_evidence_section(
+        "比较 Transformer、BERT 与 GPT-3 的架构路线。",
+        planned,
+        evidence,
+        text_completion=None,
+    )
+
+    assert set(section["citation_ids"]) == {"1", "2", "3"}
+
+
+def test_review_limitation_section_accepts_direct_failure_evidence():
+    planned = {
+        "id": "limits",
+        "title": "能力边界与局限性",
+        "objective": "总结 GPT-3 的 few-shot weaknesses and limitations。",
+    }
+
+    assert _claim_addresses_review_section(
+        {"text": "Few-shot performance struggles on ANLI and reading comprehension tasks."},
+        planned,
+    ) is True
+
+
+def test_cited_evidence_gap_placeholder_fails_review_verification():
+    cited = {"text": "当前带锚点证据不足以支持本节目标，因此不据此作扩展推断。", "citation_ids": ["1"]}
+    document = {
+        "abstract": cited,
+        "sections": [],
+        "comparison_table": {"rows": []},
+        "controversies": [],
+        "open_questions": [],
+    }
+    references = [{"citation_id": "1", "html_path": "paper.md", "html_anchor": "s1", "exact_quote": "Evidence."}]
+
+    result = _verify_review_document(document, references)
+
+    assert result["passed"] is False
+    assert result["unsupported_cited_claim_ids"] == ["review-0001"]
+
+
+def test_three_retrieved_documents_require_three_cited_documents():
+    research = _research_payload()
+    research["retrieval_summary"]["document_count"] = 3
+    research["evidence"][3]["doc_id"] = "paper-c"
+    research["evidence"][3]["paper"] = "研究 C"
+
+    result = synthesize_literature_review(research, chat_client=FakeReviewClient())
+
+    assert result["adequacy"]["min_documents"] == 3
+    assert result["adequacy"]["document_count"] == 3
+    assert result["adequacy"]["is_sufficient"] is True
