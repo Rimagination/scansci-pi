@@ -1457,11 +1457,14 @@ function positionTaskMenu() {
   const row = list?.querySelector(".task-row.has-open-menu");
   const menu = row?.querySelector(".task-menu");
   if (!list || !row || !menu) return;
-  const listRect = list.getBoundingClientRect();
   const rowRect = row.getBoundingClientRect();
+  const width = Math.max(220, Math.round(rowRect.width - 10));
+  menu.style.width = `${Math.min(width, window.innerWidth - 24)}px`;
+  menu.style.left = `${Math.max(12, Math.round(rowRect.left + 10))}px`;
   const neededHeight = menu.offsetHeight + 8;
-  const roomAbove = rowRect.top - listRect.top;
-  menu.classList.toggle("opens-downward", roomAbove < neededHeight);
+  const opensDownward = rowRect.top < neededHeight + 12;
+  menu.classList.toggle("opens-downward", opensDownward);
+  menu.style.top = `${Math.round(opensDownward ? rowRect.bottom + 6 : rowRect.top - menu.offsetHeight - 6)}px`;
 }
 
 async function archiveTask(runId) {
@@ -4257,6 +4260,12 @@ document.addEventListener("keydown", (event) => {
 
 installSidebarResizer();
 applySidebarState();
+byId("taskList")?.addEventListener("scroll", () => {
+  if (state.historyMenuRunId) positionTaskMenu();
+});
+window.addEventListener("resize", () => {
+  if (state.historyMenuRunId) positionTaskMenu();
+});
 renderProfileAvatar();
 updateChromeControls();
 observeIcons();

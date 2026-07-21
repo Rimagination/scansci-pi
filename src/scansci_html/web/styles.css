@@ -134,8 +134,8 @@ h1, h2, h3, p { margin-top: 0; }
 .task-more .ui-icon { --icon-size: 17px; stroke-width: 2.2; }
 .task-row:hover .task-more, .task-row.has-open-menu .task-more, .task-more:focus-visible { opacity: 1; }
 .task-more:hover, .task-row.has-open-menu .task-more { color: #35373c; background: rgba(255, 255, 255, .72); }
-.task-menu { position: absolute; z-index: 20; right: 0; bottom: calc(100% + 6px); left: 10px; display: grid; gap: 2px; margin: 0; padding: 5px; border: 1px solid #dedfe3; border-radius: 10px; background: rgba(255, 255, 255, .98); box-shadow: 0 12px 30px rgba(48, 51, 57, .14), 0 1px 5px rgba(48, 51, 57, .06); transform-origin: right bottom; animation: task-menu-enter .14s ease both; }
-.task-menu.opens-downward { top: calc(100% + 6px); bottom: auto; transform-origin: right top; }
+.task-menu { position: fixed; z-index: 70; display: grid; gap: 2px; margin: 0; padding: 5px; border: 1px solid #dedfe3; border-radius: 10px; background: rgba(255, 255, 255, .98); box-shadow: 0 12px 30px rgba(48, 51, 57, .14), 0 1px 5px rgba(48, 51, 57, .06); transform-origin: right bottom; animation: task-menu-enter .14s ease both; }
+.task-menu.opens-downward { transform-origin: right top; }
 .task-menu button { display: flex; min-height: 34px; align-items: center; gap: 9px; padding: 0 9px; border-radius: 7px; color: #4e5056; background: transparent; font-size: 12px; line-height: 18px; text-align: left; }
 .task-menu button .ui-icon { --icon-size: 16px; flex: 0 0 auto; }
 .task-menu button:not(:disabled):hover { color: #282a2f; background: #f1f2f3; }

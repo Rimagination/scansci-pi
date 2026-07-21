@@ -99,6 +99,8 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     assert "function deleteTask" in script
     assert "function positionTaskMenu" in script
     assert "window.setTimeout(positionTaskMenu, 0)" in script
+    assert 'menu.style.top = `${Math.round' in script
+    assert 'byId("taskList")?.addEventListener("scroll"' in script
     assert 'data-action="delete-task"' in script
     assert "function requestConfirmation" in script
     assert "function settleConfirmation" in script
@@ -106,7 +108,7 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     assert "window.confirm(" not in script
     assert "已经导出的 PPTX、Markdown 和下载的论文文件会保留" in script
     assert ".task-menu" in styles
-    assert "bottom: calc(100% + 6px)" in styles
+    assert "position: fixed; z-index: 70" in styles
     assert ".task-menu.opens-downward" in styles
     assert ".task-more:focus-visible" in styles
     assert ".confirm-dialog-card" in styles
