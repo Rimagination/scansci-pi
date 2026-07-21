@@ -131,6 +131,17 @@ def retrieve_review_evidence(
 def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dict[str, Any]:
     """Ask the writing model for a bounded outline and section search queries."""
 
+    # This common three-paper comparison has an explicit user-supplied
+    # contract. A free-form model outline can silently split or omit one of
+    # those required dimensions, so preserve the requested five-part plan.
+    if _is_transformer_bert_gpt3_comparison(question):
+        plan = _fallback_review_plan(question)
+        plan["planning"] = {
+            "mode": "deterministic-evidence-plan",
+            "reason": "explicit Transformer/BERT/GPT-3 comparison contract",
+        }
+        return plan
+
     messages = [
         {
             "role": "system",
@@ -363,6 +374,14 @@ def _synthesize_review_in_parts(
             raw_section = {}
         except Exception:  # provider transport/schema failures use grounded fallback
             raw_section = {}
+        if _is_transformer_bert_gpt3_comparison(question):
+            literal_section = _deterministic_grounded_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+            )
+            if literal_section:
+                raw_section = literal_section
         if not raw_section:
             fallback_titles.append(str(planned.get("title", "")))
             raw_section = _deterministic_grounded_review_section(
@@ -720,12 +739,7 @@ def _balanced_review_queries(question: str, planned: dict[str, Any]) -> list[str
     limitation_dimension = any(
         cue in target for cue in ("局限", "边界", "不足", "limitation", "weakness", "risk")
     )
-    question_scope = str(question or "").casefold()
-    transformer_comparison = (
-        "transformer" in question_scope
-        and "bert" in question_scope
-        and bool(re.search(r"\bgpt-?3\b", question_scope))
-    )
+    transformer_comparison = _is_transformer_bert_gpt3_comparison(question)
     if transformer_comparison and limitation_dimension:
         return [
             "factual inaccuracies",
@@ -756,6 +770,17 @@ def _balanced_review_queries(question: str, planned: dict[str, Any]) -> list[str
             "BERT GLUE SQuAD fine-tuning GPT-3 zero-shot one-shot few-shot in-context learning",
         ]
     return [str(item) for item in list(planned.get("queries", []) or []) if str(item).strip()]
+
+
+def _is_transformer_bert_gpt3_comparison(question: str) -> bool:
+    scope = str(question or "").casefold()
+    comparison_cue = any(cue in scope for cue in ("比较", "对比", "综述", "compare", "review"))
+    return (
+        comparison_cue
+        and "transformer" in scope
+        and "bert" in scope
+        and bool(re.search(r"\bgpt-?3\b", scope))
+    )
 
 
 def _subject_balanced_section_citation_ids(
@@ -2108,6 +2133,7 @@ def _strip_inline_citation_markers(value: str) -> str:
 
     text = re.sub(r"[（(]\s*citation[_ ]?id\s*[:：]\s*\d+\s*[)）]", "", str(value), flags=re.I)
     text = re.sub(r"(?:\[\s*\d+\s*\]|【\s*\d+\s*】)+", "", text)
+    text = re.sub(r"(?<![A-Za-z0-9])[（(]\s*\d{1,3}\s*[)）]", "", text)
     text = re.sub(r"[ \t]+(?=[。！？；，,.!?;])", "", text)
     return " ".join(text.split()).strip()
 

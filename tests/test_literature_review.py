@@ -270,6 +270,25 @@ def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():
     ) == ["原始 Transformer", "BERT", "GPT-3"]
 
 
+def test_explicit_three_paper_contract_does_not_accept_a_model_rewritten_outline():
+    class RewritingClient:
+        def complete_json(self, messages, *, schema_name):
+            raise AssertionError("the explicit five-part comparison should not be replanned")
+
+    plan = plan_literature_review(
+        "请写综述并比较原始 Transformer、BERT 与 GPT-3。",
+        chat_client=RewritingClient(),
+    )
+
+    assert [section["id"] for section in plan["sections"]] == [
+        "transformer",
+        "objectives",
+        "evidence",
+        "adaptation",
+        "limits",
+    ]
+
+
 def test_review_section_evidence_is_diverse_before_filling_remaining_slots():
     evidence = {
         "1": {"doc_id": "paper-a"},
@@ -646,7 +665,7 @@ def test_cited_evidence_gap_placeholder_fails_review_verification():
 
 
 def test_model_authored_inline_citation_labels_are_removed_before_remapping():
-    text = "BERT 使用掩码语言模型【20】，并在下游任务微调 [15]（citation_id: 7）。"
+    text = "BERT (14) 使用掩码语言模型【20】，并在下游任务微调 [15]（citation_id: 7）。"
 
     assert _strip_inline_citation_markers(text) == "BERT 使用掩码语言模型，并在下游任务微调。"
 
