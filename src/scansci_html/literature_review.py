@@ -356,6 +356,14 @@ def _synthesize_review_in_parts(
                 break
         if not raw_section:
             fallback_titles.append(str(planned.get("title", "")))
+            if callable(text_completion):
+                raw_section = _synthesize_plain_review_section(
+                    question,
+                    dict(planned),
+                    section_evidence,
+                    text_completion=text_completion,
+                )
+        if not raw_section:
             raw_section = _direct_evidence_section(
                 question,
                 dict(planned),
@@ -374,6 +382,14 @@ def _synthesize_review_in_parts(
             section_evidence,
             text_completion=text_completion if callable(text_completion) else None,
         )
+        raw_section, subject_coverage_complete = _supplement_review_subject_coverage(
+            question,
+            dict(planned),
+            raw_section,
+            section_evidence,
+            chat_client=chat_client,
+        )
+        coverage_complete = coverage_complete and subject_coverage_complete
         if not coverage_complete:
             coverage_gap_titles.append(str(planned.get("title", "")))
         paragraph = _normalized_cited_text(
@@ -381,6 +397,10 @@ def _synthesize_review_in_parts(
             known_ids=set(citation_ids),
             field=f"章节“{planned.get('title', '')}”",
         )
+        if re.search(r"[\u3400-\u9fff]", question):
+            chinese_characters = len(re.findall(r"[\u3400-\u9fff]", str(paragraph.get("text", ""))))
+            if chinese_characters < 45:
+                raise ValueError("中文综述写作模型暂时不可用，请稍后重试；系统不会把英文摘录伪装成中文综述")
         sections.append(
             {
                 "id": str(planned.get("id", "")),
@@ -480,10 +500,10 @@ def _synthesize_structured_review_section(
             raise ValueError("review section is not a substantive Chinese paragraph")
     if not _claim_addresses_review_section({"text": text}, planned):
         raise ValueError("review section does not address its planned subject")
-    if not _review_subject_coverage_complete(question, planned, text):
-        raise ValueError("review comparison section does not cover every required subject")
-    if _has_unrequested_model_detour(question, planned, text):
-        raise ValueError("review comparison section replaces a required subject with an unrelated model")
+    text = _strip_review_excerpt_artifacts(_strip_unrequested_model_detours(question, planned, text))
+    if not text:
+        raise ValueError("review comparison section contains only unrelated model detours")
+    paragraph["text"] = text
     quote_text_by_id = {
         str(row["citation_id"]): str(row["exact_quote"])
         for row in evidence_rows
@@ -711,6 +731,124 @@ def _supplement_review_section_coverage(
     return raw_section, len(final_documents) >= desired
 
 
+def _synthesize_plain_review_section(
+    question: str,
+    planned: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    text_completion: Callable[..., str],
+) -> dict[str, Any]:
+    """Use one plain-text model call before falling back to source-language excerpts."""
+
+    rows = [
+        {
+            "citation_id": str(row.get("citation_id", "")),
+            "paper": str(row.get("paper", "")),
+            "exact_quote": str(row.get("exact_quote", "")),
+        }
+        for row in evidence
+        if str(row.get("citation_id", "")) and str(row.get("exact_quote", ""))
+    ]
+    if not rows:
+        return {}
+    required_subjects = _required_review_subjects(question, planned)
+    try:
+        text = str(
+            text_completion(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是证据约束的中文文献综述作者。只依据输入 exact_quote 写一个 100 到 260 字的连贯中文段落，"
+                            "不得复制目录、表格、章节号或受试者招募细节，不得引入外部知识。"
+                            "逐一覆盖 required_subjects 中列出的对象；若证据不对称，只写有直接证据支持的边界，不制造对称结论。"
+                            "不要输出标题、项目符号、引用编号或解释，只输出正文。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "review_question": question,
+                                "section": {
+                                    "title": str(planned.get("title", "")),
+                                    "objective": str(planned.get("objective", "")),
+                                    "required_subjects": required_subjects,
+                                },
+                                "evidence": rows,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                max_tokens=700,
+            )
+        ).strip()
+    except Exception:
+        return {}
+    text = _strip_unrequested_model_detours(
+        question,
+        planned,
+        _strip_inline_citation_markers(text),
+    )
+    if len(re.findall(r"[\u3400-\u9fff]", text)) < 45:
+        return {}
+    if not _claim_addresses_review_section({"text": text}, planned):
+        return {}
+    citation_ids = [str(row["citation_id"]) for row in rows]
+    quote_text_by_id = {str(row["citation_id"]): str(row["exact_quote"]) for row in rows}
+    if not _semantic_cues_are_grounded(
+        {"text": text, "quote_ids": citation_ids},
+        quote_text_by_id,
+    ):
+        return {}
+    return {"text": text, "citation_ids": citation_ids}
+
+
+def _supplement_review_subject_coverage(
+    question: str,
+    planned: dict[str, Any],
+    raw_section: dict[str, Any],
+    evidence: list[dict[str, str]],
+    *,
+    chat_client: ChatJsonClient,
+) -> tuple[dict[str, Any], bool]:
+    """Add one bounded grounded sentence for each missing named comparison subject."""
+
+    required = _required_review_subjects(question, planned)
+    if not required or _review_subject_coverage_complete(question, planned, str(raw_section.get("text", ""))):
+        return raw_section, True
+    text = str(raw_section.get("text", "")).strip()
+    citations = [str(item) for item in list(raw_section.get("citation_ids", []) or []) if str(item)]
+    for subject in required:
+        if _subject_is_present(subject, text):
+            continue
+        subject_evidence = [row for row in evidence if _evidence_matches_review_subject(subject, row)]
+        if not subject_evidence:
+            continue
+        targeted = {
+            "id": f"{planned.get('id', '')}-{subject}",
+            "title": subject,
+            "objective": f"只陈述 {subject} 与“{planned.get('title', '')}”直接相关且有原文支持的事实。",
+        }
+        try:
+            extension = _synthesize_structured_review_section(
+                question,
+                targeted,
+                subject_evidence[:4],
+                chat_client=chat_client,
+            )
+        except Exception:
+            extension = {}
+        extension_text = str(extension.get("text", "")).strip()
+        if not extension_text or not _subject_is_present(subject, extension_text):
+            continue
+        text = " ".join(item for item in (text, extension_text) if item)
+        citations.extend(str(item) for item in list(extension.get("citation_ids", []) or []) if str(item))
+    raw_section = {**raw_section, "text": text, "citation_ids": list(dict.fromkeys(citations))}
+    return raw_section, _review_subject_coverage_complete(question, planned, text)
+
+
 def _review_document_key(row: dict[str, Any]) -> str:
     return str(row.get("doc_id", "") or row.get("paper", "") or row.get("citation_id", ""))
 
@@ -816,27 +954,47 @@ def _required_review_subjects(question: str, planned: dict[str, Any]) -> list[st
     """Return explicitly required model subjects for a focused comparison section."""
 
     target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
+    multi_subject = any(
+        cue in target
+        for cue in ("三者", "三种模型", "三个模型", "all three", "three models")
+    )
+    scope = f"{target} {question}".casefold() if multi_subject else target
     subjects: list[str] = []
-    if any(cue in target for cue in ("原始 transformer", "original transformer")):
+    if any(cue in scope for cue in ("原始 transformer", "original transformer")):
         subjects.append("原始 Transformer")
-    if "bert" in target:
+    if "bert" in scope:
         subjects.append("BERT")
-    if re.search(r"\bgpt-?3\b", target):
+    if re.search(r"\bgpt-?3\b", scope):
         subjects.append("GPT-3")
+    if multi_subject and any(cue in target for cue in ("局限", "边界", "limitation", "weakness")):
+        subjects = [subject for subject in subjects if subject != "原始 Transformer"]
     return subjects
 
 
 def _review_subject_coverage_complete(question: str, planned: dict[str, Any], text: str) -> bool:
+    return all(_subject_is_present(subject, text) for subject in _required_review_subjects(question, planned))
+
+
+def _subject_is_present(subject: str, text: str) -> bool:
     folded = str(text or "").casefold()
-    for subject in _required_review_subjects(question, planned):
-        if subject == "原始 Transformer":
-            if not any(cue in folded for cue in ("原始 transformer", "original transformer")):
-                return False
-        elif subject == "BERT" and "bert" not in folded:
-            return False
-        elif subject == "GPT-3" and not re.search(r"\bgpt-?3\b", folded):
-            return False
-    return True
+    if subject == "原始 Transformer":
+        return any(cue in folded for cue in ("原始 transformer", "original transformer"))
+    if subject == "BERT":
+        return "bert" in folded
+    if subject == "GPT-3":
+        return bool(re.search(r"\bgpt-?3\b", folded))
+    return subject.casefold() in folded
+
+
+def _evidence_matches_review_subject(subject: str, row: dict[str, Any]) -> bool:
+    quote = str(row.get("exact_quote", "")).casefold()
+    if subject == "原始 Transformer":
+        return "transformer" in quote and "bert" not in quote and not re.search(r"\bgpt-?3\b", quote)
+    if subject == "BERT":
+        return "bert" in quote
+    if subject == "GPT-3":
+        return bool(re.search(r"\bgpt-?3\b", quote))
+    return subject.casefold() in quote
 
 
 def _has_unrequested_model_detour(question: str, planned: dict[str, Any], text: str) -> bool:
@@ -853,6 +1011,41 @@ def _has_unrequested_model_detour(question: str, planned: dict[str, Any], text: 
         (r"\bopenai gpt\b", "openai gpt"),
     )
     return any(re.search(pattern, folded) and label not in scope for pattern, label in detours)
+
+
+def _strip_unrequested_model_detours(question: str, planned: dict[str, Any], text: str) -> str:
+    if not _has_unrequested_model_detour(question, planned, text):
+        return str(text or "").strip()
+    parts = [
+        item.strip()
+        for item in re.split(r"(?<=[。！？!?])\s*|(?<=\.)\s+", str(text or ""))
+        if item.strip()
+    ]
+    kept = [item for item in parts if not _has_unrequested_model_detour(question, planned, item)]
+    return " ".join(kept).strip()
+
+
+def _strip_review_excerpt_artifacts(text: str) -> str:
+    """Remove table captions and paper-first-person lead-ins from fallback prose."""
+
+    parts = [
+        item.strip()
+        for item in re.split(r"(?<=[。！？!?])\s*|(?<=\.)\s+", str(text or ""))
+        if item.strip()
+    ]
+    rejected = (
+        re.compile(r"^(?:表|table)\s*\d+\s*[:：]", re.I),
+        re.compile(r"^(?:请注意|note that)[，,:：]", re.I),
+        re.compile(r"^\d+(?:\.\d+)+\s+"),
+    )
+    kept = [
+        item
+        for item in parts
+        if not any(pattern.search(item) for pattern in rejected)
+        and "解析器训练 wsj" not in item.casefold()
+        and "participants:" not in item.casefold()
+    ]
+    return " ".join(kept).strip()
 
 
 def _section_evidence_score(planned: dict[str, Any], row: dict[str, str]) -> float:

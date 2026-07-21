@@ -15,6 +15,7 @@ from scansci_html.literature_review import (
     _has_unrequested_model_detour,
     _required_review_subjects,
     _review_subject_coverage_complete,
+    _strip_unrequested_model_detours,
     _semantic_cues_are_grounded,
     _strip_inline_citation_markers,
     _verify_review_document,
@@ -449,16 +450,21 @@ def test_three_model_comparison_rejects_side_model_substitution():
         planned,
         "原始 Transformer、BERT 与 GPT-3 采用不同适配方式。",
     ) is False
+    assert _strip_unrequested_model_detours(
+        question,
+        planned,
+        "原始 Transformer 采用任务训练。BERT 与 GPT-3 采用不同适配方式。T5-Small 的计算量不同。",
+    ) == "原始 Transformer 采用任务训练。 BERT 与 GPT-3 采用不同适配方式。"
 
 
-def test_generic_three_model_limit_heading_does_not_force_unsupported_symmetry():
+def test_generic_three_model_limit_heading_requires_supported_modern_boundaries_only():
     assert _required_review_subjects(
         "比较原始 Transformer、BERT 与 GPT-3。",
         {
             "title": "能力边界与局限",
             "objective": "总结并比较三种模型的能力边界与局限。",
         },
-    ) == []
+    ) == ["BERT", "GPT-3"]
 
 
 def test_review_limitation_section_accepts_direct_failure_evidence():
@@ -495,6 +501,56 @@ def test_model_authored_inline_citation_labels_are_removed_before_remapping():
     text = "BERT 使用掩码语言模型【20】，并在下游任务微调 [15]（citation_id: 7）。"
 
     assert _strip_inline_citation_markers(text) == "BERT 使用掩码语言模型，并在下游任务微调。"
+
+
+def test_chinese_review_never_succeeds_with_english_excerpt_fallback():
+    class UnavailableWritingClient:
+        def complete_json(self, messages, *, schema_name):
+            raise RuntimeError("gateway unavailable")
+
+        def complete_text(self, messages, *, max_tokens=700):
+            raise RuntimeError("gateway unavailable")
+
+    evidence = [
+        {
+            "citation_id": str(index),
+            "quote_id": f"q{index}",
+            "paper": "Attention Is All You Need",
+            "doc_id": f"transformer-{index}",
+            "section": "Conclusion",
+            "evidence_id": f"transformer-{index}.s1",
+            "exact_quote": (
+                "The Transformer is a sequence transduction model based entirely on attention, "
+                "replacing recurrent layers with multi-headed self-attention."
+            ),
+            "html_path": f"transformer-{index}.md",
+            "html_anchor": "s1",
+        }
+        for index in range(1, 4)
+    ]
+    research = {
+        "phase": "retrieval",
+        "question": "原始 Transformer 使用什么架构？",
+        "review_plan": {
+            "title": "Transformer 架构综述",
+            "scope": "原始论文",
+            "sections": [
+                {
+                    "id": "transformer",
+                    "title": "原始 Transformer 架构",
+                    "objective": "解释原始 Transformer 的 self-attention 与编码器—解码器结构。",
+                    "queries": ["Transformer architecture"],
+                    "citation_ids": ["1", "2", "3"],
+                }
+            ],
+        },
+        "evidence": evidence,
+        "section_results": [],
+        "retrieval_summary": {"section_count": 1, "document_count": 3, "evidence_count": 3},
+    }
+
+    with pytest.raises(ValueError, match="不会把英文摘录伪装成中文综述"):
+        synthesize_literature_review(research, chat_client=UnavailableWritingClient())
 
 
 def test_three_retrieved_documents_require_three_cited_documents():
