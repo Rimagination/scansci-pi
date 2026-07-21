@@ -20,6 +20,8 @@ const state = {
   sourceQuery: "",
   historyQuery: "",
   historyCollapsed: window.localStorage.getItem("scansci.history.collapsed") === "true",
+  historyView: window.localStorage.getItem("scansci.history.view") === "archived" ? "archived" : "active",
+  historyMenuRunId: "",
   historySearchOpen: false,
   directMessages: [],
   runs: [],
@@ -296,6 +298,10 @@ const uiIconPaths = {
   copy: '<rect x="8" y="8" width="10" height="10" rx="1.5"></rect><path d="M6 15H5.5A1.5 1.5 0 0 1 4 13.5v-8A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5V6"></path>',
   download: '<path d="M12 4v10M8 11l4 4 4-4M5 19.5h14"></path>',
   expand: '<path d="M8 4H4v4M16 4h4v4M20 16v4h-4M4 16v4h4"></path>',
+  archive: '<path d="M4 7h16v13H4zM3 4h18v3H3zM9 11h6"></path>',
+  "archive-restore": '<path d="M4 7h16v13H4zM3 4h18v3H3zM8 13a4 4 0 1 1 1.2 2.9M8 13v4h4"></path>',
+  "more-horizontal": '<path d="M5 12h.01M12 12h.01M19 12h.01"></path>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"></path>',
 };
 
 function uiIcon(name, className = "") {
@@ -616,7 +622,7 @@ async function initialize() {
       request("/api/settings"),
       request("/api/settings/presets"),
       request("/api/capabilities"),
-      request("/api/runs"),
+      request("/api/runs?view=all&limit=200"),
       request("/api/slides/templates").catch(() => ({ available: false, templates: [] })),
       request("/api/local-models/installed").catch(() => ({ models: [] })),
       request("/api/local-models/market").catch(() => ({ items: [] })),
@@ -1302,16 +1308,27 @@ function renderTasks() {
   const target = byId("taskList");
   renderHistoryControls();
   const query = state.historyQuery.trim().toLowerCase();
-  const runs = state.runs.filter((run) => [run.title, run.status, run.updated_at].join(" ").toLowerCase().includes(query));
-  if (!state.runs.length) {
-    target.innerHTML = '<p class="history-empty">暂无对话</p>';
+  const archived = state.historyView === "archived";
+  const availableRuns = state.runs.filter((run) => Boolean(run.archived) === archived);
+  const runs = availableRuns.filter((run) => [run.title, run.status, run.updated_at].join(" ").toLowerCase().includes(query));
+  if (!availableRuns.length) {
+    target.innerHTML = `<p class="history-empty">${archived ? "暂无归档对话" : "暂无对话"}</p>`;
     return;
   }
   if (!runs.length) {
     target.innerHTML = '<p class="history-empty">没有匹配的历史对话</p>';
     return;
   }
-  target.innerHTML = runs.slice(0, 40).map((run) => `<button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(runDisplayTitle(run), 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button>`).join("");
+  const renderedRuns = runs.slice(0, 80);
+  target.innerHTML = renderedRuns.map((run, index) => {
+    const open = state.historyMenuRunId === run.run_id;
+    const opensUp = renderedRuns.length > 4 && index >= renderedRuns.length - 2;
+    const manageDisabled = Boolean(run.cancellable || run.status === "needs_confirmation");
+    const organizeAction = archived ? "restore-task" : "archive-task";
+    const organizeLabel = archived ? "恢复到历史对话" : "归档对话";
+    const organizeIcon = archived ? "archive-restore" : "archive";
+    return `<div class="task-row ${open ? "has-open-menu" : ""} ${opensUp ? "opens-up" : ""}"><button type="button" class="task-item ${run.run_id === state.activeTaskId ? "is-active" : ""}" data-action="open-task" data-task-id="${escapeHtml(run.run_id)}"><span>${escapeHtml(compact(runDisplayTitle(run), 28))}</span><time class="task-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</time></button><button type="button" class="task-more" data-action="toggle-task-menu" data-task-id="${escapeHtml(run.run_id)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-task" data-task-id="${escapeHtml(run.run_id)}" ${manageDisabled ? "disabled" : ""}>${uiIcon("trash")}<span>删除对话</span></button>${manageDisabled ? '<small>运行结束后可整理</small>' : ""}</div>` : ""}</div>`;
+  }).join("");
 }
 
 function renderHistoryControls() {
@@ -1320,8 +1337,16 @@ function renderHistoryControls() {
   const searchTrigger = byId("historySearchTrigger");
   const searchPanel = byId("historySearchPanel");
   const search = byId("historySearch");
+  const archiveTrigger = byId("historyArchiveTrigger");
+  const historyTitle = byId("historyTitle");
+  const archived = state.historyView === "archived";
   area?.classList.toggle("is-collapsed", state.historyCollapsed);
   collapse?.setAttribute("aria-expanded", String(!state.historyCollapsed));
+  if (historyTitle) historyTitle.textContent = archived ? "已归档" : "历史对话";
+  archiveTrigger?.classList.toggle("is-active", archived);
+  archiveTrigger?.setAttribute("aria-pressed", String(archived));
+  archiveTrigger?.setAttribute("aria-label", archived ? "返回历史对话" : "查看已归档对话");
+  archiveTrigger?.setAttribute("title", archived ? "返回历史对话" : "查看已归档对话");
   if (searchPanel) searchPanel.hidden = state.historyCollapsed || !state.historySearchOpen;
   searchTrigger?.setAttribute("aria-expanded", String(!state.historyCollapsed && state.historySearchOpen));
   if (search && search.value !== state.historyQuery) search.value = state.historyQuery;
@@ -1341,6 +1366,47 @@ function toggleHistorySearch() {
   window.localStorage.setItem("scansci.history.collapsed", String(state.historyCollapsed));
   renderTasks();
   if (state.historySearchOpen) window.setTimeout(() => byId("historySearch")?.focus(), 0);
+}
+
+function toggleHistoryView() {
+  state.historyView = state.historyView === "archived" ? "active" : "archived";
+  state.historyMenuRunId = "";
+  state.historyQuery = "";
+  state.historySearchOpen = false;
+  window.localStorage.setItem("scansci.history.view", state.historyView);
+  renderTasks();
+}
+
+function toggleTaskMenu(runId) {
+  state.historyMenuRunId = state.historyMenuRunId === runId ? "" : runId;
+  renderTasks();
+}
+
+async function archiveTask(runId) {
+  state.historyMenuRunId = "";
+  const run = await request(`/api/runs/${encodeURIComponent(runId)}/archive`, { method: "POST", body: "{}" });
+  upsertRun(run);
+  if (state.activeTaskId === runId) startTask();
+  toast("对话已归档");
+}
+
+async function restoreTask(runId) {
+  state.historyMenuRunId = "";
+  const run = await request(`/api/runs/${encodeURIComponent(runId)}/restore`, { method: "POST", body: "{}" });
+  upsertRun(run);
+  toast("对话已恢复");
+}
+
+async function deleteTask(runId) {
+  const run = state.runs.find((item) => item.run_id === runId);
+  const title = compact(runDisplayTitle(run || {}), 36);
+  if (!window.confirm(`永久删除“${title}”？\n\n此操作不可撤销，但已经导出的 PPTX、Markdown 和下载的论文文件会保留。`)) return;
+  state.historyMenuRunId = "";
+  await request(`/api/runs/${encodeURIComponent(runId)}/delete`, { method: "POST", body: "{}" });
+  state.runs = state.runs.filter((item) => item.run_id !== runId);
+  if (state.activeTaskId === runId) startTask();
+  else renderTasks();
+  toast("对话已删除");
 }
 
 function runStatusLabel(run) {
@@ -3434,6 +3500,10 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("[data-composer-thinking]")) closeComposerThinkingPickers();
   if (!event.target.closest("[data-attachment-picker]")) closeAttachmentMenus();
   if (!event.target.closest("[data-profile-picker]")) closeProfileAvatarPicker();
+  if (!event.target.closest(".task-row") && state.historyMenuRunId) {
+    state.historyMenuRunId = "";
+    renderTasks();
+  }
   if (!event.target.closest(".skill-suggestions, #homeQuestionInput, #chatQuestionInput")) closeSkillSuggestions();
   const extensionTab = event.target.closest("[data-extension-tab]");
   if (extensionTab) {
@@ -3592,6 +3662,11 @@ document.addEventListener("click", (event) => {
   else if (action === "history-forward") moveNavigation(1);
   else if (action === "toggle-history-collapse") toggleHistoryCollapse();
   else if (action === "toggle-history-search") toggleHistorySearch();
+  else if (action === "toggle-history-view") toggleHistoryView();
+  else if (action === "toggle-task-menu") toggleTaskMenu(element.dataset.taskId || "");
+  else if (action === "archive-task") archiveTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
+  else if (action === "restore-task") restoreTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
+  else if (action === "delete-task") deleteTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
   else if (action === "new-task") startTask();
   else if (action === "open-extensions") openExtensions();
   else if (action === "open-mcp-marketplace") openMcpMarketplace();
@@ -3658,7 +3733,10 @@ document.addEventListener("click", (event) => {
     refreshMcpMarketplaceSurface();
   }
   else if (action === "open-conversation") setView("conversation");
-  else if (action === "open-task") openTask(element.dataset.taskId);
+  else if (action === "open-task") {
+    state.historyMenuRunId = "";
+    openTask(element.dataset.taskId);
+  }
   else handleSettingsAction(action, element).catch((error) => toast(error.message, true));
 });
 

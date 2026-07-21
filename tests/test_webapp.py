@@ -17,6 +17,7 @@ from scansci_html.research_agent import (
     _safe_good_question_fallback,
     _validate_direct_chat_output,
 )
+from scansci_html.research_runs import StageSpec
 from scansci_html.workspace import attach_annotation_layers_to_notebook, sync_sources_from_evidence_store
 
 
@@ -81,6 +82,24 @@ def test_review_document_ui_does_not_replay_the_user_instruction(tmp_path: Path)
     assert 'const title = ready ? "综述稿件"' in script
     assert ".review-request" not in styles
     assert "font-size: clamp(23px, 1.7vw, 28px)" in styles
+
+
+def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert 'id="historyArchiveTrigger"' in page
+    assert 'data-action="toggle-history-view"' in page
+    assert "function toggleTaskMenu" in script
+    assert "function archiveTask" in script
+    assert "function restoreTask" in script
+    assert "function deleteTask" in script
+    assert 'data-action="delete-task"' in script
+    assert "已经导出的 PPTX、Markdown 和下载的论文文件会保留" in script
+    assert ".task-menu" in styles
+    assert ".task-more:focus-visible" in styles
 
 
 def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):
@@ -455,6 +474,31 @@ def test_notebook_webapp_runs_persistent_evidence_workflow(tmp_path: Path):
     assert completed["metadata"]["evidence_budget"] == 14
     assert listing["runs"][0]["run_id"] == run_id
     assert any(item["id"] == "literature_review" for item in catalog["workflows"])
+
+
+def test_notebook_webapp_archives_restores_and_deletes_conversations(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    run = app.research_agent.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Archive from the sidebar",
+        input_payload={"question": "Archive this"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    app.research_agent.store.complete_run(run["run_id"])
+
+    archived = _payload(app.dispatch("POST", f"/api/runs/{run['run_id']}/archive", b"{}"))
+    assert archived["archived"] is True
+    assert _payload(app.dispatch("GET", "/api/runs"))["runs"] == []
+    archived_listing = _payload(app.dispatch("GET", "/api/runs?view=archived&limit=200"))
+    assert archived_listing["runs"][0]["run_id"] == run["run_id"]
+
+    restored = _payload(app.dispatch("POST", f"/api/runs/{run['run_id']}/restore", b"{}"))
+    assert restored["archived"] is False
+
+    deleted = _payload(app.dispatch("POST", f"/api/runs/{run['run_id']}/delete", b"{}"))
+    assert deleted["deleted"] is True
+    assert app.dispatch("GET", f"/api/runs/{run['run_id']}").status == 404
 
 
 def test_notebook_webapp_writes_notes_audits_and_serves_source_anchors(tmp_path: Path):

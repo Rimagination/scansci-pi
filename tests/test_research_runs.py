@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from scansci_html.research_runs import ResearchRunStore, StageSpec
 
 
@@ -143,3 +145,47 @@ def test_research_run_follow_up_messages_stay_with_the_original_run(tmp_path: Pa
     assert reopened["messages"][1]["usage"]["total_tokens"] == 17
     assert reopened["messages"][1]["processing_ms"] == 321
     assert store.list_runs()[0]["run_id"] == run["run_id"]
+
+
+def test_research_run_archive_restore_and_delete_are_persistent(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    store = ResearchRunStore(workspace)
+    run = store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Conversation to organize",
+        input_payload={"question": "Keep the exported files"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+
+    with pytest.raises(ValueError, match="运行中的对话不能归档或删除"):
+        store.archive_run(run["run_id"])
+
+    store.append_message(run["run_id"], role="user", content="Keep this until I delete the conversation")
+    artifact = store.create_artifact(
+        run["run_id"],
+        artifact_type="evidence_answer",
+        title="Saved answer",
+        summary="Saved locally",
+        payload={"text": "Answer"},
+        evidence_links=[{"evidence_id": "doc.s0001", "doc_id": "doc", "exact_quote": "Answer"}],
+    )
+    store.complete_run(run["run_id"], output_artifact_id=artifact["artifact_id"])
+    archived = store.archive_run(run["run_id"])
+    assert archived["archived"] is True
+    assert store.list_runs() == []
+    assert store.list_runs(archived=True)[0]["run_id"] == run["run_id"]
+
+    restored = ResearchRunStore(workspace).restore_run(run["run_id"])
+    assert restored["archived"] is False
+    assert store.list_runs()[0]["run_id"] == run["run_id"]
+
+    deleted = store.delete_run(run["run_id"])
+    assert deleted == {
+        "ok": True,
+        "run_id": run["run_id"],
+        "title": "Conversation to organize",
+        "deleted": True,
+    }
+    with pytest.raises(FileNotFoundError):
+        store.get_run(run["run_id"])

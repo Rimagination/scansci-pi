@@ -48,9 +48,12 @@
         <section class="project-area history-area" id="historyArea" aria-label="历史对话">
           <div class="history-head">
             <button type="button" class="history-collapse" id="historyCollapse" data-action="toggle-history-collapse" aria-expanded="true" aria-controls="taskList">
-              <span>历史对话</span><span data-ui-icon="chevron-down" data-icon-class="history-collapse-chevron" aria-hidden="true"></span>
+              <span id="historyTitle">历史对话</span><span data-ui-icon="chevron-down" data-icon-class="history-collapse-chevron" aria-hidden="true"></span>
             </button>
-            <button type="button" class="history-search-trigger" id="historySearchTrigger" data-action="toggle-history-search" aria-expanded="false" aria-controls="historySearchPanel" aria-label="搜索历史对话"><span data-ui-icon="search"></span></button>
+            <div class="history-head-actions">
+              <button type="button" class="history-archive-trigger" id="historyArchiveTrigger" data-action="toggle-history-view" aria-pressed="false" aria-label="查看已归档对话" title="查看已归档对话"><span data-ui-icon="archive"></span></button>
+              <button type="button" class="history-search-trigger" id="historySearchTrigger" data-action="toggle-history-search" aria-expanded="false" aria-controls="historySearchPanel" aria-label="搜索历史对话"><span data-ui-icon="search"></span></button>
+            </div>
           </div>
           <label class="history-search" id="historySearchPanel" hidden>
             <span data-ui-icon="search" aria-hidden="true"></span><input id="historySearch" type="search" autocomplete="off" placeholder="搜索历史对话" aria-label="搜索历史对话" />

@@ -115,30 +115,78 @@ class ResearchRunStore:
             connection.commit()
         return self.get_run(run_id)
 
-    def list_runs(self, *, notebook_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        *,
+        notebook_id: str = "",
+        limit: int = 50,
+        archived: bool | None = False,
+    ) -> list[dict[str, Any]]:
         limit_value = min(200, max(1, int(limit)))
         with self._connect() as connection:
             self._initialize_schema(connection)
+            conditions: list[str] = []
+            values: list[Any] = []
             if notebook_id:
-                rows = connection.execute(
-                    """
-                    select * from research_runs
-                    where notebook_id = ?
-                    order by updated_at desc, created_at desc
-                    limit ?
-                    """,
-                    (str(notebook_id), limit_value),
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    select * from research_runs
-                    order by updated_at desc, created_at desc
-                    limit ?
-                    """,
-                    (limit_value,),
-                ).fetchall()
+                conditions.append("notebook_id = ?")
+                values.append(str(notebook_id))
+            if archived is True:
+                conditions.append("archived_at <> ''")
+            elif archived is False:
+                conditions.append("archived_at = ''")
+            where = f"where {' and '.join(conditions)}" if conditions else ""
+            rows = connection.execute(
+                f"""
+                select * from research_runs
+                {where}
+                order by updated_at desc, created_at desc
+                limit ?
+                """,
+                (*values, limit_value),
+            ).fetchall()
             return [self._run_summary(connection, row) for row in rows]
+
+    def archive_run(self, run_id: str) -> dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = self._require_manageable_run(connection, run_id)
+            if str(row["archived_at"]):
+                return self.get_run(run_id)
+            connection.execute(
+                "update research_runs set archived_at = ?, updated_at = ? where run_id = ?",
+                (now, now, run_id),
+            )
+            connection.commit()
+        return self.get_run(run_id)
+
+    def restore_run(self, run_id: str) -> dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            self._require_run(connection, run_id)
+            connection.execute(
+                "update research_runs set archived_at = '', updated_at = ? where run_id = ?",
+                (now, run_id),
+            )
+            connection.commit()
+        return self.get_run(run_id)
+
+    def delete_run(self, run_id: str) -> dict[str, Any]:
+        """Permanently remove one conversation while preserving exported files."""
+
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            row = self._require_manageable_run(connection, run_id)
+            title = str(row["title"])
+            connection.execute("delete from research_evidence_links where run_id = ?", (run_id,))
+            connection.execute("delete from research_tool_calls where run_id = ?", (run_id,))
+            connection.execute("delete from research_run_messages where run_id = ?", (run_id,))
+            connection.execute("delete from research_artifacts where run_id = ?", (run_id,))
+            connection.execute("delete from research_stages where run_id = ?", (run_id,))
+            connection.execute("delete from research_runs where run_id = ?", (run_id,))
+            connection.commit()
+        return {"ok": True, "run_id": run_id, "title": title, "deleted": True}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -614,7 +662,8 @@ class ResearchRunStore:
               updated_at text not null,
               started_at text not null,
               completed_at text not null,
-              metadata_json text not null
+              metadata_json text not null,
+              archived_at text not null default ''
             );
             create table if not exists research_stages (
               stage_id text primary key,
@@ -695,6 +744,12 @@ class ResearchRunStore:
             create index if not exists idx_research_messages_run on research_run_messages(run_id, created_at);
             """
         )
+        columns = {str(row["name"]) for row in connection.execute("pragma table_info(research_runs)")}
+        if "archived_at" not in columns:
+            connection.execute("alter table research_runs add column archived_at text not null default ''")
+        connection.execute(
+            "create index if not exists idx_research_runs_archived on research_runs(archived_at, updated_at)"
+        )
 
     def _run_summary(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         stage_counts = connection.execute(
@@ -727,6 +782,8 @@ class ResearchRunStore:
             "updated_at": str(row["updated_at"]),
             "started_at": str(row["started_at"]),
             "completed_at": str(row["completed_at"]),
+            "archived_at": str(row["archived_at"]),
+            "archived": bool(row["archived_at"]),
             "stage_counts": {
                 "total": int(stage_counts["total"] or 0),
                 "completed": int(stage_counts["completed"] or 0),
@@ -734,6 +791,13 @@ class ResearchRunStore:
             "resumable": str(row["status"]) in RESUMABLE_RUN_STATUSES,
             "cancellable": str(row["status"]) in ACTIVE_RUN_STATUSES,
         }
+
+    @staticmethod
+    def _require_manageable_run(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+        row = ResearchRunStore._require_run(connection, run_id)
+        if str(row["status"]) in ACTIVE_RUN_STATUSES | {"needs_confirmation"}:
+            raise ValueError("运行中的对话不能归档或删除，请先等待任务结束或停止任务。")
+        return row
 
     @staticmethod
     def _stage_payload(row: sqlite3.Row) -> dict[str, Any]:

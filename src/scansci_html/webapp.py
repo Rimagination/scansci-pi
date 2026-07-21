@@ -205,7 +205,14 @@ class NotebookWebApp:
                 capability_snapshot(workspace=self.workspace, evidence_db=self.evidence_db),
             )
         if path == "/api/runs":
-            return self._json(HTTPStatus.OK, {"runs": self.research_agent.store.list_runs()})
+            params = parse_qs(query)
+            view = str(params.get("view", ["active"])[0] or "active").strip().lower()
+            archived = True if view == "archived" else None if view == "all" else False
+            limit = min(200, max(1, int(params.get("limit", [50])[0] or 50)))
+            return self._json(
+                HTTPStatus.OK,
+                {"runs": self.research_agent.store.list_runs(limit=limit, archived=archived), "view": view},
+            )
         if path == "/api/runs/catalog":
             return self._json(HTTPStatus.OK, {"workflows": self.research_agent.workflow_catalog()})
         if path == "/api/slides/templates":
@@ -286,6 +293,12 @@ class NotebookWebApp:
             )
         if path == "/api/runs":
             return self._json(HTTPStatus.ACCEPTED, self.research_agent.start(payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "archive":
+            return self._json(HTTPStatus.OK, self.research_agent.store.archive_run(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "restore":
+            return self._json(HTTPStatus.OK, self.research_agent.store.restore_run(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "delete":
+            return self._json(HTTPStatus.OK, self.research_agent.store.delete_run(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "messages":
             return self._json(HTTPStatus.OK, self.research_agent.continue_run_conversation(parts[2], payload))
         if path == "/api/settings":
