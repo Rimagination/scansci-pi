@@ -816,17 +816,12 @@ def _required_review_subjects(question: str, planned: dict[str, Any]) -> list[st
     """Return explicitly required model subjects for a focused comparison section."""
 
     target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
-    multi_subject = any(
-        cue in target
-        for cue in ("三者", "三种模型", "三个模型", "all three", "three models")
-    )
-    subject_scope = f"{question} {target}".casefold() if multi_subject else target
     subjects: list[str] = []
-    if any(cue in subject_scope for cue in ("原始 transformer", "original transformer")):
+    if any(cue in target for cue in ("原始 transformer", "original transformer")):
         subjects.append("原始 Transformer")
-    if "bert" in subject_scope:
+    if "bert" in target:
         subjects.append("BERT")
-    if re.search(r"\bgpt-?3\b", subject_scope):
+    if re.search(r"\bgpt-?3\b", target):
         subjects.append("GPT-3")
     return subjects
 

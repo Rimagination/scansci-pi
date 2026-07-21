@@ -451,6 +451,16 @@ def test_three_model_comparison_rejects_side_model_substitution():
     ) is False
 
 
+def test_generic_three_model_limit_heading_does_not_force_unsupported_symmetry():
+    assert _required_review_subjects(
+        "比较原始 Transformer、BERT 与 GPT-3。",
+        {
+            "title": "能力边界与局限",
+            "objective": "总结并比较三种模型的能力边界与局限。",
+        },
+    ) == []
+
+
 def test_review_limitation_section_accepts_direct_failure_evidence():
     planned = {
         "id": "limits",
