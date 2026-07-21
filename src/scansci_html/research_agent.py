@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any
@@ -47,6 +48,65 @@ from .research_tools import (
 )
 from .slide_studio import create_source_slide_deck, persist_slide_sources
 from .workspace import load_workspace_summary
+
+
+_GOOD_QUESTION_FIELDS = (
+    "**暂定题目：**",
+    "**核心研究问题：**",
+    "**为什么值得做：**",
+    "**它挑战了什么默认假设：**",
+    "**竞争性解释：**",
+    "**关键判别证据或实验：**",
+    "**什么结果会推翻它：**",
+    "**两周内可做的 pilot：**",
+    "**所需数据与资源：**",
+    "**最强评审质疑：**",
+    "**下一步：**",
+)
+_REPEATED_CJK_PHRASE = re.compile(r"(?P<phrase>[\u3400-\u9fff]{2,6})(?P=phrase)")
+
+
+def _has_selected_skill(selected_skills: list[dict[str, Any]], identifier: str) -> bool:
+    return any(str(item.get("id", "")).strip().lower() == identifier for item in selected_skills)
+
+
+def _normalize_direct_chat_output(text: str, selected_skills: list[dict[str, Any]]) -> str:
+    """Apply narrow presentational cleanup required by formal Skill outputs."""
+
+    normalized = str(text or "").strip()
+    if not _has_selected_skill(selected_skills, "good-question"):
+        return normalized
+    # Small managed models occasionally repeat a whole Chinese phrase at a
+    # token boundary (for example, ``线性线性``).  This is safe to collapse in
+    # the formal card because intentional rhetorical repetition is forbidden
+    # by the Skill contract.
+    for _ in range(3):
+        cleaned = _REPEATED_CJK_PHRASE.sub(r"\g<phrase>", normalized)
+        if cleaned == normalized:
+            break
+        normalized = cleaned
+    return normalized
+
+
+def _validate_direct_chat_output(text: str, selected_skills: list[dict[str, Any]]) -> None:
+    """Refuse to mark an incomplete formal Skill artifact as delivered."""
+
+    if not _has_selected_skill(selected_skills, "good-question"):
+        return
+    missing = [field for field in _GOOD_QUESTION_FIELDS if field not in text]
+    for hypothesis in ("H1", "H2", "H3"):
+        if hypothesis not in text:
+            missing.append(hypothesis)
+    if len(text) < 320:
+        missing.append("完整卡片正文")
+    if "�" in text:
+        missing.append("无乱码正文")
+    if missing:
+        labels = "、".join(dict.fromkeys(item.replace("**", "") for item in missing))
+        raise RuntimeError(
+            f"科学问题卡未通过完整性校验（缺少：{labels}）。"
+            "ScanSci 没有把不完整草稿标记为完成，请重试或切换内置 GLM 模型。"
+        )
 
 
 _WORKFLOWS: dict[str, dict[str, Any]] = {
@@ -446,6 +506,8 @@ class ResearchAgentRuntime:
                 text, usage = completion
             else:
                 text, usage = completion, {}
+        text = _normalize_direct_chat_output(text, chat_request.selected_skills)
+        _validate_direct_chat_output(text, chat_request.selected_skills)
         trace = self._direct_process_trace(chat_request, had_attachments=bool(ingestion))
         if local_facts:
             trace[-1] = {"title": "读取运行时事实", "detail": "已从当前安装状态读取版本、模型、模式与 Skill，避免模型猜测。"}
@@ -613,6 +675,7 @@ class ResearchAgentRuntime:
             fragments: list[str] = []
             usage: dict[str, int] = {}
             truncated = False
+            buffer_skill_output = _has_selected_skill(chat_request.selected_skills, "good-question")
             if local_facts:
                 model_events = [{"type": "delta", "content": local_facts}, {"type": "done", "truncated": False}]
             elif pi_eligible:
@@ -643,12 +706,13 @@ class ResearchAgentRuntime:
                     content = str(model_event.get("content", ""))
                     if content:
                         fragments.append(content)
-                        yield run_event(
-                            TEXT_MESSAGE_CONTENT,
-                            run_id=run_id,
-                            messageId=message_id,
-                            delta=content,
-                        )
+                        if not buffer_skill_output:
+                            yield run_event(
+                                TEXT_MESSAGE_CONTENT,
+                                run_id=run_id,
+                                messageId=message_id,
+                                delta=content,
+                            )
                 elif model_event.get("type") == "done":
                     received_usage = model_event.get("usage")
                     if not isinstance(received_usage, dict):
@@ -689,11 +753,19 @@ class ResearchAgentRuntime:
                     )
                     yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
 
-            text = "".join(fragments).strip()
+            text = _normalize_direct_chat_output("".join(fragments), chat_request.selected_skills)
             if not text:
                 raise RuntimeError("The model returned an empty response")
             if truncated:
                 raise RuntimeError("模型连续达到输出上限，ScanSci 没有把不完整内容标记为完成；请缩小问题范围后重试。")
+            _validate_direct_chat_output(text, chat_request.selected_skills)
+            if buffer_skill_output:
+                yield run_event(
+                    TEXT_MESSAGE_CONTENT,
+                    run_id=run_id,
+                    messageId=message_id,
+                    delta=text,
+                )
             trace.append({"title": "完成回答", "detail": "模型已返回完整内容并完成响应收束。"})
             yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
             message: dict[str, Any] = {

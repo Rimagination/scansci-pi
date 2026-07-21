@@ -15,6 +15,49 @@ _MAX_SKILL_CHARS = 24_000
 _MAX_SELECTED_SKILLS = 3
 
 
+_COMPACT_SKILL_CONTRACTS = {
+    "good-question": """# Good Question：运行时精简契约
+
+目标：把用户的模糊方向收束为重要、可执行、可证伪、能经受评审质疑的科学问题。不要只列选题，不要把缺少证据本身当作创新。
+
+请只输出一张完整的中文卡片，严格使用以下字段且每个字段只出现一次：
+
+## 好问题卡
+**暂定题目：** 一句话，避免空泛口号。
+**核心研究问题：** 写成一个边界清楚、可由数据回答的问句；指出对象、条件和结果。
+**为什么值得做：** 说明改变哪项认识或决策；若未联网，只能标为“基于用户信息的暂定判断”，不得虚构文献空白。
+**它挑战了什么默认假设：** 写出可被检验的默认认识。
+**竞争性解释：** 分别写 H1、H2、H3；三者必须彼此可区分，并各自给出不同的可观测预测。
+**关键判别证据或实验：** 明确自变量/暴露、因变量/结局、关键对照与判别规则，说明什么结果更支持哪一个 H。
+**什么结果会推翻它：** 给出至少一个能否定主张的具体结果，不得只写“结果不显著”。
+**两周内可做的 pilot：** 必须能在 14 天内完成，列出最小样本或最小数据、4 个以内里程碑，以及继续/修改/停止的数值化决策门槛；不得把一年、季度或完整项目写成两周 pilot。
+**所需数据与资源：** 区分已有资源、待补数据和最大依赖。
+**最强评审质疑：** 写出最可能导致拒稿或否定结论的一条质疑，并给出最低成本应对。
+**下一步：** 只给一个立即可执行的动作。
+
+质量底线：
+- 若用户信息不足，做最少且显式的假设，并标注“待用户确认”；仍需给出可讨论的完整初稿。
+- 核心问题、H1/H2/H3、判别实验、推翻条件和 pilot 决策门槛必须互相对应。
+- 不输出内部思维过程、参考卡名称或元说明；不编造数据、引文或已完成的实验。
+- 使用简洁自然的中文，避免重复词、乱码、字段重复、残缺编号和未闭合标点；全文宜控制在 1200 字以内。
+""",
+}
+
+
+def _runtime_skill_instructions(identifier: str, instructions: str) -> str:
+    """Return a model-sized Skill contract while preserving acceptance criteria.
+
+    Some bundled Skills include long routing essays and reading lists intended
+    for a frontier coding agent.  Passing those verbatim to a small managed
+    chat model can consume most of its useful attention and cause degenerate
+    output.  Product-owned compact contracts keep the task and its quality
+    gates explicit without treating the reference material as prompt filler.
+    """
+
+    compact = _COMPACT_SKILL_CONTRACTS.get(identifier.strip().lower())
+    return compact.strip() if compact else instructions
+
+
 def runtime_self_description(
     workspace: str | Path,
     *,
@@ -111,6 +154,7 @@ def build_agent_system_context(
             instructions = skill_file.read_text(encoding="utf-8-sig", errors="replace")[:_MAX_SKILL_CHARS]
         except OSError:
             continue
+        instructions = _runtime_skill_instructions(str(item.get("id", "")), instructions)
         selected.append(
             {
                 "id": str(item.get("id", "")),

@@ -11,7 +11,11 @@ from scansci_html.app_settings import save_settings
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.grounded_annotation import ground_draft_text
 from scansci_html.webapp import NotebookWebApp, create_notebook_server, serve_notebook
-from scansci_html.research_agent import ResearchAgentRuntime
+from scansci_html.research_agent import (
+    ResearchAgentRuntime,
+    _normalize_direct_chat_output,
+    _validate_direct_chat_output,
+)
 from scansci_html.workspace import attach_annotation_layers_to_notebook, sync_sources_from_evidence_store
 
 
@@ -184,8 +188,42 @@ def test_direct_chat_knows_scansci_identity_and_loads_an_explicit_skill(tmp_path
     assert "当前底层模型为 glm-4.7-flash" in system
     assert "写作模式" in system
     assert '<selected_skill id="good-question">' in system
+    assert "## 好问题卡" in system
+    assert "分别写 H1、H2、H3" in system
+    assert "必须能在 14 天内完成" in system
+    assert "一年、季度或完整项目" in system
+    assert "references/platt-strong-inference.md" not in system
+    assert len(system) < 8_000
     assert chat_request.chat_mode == "writing"
     assert [item["id"] for item in chat_request.selected_skills] == ["good-question"]
+
+
+def test_good_question_output_is_cleaned_and_must_be_a_complete_card():
+    selected = [{"id": "good-question"}]
+    complete = "\n".join(
+        [
+            "## 好问题卡",
+            "**暂定题目：** 城市树冠降温阈值",
+            "**核心研究问题：** 树冠覆盖率与地表温度是否存在线性线性关系？",
+            "**为什么值得做：** 基于用户信息的暂定判断：该结果可改变绿化配置。",
+            "**它挑战了什么默认假设：** 覆盖越多总是越冷。",
+            "**竞争性解释：** H1 阈值；H2 线性；H3 无关联。",
+            "**关键判别证据或实验：** 比较分段模型、线性模型与零效应模型。",
+            "**什么结果会推翻它：** 各城市斜率方向不一致且效应小于预设门槛。",
+            "**两周内可做的 pilot：** 14 天分析 5 个城市；3 城出现同向效应则继续，否则停止。",
+            "**所需数据与资源：** 已有城市数据和统计环境。",
+            "**最强评审质疑：** 空间混杂；以匹配对照应对。",
+            "**下一步：** 固定纳入标准。",
+            "补充说明：三个解释分别对应不同预测，试验以预注册门槛作出继续或停止决定。" * 3,
+        ]
+    )
+
+    cleaned = _normalize_direct_chat_output(complete, selected)
+    assert "线性线性" not in cleaned
+    _validate_direct_chat_output(cleaned, selected)
+
+    with pytest.raises(RuntimeError, match="未通过完整性校验"):
+        _validate_direct_chat_output("## 好问题卡", selected)
 
 
 def test_runtime_answers_version_and_capabilities_without_model_guessing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
