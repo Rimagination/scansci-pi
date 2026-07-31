@@ -3,7 +3,7 @@
 ScanSci（搜索科学）是一款面向科研资料管理、证据检索与学术工作流的桌面软件。
 
 本仓库用于发布 Windows 公开测试版和收集经过脱敏的问题反馈。请从
-[Releases](../../releases) 下载最新安装器，并在安装前核对 SHA-256。
+[Releases](https://github.com/Rimagination/scansci-pi/releases) 下载最新安装器，并在安装前核对 SHA-256。
 
 ## 当前测试重点
 
