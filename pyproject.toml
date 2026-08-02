@@ -30,7 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+  "PyMuPDF>=1.24,<2",
   "pytest>=8,<9",
+  "torch>=2.0,<3",
 ]
 rerank = [
   "sentence-transformers>=5.1,<6.0",
