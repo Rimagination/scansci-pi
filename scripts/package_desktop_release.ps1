@@ -1,0 +1,84 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$BuildDir,
+    [Parameter(Mandatory)]
+    [string]$Version,
+    [Parameter(Mandatory)]
+    [string]$PackageUrl,
+    [string]$OutputDir = "",
+    [string]$Channel = "stable",
+    [string]$LocalRuntimeManifest = ""
+)
+
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$source = [System.IO.Path]::GetFullPath($BuildDir)
+if (-not (Test-Path -LiteralPath (Join-Path $source "ScanSci.exe") -PathType Leaf)) {
+    throw "ScanSci desktop build was not found: $source"
+}
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $projectRoot "release"
+}
+$releaseRoot = [System.IO.Path]::GetFullPath($OutputDir)
+New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
+$archive = Join-Path $releaseRoot "ScanSci-$Version-windows-x64.zip"
+$manifest = Join-Path $releaseRoot "stable.json"
+Compress-Archive -Path (Join-Path $source "*") -DestinationPath $archive -CompressionLevel Optimal -Force
+$sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+$payload = [ordered]@{
+    version = $Version
+    title = "ScanSci $Version"
+    channel = $Channel
+    published_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    notes = @(
+        [ordered]@{ title = "Desktop"; items = @("Version status, release notes, and verified installation are available.") }
+    )
+    windows = [ordered]@{
+        url = $PackageUrl
+        sha256 = $sha256
+        archive = [System.IO.Path]::GetFileName($archive)
+    }
+}
+if ($LocalRuntimeManifest) {
+    $componentPath = [System.IO.Path]::GetFullPath($LocalRuntimeManifest)
+    if (-not (Test-Path -LiteralPath $componentPath -PathType Leaf)) {
+        throw "Local runtime manifest was not found: $componentPath"
+    }
+    $component = Get-Content -Raw -LiteralPath $componentPath | ConvertFrom-Json
+    $componentParts = @($component.windows.parts)
+    $hasPackageSource = [bool]$component.windows.url -or $componentParts.Count -gt 0
+    if ($component.id -ne "local-transformers" -or -not $component.version -or -not $hasPackageSource -or -not $component.windows.sha256) {
+        throw "Local runtime manifest is incomplete."
+    }
+    $componentWindows = [ordered]@{
+        sha256 = [string]$component.windows.sha256
+        size = [long]$component.windows.size
+    }
+    if ($component.windows.url) {
+        $componentWindows.url = [string]$component.windows.url
+    }
+    if ($componentParts.Count -gt 0) {
+        $componentWindows.parts = @($componentParts | ForEach-Object {
+            if (-not $_.url -or -not $_.sha256 -or -not $_.size) {
+                throw "Local runtime multipart manifest is incomplete."
+            }
+            [ordered]@{
+                url = [string]$_.url
+                sha256 = [string]$_.sha256
+                size = [long]$_.size
+            }
+        })
+    }
+    if ($component.windows.diagnostics) {
+        $componentWindows.diagnostics = $component.windows.diagnostics
+    }
+    $payload.components = [ordered]@{
+        "local-transformers" = [ordered]@{
+            version = [string]$component.version
+            windows = $componentWindows
+        }
+    }
+}
+$payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8
+Write-Output $archive
+Write-Output $manifest

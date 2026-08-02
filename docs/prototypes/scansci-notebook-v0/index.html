@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ScanSci Notebook Prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app" data-lang="zh">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-button icon-back" type="button" data-action="open-notebook-switcher" aria-label="返回笔记本">
+            <span aria-hidden="true"></span>
+          </button>
+          <a class="brand" href="#" data-action="open-notebook-switcher" aria-label="ScanSci Notebook">
+            <span class="brand-mark">S</span>
+          </a>
+          <h1 id="workspaceTitle" data-i18n="notebookTitle">Evidence-first RAG 综述</h1>
+        </div>
+        <nav class="topbar-actions" aria-label="Notebook actions">
+          <button class="top-pill dark" type="button" data-action="open-notebook-switcher" data-i18n="createNotebook">
+            创建笔记本
+          </button>
+          <button class="top-pill" type="button" data-mode="evidence" data-i18n="analyze">分析</button>
+          <button class="top-pill" type="button" data-action="open-studio-preview" data-i18n="share">分享</button>
+          <button class="top-pill" type="button" data-action="open-run-drawer" data-i18n="settings">设置</button>
+          <div class="language-toggle" role="group" aria-label="Language">
+            <button class="is-active" type="button" data-action="set-language" data-lang-value="zh">中</button>
+            <button type="button" data-action="set-language" data-lang-value="en">EN</button>
+          </div>
+        </nav>
+      </header>
+
+      <main class="notebook-page" aria-label="ScanSci notebook workspace">
+        <section class="panel source-panel" aria-label="Sources">
+          <header class="panel-head">
+            <h2 data-i18n="sources">来源</h2>
+            <span class="panel-token">3</span>
+          </header>
+
+          <button class="add-source" type="button">
+            <span class="button-icon icon-plus" aria-hidden="true"></span>
+            <strong data-i18n="addSource">添加来源</strong>
+          </button>
+
+          <div class="source-search">
+            <span data-i18n="searchSources">在文献库中搜索新来源</span>
+            <div class="search-row">
+              <button type="button" data-i18n="webSearch">Web 检索</button>
+              <button type="button" data-i18n="fastSearch">快速研究</button>
+              <button type="button" class="search-submit" aria-label="搜索">
+                <span class="button-icon icon-search" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+
+          <label class="select-all">
+            <span data-i18n="selectAll">全选</span>
+            <input type="checkbox" checked />
+          </label>
+
+          <div class="source-list">
+            <button class="source-item is-active" type="button" data-source="paperqa">
+              <span class="source-avatar">P2</span>
+              <span>
+                <strong>PaperQA2 retrieval study</strong>
+                <small data-i18n="sourceOneMeta">18 条证据 · 6 条引用 · 待审阅</small>
+              </span>
+              <input type="checkbox" checked aria-label="选择 PaperQA2 retrieval study" />
+            </button>
+            <button class="source-item" type="button" data-source="minirag">
+              <span class="source-avatar muted">MR</span>
+              <span>
+                <strong>MiniRAG reproduction notes</strong>
+                <small data-i18n="sourceTwoMeta">21 条证据 · benchmark trace 已关联</small>
+              </span>
+              <input type="checkbox" checked aria-label="选择 MiniRAG reproduction notes" />
+            </button>
+            <button class="source-item" type="button" data-source="cite">
+              <span class="source-avatar blue">CI</span>
+              <span>
+                <strong>Citation object model</strong>
+                <small data-i18n="sourceThreeMeta">9 条证据 · selector anchors 稳定</small>
+              </span>
+              <input type="checkbox" checked aria-label="选择 Citation object model" />
+            </button>
+          </div>
+        </section>
+
+        <section class="panel chat-panel" aria-label="Conversation">
+          <header class="panel-head chat-head">
+            <h2 data-i18n="conversation">对话</h2>
+            <div class="mode-strip" role="tablist" aria-label="Notebook modes">
+              <button class="mode-button is-active" type="button" data-mode="ask" data-i18n="modeAsk">对话</button>
+              <button class="mode-button" type="button" data-mode="read" data-i18n="modeRead">阅读</button>
+              <button class="mode-button" type="button" data-mode="evidence" data-i18n="modeEvidence">证据</button>
+              <button class="mode-button" type="button" data-mode="review" data-i18n="modeReview">审阅</button>
+            </div>
+          </header>
+
+          <div class="chat-scroll">
+            <section class="mode-panel is-active" data-panel="ask" aria-label="Ask mode">
+              <article class="answer-sheet">
+                <p class="question-line" data-i18n="questionLine">PaperQA2 类项目对 ScanSci 最值得吸收的是什么？</p>
+                <p data-i18n="answerOne">
+                  最值得吸收的是 notebook/source/chat 的产品组织，而不是把底层变成通用 RAG。
+                  ScanSci 应保留 clean HTML/XML 与 evidence span 作为核心坐标，让回答、综述和导出都从可审计 evidence table 生成。
+                </p>
+                <ol class="answer-steps">
+                  <li>
+                    <strong data-i18n="stepOneTitle">先组织来源。</strong>
+                    <span data-i18n="stepOneText">Source 面板只放可信来源，并保留 HTML anchor、quote snapshot 与 citation audit。</span>
+                    <button class="citation" type="button" data-source="paperqa">1</button>
+                    <button class="citation" type="button" data-source="cite">2</button>
+                  </li>
+                  <li>
+                    <strong data-i18n="stepTwoTitle">再生成产物。</strong>
+                    <span data-i18n="stepTwoText">Studio 只能从 accepted 或 partial_support 证据生成摘要、矩阵和审阅集。</span>
+                    <button class="citation" type="button" data-source="minirag">3</button>
+                  </li>
+                  <li>
+                    <strong data-i18n="stepThreeTitle">最后记录运行。</strong>
+                    <span data-i18n="stepThreeText">Codex 作为 control plane，本地小模型只做 action_decider，manifest 可复盘。</span>
+                    <button class="citation" type="button" data-source="paperqa">4</button>
+                  </li>
+                </ol>
+              </article>
+              <button class="save-note" type="button" data-action="open-studio-preview">
+                <span class="button-icon icon-bookmark" aria-hidden="true"></span>
+                <strong data-i18n="saveToNote">保存到笔记</strong>
+              </button>
+            </section>
+
+            <section class="mode-panel" data-panel="read" aria-label="Read mode">
+              <div class="reader-meta">
+                <strong id="readerTitle">PaperQA2 retrieval study</strong>
+                <span class="status-chip" data-i18n="anchorSynced">anchor 已同步</span>
+              </div>
+              <article class="document-preview" id="documentPreview">
+                <h3 data-i18n="sourceExcerpt">来源片段</h3>
+                <p>
+                  <mark data-i18n="highlightLine">Notebook 产品的信任来自引用能够跳回精确来源区域。</mark>
+                  <span data-i18n="readerParagraph">
+                    对 ScanSci 来说，关键不是聊天框更聪明，而是每个事实都能被检查、接受、拒绝和重放。
+                  </span>
+                </p>
+                <aside data-i18n="readerNote">当前证据：section 3.2，quote snapshot，html_anchor=#retrieval-audit</aside>
+              </article>
+            </section>
+
+            <section class="mode-panel" data-panel="evidence" aria-label="Evidence mode">
+              <div class="evidence-summary">
+                <span><b data-i18n="activeLayer">当前 Layer</b><i data-i18n="layerValue">NotebookLM-like 产品形态</i></span>
+                <span><b data-i18n="visibleProof">可见证据</b><i data-i18n="proofValue">只显示 supported / partial_support</i></span>
+                <span><b data-i18n="nextGate">下一门槛</b><i data-i18n="gateValue">18 条 citation audit 后再 benchmark</i></span>
+              </div>
+              <div class="evidence-table" role="table" aria-label="Evidence matrix">
+                <div class="evidence-row header" role="row">
+                  <span data-i18n="claim">Claim</span>
+                  <span data-i18n="source">Source</span>
+                  <span data-i18n="verdict">Verdict</span>
+                  <span data-i18n="audit">Audit</span>
+                </div>
+                <button class="evidence-row" type="button" data-source="paperqa" role="row">
+                  <span data-i18n="claimOne">Notebook/source 组织方式值得吸收。</span>
+                  <span>PaperQA2 study</span>
+                  <span class="status-text good">supported</span>
+                  <span data-i18n="accepted">已接受</span>
+                </button>
+                <button class="evidence-row" type="button" data-source="cite" role="row">
+                  <span data-i18n="claimTwo">可点击引用必须绑定稳定来源位置。</span>
+                  <span>Citation model</span>
+                  <span class="status-text good">supported</span>
+                  <span data-i18n="accepted">已接受</span>
+                </button>
+                <button class="evidence-row" type="button" data-source="minirag" role="row">
+                  <span data-i18n="claimThree">Benchmark 应在人审 gold 之后运行。</span>
+                  <span>MiniRAG notes</span>
+                  <span class="status-text warn">partial</span>
+                  <span data-i18n="needsHuman">需人审</span>
+                </button>
+              </div>
+            </section>
+
+            <section class="mode-panel" data-panel="review" aria-label="Review mode">
+              <div class="review-stack">
+                <button class="review-item" type="button" data-source="minirag">
+                  <strong data-i18n="reviewOneTitle">Benchmark 是否必须等待 local gold？</strong>
+                  <span data-i18n="reviewOneText">1 条 partial_support citation · 需要人审</span>
+                </button>
+                <button class="review-item accepted" type="button" data-source="paperqa">
+                  <strong data-i18n="reviewTwoTitle">Notebook shell 能降低产品理解成本。</strong>
+                  <span data-i18n="reviewTwoText">已由人审接受</span>
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <form class="composer" aria-label="Ask ScanSci" onsubmit="return false">
+            <input type="text" data-i18n-placeholder="composerPlaceholder" placeholder="开始输入..." />
+            <span data-i18n="sourceCount">3 个来源</span>
+            <button class="send-button" type="button" data-action="open-studio-preview" aria-label="发送">
+              <span class="button-icon icon-arrow-up" aria-hidden="true"></span>
+            </button>
+          </form>
+        </section>
+
+        <section class="panel studio-panel" aria-label="Studio">
+          <header class="panel-head">
+            <h2>Studio</h2>
+            <span class="panel-token">8</span>
+          </header>
+
+          <div class="studio-grid">
+            <button class="studio-card green" type="button" data-studio="matrix">
+              <span>EV</span>
+              <strong data-i18n="evidenceMatrix">证据矩阵</strong>
+            </button>
+            <button class="studio-card rose" type="button" data-studio="review">
+              <span>REV</span>
+              <strong data-i18n="reviewSet">审阅集</strong>
+            </button>
+            <button class="studio-card cream" type="button" data-studio="report">
+              <span>REP</span>
+              <strong data-i18n="reportDraft">报告草稿</strong>
+            </button>
+            <button class="studio-card blue" type="button" data-studio="glossary">
+              <span>GLO</span>
+              <strong data-i18n="glossary">术语表</strong>
+            </button>
+            <button class="studio-card sand" type="button" data-studio="timeline">
+              <span>TIM</span>
+              <strong data-i18n="timeline">时间线</strong>
+            </button>
+            <button class="studio-card cyan" type="button" data-studio="methods">
+              <span>MET</span>
+              <strong data-i18n="methodsTable">方法对比</strong>
+            </button>
+            <button class="studio-card pink" type="button" data-studio="benchmark">
+              <span>BEN</span>
+              <strong data-i18n="benchmarkRun">Benchmark</strong>
+            </button>
+            <button class="studio-card violet" type="button" data-studio="manifest">
+              <span>RUN</span>
+              <strong data-i18n="manifest">运行记录</strong>
+            </button>
+          </div>
+
+          <div class="studio-output">
+            <strong data-i18n="studioOutputTitle">等待产物</strong>
+            <p data-i18n="studioOutput">证据产物会保存在此处。</p>
+            <small data-i18n="studioHint">只展示已接入的 ScanSci 输出：矩阵、审阅集、转换模板、benchmark 和 run manifest。</small>
+
+            <div class="matrix-mini" aria-label="Evidence matrix template preview">
+              <div class="matrix-mini-head">
+                <span data-i18n="templateKicker">矩阵模板</span>
+                <strong data-i18n="matrixTemplateName">PaperQA2 类项目吸收点</strong>
+              </div>
+              <div class="template-columns">
+                <span data-i18n="colStudy">Study</span>
+                <span data-i18n="colFinding">Finding</span>
+                <span data-i18n="colEvidence">Evidence</span>
+                <span data-i18n="colReview">Review</span>
+              </div>
+              <button class="run-template-button" type="button" data-action="open-matrix-flow">
+                <span class="button-icon icon-arrow-up" aria-hidden="true"></span>
+                <strong data-i18n="runMatrixTemplate">运行模板</strong>
+              </button>
+            </div>
+          </div>
+
+          <button class="add-note-button" type="button" data-action="open-studio-preview">
+            <span class="button-icon icon-plus" aria-hidden="true"></span>
+            <strong data-i18n="addNote">添加笔记</strong>
+          </button>
+        </section>
+      </main>
+
+      <div class="notebook-switcher" hidden>
+        <div class="switcher-card">
+          <header>
+            <div>
+              <p data-i18n="switcherKicker">选择笔记本</p>
+              <h2 data-i18n="switcherTitle">继续一个研究项目</h2>
+            </div>
+            <button class="icon-button icon-close" type="button" data-action="close-notebook-switcher" aria-label="关闭">
+              <span aria-hidden="true"></span>
+            </button>
+          </header>
+          <div class="notebook-list">
+            <button type="button" data-notebook="rag">
+              <strong data-i18n="notebookRag">Evidence-first RAG 综述</strong>
+              <span data-i18n="notebookRagMeta">36 sources · 142 evidence spans</span>
+            </button>
+            <button type="button" data-notebook="cnki">
+              <strong data-i18n="notebookCnki">CNKI clean HTML 转换评估</strong>
+              <span data-i18n="notebookCnkiMeta">12 sources · parser notes</span>
+            </button>
+            <button type="button" data-notebook="methods">
+              <strong data-i18n="notebookMethods">PaperQA2 / MiniRAG / OpenScholar 对比</strong>
+              <span data-i18n="notebookMethodsMeta">24 sources · benchmark matrix</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="drawer-backdrop" hidden data-action="close-drawer"></div>
+      <aside class="run-drawer" id="runDrawer" aria-hidden="true" aria-label="Agent run manifest">
+        <header class="drawer-head">
+          <div>
+            <p>Agent Run</p>
+            <h2 id="drawerTitle">Manifest Preview</h2>
+          </div>
+          <button class="icon-button icon-close" type="button" data-action="close-drawer" aria-label="关闭">
+            <span aria-hidden="true"></span>
+          </button>
+        </header>
+        <div class="manifest-grid">
+          <span><b>control_plane</b><i>codex</i></span>
+          <span><b>autonomy</b><i>L1 dry-run</i></span>
+          <span><b>worker_model</b><i>action_decider</i></span>
+          <span><b>human_gate</b><i>review_acceptance_gold</i></span>
+        </div>
+        <section class="drawer-section matrix-template-section" data-drawer-view="matrix" hidden>
+          <header class="drawer-section-head">
+            <p data-i18n="templateKicker">矩阵模板</p>
+            <h3 data-i18n="matrixTemplateName">PaperQA2 类项目吸收点</h3>
+          </header>
+          <div class="template-column-grid" aria-label="Matrix template columns">
+            <span>
+              <b data-i18n="colStudy">Study</b>
+              <i data-i18n="colStudyHint">来源与年份</i>
+            </span>
+            <span>
+              <b data-i18n="colFinding">Finding</b>
+              <i data-i18n="colFindingHint">可吸收的产品机制</i>
+            </span>
+            <span>
+              <b data-i18n="colEvidence">Evidence</b>
+              <i data-i18n="colEvidenceHint">quote + selector</i>
+            </span>
+            <span>
+              <b data-i18n="colReview">Review</b>
+              <i data-i18n="colReviewHint">accepted / partial</i>
+            </span>
+          </div>
+        </section>
+        <ol class="run-events" id="runEvents">
+          <li><strong>observe</strong><span>Read evidence.sqlite, workspace.sqlite, acceptance manifest.</span></li>
+          <li><strong>decide</strong><span>Select next allowed action from typed action list.</span></li>
+          <li><strong>record</strong><span>Write replayable manifest without crossing human review gate.</span></li>
+        </ol>
+        <section class="drawer-section matrix-result-section" data-drawer-view="matrix" hidden>
+          <header class="drawer-section-head">
+            <p data-i18n="matrixResultKicker">输出预览</p>
+            <h3 data-i18n="matrixResultTitle">证据矩阵</h3>
+          </header>
+          <div class="matrix-result-table" role="table" aria-label="Generated evidence matrix">
+            <div class="matrix-result-row matrix-result-header" role="row">
+              <span data-i18n="colStudy">Study</span>
+              <span data-i18n="colFinding">Finding</span>
+              <span data-i18n="colEvidence">Evidence</span>
+              <span data-i18n="colReview">Review</span>
+            </div>
+            <button class="matrix-result-row" type="button" data-source="paperqa" role="row">
+              <span>PaperQA2</span>
+              <span data-i18n="matrixFindingOne">把研究任务组织成 notebook/source/chat。</span>
+              <span>
+                <i class="evidence-chip">1</i>
+                <i class="evidence-chip">2</i>
+              </span>
+              <span class="review-badge accepted" data-i18n="accepted">已接受</span>
+            </button>
+            <button class="matrix-result-row" type="button" data-source="cite" role="row">
+              <span>Citation model</span>
+              <span data-i18n="matrixFindingTwo">引用必须能跳回稳定 HTML anchor。</span>
+              <span>
+                <i class="evidence-chip">3</i>
+                <i class="evidence-chip">4</i>
+              </span>
+              <span class="review-badge accepted" data-i18n="accepted">已接受</span>
+            </button>
+            <button class="matrix-result-row" type="button" data-source="minirag" role="row">
+              <span>MiniRAG notes</span>
+              <span data-i18n="matrixFindingThree">benchmark 等待人工 gold 后再运行。</span>
+              <span>
+                <i class="evidence-chip warn">5</i>
+              </span>
+              <span class="review-badge pending" data-i18n="needsHuman">需人审</span>
+            </button>
+          </div>
+        </section>
+        <pre class="manifest-code" aria-label="Manifest JSON">{
+  "control_plane": {"type": "codex"},
+  "autonomy": "L1",
+  "worker_model": {"role": "action_decider"},
+  "next_action": "build_acceptance_workbench",
+  "requires_human": false
+}</pre>
+      </aside>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

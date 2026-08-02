@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "p0_objective": "让正式 ScanSci 桌面包保持轻量：不内置本地 AI 推理依赖或模型权重；用户可在明确确认后，从受信任的 HTTPS 组件清单按需安装运行组件和模型，并完成本地 RAG。",
+  "acceptance": [
+    {
+      "id": "stable-build-cache",
+      "requirement": "构建编号只标识交付物；PyInstaller workpath 由 Python、依赖与构建配置生成稳定缓存键，重复开发构建可以复用。"
+    },
+    {
+      "id": "standard-package",
+      "requirement": "正式 ScanSci core 标准包不内置 torch、transformers、sentence-transformers、tensorflow 或任何模型快照；内置功能必须可在无本地 AI 组件时正常运行。"
+    },
+    {
+      "id": "runtime-component",
+      "requirement": "ScanSci Local Runtime 拥有独立版本、构建缓存、ZIP 与 SHA256 清单，可安装到 LOCALAPPDATA 后被多个主程序版本复用。"
+    },
+    {
+      "id": "runtime-first-use",
+      "requirement": "资料导入、打开对话、构建基础索引和检查状态均不得隐式下载运行组件或模型。只有用户明确点击安装运行组件、完成 SHA256 校验并启用后，界面才允许按需下载 Qwen 检索权重。"
+    },
+    {
+      "id": "model-directory-preserved",
+      "requirement": "F:\\AI\\Models、Hugging Face 缓存及自动发现目录继续作为用户数据，不复制进应用或运行时组件。"
+    },
+    {
+      "id": "existing-agent-routing",
+      "requirement": "GLM、Qwen 托管模型、Skill 路由和知识库问答保持通过原有 ResearchAgentRuntime。"
+    },
+    {
+      "id": "package-identity",
+      "requirement": "验收记录中的 ExecutablePath、build_id、package_profile 与 SHA256 指向同一唯一构建。"
+    },
+    {
+      "id": "desktop-regression",
+      "requirement": "正式 EXE 的发送、参考文献栏规则、窗口最大化和资源完整性继续通过现有验收。"
+    }
+  ],
+  "non_goals": [
+    "本轮不新增聊天、知识库、PPT、模型市场或论文获取产品功能。",
+    "不克隆、迁移或重构到 OpenCode 架构。",
+    "不把用户模型权重打进 ScanSci 主程序或 Local Runtime。",
+    "不以浏览器源码预览、Mock 或单元测试替代正式 EXE 人工交互验收。"
+  ]
+}

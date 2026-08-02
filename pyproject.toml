@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scansci"
+version = "0.2.0"
+description = "Evidence-first scientific research workbench with a Pi-powered agent runtime."
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "cloakbrowser>=0.3.31",
+  "keyring>=25.0",
+  "litellm>=1.80,<2",
+  "lxml>=5.0",
+  "markitdown[all]>=0.1.3,<0.2",
+  "opentelemetry-api>=1.39,<2",
+  "opentelemetry-sdk>=1.39,<2",
+  "playwright>=1.40",
+  "pydantic>=2.0",
+  "pypdf>=5.0",
+  "openpyxl>=3.1,<4",
+  "python-docx>=1.1",
+  "python-pptx>=1.0",
+  "reportlab>=4.0,<5",
+  "pyzotero>=1.6,<2",
+  "requests>=2.31",
+  "sqlite-vec>=0.1.6,<0.2",
+]
+
+[project.optional-dependencies]
+test = [
+  "PyMuPDF>=1.24,<2",
+  "pywebview>=6.0,<7.0",
+  "pytest>=8,<9",
+  "scikit-learn>=1.4",
+  "torch>=2.0,<3",
+]
+rerank = [
+  "sentence-transformers>=5.1,<6.0",
+  "sentencepiece>=0.2,<0.3",
+]
+ie-model = [
+  "scikit-learn>=1.4",
+  "torch>=2.0",
+  "transformers>=4.40",
+]
+local-gpu = [
+  "accelerate>=1.10,<2",
+  "bitsandbytes>=0.49,<0.50",
+  "torch>=2.13,<2.14",
+  "transformers>=5.14,<6",
+]
+desktop = [
+  "pywebview>=6.0,<7.0",
+  "pyinstaller>=6.0,<7.0",
+]
+enhanced-document = [
+  "docling>=2.70,<3",
+]
+tor = [
+  "stem>=1.8,<2",
+  "PySocks>=1.7,<2",
+]
+evaluation = [
+  "deepagents>=0.6.12,<0.7",
+  "langchain-anthropic>=1.4,<2",
+  "langchain-openai>=1.3,<2",
+]
+
+[project.scripts]
+scansci = "scansci_html.cli:main"
+scansci-html = "scansci_html.cli:main"
+scansci-desktop = "scansci_html.desktop:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scansci_html = ["web/*", "web/**/*", "builtin_skill_assets/*", "builtin_skill_assets/**/*", "runtime/latex/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

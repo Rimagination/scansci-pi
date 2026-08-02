@@ -1,0 +1,26 @@
+{
+  "version": "2026-07-28",
+  "description": "Populate expected source document and evidence IDs from an approved, non-private fixture corpus before release.",
+  "cases": [
+    {
+      "id": "exact-fact",
+      "query": "Which source reports the measured outcome?",
+      "expected_route": "evidence-answer",
+      "expected_doc_ids": [],
+      "expected_evidence_ids": []
+    },
+    {
+      "id": "broad-review",
+      "query": "Write a review of the research progress and cite the original evidence.",
+      "expected_route": "evidence-review",
+      "expected_doc_ids": [],
+      "expected_evidence_ids": []
+    },
+    {
+      "id": "adversarial-unknown",
+      "query": "Does the library prove an unsupported imaginary phenomenon?",
+      "expected_route": "evidence-answer",
+      "expect_empty": true
+    }
+  ]
+}

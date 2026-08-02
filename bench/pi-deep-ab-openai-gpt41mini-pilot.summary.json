@@ -1,0 +1,94 @@
+{
+  "schema": "scansci-agent-ab-summary-v1",
+  "manifest": {
+    "schema": "scansci-agent-ab-v1",
+    "created_at": "2026-07-22T01:47:49.838600+00:00",
+    "model": "gpt-4.1-mini",
+    "gateway": "https://api.openai.com/v1",
+    "task_count": 1,
+    "repetitions": 1,
+    "planned_runs": 2,
+    "evidence_db": "F:\\AI\\scansci-pi\\.codex-tmp\\pi-deep-ab-final-20260722\\evidence.sqlite",
+    "evidence_sha256": "7df5dcfc904e38d81158274f49f66a53b607c69f04e8df69368160608ebf8f60",
+    "tasks_sha256": "6dd4748008a266b9b9dabe304a674ba298bf0d15be670f0ce528e4e3911c67a2",
+    "implementation_sha256": "f6cd80f35f1d421bb3ac1c64cde3f68cd651e5854ca5e8873b040edfd83d7045",
+    "workspace": "F:\\AI\\scansci-pi\\.codex-tmp\\pi-deep-ab-final-20260722\\workspace.sqlite",
+    "tools": [
+      "inspect_workspace",
+      "inspect_available_tools",
+      "search_local_evidence",
+      "build_verified_answer",
+      "verify_doi",
+      "discover_papers",
+      "search_journal",
+      "audit_references",
+      "build_presentation_outline"
+    ],
+    "thinking_level": "off",
+    "temperature": 0,
+    "rate_limit_policy": {
+      "retries": 2,
+      "backoff_seconds": 10.0
+    },
+    "results_jsonl": "F:\\AI\\scansci-pi\\bench\\pi-deep-ab-openai-gpt41mini-pilot.jsonl"
+  },
+  "elapsed_seconds": 68.825383,
+  "unique_slots": 2,
+  "valid_runs": 0,
+  "planned_runs": 2,
+  "is_complete": false,
+  "infrastructure_failed_slots": 2,
+  "architectures": {
+    "pi": {
+      "attempted_slots": 1,
+      "runs": 0,
+      "successful_runs": 0,
+      "success_rate": 0.0,
+      "bad_citations": 0,
+      "bad_citation_rate": 0.0,
+      "required_tool_rate": 0.0,
+      "citation_coverage_rate": 0.0,
+      "latency_mean_seconds": 0,
+      "latency_median_seconds": 0,
+      "latency_p95_seconds": 0,
+      "tokens_total": 0,
+      "tokens_mean": 0,
+      "monetary_cost_usd": null,
+      "infrastructure_errors": 1,
+      "categories": {}
+    },
+    "deep": {
+      "attempted_slots": 1,
+      "runs": 0,
+      "successful_runs": 0,
+      "success_rate": 0.0,
+      "bad_citations": 0,
+      "bad_citation_rate": 0.0,
+      "required_tool_rate": 0.0,
+      "citation_coverage_rate": 0.0,
+      "latency_mean_seconds": 0,
+      "latency_median_seconds": 0,
+      "latency_p95_seconds": 0,
+      "tokens_total": 0,
+      "tokens_mean": 0,
+      "monetary_cost_usd": null,
+      "infrastructure_errors": 1,
+      "categories": {}
+    }
+  },
+  "reliability": {
+    "pi": {
+      "real_cancel": "implemented and SDK-tested",
+      "persistent_session": "JSONL session plus logical registry",
+      "restart_recovery": "passed sidecar restart integration test",
+      "context_compaction": "native Pi compact() persisted and tested"
+    },
+    "deep": {
+      "real_cancel": "not exposed by current synchronous ScanSciDeepAgent harness",
+      "persistent_session": "thread_id supplied but no durable checkpointer configured",
+      "restart_recovery": "not available in current integration",
+      "context_compaction": "Deep Agents summarization middleware present; no ScanSci persistence hook"
+    }
+  },
+  "cost_note": "The provider reports token usage but no billed USD. Monetary cost is unavailable, so tokens are the comparison proxy."
+}

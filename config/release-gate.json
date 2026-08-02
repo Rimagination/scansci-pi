@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "product": "ScanSci",
+  "version": "0.2.0",
+  "scope_file": "config/release-scope.json",
+  "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
+  "targeted_commands": [
+    {
+      "id": "targeted-python",
+      "title": "桌面、对话、模型、Skill 与交付路径针对性测试",
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "tests/test_desktop.py",
+        "tests/test_webapp.py",
+        "tests/test_llm.py",
+        "tests/test_app_settings.py",
+        "tests/test_skill_manager.py",
+                                    "tests/test_library_manager.py",
+                                    "tests/test_slide_studio.py",
+                                    "tests/test_slides_templates.py",
+                                    "tests/test_release_gate.py",
+                                    "tests/test_verify_scansci_knowledge.py",
+                                    "tests/test_build_profiles.py",
+        "tests/test_archive_runtime_component.py",
+        "tests/test_prepare_runtime_release_manifest.py",
+        "tests/test_local_runtime_component.py",
+        "tests/test_local_transformers_compat.py",
+        "tests/test_package_desktop_release.py",
+        "tests/test_runtime_identity.py",
+        "tests/test_research_tools.py",
+        "tests/test_research_runs.py",
+        "-q"
+      ]
+    },
+    {
+      "id": "frontend-syntax",
+      "title": "前端脚本语法检查",
+      "command": ["node", "--check", "src/scansci_html/web/app.js"]
+    },
+    {
+      "id": "gateway-worker-tests",
+      "title": "托管模型网关单元测试",
+      "command": [
+        "npm.cmd",
+        "--prefix",
+        "{project_root}/services/scansci-glm-gateway",
+        "test"
+      ]
+    },
+    {
+      "id": "gateway-worker-dry-run",
+      "title": "托管模型网关部署前配置校验",
+      "command": [
+        "npm.cmd",
+        "--prefix",
+        "{project_root}/services/scansci-glm-gateway",
+        "run",
+        "check"
+      ],
+      "console": "log"
+    },
+    {
+      "id": "agent-harness-schema",
+      "title": "Scientific agent harness schema",
+      "command": [
+        "{python}",
+        "scripts/run_agent_harness.py",
+        "--validate-only",
+        "--output",
+        "{diagnostics}/agent-harness-schema.json"
+      ],
+      "result_file": "agent-harness-schema.json",
+      "console": "log"
+    },
+    {
+      "id": "internal-beta-contracts",
+      "title": "内测五条核心用户链路契约",
+      "command": [
+        "{python}",
+        "scripts/verify_internal_beta.py",
+        "--output",
+        "{diagnostics}/internal-beta-contracts.json"
+      ],
+      "result_file": "internal-beta-contracts.json",
+      "console": "log"
+    },
+    {
+      "id": "frontend-browser-submit",
+      "title": "真实浏览器点击与回车提交回归",
+      "command": [
+        "{python}",
+        "scripts/verify_scansci_frontend.py",
+        "--output",
+        "{diagnostics}/frontend-browser-submit.json"
+      ],
+      "result_file": "frontend-browser-submit.json",
+      "console": "log"
+    }
+  ],
+  "full_commands": [
+    {
+      "id": "full-python",
+      "title": "完整 Python 测试套件",
+      "command": ["{python}", "-m", "pytest", "-q"]
+    }
+  ],
+  "real_verifications": [
+    {
+      "id": "dual-model-agent",
+      "title": "ScanSci 托管默认模型、流式输出与 Skill 验证",
+      "command": [
+        "{python}",
+        "scripts/verify_scansci_agent.py",
+        "--output",
+        "{diagnostics}/agent-e2e.json"
+      ],
+      "result_file": "agent-e2e.json",
+      "console": "log",
+      "retry": {
+        "max_attempts": 3,
+        "delay_seconds": 120,
+        "failure_reason": "provider_rate_limited"
+      },
+      "timeout_seconds": 240
+    },
+    {
+      "id": "knowledge-e2e",
+      "title": "真实资料库导入、检索、证据阅读与 Agent 验证",
+      "command": [
+        "{python}",
+        "scripts/verify_scansci_knowledge.py",
+        "--source",
+        "{knowledge_source}",
+        "--limit",
+        "8",
+        "--with-model",
+        "--model",
+        "glm-4.7-flash",
+        "--output",
+        "{diagnostics}/knowledge-e2e.json"
+      ],
+      "result_file": "knowledge-e2e.json",
+      "console": "log",
+      "retry": {
+        "max_attempts": 3,
+        "delay_seconds": 120,
+        "failure_reason": "provider_rate_limited"
+      },
+      "timeout_seconds": 240
+    }
+  ],
+  "package": {
+    "mode": "onedir",
+    "name": "ScanSci",
+    "profile": "core",
+    "signature_required": true,
+    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
+    "max_package_bytes": 1500000000,
+    "forbidden_top_level_resources": [
+      "torch",
+      "transformers",
+      "sentence_transformers",
+      "tensorflow"
+    ],
+    "required_resources": [
+      "scansci_html/web/index.html",
+      "scansci_html/web/styles.css",
+      "scansci_html/web/app.js",
+      "scansci_html/builtin_skill_assets/good-question/SKILL.md",
+      "scansci_html/builtin_skill_assets/good-story/SKILL.md",
+      "scansci_html/builtin_skill_assets/web-access/SKILL.md",
+      "scansci_html/build-info.json"
+    ]
+  },
+  "visual_acceptance": {
+    "evidence_file": "visual-evidence.json",
+    "required_checks": [
+      "enter_send",
+      "button_send",
+      "general_chat_hides_references",
+      "knowledge_chat_shows_references",
+      "taskbar_visible_when_maximized",
+      "window_restore_correct",
+      "home_layout_checked",
+      "chat_layout_checked"
+    ],
+    "required_screenshots": ["home.png", "chat.png", "maximized.png"]
+  }
+}

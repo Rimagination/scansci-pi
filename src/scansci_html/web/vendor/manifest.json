@@ -1,0 +1,18 @@
+{
+  "pdfjs/pdf.mjs": {
+    "bytes": 1027959,
+    "sha256": "0ca136ece072ade5caca5131ffdcc84ef1431076ce50ed67255861cc3340b3a3"
+  },
+  "pdfjs/pdf.worker.mjs": {
+    "bytes": 2366081,
+    "sha256": "dde66d5cd41b7ac11df49b2c130162fceb15d17afe46f552b0fc072d00734a17"
+  },
+  "pdfjs/pdf_viewer.css": {
+    "bytes": 163517,
+    "sha256": "a38845ce94bd5ac25121c5b0b00a12516f75acfcc9d864e0ecd41ff99e9b437f"
+  },
+  "pptxgen/pptxgen.bundle.js": {
+    "bytes": 460889,
+    "sha256": "4fb9eac5cfefb213e2d8743c2b7151025f31bfb3f834c73c12062916daa0f3f8"
+  }
+}

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>ScanSci · 回答生成动效预览</title>
+    <style>
+      :root {
+        --paper: #f4f4f6;
+        --surface: #ffffff;
+        --ink: #24252a;
+        --muted: #85878f;
+        --faint: #b6b7bd;
+        --line: #e4e4e8;
+        --green: #1f7d4e;
+        --ui: "Segoe UI Variable Text", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      body { min-width: 320px; min-height: 100vh; margin: 0; color: var(--ink); background: var(--paper); font-family: var(--ui); }
+      button { font: inherit; }
+      .page { width: min(1120px, calc(100% - 48px)); margin: 0 auto; padding: clamp(36px, 7vw, 84px) 0 64px; }
+      .masthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: clamp(32px, 5vw, 54px); }
+      .eyebrow { display: flex; align-items: center; gap: 9px; margin: 0 0 14px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .12em; }
+      .eyebrow::before { width: 22px; height: 1px; background: var(--green); content: ""; }
+      h1 { margin: 0; font-size: clamp(27px, 4vw, 43px); font-weight: 570; letter-spacing: -.055em; line-height: 1.15; }
+      .intro { max-width: 540px; margin: 16px 0 0; color: var(--muted); font-size: 15px; line-height: 1.75; }
+      .pause-button { flex: 0 0 auto; min-height: 34px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; color: #595b63; background: rgba(255, 255, 255, .72); font-size: 13px; transition: border-color .16s ease, color .16s ease, transform .16s ease; }
+      .pause-button:hover { border-color: #cacbd1; color: var(--ink); transform: translateY(-1px); }
+      .pause-button:focus-visible, .option:focus-visible { outline: 3px solid rgba(31, 125, 78, .22); outline-offset: 3px; }
+
+      .options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+      .option { width: 100%; min-height: 282px; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; color: inherit; background: var(--surface); cursor: pointer; text-align: left; transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease; }
+      .option:hover { border-color: #d0d2d6; box-shadow: 0 16px 30px rgba(34, 35, 40, .06); transform: translateY(-2px); }
+      .option.is-selected { border-color: rgba(31, 125, 78, .46); box-shadow: 0 0 0 3px rgba(31, 125, 78, .1), 0 18px 35px rgba(34, 35, 40, .06); }
+      .preview { position: relative; display: flex; height: 185px; align-items: flex-end; padding: 25px 27px; overflow: hidden; background: linear-gradient(158deg, #fff 0%, #fafafa 100%); }
+      .preview::after { position: absolute; right: -32px; bottom: -54px; width: 150px; height: 150px; border: 1px solid rgba(37, 39, 44, .045); border-radius: 50%; content: ""; }
+      .answer { position: relative; z-index: 1; width: min(100%, 370px); }
+      .answer-meta { margin: 0 0 9px; color: #74767d; font-size: 12px; line-height: 16px; }
+      .answer-copy { width: 90%; height: 11px; margin-bottom: 9px; border-radius: 999px; background: #ededee; }
+      .answer-copy.short { width: 57%; }
+      .generation-line { display: inline-flex; height: 30px; align-items: center; margin-top: 17px; }
+      .indicator { display: inline-flex; width: 44px; align-items: center; justify-content: space-between; }
+      .dot { display: block; width: 9px; height: 9px; border-radius: 50%; background: #17181c; transform-origin: center; }
+      .option-caption { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 13px; min-height: 96px; align-items: start; padding: 19px 21px 20px; border-top: 1px solid #eeeeef; }
+      .option-index { padding-top: 2px; color: var(--faint); font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 11px; }
+      .option-caption strong { display: block; margin-bottom: 5px; font-size: 14px; font-weight: 630; letter-spacing: -.015em; }
+      .option-caption span { display: block; color: var(--muted); font-size: 12px; line-height: 18px; }
+      .selection { display: flex; min-height: 46px; align-items: center; gap: 9px; margin: 22px 0 0; color: #76787f; font-size: 13px; }
+      .selection b { color: var(--green); font-weight: 650; }
+      .selection::before { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(31, 125, 78, .1); content: ""; }
+      .note { margin: 38px 0 0; padding-top: 18px; border-top: 1px solid var(--line); color: #92949a; font-size: 12px; line-height: 20px; }
+
+      /* A — closest to the supplied reference: a quiet three-dot pulse. */
+      .breathing .dot { animation: breathing 1.25s ease-in-out infinite; }
+      .breathing .dot:nth-child(2) { animation-delay: .16s; }
+      .breathing .dot:nth-child(3) { animation-delay: .32s; }
+      @keyframes breathing { 0%, 100% { opacity: .2; transform: scale(.76); } 38% { opacity: 1; transform: scale(1); } }
+
+      /* B — the recommended marqueelike hand-off, visually active but calm. */
+      .handoff .dot { opacity: .25; animation: handoff 1.08s cubic-bezier(.38, .02, .34, 1) infinite; }
+      .handoff .dot:nth-child(2) { animation-delay: .15s; }
+      .handoff .dot:nth-child(3) { animation-delay: .30s; }
+      @keyframes handoff { 0%, 18%, 100% { opacity: .22; transform: scale(.75); } 42%, 60% { opacity: 1; transform: scale(1); } }
+
+      /* C — a small upward beat for a more expressive but still compact state. */
+      .lift .dot { animation: lift 1.05s cubic-bezier(.33, .08, .34, 1) infinite; }
+      .lift .dot:nth-child(2) { animation-delay: .12s; }
+      .lift .dot:nth-child(3) { animation-delay: .24s; }
+      @keyframes lift { 0%, 100% { opacity: .3; transform: translateY(0) scale(.78); } 45% { opacity: 1; transform: translateY(-4px) scale(1); } }
+
+      /* D — a restrained scan: only contrast moves, not the dots themselves. */
+      .scan .dot { animation: scan 1.34s linear infinite; }
+      .scan .dot:nth-child(2) { animation-delay: .18s; }
+      .scan .dot:nth-child(3) { animation-delay: .36s; }
+      @keyframes scan { 0%, 16% { opacity: .18; } 32%, 53% { opacity: 1; } 70%, 100% { opacity: .18; } }
+
+      .is-paused .dot { animation-play-state: paused; }
+      @media (prefers-reduced-motion: reduce) { .dot { animation: none !important; } }
+      @media (max-width: 720px) { .page { width: min(100% - 28px, 1120px); padding-top: 34px; } .masthead { flex-direction: column; gap: 18px; } .options { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">SCANSCl · MOTION STUDY 01</p>
+          <h1>回答正在生成</h1>
+          <p class="intro">为流式回答开始前的短暂等待设计。重点是让用户感到系统仍在工作，同时不抢走回答内容的注意力。</p>
+        </div>
+        <button class="pause-button" type="button" id="pauseButton" aria-pressed="false">暂停动效</button>
+      </header>
+
+      <section class="options" aria-label="生成中动效方案">
+        <button class="option is-selected" type="button" data-option="呼吸点">
+          <div class="preview"><div class="answer"><p class="answer-meta">ScanSciAI · 通用对话</p><div class="answer-copy"></div><div class="answer-copy short"></div><div class="generation-line"><span class="indicator breathing" aria-label="正在生成"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div></div></div>
+          <span class="option-caption"><span class="option-index">01</span><span><strong>呼吸点</strong><span>最接近参考图；三点依次呼吸，安静、熟悉。</span></span></span>
+        </button>
+        <button class="option" type="button" data-option="传递点">
+          <div class="preview"><div class="answer"><p class="answer-meta">ScanSciAI · 通用对话</p><div class="answer-copy"></div><div class="answer-copy short"></div><div class="generation-line"><span class="indicator handoff" aria-label="正在生成"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div></div></div>
+          <span class="option-caption"><span class="option-index">02</span><span><strong>传递点</strong><span>亮度从左向右交接，更有“跑马灯”感。<b>推荐</b></span></span></span>
+        </button>
+        <button class="option" type="button" data-option="抬升点">
+          <div class="preview"><div class="answer"><p class="answer-meta">ScanSciAI · 通用对话</p><div class="answer-copy"></div><div class="answer-copy short"></div><div class="generation-line"><span class="indicator lift" aria-label="正在生成"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div></div></div>
+          <span class="option-caption"><span class="option-index">03</span><span><strong>抬升点</strong><span>保留三点的节奏，同时增加一点轻微的工作感。</span></span></span>
+        </button>
+        <button class="option" type="button" data-option="扫描点">
+          <div class="preview"><div class="answer"><p class="answer-meta">ScanSciAI · 通用对话</p><div class="answer-copy"></div><div class="answer-copy short"></div><div class="generation-line"><span class="indicator scan" aria-label="正在生成"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div></div></div>
+          <span class="option-caption"><span class="option-index">04</span><span><strong>扫描点</strong><span>仅改变深浅、不改变位置；最克制，也最不容易分散注意力。</span></span></span>
+        </button>
+      </section>
+
+      <p class="selection" id="selection">当前偏好：<b>呼吸点</b>。点击任一方案即可标记。</p>
+      <p class="note">正式接入时，该提示只会在尚未收到首个流式字符的短暂阶段显示；第一段回答到达后自然让位给正文与光标。</p>
+    </main>
+    <script>
+      const pauseButton = document.querySelector("#pauseButton");
+      const selection = document.querySelector("#selection");
+      document.querySelectorAll(".option").forEach((option) => {
+        option.addEventListener("click", () => {
+          document.querySelectorAll(".option").forEach((item) => item.classList.remove("is-selected"));
+          option.classList.add("is-selected");
+          selection.innerHTML = `当前偏好：<b>${option.dataset.option}</b>。点击任一方案即可标记。`;
+        });
+      });
+      pauseButton.addEventListener("click", () => {
+        const paused = document.body.classList.toggle("is-paused");
+        pauseButton.textContent = paused ? "播放动效" : "暂停动效";
+        pauseButton.setAttribute("aria-pressed", String(paused));
+      });
+    </script>
+  </body>
+</html>
