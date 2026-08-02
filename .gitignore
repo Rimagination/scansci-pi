@@ -49,6 +49,7 @@ bench/*.lock
 bench/*.partial.summary.json
 bench/*.partial.summary.md
 bench/*.chart.html
+bench/sample_library/*.evidence.html
 releases/
 .scansci-diagnostics/
 
