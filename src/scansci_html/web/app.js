@@ -1336,7 +1336,7 @@ function mergeLocalModelInstall(job) {
   jobs.unshift(job);
   state.localModelInstall = {
     jobs,
-    active: ["queued", "downloading"].includes(job.state) ? job : jobs.find((item) => ["queued", "downloading"].includes(item.state)) || null,
+    active: ["queued", "downloading", "pausing", "cancelling"].includes(job.state) ? job : jobs.find((item) => ["queued", "downloading", "pausing", "cancelling"].includes(item.state)) || null,
   };
 }
 
@@ -1367,7 +1367,11 @@ function downloadJobTitle(job, kind = "model") {
 function downloadJobStatus(job) {
   const stateName = String(job?.state || "idle");
   if (job?.stalled) return { label: "进度停滞", tone: "warning", detail: `已 ${formatDownloadDuration(job.last_update_seconds).replace("约 ", "")} 没有收到新数据，可能是网络受阻。` };
-  if (["failed", "cancelled"].includes(stateName)) return { label: "下载失败", tone: "error", detail: job?.error || job?.message || "下载没有完成。" };
+  if (stateName === "cancelled") return { label: "已取消", tone: "warning", detail: job?.message || "下载已取消；可以重试并续传已有内容。" };
+  if (stateName === "failed") return { label: "下载失败", tone: "error", detail: job?.error || job?.message || "下载没有完成。" };
+  if (stateName === "paused") return { label: "已暂停", tone: "warning", detail: job?.message || "恢复时会继续使用已下载的临时文件。" };
+  if (stateName === "pausing") return { label: "正在暂停", tone: "warning", detail: job?.message || "正在保存可恢复的下载位置。" };
+  if (stateName === "cancelling") return { label: "正在取消", tone: "warning", detail: job?.message || "正在停止下载并保留可重试内容。" };
   if (stateName === "interrupted") return { label: "下载已中断", tone: "warning", detail: job?.message || "重新开始后会续传已有内容。" };
   if (stateName === "ready") return { label: "已完成", tone: "ready", detail: job?.message || "下载和校验已完成。" };
   if (stateName === "queued") return { label: "等待下载", tone: "active", detail: job?.message || "正在连接下载源。" };
@@ -1400,12 +1404,31 @@ function downloadTaskEntries({ includeReady = false } = {}) {
   return entries.sort((left, right) => Number(right.job.updated_at || 0) - Number(left.job.updated_at || 0));
 }
 
+function downloadTaskControls(entry) {
+  if (!["model", "runtime"].includes(entry.kind) || !entry.job?.job_id) return "";
+  const job = entry.job;
+  const jobId = escapeHtml(job.job_id);
+  const kind = escapeHtml(entry.kind);
+  const stateName = String(job.state || "");
+  if (["queued", "downloading", "installing"].includes(stateName)) {
+    return `<div class="download-task-controls"><button type="button" class="download-task-action" data-action="control-download-task" data-download-kind="${kind}" data-download-action="pause" data-job-id="${jobId}">暂停</button><button type="button" class="download-task-action is-quiet" data-action="control-download-task" data-download-kind="${kind}" data-download-action="cancel" data-job-id="${jobId}">取消</button></div>`;
+  }
+  if (["pausing", "cancelling"].includes(stateName)) return "";
+  if (["paused", "interrupted"].includes(stateName)) {
+    return `<div class="download-task-controls"><button type="button" class="download-task-action" data-action="control-download-task" data-download-kind="${kind}" data-download-action="resume" data-job-id="${jobId}">恢复</button><button type="button" class="download-task-action is-quiet" data-action="control-download-task" data-download-kind="${kind}" data-download-action="cancel" data-job-id="${jobId}">取消</button></div>`;
+  }
+  if (["failed", "cancelled"].includes(stateName)) {
+    return `<div class="download-task-controls"><button type="button" class="download-task-action" data-action="control-download-task" data-download-kind="${kind}" data-download-action="retry" data-job-id="${jobId}">重试</button></div>`;
+  }
+  return "";
+}
+
 function downloadTaskRow(entry) {
   const job = entry.job || {};
   const status = downloadJobStatus(job);
   const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress || 0) * 100)));
   const telemetry = downloadJobTelemetry(job);
-  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(entry.kind === "runtime" ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${["queued", "downloading", "installing"].includes(job.state) ? ` · ${progress}%` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div></div></article>`;
+  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(entry.kind === "runtime" ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${["queued", "downloading", "installing"].includes(job.state) ? ` · ${progress}%` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div>${downloadTaskControls(entry)}</div></article>`;
 }
 
 function renderDownloadActivity() {
@@ -1417,7 +1440,7 @@ function renderDownloadActivity() {
     host.setAttribute("aria-live", "polite");
     document.body.appendChild(host);
   }
-  const entries = downloadTaskEntries().filter((entry) => ["queued", "downloading", "installing", "failed", "cancelled", "interrupted"].includes(entry.job.state));
+  const entries = downloadTaskEntries().filter((entry) => ["queued", "downloading", "installing", "pausing", "cancelling", "paused", "failed", "cancelled", "interrupted"].includes(entry.job.state));
   if (!entries.length && !state.downloadStatusError) {
     host.hidden = true;
     host.innerHTML = "";
@@ -1461,6 +1484,24 @@ function scheduleLocalModelInstallPoll(delay = 900) {
   }, delay);
 }
 
+async function controlDownloadTask(jobId, action, kind = "model") {
+  const runtime = kind === "runtime";
+  const job = await request(runtime ? "/api/local-runtime/install-control" : "/api/local-models/install-control", {
+    method: "POST",
+    body: JSON.stringify(runtime ? { action } : { job_id: jobId, action }),
+  });
+  if (runtime) {
+    state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
+  } else {
+    mergeLocalModelInstall(job);
+  }
+  renderDownloadActivity();
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (runtime) scheduleLocalRuntimeInstallPoll(250);
+  else scheduleLocalModelInstallPoll(250);
+  toast({ pause: "下载已暂停", resume: "下载已恢复", retry: "已重新开始下载", cancel: "下载已取消" }[action] || "下载任务已更新");
+}
+
 function scheduleLocalRuntimeInstallPoll(delay = 700) {
   if (localRuntimeInstallPollTimer) return;
   localRuntimeInstallPollTimer = window.setTimeout(async () => {
@@ -1472,7 +1513,7 @@ function scheduleLocalRuntimeInstallPoll(delay = 700) {
       if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
       if (state.onboardingOpen) renderResourceOnboarding();
       renderDownloadActivity();
-      if (["queued", "installing"].includes(job.state)) {
+      if (["queued", "installing", "pausing", "cancelling"].includes(job.state)) {
         scheduleLocalRuntimeInstallPoll(700);
       } else if (job.state === "ready") {
         state.localRuntime = await request("/api/local-runtime");
@@ -1735,14 +1776,14 @@ function renderKnowledgeScopeDialog() {
     const active = ready && selected.has(String(notebook.notebook_id));
     const count = Number(notebook.counts?.sources || 0);
     const action = ready ? "toggle-notebook-scope" : unavailableKnowledgeAction(notebook);
-    const label = ready ? `${count} 篇` : unavailableKnowledgeLabel(notebook);
+    const label = ready ? `${count} 个文档` : unavailableKnowledgeLabel(notebook);
     // Selection is intentionally the only right-side affordance.  An
     // unavailable or unselected library must not render a placeholder or
     // navigation glyph here: it looks like a selected state at a glance.
     const selectionMark = active
       ? `<span class="knowledge-scope-selected" aria-label="已选中">${uiIcon("check")}</span>`
       : "";
-    return `<button type="button" class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-action="${action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}` : `${unavailableKnowledgeLabel(notebook)}：${knowledgeScopeTitle(notebook)}`)}"><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small title="${escapeHtml(ready ? `${count} 篇可检索资料` : "尚无可检索内容")}">${escapeHtml(label)}</small>${selectionMark}</button>`;
+    return `<button type="button" class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-action="${action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}` : `${unavailableKnowledgeLabel(notebook)}：${knowledgeScopeTitle(notebook)}`)}"><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small title="${escapeHtml(ready ? `${count} 个文档可检索` : "尚无可检索内容")}">${escapeHtml(label)}</small>${selectionMark}</button>`;
   }).join("");
   target.innerHTML = `<section class="knowledge-scope-connect"><button type="button" data-action="create-empty-library"><img src="/knowledge-personal.svg" alt="" /><span>个人知识库</span>${uiIcon("plus")}</button><button type="button" data-action="choose-zotero-library"><img src="/zotero-logo.svg" alt="" /><span>Zotero</span>${uiIcon("plus")}</button><button type="button" data-action="choose-obsidian-vault"><img src="/obsidian-logo.svg" alt="" /><span>Obsidian</span>${uiIcon("plus")}</button></section><section class="knowledge-scope-list"><header><h3>选择知识库</h3><span>可多选</span></header>${rows || `<div class="knowledge-scope-empty">先链接一个本地知识库</div>`}</section>`;
   hydrateIcons(target);
@@ -2709,7 +2750,7 @@ const contextPanelPresets = Object.freeze({
     kind: "sources",
     eyebrow: "研究上下文",
     title: "研究资料",
-    countUnit: " 个来源",
+    countUnit: " 个文档",
     toggleLabel: "研究资料",
     landmarkLabel: "研究资料上下文",
   },
@@ -2717,7 +2758,7 @@ const contextPanelPresets = Object.freeze({
     kind: "sources",
     eyebrow: "当前回答",
     title: "知识来源",
-    countUnit: " 个可用来源",
+    countUnit: " 个可用文档",
     toggleLabel: "知识来源",
     landmarkLabel: "知识问答来源",
   },
@@ -2725,7 +2766,7 @@ const contextPanelPresets = Object.freeze({
     kind: "sources",
     eyebrow: "可核验上下文",
     title: "证据来源",
-    countUnit: " 个来源",
+    countUnit: " 个文档",
     toggleLabel: "证据来源",
     landmarkLabel: "证据与来源",
   },
@@ -3002,7 +3043,22 @@ function upsertRun(run) {
 function renderSources() {
   const query = state.sourceQuery.toLowerCase();
   const sources = (state.notebook?.sources || []).filter((source) => [source.title, source.doi, source.doc_id].join(" ").toLowerCase().includes(query));
-  byId("sourceCount").textContent = state.notebook?.counts?.sources || 0;
+  const knowledgeCounts = state.notebook?.knowledge_counts || {};
+  const documentCount = Number(knowledgeCounts.documents ?? state.notebook?.counts?.sources ?? 0) || 0;
+  byId("sourceCount").textContent = documentCount;
+  const countSummary = byId("knowledgeCountSummary");
+  if (countSummary) {
+    const labels = [
+      ["documents", "文档"],
+      ["summaries", "摘要"],
+      ["sections", "章节"],
+      ["evidence_spans", "证据片段"],
+      ["vectors", "向量"],
+    ];
+    countSummary.innerHTML = labels
+      .map(([key, label]) => `<span><b>${Number(knowledgeCounts[key] || 0).toLocaleString("zh-CN")}</b>${label}</span>`)
+      .join("");
+  }
   if (!sources.length) {
     sourceList.innerHTML = `<div class="source-empty">${query ? "未找到文献" : "暂无来源"}</div>`;
     return;
@@ -4238,7 +4294,7 @@ function renderEvidenceReviewMethodGuide() {
   const notebooks = selectedKnowledgeNotebooks();
   const sourceCount = notebooks.reduce((sum, notebook) => sum + Number(notebook.counts?.sources || 0), 0);
   const scopeLabel = notebooks.length
-    ? `${notebooks.map((notebook) => compact(knowledgeScopeTitle(notebook), 20)).join("、")} · ${sourceCount} 篇可检索资料`
+    ? `${notebooks.map((notebook) => compact(knowledgeScopeTitle(notebook), 20)).join("、")} · ${sourceCount} 个文档可检索`
     : "先在输入框下方选择要使用的知识库";
   return `<section class="evidence-review-method" aria-label="证据综述使用方法"><header><div><span>HOW IT WORKS</span><h3>三步完成证据综述</h3></div><p>只依据当前资料库，不补写没有来源的结论。</p></header><ol><li><b>1</b><div><strong>确认资料范围</strong><small>${escapeHtml(scopeLabel)}</small></div><button type="button" data-action="open-knowledge-scope">更改</button></li><li><b>2</b><div><strong>输入综述主题</strong><small>说明对象、比较维度或时间范围即可。</small></div></li><li><b>3</b><div><strong>阅读并核验</strong><small>关键结论附引用；点击可查看原文片段。</small></div></li></ol><footer><span>${uiIcon("shield-check")} 输出：摘要、主题章节、共识与分歧、开放问题、原文引用</span><button type="button" data-action="apply-mode-example" data-mode-example="evidence-review-progress">填入示例 ${uiIcon("arrow-up-right")}</button></footer></section>`;
 }
@@ -4720,7 +4776,7 @@ async function connectLocalZotero(notebookId = "") {
   const indexedCount = Number(result.notebook?.counts?.sources || 0);
   const itemCount = Number(result.zotero?.item_count || 0);
   const message = indexedCount
-    ? `已连接本机 Zotero · 已建立 ${indexedCount} 篇可检索资料`
+    ? `已连接本机 Zotero · 已建立 ${indexedCount} 个可检索文档`
     : itemCount
       ? `已读取 Zotero 的 ${itemCount} 条文献，但未找到可检索的 PDF 正文`
       : "未读取到 Zotero 文献，请确认本机资料库中已有条目";
@@ -4786,7 +4842,7 @@ async function applyLibraryImport(result, message) {
     : ["queued", "downloading"].includes(result.model_install?.state)
       ? " · 正在通过国内源安装高质量检索组件，完成后会自动索引"
       : "";
-  toast(`${message} · ${state.notebook?.counts?.sources || 0} 篇来源${indexing}`);
+  toast(`${message} · ${state.notebook?.counts?.sources || 0} 个文档${indexing}`);
 }
 
 function toggleComposerModePicker(trigger) {
@@ -4995,9 +5051,11 @@ async function createResearchRun(workflowType, input = {}) {
         ...(state.notebook ? { notebook_id: state.notebook.notebook_id } : {}),
         ...(activeKnowledgeScopePayload() ? { knowledge_scope: activeKnowledgeScopePayload() } : {}),
       };
+  const suppliedKey = String(input.idempotency_key || input.request_id || "").trim();
+  const generatedKey = suppliedKey || `ui-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
   return request("/api/runs", {
     method: "POST",
-    body: JSON.stringify({ workflow_type: workflowType, ...knowledgePayload, ...input, thinking_level: currentThinkingLevel() }),
+    body: JSON.stringify({ workflow_type: workflowType, ...knowledgePayload, ...input, thinking_level: currentThinkingLevel(), idempotency_key: generatedKey }),
   });
 }
 
@@ -5026,12 +5084,28 @@ async function continueTaskConversation(runId, content) {
 async function watchRun(runId, onUpdate = () => {}) {
   let run = state.runs.find((item) => item.run_id === runId);
   const terminal = new Set(["completed", "failed", "cancelled", "paused", "needs_confirmation", "waiting_input"]);
-  for (let attempt = 0; attempt < 1800 && (!run || !terminal.has(run.status)); attempt += 1) {
+  let afterSequence = Number(run?.last_event_sequence || 0);
+  let hasMore = false;
+  const replayedEvents = new Map((run?.events || []).map((event) => [Number(event.sequence || 0), event]));
+  for (let attempt = 0; attempt < 1800 && (!run || !terminal.has(run.status) || hasMore); attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, attempt < 4 ? 180 : 650));
     try {
-      run = await request(`/api/runs/${encodeURIComponent(runId)}`);
+      const payload = await request(`/api/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=200`);
+      const snapshot = payload?.snapshot || payload?.run || payload;
+      const nextEvents = Array.isArray(payload?.events) ? payload.events : [];
+      nextEvents.forEach((event) => replayedEvents.set(Number(event.sequence || 0), event));
+      run = {
+        ...snapshot,
+        events: [...replayedEvents.values()].filter((event) => Number(event.sequence || 0) > 0).sort((a, b) => Number(a.sequence || 0) - Number(b.sequence || 0)),
+      };
+      afterSequence = Math.max(afterSequence, Number(payload?.last_sequence || run.last_event_sequence || 0));
+      hasMore = Boolean(payload?.has_more);
       upsertRun(run);
       onUpdate(run);
+      if (hasMore) {
+        attempt = Math.max(-1, attempt - 1);
+        continue;
+      }
     } catch (error) {
       toast(error.message, true);
       return;
@@ -5437,7 +5511,7 @@ function renderRun(run) {
     ? `${evidenceIndex.completed.toLocaleString("zh-CN")} / ${evidenceIndex.total.toLocaleString("zh-CN")} 条原文证据 · ${percent}%`
     : `${runStatusLabel(run)} · ${percent}%`;
   const indexContext = evidenceIndex
-    ? `<p class="run-index-context">资料库：<strong>${escapeHtml(evidenceIndex.title)}</strong>${evidenceIndex.sourceCount ? ` · ${escapeHtml(String(evidenceIndex.sourceCount))} 篇资料` : ""}<span>原文件与原文证据无需重新导入</span></p>`
+    ? `<p class="run-index-context">资料库：<strong>${escapeHtml(evidenceIndex.title)}</strong>${evidenceIndex.sourceCount ? ` · ${escapeHtml(String(evidenceIndex.sourceCount))} 个文档` : ""}<span>原文件与原文证据无需重新导入</span></p>`
     : "";
   const executionLog = `${runControlPlaneMarkup(run)}<details class="run-execution-log ${evidenceIndex ? "is-evidence-index" : ""}" ${active ? "open" : ""}><summary><span>${uiIcon(active ? "refresh" : "check")}</span><div><strong>${escapeHtml(executionTitle)}</strong><small>${escapeHtml(executionMeta)}</small></div>${uiIcon("chevron-right", "run-execution-chevron")}</summary><section class="run-card"><header class="run-card-head"><div><span class="run-kind">${escapeHtml(workflowLabel)}</span><h2>${escapeHtml(runDisplayTitle(run))}</h2>${indexContext}</div><div class="run-head-actions"><span class="run-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</span>${actions}</div></header><div class="run-progress"><i class="${progressWidthClass(percent)}"></i></div><ol class="run-stage-list">${stages}</ol></section>${runResult}</details>`;
   byId("answerArea").innerHTML = `<article class="run-shell">${userMessage}${executionLog}${runCompletionMessageMarkup(run)}</article>`;
@@ -6239,9 +6313,8 @@ function renderLibraryMode() {
       ? `<button type="button" class="knowledge-source-quiet" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(notebook.notebook_id)}">刷新</button>`
       : `<button type="button" class="knowledge-source-quiet" data-action="choose-library-files" data-notebook-id="${escapeHtml(notebook.notebook_id)}">添加文件</button>`;
     const dropAttributes = kindKey === "zotero" ? "" : ` data-library-dropzone data-notebook-id="${escapeHtml(notebook.notebook_id)}"`;
-    return `<article class="knowledge-source-row ${selected ? "is-selected" : ""}"${dropAttributes}><span class="knowledge-source-mark ${escapeHtml(kindKey)}">${uiIcon(kind.icon)}</span><div class="knowledge-source-copy"><span>${escapeHtml(kind.title)}${selected ? " · 本轮检索范围" : ""}</span><h3>${escapeHtml(notebook.title || pathLeaf(notebook.root_path))}</h3><p title="${escapeHtml(path)}">${escapeHtml(compact(path, 72))}</p></div><div class="knowledge-source-count"><strong>${itemCount}</strong><span>${kindKey === "zotero" ? "条文献" : "篇已索引"}</span></div><div class="knowledge-source-actions">${addAction}<button type="button" class="knowledge-source-select" data-action="select-notebook" data-notebook-id="${escapeHtml(notebook.notebook_id)}">${selected ? `${uiIcon("check")} 已选择` : "用于对话"}</button></div></article>`;
+    return `<article class="knowledge-source-row ${selected ? "is-selected" : ""}"${dropAttributes}><span class="knowledge-source-mark ${escapeHtml(kindKey)}">${uiIcon(kind.icon)}</span><div class="knowledge-source-copy"><span>${escapeHtml(kind.title)}${selected ? " · 本轮检索范围" : ""}</span><h3>${escapeHtml(notebook.title || pathLeaf(notebook.root_path))}</h3><p title="${escapeHtml(path)}">${escapeHtml(compact(path, 72))}</p></div><div class="knowledge-source-count"><strong>${itemCount}</strong><span>${kindKey === "zotero" ? "条文献记录" : "个文档"}</span></div><div class="knowledge-source-actions">${addAction}<button type="button" class="knowledge-source-select" data-action="select-notebook" data-notebook-id="${escapeHtml(notebook.notebook_id)}">${selected ? `${uiIcon("check")} 已选择` : "用于对话"}</button></div></article>`;
   }).join("");
-  return `<section class="knowledge-library knowledge-source-hub"><header class="knowledge-hub-hero"><div><span>LOCAL DATA SOURCES</span><h2>连接资料，而不是搬运资料</h2><p>Zotero、Obsidian、Notion 和本地文件夹各自作为一个数据源；在对话中只选择本轮要检索的范围。</p></div><aside>${uiIcon("shield-check")}<div><strong>原文件留在原处</strong><span>ScanSci 只保存可重建索引和引用定位，不把几千篇 PDF 画成几千本书。</span></div></aside></header><section class="knowledge-hub-summary"><div><strong>${notebooks.length}</strong><span>已连接数据源</span></div><div><strong>${totalSources}</strong><span>篇可检索来源</span></div><div><strong>${active ? escapeHtml(compact(knowledgeScopeTitle(active), 22)) : "未选择"}</strong><span>本轮检索范围</span></div></section><section class="knowledge-connector-grid" aria-label="连接数据源"><article class="knowledge-connector zotero"><span class="knowledge-connector-icon">${uiIcon("library")}</span><div><header><h3>Zotero</h3><i>${zoteroLibraries.length ? `${zoteroLibraries.length} 个已连接` : "未连接"}</i></header><p>连接本机数据库后，按全库或 Collection 选择检索范围。</p><button type="button" data-action="choose-zotero-library">${zoteroLibraries.length ? "再连接一个资料库" : "连接 Zotero"}${uiIcon("chevron-right")}</button></div></article><article class="knowledge-connector obsidian"><span class="knowledge-connector-icon">${uiIcon("book")}</span><div><header><h3>Obsidian</h3><i>${obsidianLibraries.length ? `${obsidianLibraries.length} 个已连接` : "未连接"}</i></header><p>可以绑定整个 Vault，也可以只绑定其中一个研究文件夹。</p><button type="button" data-action="choose-obsidian-vault">选择 Vault 或文件夹${uiIcon("chevron-right")}</button></div></article><article class="knowledge-connector notion"><span class="knowledge-connector-icon"><img src="/notion-logo.png" alt="" /></span><div><header><h3>Notion</h3><i>${notionLibraries.length ? `${notionLibraries.length} 个已连接` : "未连接"}</i></header><p>连接一个 Notion 根页面，自动同步它下面已授权的子页面和数据库。</p><button type="button" data-action="connect-notion">${notionLibraries.length ? "再连接一个 Notion 页面" : "连接 Notion"}${uiIcon("chevron-right")}</button></div></article><article class="knowledge-connector folder"><span class="knowledge-connector-icon">${uiIcon("folder-open")}</span><div><header><h3>本地文件夹</h3><i>${localLibraries.length ? `${localLibraries.length} 个已连接` : "未连接"}</i></header><p>C 盘、D 盘中的目录可以逐个绑定，互不替换。</p><button type="button" data-action="choose-library-folder">绑定文件夹${uiIcon("chevron-right")}</button></div></article><article class="knowledge-connector empty"><span class="knowledge-connector-icon">${uiIcon("plus")}</span><div><header><h3>空知识库</h3><i>按需创建</i></header><p>先创建一个检索容器，再逐步添加散落的文献文件。</p><button type="button" data-action="create-empty-library">创建知识库${uiIcon("chevron-right")}</button></div></article></section><section class="knowledge-source-list"><header><div><span>CONNECTED SOURCES</span><h2>已连接的数据源</h2></div><button type="button" data-action="open-knowledge-scope">选择本轮范围</button></header><div>${sourceRows || `<button type="button" class="knowledge-source-empty" data-action="choose-library-folder">${uiIcon("folder-open")}<span><strong>还没有数据源</strong><small>从 Zotero、Obsidian、Notion 或任意本地文件夹开始</small></span>${uiIcon("chevron-right")}</button>`}</div></section></section>`;
 }
 
 function knowledgeSourceKind(notebook) {
@@ -8103,6 +8176,12 @@ document.addEventListener("click", (event) => {
   else if (action === "check-app-update") refreshAppUpdate().catch((error) => toast(error.message, true));
   else if (action === "install-app-update") installAppUpdate().catch((error) => toast(error.message, true));
   else if (action === "open-download-center") openSettings("resources");
+  else if (action === "control-download-task") {
+    element.disabled = true;
+    controlDownloadTask(element.dataset.jobId || "", element.dataset.downloadAction || "", element.dataset.downloadKind || "model")
+      .catch((error) => toast(error.message, true))
+      .finally(() => { if (element.isConnected) element.disabled = false; });
+  }
   else if (action === "toggle-attachment-menu") {
     event.preventDefault();
     toggleAttachmentMenu(element);

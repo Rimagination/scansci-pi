@@ -58,6 +58,13 @@ def test_workspace_registers_notebook_sources_notes_and_layers(tmp_path: Path):
         "citation_audits": 0,
     }
     notebook_summary = summary["notebooks"][0]
+    knowledge_counts = notebook_summary["knowledge_counts"]
+    assert knowledge_counts["documents"] == 1
+    assert knowledge_counts["summaries"] == 0
+    assert knowledge_counts["sections"] == 2
+    assert knowledge_counts["evidence_spans"] == 2
+    assert knowledge_counts["vectors"] == 2
+    assert "evidence_spans" not in notebook_summary["counts"]
     assert notebook_summary["sources"][0]["doc_id"] == "10.1234_gal"
     assert notebook_summary["notes"][0]["note_id"] == note["note_id"]
     assert notebook_summary["layers"][0]["annotation_layer_id"] == "tregs"

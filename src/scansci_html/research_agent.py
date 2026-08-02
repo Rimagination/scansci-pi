@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
 import re
 import sqlite3
@@ -11,6 +13,7 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .agent_context import build_agent_system_context, runtime_self_description, selected_skill_ids
@@ -33,7 +36,7 @@ from .deep_research import (
 )
 from .deep_research_evidence import build_task_fulltext_evidence, task_evidence_root
 from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
-from .evidence_store import ensure_library_overview
+from .evidence_store import ensure_library_overview, knowledge_base_snapshot
 from .image_attachments import persist_image_attachments, vision_image_blocks
 from .ingestion import ingest_sources, ingestion_context
 from .library_manager import import_library_files, notebook_evidence_db
@@ -59,7 +62,7 @@ from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .pi_agent import PiAgentClient, PiAgentRunError
 from .qa.agent import answer_question
-from .research_runs import ResearchRunStore, StageSpec, redact_sensitive_text
+from .research_runs import ResearchRunStore, StageSpec, classify_error, redact_sensitive_text
 from .research_subagents import (
     MAX_CONCURRENT_SCIENTIFIC_SUBAGENTS,
     delegation_prompt,
@@ -1309,6 +1312,102 @@ class _DirectChatRequest:
     notebook_ids: list[str]
 
 
+class _DurableModelClient:
+    """Record model request lifecycle events for one durable research stage.
+
+    Prompts and model output are intentionally not persisted in the event
+    payload. Only hashes and structural metadata are retained, so the trace is
+    useful for recovery/audit without becoming a credential or source-text log.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        store: ResearchRunStore,
+        run_id: str,
+        stage_id: str,
+        stage_key: str,
+    ) -> None:
+        self._client = client
+        self._store = store
+        self._run_id = str(run_id)
+        self._stage_id = str(stage_id)
+        self._stage_key = str(stage_key)
+
+    def complete_json(self, messages: list[dict[str, Any]], *, schema_name: str, **kwargs: Any) -> Any:
+        request_id = f"model-{uuid4().hex}"
+        input_shape = [
+            {
+                "role": str(message.get("role", "")),
+                "content_length": len(str(message.get("content", ""))),
+            }
+            for message in list(messages or [])
+        ]
+        input_hash = hashlib.sha256(
+            json.dumps(
+                {"schema_name": str(schema_name), "messages": input_shape},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        common = {
+            "request_id": request_id,
+            "schema_name": str(schema_name),
+            "stage_key": self._stage_key,
+        }
+        self._store.append_event(
+            self._run_id,
+            event_type="model.request.started",
+            summary=f"模型请求开始：{str(schema_name)[:120]}",
+            actor="worker",
+            stage_id=self._stage_id,
+            request_id=request_id,
+            payload={**common, "input_shape": input_shape},
+            input_hash=input_hash,
+            idempotency_key=f"{request_id}:started",
+        )
+        try:
+            result = self._client.complete_json(messages, schema_name=schema_name, **kwargs)
+        except Exception as error:  # noqa: BLE001 - lifecycle event must precede re-raise
+            self._store.append_event(
+                self._run_id,
+                event_type="model.request.failed",
+                summary=f"模型请求失败：{str(schema_name)[:120]}",
+                actor="worker",
+                stage_id=self._stage_id,
+                request_id=request_id,
+                payload={**common, "error": redact_sensitive_text(str(error))[:240]},
+                input_hash=input_hash,
+                error_category=classify_error(error, operation="model.request"),
+                idempotency_key=f"{request_id}:failed",
+            )
+            raise
+        output_hash = hashlib.sha256(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        self._store.append_event(
+            self._run_id,
+            event_type="model.request.completed",
+            summary=f"模型请求完成：{str(schema_name)[:120]}",
+            actor="worker",
+            stage_id=self._stage_id,
+            request_id=request_id,
+            payload={
+                **common,
+                "output_type": type(result).__name__,
+                "output_keys": sorted(str(key) for key in result) if isinstance(result, dict) else [],
+            },
+            input_hash=input_hash,
+            output_hash=output_hash,
+            idempotency_key=f"{request_id}:completed",
+        )
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 def _apply_direct_chat_profile(
     chat_request: _DirectChatRequest,
     task_profile: dict[str, Any] | None,
@@ -1378,11 +1477,24 @@ class ResearchAgentRuntime:
         # monkeypatch this to False so _execute_run completes in one pass.
         self._pause_for_plan_review = True
         self._stage_retry_counts: dict[str, int] = {}
+        self._model_event_context = threading.local()
         self._active_pi_lock = threading.Lock()
         self._active_pi_clients: dict[str, PiAgentClient] = {}
         self._managed_writing_clients: dict[tuple[str, str, str], Any] = {}
         self._local_evidence_models: dict[str, LocalEvidenceStack] = {}
         self._academic_discovery_models: dict[str, LocalEvidenceStack] = {}
+
+    def _wrap_model_client(self, client: Any) -> Any:
+        context = getattr(self._model_event_context, "value", None)
+        if not isinstance(context, dict) or not context.get("run_id"):
+            return client
+        return _DurableModelClient(
+            client,
+            store=self.store,
+            run_id=str(context["run_id"]),
+            stage_id=str(context.get("stage_id", "")),
+            stage_key=str(context.get("stage_key", "")),
+        )
 
     @classmethod
     def verified_answer_pi_timeout_seconds(cls, *, managed: bool) -> float:
@@ -1661,6 +1773,7 @@ class ResearchAgentRuntime:
             user_text=self._task_request_text(normalized),
             workflow_type=workflow_type,
         )
+        knowledge_metadata = self._knowledge_run_metadata(notebook)
         routing_metadata = (
             {
                 "origin": "freeform",
@@ -1696,8 +1809,10 @@ class ResearchAgentRuntime:
                 "evidence_budget": evidence_budget_for_thinking(thinking_level),
                 "evidence_policy": self._workflow_evidence_policy(workflow_type, normalized),
                 "routing": routing_metadata,
+                **knowledge_metadata,
             },
             task_contract=task_contract,
+            idempotency_key=str(payload.get("idempotency_key") or payload.get("request_id") or "").strip(),
         )
         self._submit(str(run["run_id"]))
         return self.store.get_run(str(run["run_id"]))
@@ -4091,6 +4206,31 @@ class ResearchAgentRuntime:
                 f"run_id={str(run.get('run_id', '')).strip()} before answering. Never emit a literal "
                 "<SCANSCI_TOOL_CALL> tag or ask the user to re-upload files already registered here."
             )
+        metadata = dict(run.get("metadata", {}) or {})
+        knowledge_ids = [
+            str(value).strip()
+            for value in list(metadata.get("knowledge_base_ids", []) or [])
+            if str(value).strip()
+        ]
+        index_versions = dict(metadata.get("index_version", {}) or {})
+        evidence_snapshot = dict(metadata.get("evidence_snapshot", {}) or {})
+        knowledge_rule = ""
+        if knowledge_ids:
+            version_text = ", ".join(
+                f"{knowledge_id}={int(index_versions.get(knowledge_id, 0) or 0)}"
+                for knowledge_id in knowledge_ids
+            )
+            snapshot_text = "; ".join(
+                f"{knowledge_id}: documents={int(dict(snapshot).get('document_count', 0) or 0)}, "
+                f"evidence_spans={int(dict(snapshot).get('evidence_span_count', 0) or 0)}"
+                for knowledge_id, snapshot in evidence_snapshot.items()
+            )
+            knowledge_rule = (
+                f"\nBound knowledge bases: {', '.join(knowledge_ids)}"
+                f"\nBound index versions: {version_text or '未记录'}"
+                f"\nEvidence snapshot: {snapshot_text or '未记录'}"
+                "\nContinue using the bound knowledge base identity; do not silently replace it with a different library."
+            )
         return (
             "You are continuing an existing ScanSci task, not starting a new conversation. "
             "Keep the answer tied to this task, its mode, inputs, and generated deliverable. "
@@ -4106,6 +4246,7 @@ class ResearchAgentRuntime:
             f"Registered task files: {registered_files}\n"
             f"Generated slide titles: {slide_summary}\n"
             f"Generated result: {artifact_summary}"
+            f"{knowledge_rule}"
             f"{document_rule}"
         )
 
@@ -6244,6 +6385,11 @@ class ResearchAgentRuntime:
                     return
                 stage_key = str(stage["key"])
                 self.store.start_stage(run_id, stage_key)
+                self._model_event_context.value = {
+                    "run_id": run_id,
+                    "stage_id": str(stage.get("stage_id", "")),
+                    "stage_key": stage_key,
+                }
                 try:
                     if stage["kind"] == "planner":
                         output = self._plan(self.store.get_run(run_id))
@@ -6296,6 +6442,8 @@ class ResearchAgentRuntime:
                     self.store.set_recovery(run_id, _structured_recovery(error, stage_key=stage_key))
                     self.store.fail_stage(run_id, stage_key, error)
                     return
+                finally:
+                    self._model_event_context.value = None
                 if self.store.cancel_requested(run_id):
                     latest = self.store.get_run(run_id)
                     remaining = [item for item in latest["stages"] if item["status"] != "completed"]
@@ -7644,6 +7792,52 @@ class ResearchAgentRuntime:
             return isolated
         return self.evidence_db
 
+    def _knowledge_run_metadata(self, notebook: dict[str, Any]) -> dict[str, Any]:
+        """Freeze selected knowledge identity for conversation continuation."""
+
+        notebook_id = str(notebook.get("notebook_id", "") or "").strip()
+        if not notebook_id:
+            return {
+                "knowledge_base_ids": [],
+                "index_version": {},
+                "evidence_snapshot": {},
+            }
+        paths = {
+            str(dict(source).get("evidence_db_path", "") or "").strip()
+            for source in list(notebook.get("sources", []) or [])
+            if str(dict(source).get("evidence_db_path", "") or "").strip()
+        }
+        if not paths:
+            candidate = self._evidence_db_for_notebook(notebook)
+            if candidate.is_file():
+                paths.add(str(candidate))
+        snapshots: list[dict[str, Any]] = []
+        for path in sorted(paths):
+            snapshot = knowledge_base_snapshot(path, knowledge_base_id=notebook_id)
+            snapshots.append(snapshot)
+        if not snapshots:
+            return {
+                "knowledge_base_ids": [],
+                "index_version": {},
+                "evidence_snapshot": {},
+            }
+        return {
+            "knowledge_base_ids": [notebook_id],
+            "index_version": {
+                notebook_id: max(int(item.get("index_version", 0) or 0) for item in snapshots)
+            },
+            "evidence_snapshot": {
+                notebook_id: {
+                    "index_version": max(int(item.get("index_version", 0) or 0) for item in snapshots),
+                    "stores": snapshots,
+                    "document_count": sum(int(item.get("document_count", 0) or 0) for item in snapshots),
+                    "evidence_span_count": sum(
+                        int(item.get("evidence_span_count", 0) or 0) for item in snapshots
+                    ),
+                }
+            },
+        }
+
     @staticmethod
     def _academic_provider_names(payload: dict[str, Any]) -> list[str]:
         raw = payload.get("providers")
@@ -7777,7 +7971,7 @@ class ResearchAgentRuntime:
             managed = str(provider.get("auth_mode", "")) == "managed"
             cache_key = (provider_id, model_id, str(provider.get("base_url", "")))
             if managed and cache_key in self._managed_writing_clients:
-                return self._managed_writing_clients[cache_key]
+                return self._wrap_model_client(self._managed_writing_clients[cache_key])
             primary_client = build_chat_json_client(
                 str(provider.get("kind", "")),
                 base_url=str(provider.get("base_url", "")),
@@ -7788,7 +7982,7 @@ class ResearchAgentRuntime:
                 thinking_mode="disabled" if managed else None,
             )
             if not managed:
-                return primary_client
+                return self._wrap_model_client(primary_client)
             fallback_model = next(
                 (
                     str(item.get("id", ""))
@@ -7799,7 +7993,7 @@ class ResearchAgentRuntime:
             )
             if not fallback_model:
                 self._managed_writing_clients[cache_key] = primary_client
-                return primary_client
+                return self._wrap_model_client(primary_client)
             fallback_client = build_chat_json_client(
                 str(provider.get("kind", "")),
                 base_url=str(provider.get("base_url", "")),
@@ -7811,7 +8005,7 @@ class ResearchAgentRuntime:
             )
             client = CascadingChatJsonClient([primary_client, fallback_client])
             self._managed_writing_clients[cache_key] = client
-            return client
+            return self._wrap_model_client(client)
         if reference.startswith("local:"):
             local_id = reference.removeprefix("local:")
             local_model = next(
@@ -7828,12 +8022,12 @@ class ResearchAgentRuntime:
             model_id = str(local_model.get("model_id", "")).strip()
             if not base_url or not model_id:
                 raise ValueError("本地写作模型需要配置 Base URL 和模型 ID")
-            return build_chat_json_client(
+            return self._wrap_model_client(build_chat_json_client(
                 "openai-compatible",
                 base_url=base_url,
                 api_key="scansci-local-runtime",
                 model=model_id,
-            )
+            ))
         raise ValueError("尚未指定写作模型，请在“设置 → 模型服务 → 功能分工”中选择")
 
     @staticmethod
@@ -7967,7 +8161,7 @@ class ResearchAgentRuntime:
             api_key = "scansci-managed-gateway" if str(provider.get("auth_mode", "")) == "managed" else get_provider_api_key(self.workspace, provider_id)
             if not api_key:
                 raise ValueError("演示模型尚未配置 API Key")
-            return build_chat_json_client(
+            return self._wrap_model_client(build_chat_json_client(
                 str(provider.get("kind", "")),
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
@@ -7977,7 +8171,7 @@ class ResearchAgentRuntime:
                 # hidden chain of thought. This is supported by the managed
                 # GLM gateway; other providers keep their own default.
                 thinking_mode="disabled" if str(provider.get("auth_mode", "")) == "managed" else None,
-            )
+            ))
         if reference.startswith("local:"):
             local_id = reference.removeprefix("local:")
             local_model = next(
@@ -7992,12 +8186,12 @@ class ResearchAgentRuntime:
             model_id = str(local_model.get("model_id", "")).strip()
             if not base_url or not model_id:
                 raise ValueError("本地演示模型需要配置 Base URL 和模型 ID")
-            return build_chat_json_client(
+            return self._wrap_model_client(build_chat_json_client(
                 "openai-compatible",
                 base_url=base_url,
                 api_key="scansci-local-runtime",
                 model=model_id,
-            )
+            ))
         raise ValueError("尚未指定演示模型")
 
     @staticmethod

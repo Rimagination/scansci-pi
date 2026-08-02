@@ -549,3 +549,36 @@ def test_provider_retries_a_rate_limit_before_returning_semantic_scholar_results
 @pytest.mark.parametrize("name, expected", [("openreview", OpenReviewAcademicProvider), ("dblp", DblpAcademicProvider)])
 def test_new_provider_names_are_registered(name, expected) -> None:
     assert isinstance(build_academic_provider(name), expected)
+
+
+def test_zero_result_search_tries_a_bounded_transparent_query_expansion() -> None:
+    class _ExpandingProvider:
+        source_name = "openalex"
+
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def search(self, query: str, *, limit: int = 10, year_from: int | None = None) -> list[AcademicPaper]:
+            self.queries.append(query)
+            if query == "RAG factuality":
+                return []
+            return [
+                AcademicPaper(
+                    title="Retrieval augmented generation faithfulness",
+                    source="openalex",
+                    abstract="Faithfulness evaluation for retrieval augmented generation.",
+                    provider_rank=1,
+                )
+            ]
+
+    provider = _ExpandingProvider()
+    result = FederatedAcademicSearch(providers=[provider]).search(
+        "RAG factuality",
+        limit=5,
+        per_source=5,
+    )
+
+    assert result["zero_result_expanded"] is True
+    assert result["query_expansions"] == ["retrieval augmented generation faithfulness"]
+    assert provider.queries == ["RAG factuality", "retrieval augmented generation faithfulness"]
+    assert result["count"] == 1

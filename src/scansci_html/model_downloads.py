@@ -37,6 +37,14 @@ class ModelDownloadError(RuntimeError):
     """Raised after every configured official model source has failed."""
 
 
+class DownloadPaused(ModelDownloadError):
+    """Raised when the user pauses a resumable model download."""
+
+
+class DownloadCancelled(ModelDownloadError):
+    """Raised when the user cancels a model download."""
+
+
 class ModelSourceUnavailable(ModelDownloadError):
     """Raised when one source cannot provide the requested public snapshot."""
 
@@ -91,6 +99,8 @@ def download_snapshot(
                 "fallback_used": route != routes[0],
                 "source_failures": failures,
             }
+        except (DownloadPaused, DownloadCancelled):
+            raise
         except Exception as exc:  # one source must never prevent the fallback
             failures.append(f"{route}: {type(exc).__name__}: {exc}"[:1000])
     detail = "；".join(failures) or "没有可用下载源"
@@ -347,6 +357,8 @@ def _download_file(
                 raise ModelDownloadError(f"{destination.name} 下载后校验失败")
             partial.replace(destination)
             return destination.stat().st_size
+        except (DownloadPaused, DownloadCancelled):
+            raise
         except Exception as exc:
             last_error = exc
     raise ModelDownloadError(f"{destination.name} 下载失败：{last_error}") from last_error
@@ -480,6 +492,7 @@ class ModelInstallManager:
         self._threads: dict[str, threading.Thread] = {}
         self._callbacks: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
         self._speed_samples: dict[str, tuple[str, int, float, float]] = {}
+        self._controls: dict[str, str] = {}
         self._last_persist_at = 0.0
         self._load_jobs()
 
@@ -502,6 +515,7 @@ class ModelInstallManager:
                 if on_complete:
                     self._callbacks.setdefault(identifier, []).append(on_complete)
                 return deepcopy(existing)
+            self._controls.pop(identifier, None)
             ready = [model for model in models if self.ready_checker(model)]
             state = "ready" if len(ready) == len(models) else "queued"
             job = {
@@ -518,6 +532,7 @@ class ModelInstallManager:
                 "eta_seconds": None,
                 "progress": 1.0 if state == "ready" else len(ready) / len(models),
                 "source": "",
+                "requested_source": str(source or "auto"),
                 "source_policy": "国内 ModelScope 优先，Hugging Face 备用",
                 "message": "模型已在本机，无需重复下载" if state == "ready" else "正在准备下载",
                 "error": "",
@@ -553,7 +568,93 @@ class ModelInstallManager:
                 key=lambda item: int(item.get("updated_at", 0) or 0),
                 reverse=True,
             )
-            return {"jobs": rows, "active": next((item for item in rows if item.get("state") in {"queued", "downloading"}), None)}
+            return {
+                "jobs": rows,
+                "active": next(
+                    (item for item in rows if item.get("state") in {"queued", "downloading", "pausing", "cancelling"}),
+                    None,
+                ),
+            }
+
+    def pause(self, job_id: str) -> dict[str, Any]:
+        return self._request_control(job_id, "pause")
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        return self._request_control(job_id, "cancel")
+
+    def resume(self, job_id: str) -> dict[str, Any]:
+        return self._restart(job_id, action="resume")
+
+    def retry(self, job_id: str) -> dict[str, Any]:
+        return self._restart(job_id, action="retry")
+
+    def _request_control(self, job_id: str, action: str) -> dict[str, Any]:
+        identifier = str(job_id or "").strip()
+        if not identifier:
+            raise ValueError("下载任务缺少 job_id")
+        with self._lock:
+            job = self._jobs.get(identifier)
+            if job is None:
+                raise ValueError(f"下载任务不存在：{identifier}")
+            state = str(job.get("state", ""))
+            if state in {"ready", "failed", "cancelled"}:
+                if action == "cancel" and state == "cancelled":
+                    return self._status_snapshot(job)
+                raise ValueError(f"下载任务当前状态不支持{('暂停' if action == 'pause' else '取消')}：{state}")
+            thread = self._threads.get(identifier)
+            if thread is None or not thread.is_alive():
+                job.update(
+                    {
+                        "state": "paused" if action == "pause" else "cancelled",
+                        "message": (
+                            "下载已暂停；恢复时会继续使用已下载的临时文件"
+                            if action == "pause"
+                            else "下载已取消；已有临时文件会保留，重试时可续传"
+                        ),
+                        "error": "",
+                        "updated_at": int(time.time()),
+                    }
+                )
+                self._persist_locked(force=True)
+                return self._status_snapshot(job)
+            self._controls[identifier] = action
+            job.update(
+                {
+                    "state": "pausing" if action == "pause" else "cancelling",
+                    "message": "正在暂停下载…" if action == "pause" else "正在取消下载…",
+                    "updated_at": int(time.time()),
+                }
+            )
+            self._persist_locked(force=True)
+            return self._status_snapshot(job)
+
+    def _restart(self, job_id: str, *, action: str) -> dict[str, Any]:
+        identifier = str(job_id or "").strip()
+        if not identifier:
+            raise ValueError("下载任务缺少 job_id")
+        with self._lock:
+            job = self._jobs.get(identifier)
+            if job is None:
+                raise ValueError(f"下载任务不存在：{identifier}")
+            thread = self._threads.get(identifier)
+            if thread is not None and thread.is_alive():
+                return self._status_snapshot(job)
+            state = str(job.get("state", ""))
+            if state == "ready":
+                return self._status_snapshot(job)
+            if state not in {"paused", "interrupted", "failed", "cancelled", "queued", "downloading"}:
+                raise ValueError(f"下载任务当前状态不支持{action}：{state}")
+            models = [str(item) for item in list(job.get("models", [])) if str(item).strip()]
+            source = str(job.get("requested_source", "auto") or "auto")
+        return self.start(models, job_id=identifier, source=source)
+
+    def _check_control(self, job_id: str) -> None:
+        with self._lock:
+            action = self._controls.get(job_id, "")
+        if action == "pause":
+            raise DownloadPaused("用户已暂停下载")
+        if action == "cancel":
+            raise DownloadCancelled("用户已取消下载")
 
     def _run(self, job_id: str, source: str) -> None:
         try:
@@ -561,11 +662,13 @@ class ModelInstallManager:
                 job = self._jobs[job_id]
                 models = list(job["models"])
             for index, model_id in enumerate(models):
+                self._check_control(job_id)
                 if self.ready_checker(model_id):
                     self._mark_model_ready(job_id, model_id)
                     continue
 
                 def on_progress(event: dict[str, Any], *, _index=index, _model=model_id) -> None:
+                    self._check_control(job_id)
                     with self._lock:
                         current = self._jobs[job_id]
                         now = time.time()
@@ -605,6 +708,7 @@ class ModelInstallManager:
                     source=source,
                     progress_callback=on_progress,
                 )
+                self._check_control(job_id)
                 with self._lock:
                     self._jobs[job_id]["source"] = str(result.get("source", ""))
                     self._persist_locked(force=True)
@@ -634,6 +738,10 @@ class ModelInstallManager:
                     callback(deepcopy(snapshot))
                 except Exception:
                     continue
+        except DownloadPaused as exc:
+            self._finish_controlled_job(job_id, "paused", str(exc) or "用户已暂停下载")
+        except DownloadCancelled as exc:
+            self._finish_controlled_job(job_id, "cancelled", str(exc) or "用户已取消下载")
         except Exception as exc:
             with self._lock:
                 job = self._jobs[job_id]
@@ -647,6 +755,25 @@ class ModelInstallManager:
                 )
                 self._persist_locked(force=True)
                 self._callbacks.pop(job_id, None)
+
+    def _finish_controlled_job(self, job_id: str, state: str, detail: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            self._controls.pop(job_id, None)
+            job.update(
+                {
+                    "state": state,
+                    "message": (
+                        "下载已暂停；恢复时会继续使用已下载的临时文件"
+                        if state == "paused"
+                        else "下载已取消；已有临时文件会保留，重试时可续传"
+                    ),
+                    "error": "" if state == "paused" else detail[:1200],
+                    "updated_at": int(time.time()),
+                }
+            )
+            self._persist_locked(force=True)
+            self._callbacks.pop(job_id, None)
 
     def _mark_model_ready(self, job_id: str, model_id: str) -> None:
         with self._lock:

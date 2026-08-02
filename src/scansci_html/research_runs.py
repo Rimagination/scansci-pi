@@ -8,7 +8,8 @@ the store records stages, calls, artifacts, evidence links, and recovery state.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 from .agent_capabilities import artifact_uri, evidence_uri, run_uri
+from .schema_migrations import Migration, apply_migrations, current_schema_version, rollback_migration
 
 
 RUN_STATUSES = {
@@ -35,6 +37,19 @@ RUN_STATUSES = {
 STAGE_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled", "skipped"}
 ACTIVE_RUN_STATUSES = {"queued", "planning", "running", "verifying"}
 RESUMABLE_RUN_STATUSES = {"paused", "failed", "cancelled", "needs_confirmation", "waiting_input"}
+SCIENTIFIC_EVENT_SCHEMA_VERSION = "scientific_event.v1"
+RESEARCH_SCHEMA_NAME = "research_runs"
+RESEARCH_SCHEMA_VERSION = 2
+
+_CANONICAL_EVENT_TYPES = {
+    "task.created": "run.created",
+    "task.started": "run.started",
+    "task.paused": "run.paused",
+    "task.resumed": "run.resumed",
+    "task.completed": "run.completed",
+    "task.failed": "run.failed",
+    "task.cancelled": "run.cancelled",
+}
 
 _SENSITIVE_VALUE_PATTERN = re.compile(
     r"(?i)"
@@ -52,6 +67,16 @@ _SENSITIVE_KEYS = {
     "password",
     "secret",
 }
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """Make ``with store._connect()`` release Windows file handles promptly."""
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 def redact_sensitive_text(value: object) -> str:
@@ -82,6 +107,159 @@ def _redact_sensitive_value(value: Any, *, key: str = "", depth: int = 0) -> Any
     if isinstance(value, str):
         return redact_sensitive_text(value)
     return value
+
+
+def classify_error(error: BaseException | str, *, operation: str = "") -> str:
+    """Return a stable recovery category without persisting exception details."""
+
+    text = str(error or "").lower()
+    name = error.__class__.__name__.lower() if isinstance(error, BaseException) else ""
+    combined = f"{name} {operation.lower()} {text}"
+    if any(token in combined for token in ("cancel", "aborted by user", "user stopped")):
+        return "user_cancelled"
+    if any(token in combined for token in ("api_key", "access_token", "permission", "forbidden", "unauthorized", "credential")):
+        return "credential_or_permission"
+    if any(token in combined for token in ("429", "rate limit", "too many requests", "ratelimit")):
+        return "rate_limited"
+    if isinstance(error, TimeoutError) or any(token in combined for token in ("timeout", "timed out", "deadline exceeded")):
+        return "timeout"
+    if any(token in combined for token in ("connection", "dns", "network", "socket", "unreachable", "http 5")):
+        return "network"
+    if any(token in combined for token in ("jsondecode", "parse", "malformed", "invalid response", "unexpected token")):
+        return "parse"
+    if any(token in combined for token in ("repeat", "duplicate output", "on on on", "degenerate", "循环", "重复")):
+        return "model_degraded"
+    if any(token in combined for token in ("module not found", "no module named", "executable not found", "missing component")):
+        return "missing_component"
+    return "unknown"
+
+
+def _add_column_if_missing(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {str(row[1]) for row in connection.execute(f"pragma table_info({table})")}
+    if column not in columns:
+        connection.execute(f"alter table {table} add column {column} {definition}")
+
+
+def _apply_research_event_migration(connection: sqlite3.Connection) -> None:
+    """Additive v2 migration for ScientificEvent v1 and recovery primitives."""
+
+    _add_column_if_missing(connection, "research_runs", "idempotency_key", "text not null default ''")
+    event_columns = (
+        ("schema_version", "text not null default 'scientific_event.v1'"),
+        ("sequence", "integer not null default 0"),
+        ("timestamp", "text not null default ''"),
+        ("actor", "text not null default 'system'"),
+        ("stage_id", "text not null default ''"),
+        ("request_id", "text not null default ''"),
+        ("tool_id", "text not null default ''"),
+        ("parent_event_id", "text not null default ''"),
+        ("input_hash", "text not null default ''"),
+        ("output_hash", "text not null default ''"),
+        ("idempotency_key", "text not null default ''"),
+        ("terminal", "integer not null default 0"),
+        ("canonical_type", "text not null default ''"),
+        ("error_category", "text not null default ''"),
+    )
+    for column, definition in event_columns:
+        _add_column_if_missing(connection, "research_run_events", column, definition)
+
+    # Existing events receive a deterministic per-run sequence.  rowid is used
+    # only as a tie breaker for old rows with the same second-level timestamp.
+    run_ids = [str(row[0]) for row in connection.execute("select distinct run_id from research_run_events")]
+    for run_id in run_ids:
+        rows = connection.execute(
+            "select event_id, event_type, created_at from research_run_events where run_id = ? order by created_at, rowid",
+            (run_id,),
+        ).fetchall()
+        for sequence, row in enumerate(rows, start=1):
+            event_type = str(row[1] or "")
+            connection.execute(
+                """
+                update research_run_events
+                set sequence = ?, timestamp = case when timestamp = '' then ? else timestamp end,
+                    schema_version = case when schema_version = '' then ? else schema_version end,
+                    actor = case when actor = '' then 'system' else actor end,
+                    canonical_type = case when canonical_type = '' then ? else canonical_type end,
+                    terminal = case when event_type in ('task.completed', 'task.failed', 'task.cancelled', 'run.completed', 'run.failed', 'run.cancelled') then 1 else terminal end
+                where event_id = ?
+                """,
+                (
+                    sequence,
+                    str(row[2] or ""),
+                    SCIENTIFIC_EVENT_SCHEMA_VERSION,
+                    _CANONICAL_EVENT_TYPES.get(event_type, event_type),
+                    str(row[0]),
+                ),
+            )
+
+    statements = (
+        "create unique index if not exists idx_research_events_sequence on research_run_events(run_id, sequence)",
+        "create unique index if not exists idx_research_events_idempotency on research_run_events(run_id, idempotency_key) where idempotency_key <> ''",
+        "create unique index if not exists idx_research_runs_idempotency on research_runs(notebook_id, idempotency_key) where idempotency_key <> ''",
+        """
+        create table if not exists research_run_checkpoints (
+          checkpoint_id text primary key,
+          run_id text not null,
+          stage_key text not null,
+          checkpoint_key text not null,
+          status text not null,
+          state_json text not null,
+          input_hash text not null default '',
+          output_hash text not null default '',
+          idempotency_key text not null default '',
+          created_at text not null,
+          updated_at text not null,
+          unique(run_id, stage_key, checkpoint_key),
+          foreign key(run_id) references research_runs(run_id)
+        )
+        """,
+        "create unique index if not exists idx_research_checkpoints_idempotency on research_run_checkpoints(run_id, idempotency_key) where idempotency_key <> ''",
+        "create index if not exists idx_research_checkpoints_stage on research_run_checkpoints(run_id, stage_key, updated_at)",
+        """
+        create table if not exists research_worker_leases (
+           lease_id text primary key,
+          run_id text not null,
+          stage_key text not null,
+          worker_id text not null,
+          status text not null,
+          acquired_at text not null,
+          heartbeat_at text not null,
+          expires_at text not null,
+          metadata_json text not null default '{}',
+          unique(run_id, stage_key),
+          foreign key(run_id) references research_runs(run_id)
+        )
+        """,
+        "create index if not exists idx_research_worker_leases_expiry on research_worker_leases(status, expires_at)",
+        """
+        create table if not exists research_side_effect_receipts (
+          receipt_id text primary key,
+          run_id text not null,
+          effect_type text not null,
+          effect_key text not null,
+          status text not null,
+          input_hash text not null default '',
+          output_hash text not null default '',
+          result_json text not null default '{}',
+          error_category text not null default '',
+          error_message text not null default '',
+          created_at text not null,
+          updated_at text not null,
+          unique(run_id, effect_type, effect_key),
+          foreign key(run_id) references research_runs(run_id)
+        )
+        """,
+        "create index if not exists idx_research_receipts_status on research_side_effect_receipts(run_id, effect_type, status)",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def _research_migrations() -> tuple[Migration, ...]:
+    return (
+        Migration(1, "research baseline registry", lambda _connection: None),
+        Migration(2, "scientific event v1 and recovery primitives", _apply_research_event_migration),
+    )
 
 
 @dataclass(frozen=True)
@@ -117,9 +295,21 @@ class ResearchRunStore:
         parent_run_id: str = "",
         branch_from_message_id: str = "",
         background: bool = True,
+        idempotency_key: str = "",
     ) -> dict[str, Any]:
         if not stages:
             raise ValueError("A research run requires at least one stage")
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        if normalized_idempotency_key:
+            with self._connect() as connection:
+                self._initialize_schema(connection)
+                existing = connection.execute(
+                    "select run_id from research_runs where notebook_id = ? and idempotency_key = ?",
+                    (str(notebook_id), normalized_idempotency_key),
+                ).fetchone()
+                connection.commit()
+            if existing is not None:
+                return self.get_run(str(existing[0]))
         run_id = _new_id("run")
         now = _utc_now()
         with self._connect() as connection:
@@ -132,9 +322,9 @@ class ResearchRunStore:
                   cancel_requested, error_code, error_message,
                   model_provider_id, model_id, created_at, updated_at,
                   started_at, completed_at, metadata_json, parent_run_id,
-                  branch_from_message_id, background, interaction_json, recovery_json,
+                  branch_from_message_id, background, idempotency_key, interaction_json, recovery_json,
                   task_contract_json
-                ) values (?, ?, ?, ?, 'queued', ?, 0, ?, '', 0, '', '', ?, ?, ?, ?, '', '', ?, ?, ?, ?, '{}', '{}', ?)
+                ) values (?, ?, ?, ?, 'queued', ?, 0, ?, '', 0, '', '', ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, '{}', '{}', ?)
                 """,
                 (
                     run_id,
@@ -151,6 +341,7 @@ class ResearchRunStore:
                     str(parent_run_id),
                     str(branch_from_message_id),
                     1 if background else 0,
+                    normalized_idempotency_key,
                     _json_dumps(_redact_sensitive_value(dict(task_contract or {}))),
                 ),
             )
@@ -297,7 +488,7 @@ class ResearchRunStore:
                 for item in connection.execute(
                     """
                     select * from research_run_events
-                    where run_id = ? order by created_at, rowid limit 80
+                    where run_id = ? order by sequence limit 80
                     """,
                     (run_id,),
                 ).fetchall()
@@ -313,6 +504,53 @@ class ResearchRunStore:
                 (item for item in artifacts if item["artifact_id"] == payload["output_artifact_id"]), None
             )
             return payload
+
+    def events_after(self, run_id: str, *, after_sequence: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        """Replay only the append-only tail after a client checkpoint."""
+
+        limit_value = min(1000, max(1, int(limit)))
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            self._require_run(connection, run_id)
+            rows = connection.execute(
+                """
+                select * from research_run_events
+                where run_id = ? and sequence > ?
+                order by sequence limit ?
+                """,
+                (str(run_id), max(0, int(after_sequence)), limit_value),
+            ).fetchall()
+            return [self._event_payload(row) for row in rows]
+
+    # The explicit name is useful to API adapters and keeps the replay contract
+    # discoverable without making clients know the SQLite table name.
+    def get_events_after(self, run_id: str, *, after_sequence: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        return self.events_after(run_id, after_sequence=after_sequence, limit=limit)
+
+    def snapshot(self, run_id: str, *, after_sequence: int = 0, event_limit: int = 200) -> dict[str, Any]:
+        """Return a durable state snapshot plus an ordered event replay tail."""
+
+        state = self.get_run(run_id)
+        events = self.events_after(run_id, after_sequence=after_sequence, limit=event_limit)
+        snapshot_state = dict(state)
+        snapshot_state["events"] = []
+        return {
+            "schema_version": SCIENTIFIC_EVENT_SCHEMA_VERSION,
+            "snapshot": snapshot_state,
+            "events": events,
+            "after_sequence": max(0, int(after_sequence)),
+            "last_sequence": int(state.get("last_event_sequence", 0) or 0),
+            "has_more": bool(events and int(events[-1].get("sequence", 0)) < int(state.get("last_event_sequence", 0) or 0)),
+        }
+
+    def schema_status(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            return {
+                "schema_name": RESEARCH_SCHEMA_NAME,
+                "schema_version": current_schema_version(connection, RESEARCH_SCHEMA_NAME),
+                "target_version": RESEARCH_SCHEMA_VERSION,
+            }
 
     def fork_run(
         self,
@@ -575,6 +813,15 @@ class ResearchRunStore:
                     """,
                     tuple(run_ids),
                 )
+                for interrupted_run_id in run_ids:
+                    self._append_event(
+                        connection,
+                        interrupted_run_id,
+                        event_type="task.paused",
+                        summary="应用已重启，可从当前阶段继续",
+                        payload={"reason": "app_restarted", "resume_available": True},
+                        created_at=now,
+                    )
             connection.commit()
             return len(run_ids)
 
@@ -621,6 +868,15 @@ class ResearchRunStore:
                 "update research_runs set cancel_requested = 1, updated_at = ? where run_id = ?",
                 (now, run_id),
             )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="run.cancel_requested",
+                summary="已请求停止任务",
+                payload={"status": status},
+                created_at=now,
+                idempotency_key="run.cancel_requested",
+            )
             connection.commit()
         return self.get_run(run_id)
 
@@ -632,7 +888,13 @@ class ResearchRunStore:
     def mark_cancelled(self, run_id: str, *, summary: str = "任务已停止") -> dict[str, Any]:
         now = _utc_now()
         with self._connect() as connection:
-            self._require_run(connection, run_id)
+            row = self._require_run(connection, run_id)
+            # A terminal transition is durable and must be idempotent.  In
+            # particular, a late cancellation request must not rewrite a
+            # completed/failed run or emit a second terminal event.
+            if str(row["status"]) in {"completed", "failed", "cancelled"}:
+                connection.commit()
+                return self.get_run(run_id)
             connection.execute(
                 """
                 update research_stages set status = 'cancelled', completed_at = ?, summary = ?
@@ -648,6 +910,16 @@ class ResearchRunStore:
                 where run_id = ?
                 """,
                 (now, now, summary, run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="task.cancelled",
+                summary=summary,
+                payload={"reason": "user_cancelled"},
+                created_at=now,
+                terminal=True,
+                error_category="user_cancelled",
             )
             connection.commit()
         return self.get_run(run_id)
@@ -811,6 +1083,7 @@ class ResearchRunStore:
                 summary=str(stage["title"]),
                 payload={"stage_key": stage_key, "attempt": int(stage["attempt"] or 0) + 1},
                 created_at=now,
+                stage_id=str(stage["stage_id"]),
             )
             connection.commit()
             return self._stage_payload(self._require_stage(connection, run_id, stage_key))
@@ -825,7 +1098,7 @@ class ResearchRunStore:
     ) -> dict[str, Any]:
         now = _utc_now()
         with self._connect() as connection:
-            self._require_stage(connection, run_id, stage_key)
+            stage = self._require_stage(connection, run_id, stage_key)
             connection.execute(
                 """
                 update research_stages
@@ -843,6 +1116,7 @@ class ResearchRunStore:
                 summary=str(summary).strip() or str(stage_key),
                 payload={"stage_key": stage_key},
                 created_at=now,
+                stage_id=str(stage["stage_id"]),
             )
             connection.commit()
         return self.get_run(run_id)
@@ -911,6 +1185,13 @@ class ResearchRunStore:
         message = redact_sensitive_text(str(error) or error.__class__.__name__)
         with self._connect() as connection:
             self._require_stage(connection, run_id, stage_key)
+            run = self._require_run(connection, run_id)
+            # A worker that reports a stale failure after the run has already
+            # reached a terminal state must not mutate state or append another
+            # terminal event.
+            if str(run["status"]) in {"completed", "failed", "cancelled"}:
+                connection.commit()
+                return self.get_run(run_id)
             connection.execute(
                 """
                 update research_stages
@@ -936,6 +1217,17 @@ class ResearchRunStore:
                 summary=message,
                 payload={"stage_key": stage_key},
                 created_at=now,
+                error_category=classify_error(error, operation="stage"),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="task.failed",
+                summary=message,
+                payload={"stage_key": stage_key},
+                created_at=now,
+                terminal=True,
+                error_category=classify_error(error, operation="stage"),
             )
             connection.commit()
         return self.get_run(run_id)
@@ -960,6 +1252,7 @@ class ResearchRunStore:
                 summary="任务已完成",
                 payload={"output_artifact_id": str(output_artifact_id)},
                 created_at=now,
+                terminal=True,
             )
             connection.commit()
         return self.get_run(run_id)
@@ -976,6 +1269,18 @@ class ResearchRunStore:
         event_type: str,
         summary: str,
         payload: dict[str, Any] | None = None,
+        actor: str = "system",
+        stage_id: str = "",
+        request_id: str = "",
+        tool_id: str = "",
+        parent_event_id: str = "",
+        input_value: Any = None,
+        output_value: Any = None,
+        input_hash: str = "",
+        output_hash: str = "",
+        idempotency_key: str = "",
+        terminal: bool = False,
+        error_category: str = "",
     ) -> dict[str, Any]:
         """Append an auditable, redacted task event without changing task state."""
 
@@ -989,6 +1294,18 @@ class ResearchRunStore:
                 summary=summary,
                 payload=payload,
                 created_at=now,
+                actor=actor,
+                stage_id=stage_id,
+                request_id=request_id,
+                tool_id=tool_id,
+                parent_event_id=parent_event_id,
+                input_value=input_value,
+                output_value=output_value,
+                input_hash=input_hash,
+                output_hash=output_hash,
+                idempotency_key=idempotency_key,
+                terminal=terminal,
+                error_category=error_category,
             )
             connection.execute("update research_runs set updated_at = ? where run_id = ?", (now, run_id))
             connection.commit()
@@ -1032,6 +1349,9 @@ class ResearchRunStore:
                 summary=str(tool_name),
                 payload={"stage_key": stage_key, "tool_call_id": call_id},
                 created_at=now,
+                stage_id=str(stage["stage_id"]),
+                tool_id=call_id,
+                input_value=input_payload,
             )
             connection.commit()
         return call_id
@@ -1056,6 +1376,9 @@ class ResearchRunStore:
                 summary=str(row["tool_name"]),
                 payload={"tool_call_id": tool_call_id, "duration_ms": duration},
                 created_at=now,
+                stage_id=str(row["stage_id"]),
+                tool_id=tool_call_id,
+                output_value=output,
             )
             connection.commit()
             return self._tool_call_payload(self._require_tool_call(connection, tool_call_id))
@@ -1081,6 +1404,9 @@ class ResearchRunStore:
                 summary=message,
                 payload={"tool_call_id": tool_call_id, "tool_name": str(row["tool_name"])},
                 created_at=now,
+                stage_id=str(row["stage_id"]),
+                tool_id=tool_call_id,
+                error_category=classify_error(error, operation="tool"),
             )
             connection.commit()
             return self._tool_call_payload(self._require_tool_call(connection, tool_call_id))
@@ -1107,9 +1433,331 @@ class ResearchRunStore:
                 summary=str(row["tool_name"]),
                 payload={"tool_call_id": tool_call_id, "duration_ms": duration},
                 created_at=now,
+                stage_id=str(row["stage_id"]),
+                tool_id=tool_call_id,
+                output_value=output or {},
+                error_category="user_cancelled",
             )
             connection.commit()
             return self._tool_call_payload(self._require_tool_call(connection, tool_call_id))
+
+    def checkpoint_stage(
+        self,
+        run_id: str,
+        stage_key: str,
+        *,
+        checkpoint_key: str,
+        state: dict[str, Any],
+        status: str = "completed",
+        input_value: Any = None,
+        output_value: Any = None,
+        input_hash: str = "",
+        output_hash: str = "",
+        idempotency_key: str = "",
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """Persist a resumable stage checkpoint and its trace atomically."""
+
+        normalized_key = str(checkpoint_key or "").strip()
+        if not normalized_key:
+            raise ValueError("checkpoint_key is required")
+        now = _utc_now()
+        resolved_input_hash = str(input_hash or "") or _value_hash(input_value)
+        resolved_output_hash = str(output_hash or "") or _value_hash(output_value if output_value is not None else state)
+        with self._connect() as connection:
+            stage = self._require_stage(connection, run_id, stage_key)
+            existing = connection.execute(
+                "select * from research_run_checkpoints where run_id = ? and stage_key = ? and checkpoint_key = ?",
+                (str(run_id), str(stage_key), normalized_key),
+            ).fetchone()
+            if existing is None:
+                checkpoint_id = _new_id("checkpoint")
+                connection.execute(
+                    """
+                    insert into research_run_checkpoints (
+                      checkpoint_id, run_id, stage_key, checkpoint_key, status, state_json,
+                      input_hash, output_hash, idempotency_key, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint_id,
+                        str(run_id),
+                        str(stage_key),
+                        normalized_key,
+                        str(status or "completed"),
+                        _json_dumps(_redact_sensitive_value(dict(state or {}))),
+                        resolved_input_hash,
+                        resolved_output_hash,
+                        str(idempotency_key or ""),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                checkpoint_id = str(existing["checkpoint_id"])
+                connection.execute(
+                    """
+                    update research_run_checkpoints
+                    set status = ?, state_json = ?, input_hash = ?, output_hash = ?,
+                        idempotency_key = case when ? <> '' then ? else idempotency_key end,
+                        updated_at = ?
+                    where checkpoint_id = ?
+                    """,
+                    (
+                        str(status or "completed"),
+                        _json_dumps(_redact_sensitive_value(dict(state or {}))),
+                        resolved_input_hash,
+                        resolved_output_hash,
+                        str(idempotency_key or ""),
+                        str(idempotency_key or ""),
+                        now,
+                        checkpoint_id,
+                    ),
+                )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="stage.checkpointed",
+                summary=str(summary or normalized_key),
+                payload={"stage_key": stage_key, "checkpoint_key": normalized_key, "status": str(status)},
+                created_at=now,
+                stage_id=str(stage["stage_id"]),
+                input_hash=resolved_input_hash,
+                output_hash=resolved_output_hash,
+                idempotency_key=str(idempotency_key or ""),
+            )
+            connection.commit()
+            row = connection.execute(
+                "select * from research_run_checkpoints where checkpoint_id = ?", (checkpoint_id,)
+            ).fetchone()
+            return self._checkpoint_payload(row)
+
+    def list_checkpoints(self, run_id: str, *, stage_key: str = "") -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            self._require_run(connection, run_id)
+            if stage_key:
+                rows = connection.execute(
+                    "select * from research_run_checkpoints where run_id = ? and stage_key = ? order by updated_at",
+                    (str(run_id), str(stage_key)),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "select * from research_run_checkpoints where run_id = ? order by updated_at",
+                    (str(run_id),),
+                ).fetchall()
+            return [self._checkpoint_payload(row) for row in rows]
+
+    def acquire_worker_lease(
+        self,
+        run_id: str,
+        stage_key: str,
+        *,
+        worker_id: str,
+        ttl_seconds: int = 30,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Claim one stage until heartbeat expiry, preventing duplicate workers."""
+
+        now = _utc_now()
+        expires = _lease_expiry(ttl_seconds)
+        with self._connect() as connection:
+            stage = self._require_stage(connection, run_id, stage_key)
+            existing = connection.execute(
+                "select * from research_worker_leases where run_id = ? and stage_key = ?",
+                (str(run_id), str(stage_key)),
+            ).fetchone()
+            if existing is not None and str(existing["status"]) == "active" and not _is_expired(str(existing["expires_at"])):
+                if str(existing["worker_id"]) != str(worker_id):
+                    raise RuntimeError(f"Stage lease is held by worker {str(existing['worker_id'])}")
+                lease_id = str(existing["lease_id"])
+                connection.execute(
+                    """
+                    update research_worker_leases
+                    set heartbeat_at = ?, expires_at = ?, metadata_json = ? where lease_id = ?
+                    """,
+                    (now, expires, _json_dumps(_redact_sensitive_value(dict(metadata or {}))), lease_id),
+                )
+            else:
+                lease_id = str(existing["lease_id"]) if existing is not None else _new_id("lease")
+                connection.execute(
+                    """
+                    insert into research_worker_leases (
+                      lease_id, run_id, stage_key, worker_id, status, acquired_at,
+                      heartbeat_at, expires_at, metadata_json
+                    ) values (?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                    on conflict(run_id, stage_key) do update set
+                      worker_id = excluded.worker_id, status = 'active', acquired_at = excluded.acquired_at,
+                      heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at,
+                      metadata_json = excluded.metadata_json
+                    """,
+                    (
+                        lease_id,
+                        str(run_id),
+                        str(stage_key),
+                        str(worker_id),
+                        now,
+                        now,
+                        expires,
+                        _json_dumps(_redact_sensitive_value(dict(metadata or {}))),
+                    ),
+                )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="worker.lease.acquired",
+                summary=str(worker_id),
+                payload={"stage_key": stage_key, "lease_id": lease_id, "expires_at": expires},
+                created_at=now,
+                stage_id=str(stage["stage_id"]),
+                idempotency_key=f"lease:{stage_key}:{worker_id}",
+            )
+            connection.commit()
+            row = connection.execute("select * from research_worker_leases where lease_id = ?", (lease_id,)).fetchone()
+            return self._lease_payload(row)
+
+    def heartbeat_worker_lease(self, lease_id: str, *, ttl_seconds: int = 30) -> dict[str, Any]:
+        now = _utc_now()
+        expires = _lease_expiry(ttl_seconds)
+        with self._connect() as connection:
+            row = connection.execute("select * from research_worker_leases where lease_id = ?", (str(lease_id),)).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"Worker lease does not exist: {lease_id}")
+            if str(row["status"]) != "active" or _is_expired(str(row["expires_at"])):
+                raise RuntimeError("Worker lease has expired")
+            connection.execute(
+                "update research_worker_leases set heartbeat_at = ?, expires_at = ? where lease_id = ?",
+                (now, expires, str(lease_id)),
+            )
+            connection.commit()
+            return self._lease_payload(connection.execute("select * from research_worker_leases where lease_id = ?", (str(lease_id),)).fetchone())
+
+    def release_worker_lease(self, lease_id: str) -> dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            row = connection.execute("select * from research_worker_leases where lease_id = ?", (str(lease_id),)).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"Worker lease does not exist: {lease_id}")
+            connection.execute(
+                "update research_worker_leases set status = 'released', heartbeat_at = ?, expires_at = ? where lease_id = ?",
+                (now, now, str(lease_id)),
+            )
+            connection.commit()
+            return self._lease_payload(connection.execute("select * from research_worker_leases where lease_id = ?", (str(lease_id),)).fetchone())
+
+    def reap_expired_worker_leases(self) -> int:
+        now = _utc_now()
+        with self._connect() as connection:
+            updated = connection.execute(
+                "update research_worker_leases set status = 'expired' where status = 'active' and expires_at <= ?",
+                (now,),
+            )
+            connection.commit()
+            return int(updated.rowcount or 0)
+
+    def record_side_effect_receipt(
+        self,
+        run_id: str,
+        *,
+        effect_type: str,
+        effect_key: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        input_value: Any = None,
+        output_value: Any = None,
+        input_hash: str = "",
+        output_hash: str = "",
+        error: BaseException | str | None = None,
+    ) -> dict[str, Any]:
+        """Record download/index/export side effects so retries can be skipped."""
+
+        normalized_type = str(effect_type or "").strip()
+        normalized_key = str(effect_key or "").strip()
+        if not normalized_type or not normalized_key:
+            raise ValueError("effect_type and effect_key are required")
+        now = _utc_now()
+        category = classify_error(error, operation=normalized_type) if error else ""
+        message = redact_sensitive_text(str(error or ""))[:600]
+        resolved_input_hash = str(input_hash or "") or _value_hash(input_value)
+        resolved_output_hash = str(output_hash or "") or _value_hash(output_value if output_value is not None else result)
+        with self._connect() as connection:
+            self._require_run(connection, run_id)
+            existing = connection.execute(
+                "select * from research_side_effect_receipts where run_id = ? and effect_type = ? and effect_key = ?",
+                (str(run_id), normalized_type, normalized_key),
+            ).fetchone()
+            if existing is not None and str(existing["status"]) == "completed" and str(status or "") == "completed":
+                connection.commit()
+                return self._receipt_payload(existing)
+            if existing is None:
+                receipt_id = _new_id("receipt")
+                connection.execute(
+                    """
+                    insert into research_side_effect_receipts (
+                      receipt_id, run_id, effect_type, effect_key, status, input_hash,
+                      output_hash, result_json, error_category, error_message, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        str(run_id),
+                        normalized_type,
+                        normalized_key,
+                        str(status or "pending"),
+                        resolved_input_hash,
+                        resolved_output_hash,
+                        _json_dumps(_redact_sensitive_value(dict(result or {}))),
+                        category,
+                        message,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                receipt_id = str(existing["receipt_id"])
+                connection.execute(
+                    """
+                    update research_side_effect_receipts
+                    set status = ?, input_hash = ?, output_hash = ?, result_json = ?,
+                        error_category = ?, error_message = ?, updated_at = ?
+                    where receipt_id = ?
+                    """,
+                    (
+                        str(status or "pending"),
+                        resolved_input_hash,
+                        resolved_output_hash,
+                        _json_dumps(_redact_sensitive_value(dict(result or {}))),
+                        category,
+                        message,
+                        now,
+                        receipt_id,
+                    ),
+                )
+            event_suffix = "progress" if str(status) in {"running", "progress", "pending"} else str(status)
+            self._append_event(
+                connection,
+                run_id,
+                event_type=f"{normalized_type}.{event_suffix}",
+                summary=f"{normalized_type}: {normalized_key}",
+                payload={"effect_type": normalized_type, "effect_key": normalized_key, "status": str(status), "receipt_id": receipt_id},
+                created_at=now,
+                input_hash=resolved_input_hash,
+                output_hash=resolved_output_hash,
+                error_category=category,
+            )
+            connection.commit()
+            row = connection.execute("select * from research_side_effect_receipts where receipt_id = ?", (receipt_id,)).fetchone()
+            return self._receipt_payload(row)
+
+    def get_side_effect_receipt(self, run_id: str, *, effect_type: str, effect_key: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "select * from research_side_effect_receipts where run_id = ? and effect_type = ? and effect_key = ?",
+                (str(run_id), str(effect_type), str(effect_key)),
+            ).fetchone()
+            return self._receipt_payload(row) if row is not None else None
+
+    def side_effect_receipt(self, run_id: str, *, effect_type: str, effect_key: str) -> dict[str, Any] | None:
+        return self.get_side_effect_receipt(run_id, effect_type=effect_type, effect_key=effect_key)
 
     def create_artifact(
         self,
@@ -1169,6 +1817,16 @@ class ResearchRunStore:
                         _json_dumps(dict(item.get("metadata", {}) or {})),
                     ),
                 )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="artifact.created",
+                summary=str(title),
+                payload={"artifact_id": artifact_id, "artifact_type": str(artifact_type)},
+                created_at=now,
+                input_value=payload,
+                output_value={"artifact_id": artifact_id, "file_path": str(file_path)},
+            )
             connection.commit()
             row = connection.execute(
                 "select * from research_artifacts where artifact_id = ?", (artifact_id,)
@@ -1176,7 +1834,7 @@ class ResearchRunStore:
             return self._artifact_payload(connection, row)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.workspace, timeout=15)
+        connection = sqlite3.connect(self.workspace, timeout=15, factory=_ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("pragma foreign_keys = on")
         connection.execute("pragma busy_timeout = 15000")
@@ -1324,6 +1982,7 @@ class ResearchRunStore:
         connection.execute(
             "create index if not exists idx_research_runs_parent on research_runs(parent_run_id, updated_at)"
         )
+        apply_migrations(connection, RESEARCH_SCHEMA_NAME, _research_migrations(), target_version=RESEARCH_SCHEMA_VERSION)
 
     def _run_summary(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         stage_counts = connection.execute(
@@ -1336,6 +1995,9 @@ class ResearchRunStore:
         ).fetchone()
         event_count = connection.execute(
             "select count(*) from research_run_events where run_id = ?", (row["run_id"],)
+        ).fetchone()[0]
+        last_sequence = connection.execute(
+            "select coalesce(max(sequence), 0) from research_run_events where run_id = ?", (row["run_id"],)
         ).fetchone()[0]
         return {
             "run_id": str(row["run_id"]),
@@ -1365,6 +2027,7 @@ class ResearchRunStore:
             "parent_run_id": str(row["parent_run_id"]),
             "branch_from_message_id": str(row["branch_from_message_id"]),
             "background": bool(row["background"]),
+            "idempotency_key": str(row["idempotency_key"]),
             "interaction": _json_loads(row["interaction_json"]),
             "recovery": _json_loads(row["recovery_json"]),
             "task_contract": _json_loads(row["task_contract_json"]),
@@ -1373,6 +2036,7 @@ class ResearchRunStore:
                 "completed": int(stage_counts["completed"] or 0),
             },
             "event_count": int(event_count or 0),
+            "last_event_sequence": int(last_sequence or 0),
             "resumable": str(row["status"]) in RESUMABLE_RUN_STATUSES,
             "cancellable": str(row["status"]) in ACTIVE_RUN_STATUSES,
         }
@@ -1441,23 +2105,92 @@ class ResearchRunStore:
         summary: str,
         payload: dict[str, Any] | None = None,
         created_at: str,
+        canonical_type: str = "",
+        actor: str = "system",
+        stage_id: str = "",
+        request_id: str = "",
+        tool_id: str = "",
+        parent_event_id: str = "",
+        input_value: Any = None,
+        output_value: Any = None,
+        input_hash: str = "",
+        output_hash: str = "",
+        idempotency_key: str = "",
+        terminal: bool = False,
+        error_category: str = "",
     ) -> str:
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        resolved_canonical_type = str(canonical_type or "") or _CANONICAL_EVENT_TYPES.get(str(event_type), str(event_type))
+        if normalized_idempotency_key:
+            existing = connection.execute(
+                "select event_id from research_run_events where run_id = ? and idempotency_key = ?",
+                (str(run_id), normalized_idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
+        if terminal:
+            existing = connection.execute(
+                """
+                select event_id from research_run_events
+                where run_id = ? and terminal = 1 and (canonical_type = ? or event_type = ?)
+                order by sequence desc limit 1
+                """,
+                (str(run_id), resolved_canonical_type, str(event_type)),
+            ).fetchone()
+            if existing is not None:
+                return str(existing[0])
         event_id = _new_id("event")
-        connection.execute(
-            """
-            insert into research_run_events (
-              event_id, run_id, event_type, summary, payload_json, created_at
-            ) values (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id,
-                str(run_id),
-                str(event_type),
-                redact_sensitive_text(str(summary or ""))[:600],
-                _json_dumps(_redact_sensitive_value(dict(payload or {}))),
-                str(created_at),
-            ),
+        sequence = int(
+            connection.execute(
+                "select coalesce(max(sequence), 0) + 1 from research_run_events where run_id = ?",
+                (str(run_id),),
+            ).fetchone()[0]
+            or 1
         )
+        resolved_input_hash = str(input_hash or "") or _value_hash(input_value)
+        resolved_output_hash = str(output_hash or "") or _value_hash(output_value)
+        try:
+            connection.execute(
+                """
+                insert into research_run_events (
+                  event_id, run_id, event_type, summary, payload_json, created_at,
+                  schema_version, sequence, timestamp, actor, stage_id, request_id,
+                  tool_id, parent_event_id, input_hash, output_hash, idempotency_key,
+                  terminal, canonical_type, error_category
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    str(run_id),
+                    str(event_type),
+                    redact_sensitive_text(str(summary or ""))[:600],
+                    _json_dumps(_redact_sensitive_value(dict(payload or {}))),
+                    str(created_at),
+                    SCIENTIFIC_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    str(created_at),
+                    redact_sensitive_text(str(actor or "system"))[:120],
+                    str(stage_id or ""),
+                    str(request_id or ""),
+                    str(tool_id or ""),
+                    str(parent_event_id or ""),
+                    resolved_input_hash,
+                    resolved_output_hash,
+                    normalized_idempotency_key,
+                    1 if terminal else 0,
+                    resolved_canonical_type,
+                    str(error_category or ""),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            if normalized_idempotency_key:
+                existing = connection.execute(
+                    "select event_id from research_run_events where run_id = ? and idempotency_key = ?",
+                    (str(run_id), normalized_idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    return str(existing[0])
+            raise
         return event_id
 
     @staticmethod
@@ -1469,6 +2202,67 @@ class ResearchRunStore:
             "summary": str(row["summary"]),
             "payload": _json_loads(row["payload_json"]),
             "created_at": str(row["created_at"]),
+            "schema_version": str(row["schema_version"]),
+            "sequence": int(row["sequence"] or 0),
+            "timestamp": str(row["timestamp"] or row["created_at"]),
+            "actor": str(row["actor"]),
+            "stage_id": str(row["stage_id"]),
+            "request_id": str(row["request_id"]),
+            "tool_id": str(row["tool_id"]),
+            "parent_event_id": str(row["parent_event_id"]),
+            "input_hash": str(row["input_hash"]),
+            "output_hash": str(row["output_hash"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "terminal": bool(row["terminal"]),
+            "canonical_type": str(row["canonical_type"] or row["event_type"]),
+            "error_category": str(row["error_category"]),
+        }
+
+    @staticmethod
+    def _checkpoint_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "checkpoint_id": str(row["checkpoint_id"]),
+            "run_id": str(row["run_id"]),
+            "stage_key": str(row["stage_key"]),
+            "checkpoint_key": str(row["checkpoint_key"]),
+            "status": str(row["status"]),
+            "state": _json_loads(row["state_json"]),
+            "input_hash": str(row["input_hash"]),
+            "output_hash": str(row["output_hash"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _lease_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "lease_id": str(row["lease_id"]),
+            "run_id": str(row["run_id"]),
+            "stage_key": str(row["stage_key"]),
+            "worker_id": str(row["worker_id"]),
+            "status": str(row["status"]),
+            "acquired_at": str(row["acquired_at"]),
+            "heartbeat_at": str(row["heartbeat_at"]),
+            "expires_at": str(row["expires_at"]),
+            "metadata": _json_loads(row["metadata_json"]),
+        }
+
+    @staticmethod
+    def _receipt_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "receipt_id": str(row["receipt_id"]),
+            "run_id": str(row["run_id"]),
+            "effect_type": str(row["effect_type"]),
+            "effect_key": str(row["effect_key"]),
+            "status": str(row["status"]),
+            "input_hash": str(row["input_hash"]),
+            "output_hash": str(row["output_hash"]),
+            "result": _json_loads(row["result_json"]),
+            "error_category": str(row["error_category"]),
+            "error_message": str(row["error_message"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
         }
 
     @staticmethod
@@ -1558,6 +2352,16 @@ def _json_dumps(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _json_dumps_value(value: Any) -> str:
+    return json.dumps(_redact_sensitive_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _value_hash(value: Any) -> str:
+    if value is None:
+        return ""
+    return hashlib.sha256(_json_dumps_value(value).encode("utf-8")).hexdigest()
+
+
 def _json_loads(value: object) -> dict[str, Any]:
     if not value:
         return {}
@@ -1579,3 +2383,16 @@ def _duration_ms(started_at: str, completed_at: str) -> int:
     except ValueError:
         return 0
     return max(0, int((completed - started).total_seconds() * 1000))
+
+
+def _lease_expiry(ttl_seconds: int) -> str:
+    ttl = max(1, min(24 * 60 * 60, int(ttl_seconds or 30)))
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat(timespec="seconds")
+
+
+def _is_expired(value: str) -> bool:
+    try:
+        expiry = datetime.fromisoformat(str(value))
+    except ValueError:
+        return True
+    return expiry <= datetime.now(timezone.utc)

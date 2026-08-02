@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 
 import pytest
@@ -213,3 +214,67 @@ def test_install_manager_reports_stalled_active_download(tmp_path: Path) -> None
 
     assert status["stalled"] is True
     assert status["last_update_seconds"] >= 90
+
+
+def test_install_manager_pause_resume_cancel_and_retry_are_persistent_controls(tmp_path: Path) -> None:
+    ready: set[str] = set()
+    entered: dict[str, threading.Event] = {}
+    attempts: dict[str, int] = {}
+
+    def download(repo_id: str, *, progress_callback, **_kwargs):
+        attempts[repo_id] = attempts.get(repo_id, 0) + 1
+        signal = entered.setdefault(repo_id, threading.Event())
+        signal.set()
+        for index in range(20):
+            progress_callback(
+                {
+                    "source": "modelscope",
+                    "completed_bytes": index,
+                    "total_bytes": 20,
+                    "progress": index / 20,
+                }
+            )
+            time.sleep(0.01)
+        ready.add(repo_id)
+        return {"source": "modelscope", "id": repo_id}
+
+    manager = ModelInstallManager(
+        cache_root=tmp_path,
+        ready_checker=lambda model_id: model_id in ready,
+        downloader=download,
+    )
+
+    entered["Qwen/Pause"] = threading.Event()
+    manager.start(["Qwen/Pause"], job_id="pause-job")
+    assert entered["Qwen/Pause"].wait(1)
+    requested = manager.pause("pause-job")
+    assert requested["state"] in {"pausing", "paused"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and manager.status("pause-job")["state"] != "paused":
+        time.sleep(0.01)
+    assert manager.status("pause-job")["state"] == "paused"
+    resumed = manager.resume("pause-job")
+    assert resumed["state"] in {"queued", "downloading"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and manager.status("pause-job")["state"] != "ready":
+        time.sleep(0.01)
+    assert manager.status("pause-job")["state"] == "ready"
+    assert attempts["Qwen/Pause"] == 2
+
+    entered["Qwen/Cancel"] = threading.Event()
+    manager.start(["Qwen/Cancel"], job_id="cancel-job")
+    assert entered["Qwen/Cancel"].wait(1)
+    requested = manager.cancel("cancel-job")
+    assert requested["state"] in {"cancelling", "cancelled"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and manager.status("cancel-job")["state"] != "cancelled":
+        time.sleep(0.01)
+    assert manager.status("cancel-job")["state"] == "cancelled"
+    assert "临时文件" in manager.status("cancel-job")["message"]
+    retried = manager.retry("cancel-job")
+    assert retried["state"] in {"queued", "downloading"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and manager.status("cancel-job")["state"] != "ready":
+        time.sleep(0.01)
+    assert manager.status("cancel-job")["state"] == "ready"
+    assert attempts["Qwen/Cancel"] == 2

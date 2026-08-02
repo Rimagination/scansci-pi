@@ -13,5 +13,9 @@ datas = collect_data_files(
     "litellm",
     excludes=[
         "**/guardrail_benchmarks/**",
+        # ScanSci uses LiteLLM as an in-process client.  The proxy's demo
+        # configuration and static web assets are not imported by the
+        # desktop runtime and may contain credential-shaped examples.
+        "**/proxy/**",
     ],
 )

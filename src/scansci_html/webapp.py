@@ -506,7 +506,23 @@ class NotebookWebApp:
         if len(parts) == 6 and parts[:3] == ["api", "slides", "templates"] and parts[4] == "pages":
             asset = slide_template_asset(parts[3], parts[5], self.slides_root)
             return WebResponse(HTTPStatus.OK, "image/svg+xml; charset=utf-8", asset.read_bytes())
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
+            params = parse_qs(query)
+            after_sequence = max(0, int(params.get("after_sequence", [0])[0] or 0))
+            limit = min(1000, max(1, int(params.get("limit", [200])[0] or 200)))
+            return self._json(
+                HTTPStatus.OK,
+                self.research_agent.store.snapshot(parts[2], after_sequence=after_sequence, event_limit=limit),
+            )
         if len(parts) == 3 and parts[:2] == ["api", "runs"]:
+            params = parse_qs(query)
+            if "after_sequence" in params:
+                after_sequence = max(0, int(params.get("after_sequence", [0])[0] or 0))
+                limit = min(1000, max(1, int(params.get("limit", [200])[0] or 200)))
+                return self._json(
+                    HTTPStatus.OK,
+                    self.research_agent.store.snapshot(parts[2], after_sequence=after_sequence, event_limit=limit),
+                )
             return self._json(HTTPStatus.OK, self.research_agent.store.get_run(parts[2]))
         if len(parts) == 6 and parts[:2] == ["api", "runs"] and parts[3] == "sources" and parts[5] == "reader":
             return self._task_evidence_reader(parts[2], parts[4], query=query)
@@ -893,6 +909,18 @@ class NotebookWebApp:
                 source=str(payload.get("source", "auto") or "auto"),
             )
             return self._json(HTTPStatus.ACCEPTED, install)
+        if path == "/api/local-models/install-control":
+            job_id = str(payload.get("job_id", "") or "").strip()
+            action = str(payload.get("action", "") or "").strip().lower()
+            actions = {
+                "pause": self.model_installs.pause,
+                "resume": self.model_installs.resume,
+                "retry": self.model_installs.retry,
+                "cancel": self.model_installs.cancel,
+            }
+            if action not in actions:
+                raise ValueError("下载控制 action 必须是 pause、resume、retry 或 cancel")
+            return self._json(HTTPStatus.ACCEPTED, actions[action](job_id))
         if path == "/api/resources/retrieval/download":
             blocked = self._model_download_requires_runtime()
             if blocked is not None:
@@ -904,6 +932,17 @@ class NotebookWebApp:
                 on_complete=lambda _job: self._after_retrieval_models_ready(),
             )
             return self._json(HTTPStatus.ACCEPTED, install)
+        if path == "/api/local-runtime/install-control":
+            action = str(payload.get("action", "") or "").strip().lower()
+            actions = {
+                "pause": self.local_runtime.pause_install,
+                "resume": self.local_runtime.resume_install,
+                "retry": self.local_runtime.retry_install,
+                "cancel": self.local_runtime.cancel_install,
+            }
+            if action not in actions:
+                raise ValueError("本地运行组件控制 action 必须是 pause、resume、retry 或 cancel")
+            return self._json(HTTPStatus.ACCEPTED, actions[action]())
         if path == "/api/local-runtime/install":
             return self._json(HTTPStatus.ACCEPTED, self.local_runtime.start_install())
         if path == "/api/tools/paper-atlas/search":

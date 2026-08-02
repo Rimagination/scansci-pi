@@ -729,43 +729,58 @@ class FederatedAcademicSearch:
         provider_results: dict[str, list[AcademicPaper]] = {}
         provider_queries: dict[str, list[str]] = {}
         errors: dict[str, str] = {}
-        executor = ThreadPoolExecutor(max_workers=max(1, min(self.max_workers, len(self.providers) * len(variants))))
-        futures = {
-            executor.submit(provider.search, variant, limit=variant_limit, year_from=year_from): (provider, variant)
-            for provider in self.providers
-            for variant in variants
-        }
-        pending = set(futures)
-        abandoned = False
-        try:
-            while pending:
-                if cancelled():
-                    for future in futures:
-                        future.cancel()
-                    abandoned = True
-                    raise InterruptedError("academic search cancelled")
-                completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    provider, variant = futures[future]
-                    try:
-                        papers = future.result()
-                        provider_results.setdefault(provider.source_name, []).extend(papers)
-                        provider_queries.setdefault(provider.source_name, []).append(variant)
-                    except Exception as error:  # one provider must not collapse federation
-                        previous = errors.get(provider.source_name, "")
-                        message = f"{type(error).__name__}: {error}"[:500]
-                        errors[provider.source_name] = message if not previous else f"{previous}; {message}"[:500]
-        finally:
-            executor.shutdown(wait=not abandoned, cancel_futures=abandoned)
+        def collect_provider_results(query_batch: Sequence[str]) -> None:
+            executor = ThreadPoolExecutor(
+                max_workers=max(1, min(self.max_workers, len(self.providers) * len(query_batch)))
+            )
+            futures = {
+                executor.submit(provider.search, variant, limit=variant_limit, year_from=year_from): (provider, variant)
+                for provider in self.providers
+                for variant in query_batch
+            }
+            pending = set(futures)
+            abandoned = False
+            try:
+                while pending:
+                    if cancelled():
+                        for future in futures:
+                            future.cancel()
+                        abandoned = True
+                        raise InterruptedError("academic search cancelled")
+                    completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        provider, variant = futures[future]
+                        try:
+                            papers = future.result()
+                            provider_results.setdefault(provider.source_name, []).extend(papers)
+                            provider_queries.setdefault(provider.source_name, []).append(variant)
+                        except Exception as error:  # one provider must not collapse federation
+                            previous = errors.get(provider.source_name, "")
+                            message = f"{type(error).__name__}: {error}"[:500]
+                            errors[provider.source_name] = message if not previous else f"{previous}; {message}"[:500]
+            finally:
+                executor.shutdown(wait=not abandoned, cancel_futures=abandoned)
 
+        collect_provider_results(variants)
         merged = _merge_provider_results(provider_results)
+        expansion_variants = _zero_result_query_expansions(clean, variants) if not merged else []
+        if expansion_variants:
+            # A zero-result search is still a useful state, but a concise
+            # deterministic relaxation often recovers records when a user
+            # pasted a title suffix, acronym, or over-specific phrase.  Keep
+            # this to one bounded retry and expose it in the artifact.
+            collect_provider_results(expansion_variants)
+            merged = _merge_provider_results(provider_results)
+        searched_variants = _unique_strings([*variants, *expansion_variants])
         diagnostics: dict[str, Any] = {}
-        ranked = self._rank(" ".join(variants), merged, diagnostics=diagnostics)
+        ranked = self._rank(" ".join(searched_variants), merged, diagnostics=diagnostics)
         accepted, quality_gate = _apply_topic_quality_gate(ranked, required_terms)
         elapsed = datetime.now(timezone.utc) - started
         return {
             "query": clean,
-            "query_variants": variants,
+            "query_variants": searched_variants,
+            "query_expansions": expansion_variants,
+            "zero_result_expanded": bool(expansion_variants),
             "items": accepted[:result_limit],
             "count": min(result_limit, len(accepted)),
             "candidate_count": sum(len(items) for items in provider_results.values()),
@@ -1139,6 +1154,40 @@ def _int_or_none(value: Any) -> int | None:
         return int(value) if value not in {None, ""} else None
     except (TypeError, ValueError):
         return None
+
+
+def _zero_result_query_expansions(query: str, attempted: Sequence[str]) -> list[str]:
+    """Build at most two transparent relaxations after a true zero result."""
+
+    clean = _clean_space(query)
+    if not clean or re.search(r"(?:10\.\d{4,9}/|\barxiv\s*:\s*|\b\d{4}\.\d{4,5})", clean, re.IGNORECASE):
+        return []
+    attempted_keys = {str(item).casefold() for item in attempted}
+    candidates: list[str] = []
+    without_boilerplate = re.sub(
+        r"(?:please\s+)?(?:find|search|retrieve|look\s+for|papers?|articles?|研究|论文|文献|检索|搜索|查找)",
+        " ",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    compact = _clean_space(without_boilerplate).strip(" -:：,，;；")
+    if compact and compact.casefold() != clean.casefold() and len(_content_terms(compact)) >= 2:
+        candidates.append(compact)
+
+    replacements = {
+        "rag": "retrieval augmented generation",
+        "factuality": "faithfulness",
+        "groundedness": "faithfulness",
+        "photovoltaic": "solar photovoltaic",
+        "machine learning": "artificial intelligence",
+    }
+    expanded = clean
+    for source, target in replacements.items():
+        expanded = re.sub(rf"\b{re.escape(source)}\b", target, expanded, flags=re.IGNORECASE)
+    expanded = _clean_space(expanded)
+    if expanded.casefold() != clean.casefold() and len(_content_terms(expanded)) >= 2:
+        candidates.append(expanded)
+    return [item for item in _unique_strings(candidates) if item.casefold() not in attempted_keys][:2]
 
 
 def _unique_strings(values: Iterable[Any]) -> list[str]:
