@@ -243,6 +243,7 @@ def test_review_document_ui_does_not_replay_the_user_instruction(tmp_path: Path)
 def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    normalized_script = script.replace("\r\n", "\n")
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
 
     assert "function conversationMessageMarkup" in script
@@ -272,7 +273,7 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert "Publisher-declared PDF" in script
     assert "文献检索服务返回了无法读取的结果，下载尚未开始。" in script
     assert 'const primaryAction = (recovery.actions || []).find((action) => action.kind !== "branch")' in script
-    assert 'if (run.status === "failed") {\n    return "";' in script
+    assert 'if (run.status === "failed") {\n    return "";' in normalized_script
     assert "escapeHtml(runFailureSummary(run))" in script
     assert "escapeHtml(recovery.detail)" not in script
     assert '${run.error?.message || "执行阶段返回了错误"}' not in script

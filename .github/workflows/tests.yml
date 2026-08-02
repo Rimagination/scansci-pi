@@ -18,8 +18,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
       - name: Install package
-        run: python -m pip install -e ".[test]"
+        run: python -m pip install -e ".[test,evaluation,rerank]"
+      - name: Install Pi runtime dependencies
+        run: npm ci
+      - name: Build Pi runtime
+        run: npm run build:pi-runtime
       - name: Run tests
         run: python -m pytest tests -q
       - name: Build sample evidence benchmark store

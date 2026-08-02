@@ -42,6 +42,53 @@ def _make_pdf(path: Path) -> Path:
     return path
 
 
+def _classic_easyslides_fixture(tmp_path: Path) -> Path:
+    root = tmp_path / "easyslides"
+    layouts = root / "templates" / "layouts"
+    template = layouts / "defense_leftnav"
+    template.mkdir(parents=True)
+    (layouts / "layouts_index.json").write_text(
+        json.dumps(
+            {
+                "defense_leftnav": {
+                    "summary": "Classic academic defense template.",
+                    "keywords": ["academic", "defense"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (template / "design_spec.md").write_text(
+        """---
+template_id: defense_leftnav
+display_name_zh: Defense Left Navigation
+category: defense
+primary_color: "#8B0012"
+canvas_format: ppt169
+replication_mode: classic
+---
+""",
+        encoding="utf-8",
+    )
+    roles = ("cover", "toc", "chapter", "content", "ending")
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#fff"/></svg>'
+    for index, role in enumerate(roles, start=1):
+        (template / f"{index:02d}_{role}.svg").write_text(svg, encoding="utf-8")
+    (template / "layouts.json").write_text(
+        json.dumps(
+            {
+                "template_id": "defense_leftnav",
+                "replication_mode": "classic",
+                "shells": [{"role": role} for role in roles],
+                "slot_models": {role: [{"id": f"{role}-default"}] for role in roles},
+                "text_fit_policy": {"overflow": "shrink"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
 def test_pdf_source_creates_editable_pptx_without_a_library(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     source = _make_pdf(tmp_path / "study.pdf")
@@ -66,6 +113,7 @@ def test_pdf_source_creates_editable_pptx_without_a_library(tmp_path: Path):
 
 def test_selected_classic_template_routes_to_the_native_easyslides_renderer(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace.sqlite"
+    slides_root = _classic_easyslides_fixture(tmp_path)
     source = _make_pdf(tmp_path / "study.pdf")
     persisted = persist_slide_sources(workspace, [{"name": source.name, "path": str(source)}])
     calls: list[dict[str, object]] = []
@@ -100,6 +148,7 @@ def test_selected_classic_template_routes_to_the_native_easyslides_renderer(tmp_
         sources=persisted,
         topic="Template-aware scientific briefing",
         template_id="defense_leftnav",
+        slides_root=slides_root,
     )
     presentation = Presentation(output["pptx_path"])
     content_shapes = presentation.slides[0].shapes

@@ -31,7 +31,9 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "PyMuPDF>=1.24,<2",
+  "pywebview>=6.0,<7.0",
   "pytest>=8,<9",
+  "scikit-learn>=1.4",
   "torch>=2.0,<3",
 ]
 rerank = [
