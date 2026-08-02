@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from hashlib import blake2b
 import re
 from pathlib import Path
 from typing import Iterable
@@ -28,6 +29,15 @@ class EvidenceSpan:
     char_start: int
     char_end: int
     text: str
+    # These fields make the structural path explicit instead of forcing
+    # downstream callers to reverse-engineer it from a display label.  They
+    # intentionally have defaults so existing benchmark fixtures can keep
+    # constructing EvidenceSpan objects without a migration flag day.
+    section_id: str = ""
+    parent_section_id: str = ""
+    section_path: str = ""
+    section_level: int = 0
+    source_locator: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -138,10 +148,11 @@ def _ensure_evidence_styles(soup: BeautifulSoup) -> None:
     style.string = """
     [data-evidence-id] { scroll-margin-top: 6rem; }
     [data-evidence-id]:target {
-      background: #fff1a6;
-      outline: 2px solid #2457a6;
-      box-shadow: 0 0 0 4px rgba(36, 87, 166, 0.16);
-      border-radius: 2px;
+      background: #caff4d;
+      color: #17210b;
+      outline: none;
+      box-shadow: none;
+      border-radius: 0;
     }
     """
     head.append(style)
@@ -197,7 +208,7 @@ def _scan_evidence_spans(
                 direct_kind = _section_kind(heading_text)
                 current_section_kind = _inherited_section_kind(direct_kind, section_stack)
                 section_stack.append((level, heading_text, current_section_kind))
-                current_section = heading_text
+            current_section = heading_text
             continue
         block_type = _block_type(tag)
         if not block_type or _inside_same_block(tag):
@@ -211,6 +222,11 @@ def _scan_evidence_spans(
         section_kind = current_section_kind or _section_kind(current_section)
         if _is_non_evidence_section(section_kind):
             continue
+        section, section_path, section_level, section_id, parent_section_id = _section_metadata(
+            doc_id,
+            section_stack,
+            fallback=current_section,
+        )
         fragments: list[_SentenceFragment] = []
         local_sentence_index = 0
         sentence_offsets = (
@@ -234,7 +250,7 @@ def _scan_evidence_spans(
                 publication_year=publication_year,
                 html_path=normalized_path,
                 html_anchor=html_anchor,
-                section=current_section,
+                section=section,
                 section_kind=section_kind,
                 block_id=f"{doc_id}:{block_anchor}",
                 block_type=block_type,
@@ -242,6 +258,11 @@ def _scan_evidence_spans(
                 char_start=char_start,
                 char_end=char_end,
                 text=sentence_text,
+                section_id=section_id,
+                parent_section_id=parent_section_id,
+                section_path=section_path,
+                section_level=section_level,
+                source_locator=_source_locator(section_path, html_anchor=html_anchor),
             )
             spans.append(span)
             fragments.append(_SentenceFragment(sentence_text, span))
@@ -251,19 +272,150 @@ def _scan_evidence_spans(
 
 
 def _sentence_offsets(text: str) -> Iterable[tuple[str, int, int]]:
-    protected, replacements = _protect_abbreviations(text)
+    """Yield traceable, bounded evidence fragments from one source block.
+
+    This is deliberately rule based: an evidence fragment must remain an exact
+    substring of the parsed source block.  Earlier code only split English
+    full stops followed by an uppercase token, which left Chinese paragraphs
+    and transcript pages as multi-thousand-character "sentences".  Here we
+    handle Chinese punctuation, ordinary English punctuation, and timestamped
+    transcripts without involving an LLM.
+    """
+
+    value = str(text or "")
+    if not value:
+        return
+    timestamped = tuple(_timestamp_group_offsets(value))
+    if timestamped:
+        yield from timestamped
+        return
+
+    boundaries: list[int] = []
+    for index, character in enumerate(value):
+        if _is_sentence_boundary(value, index, character):
+            end = _consume_closing_punctuation(value, index + 1)
+            if not boundaries or end > boundaries[-1]:
+                boundaries.append(end)
+
     start = 0
-    for match in re.finditer(r"(?<=[.!?])\s+(?=[A-Z0-9])", protected):
-        if _inside_decimal_fragment(protected, match):
+    for end in [*boundaries, len(value)]:
+        if end <= start:
             continue
-        end = match.start()
-        sentence = _restore_abbreviations(protected[start:end].strip(), replacements)
-        if sentence:
-            yield sentence, start, end
-        start = match.end()
-    sentence = _restore_abbreviations(protected[start:].strip(), replacements)
-    if sentence:
-        yield sentence, start, len(text)
+        yield from _bounded_fragment_offsets(value, start, end)
+        start = end
+
+
+def _timestamp_group_offsets(text: str, *, target_length: int = 480) -> Iterable[tuple[str, int, int]]:
+    """Group timestamped transcript cues into retrieval-sized original spans."""
+
+    markers = list(re.finditer(r"\[(?:\d+(?:\.\d+)?)\s*-\s*(?:\d+(?:\.\d+)?)\]", text))
+    if len(markers) < 3:
+        return ()
+    pieces = [
+        (marker.start(), markers[index + 1].start() if index + 1 < len(markers) else len(text))
+        for index, marker in enumerate(markers)
+    ]
+    groups: list[tuple[int, int]] = []
+    group_start, group_end = pieces[0]
+    for piece_start, piece_end in pieces[1:]:
+        if group_end - group_start >= target_length:
+            groups.append((group_start, group_end))
+            group_start = piece_start
+        group_end = piece_end
+    groups.append((group_start, group_end))
+    if len(groups) > 1 and groups[-1][1] - groups[-1][0] < target_length // 3:
+        previous_start, _ = groups[-2]
+        groups[-2] = (previous_start, groups[-1][1])
+        groups.pop()
+    return tuple(_trimmed_fragment(text, start, end) for start, end in groups if text[start:end].strip())
+
+
+def _is_sentence_boundary(text: str, index: int, character: str) -> bool:
+    if character in "。！？；!?":
+        return True
+    if character != ".":
+        return False
+    if _decimal_period(text, index) or _abbreviation_period(text, index):
+        return False
+    if index + 1 < len(text) and not text[index + 1].isspace() and not _is_cjk(text[index + 1]):
+        # A period inside a DOI, URL, version number, or abbreviation has no
+        # following whitespace.  Do not turn `10.1000/ABC.Def` into two
+        # fabricated evidence fragments merely because the next token starts
+        # with a capital letter.
+        return False
+    next_index = index + 1
+    while next_index < len(text) and text[next_index].isspace():
+        next_index += 1
+    if next_index >= len(text):
+        return True
+    next_character = text[next_index]
+    return bool(next_character.isupper() or next_character.isdigit() or _is_cjk(next_character))
+
+
+def _decimal_period(text: str, index: int) -> bool:
+    before = index - 1
+    after = index + 1
+    while before >= 0 and text[before].isspace():
+        before -= 1
+    while after < len(text) and text[after].isspace():
+        after += 1
+    return before >= 0 and after < len(text) and text[before].isdigit() and text[after].isdigit()
+
+
+def _abbreviation_period(text: str, index: int) -> bool:
+    prefix = text[max(0, index - 12) : index + 1].lower()
+    return bool(re.search(r"(?:figs?|eqs?|dr|prof|mr|mrs|ms|vs|etc|al|e\.g|i\.e)\.$", prefix))
+
+
+def _consume_closing_punctuation(text: str, index: int) -> int:
+    cursor = index
+    while cursor < len(text) and text[cursor] in "”’\"')】」』":
+        cursor += 1
+    return cursor
+
+
+def _bounded_fragment_offsets(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    max_length: int = 900,
+) -> Iterable[tuple[str, int, int]]:
+    """Fallback split for malformed/OCR text that lacks sentence punctuation."""
+
+    cursor = start
+    while end - cursor > max_length:
+        window_end = min(end, cursor + max_length)
+        boundary = _best_soft_boundary(text, cursor, window_end)
+        if boundary <= cursor:
+            boundary = window_end
+        yield _trimmed_fragment(text, cursor, boundary)
+        cursor = boundary
+    if cursor < end:
+        yield _trimmed_fragment(text, cursor, end)
+
+
+def _best_soft_boundary(text: str, start: int, end: int) -> int:
+    lower_bound = start + max(160, (end - start) // 2)
+    for index in range(end - 1, lower_bound - 1, -1):
+        if text[index] in "，,、:：;；\n":
+            return index + 1
+    for index in range(end - 1, lower_bound - 1, -1):
+        if text[index].isspace():
+            return index + 1
+    return end
+
+
+def _trimmed_fragment(text: str, start: int, end: int) -> tuple[str, int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return text[start:end], start, end
+
+
+def _is_cjk(character: str) -> bool:
+    return "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
 
 
 def _inside_decimal_fragment(text: str, match: re.Match[str]) -> bool:
@@ -398,7 +550,7 @@ def _section_kind(section: str) -> str:
     value = _normalized_section_heading(section)
     if not value:
         return ""
-    if "reference" in value or "bibliograph" in value:
+    if "reference" in value or "bibliograph" in value or value in {"参考文献", "參考文獻"}:
         return "references"
     if "author" in value and ("affiliation" in value or "information" in value or "contribution" in value):
         return "authors"
@@ -406,7 +558,7 @@ def _section_kind(section: str) -> str:
         return "authors"
     if "contribution" in value:
         return "contributions"
-    if "acknowledgement" in value or "acknowledgment" in value:
+    if "acknowledgement" in value or "acknowledgment" in value or value in {"致谢", "致謝"}:
         return "acknowledgements"
     if "funding" in value:
         return "funding"
@@ -420,17 +572,17 @@ def _section_kind(section: str) -> str:
         return "supplementary"
     if "source data" in value:
         return "source_data"
-    if "abstract" in value:
+    if "abstract" in value or value in {"摘要", "中文摘要", "英文摘要"}:
         return "abstract"
-    if "method" in value or "materials" in value:
+    if "method" in value or "materials" in value or value in {"方法", "研究方法", "实验方法", "實驗方法", "材料与方法", "材料與方法"}:
         return "methods"
-    if value == "main" or "result" in value or "finding" in value:
+    if value == "main" or "result" in value or "finding" in value or value in {"结果", "結果", "研究结果", "研究結果"}:
         return "results"
-    if "discussion" in value:
+    if "discussion" in value or value in {"讨论", "討論"}:
         return "discussion"
-    if "conclusion" in value:
+    if "conclusion" in value or value in {"结论", "結論"}:
         return "conclusion"
-    if "introduction" in value or value == "intro":
+    if "introduction" in value or value == "intro" or value in {"引言", "前言", "介绍", "介紹"}:
         return "introduction"
     return "other"
 
@@ -438,6 +590,38 @@ def _section_kind(section: str) -> str:
 def _normalized_section_heading(section: str) -> str:
     value = section.strip().lower()
     return re.sub(r"^\s*(?:\d+(?:\.\d+)*|[ivxlcdm]+)(?:[\).:-]|\s+)\s*", "", value)
+
+
+def _section_metadata(
+    doc_id: str,
+    section_stack: list[tuple[int, str, str]],
+    *,
+    fallback: str,
+) -> tuple[str, str, int, str, str]:
+    """Return a stable, hierarchical section identity for a source block."""
+
+    titles = [title.strip() for _, title, _ in section_stack if title.strip()]
+    if not titles:
+        titles = [str(fallback or "正文").strip() or "正文"]
+    section = titles[-1]
+    section_path = " / ".join(titles)
+    section_level = int(section_stack[-1][0]) if section_stack else 0
+    section_id = _section_id(doc_id, section_path)
+    parent_section_id = _section_id(doc_id, " / ".join(titles[:-1])) if len(titles) > 1 else ""
+    return section, section_path, section_level, section_id, parent_section_id
+
+
+def _section_id(doc_id: str, section_path: str) -> str:
+    digest = re.sub(r"[^a-z0-9]+", "-", section_path.lower()).strip("-")[:56] or "root"
+    fingerprint = blake2b(section_path.encode("utf-8"), digest_size=5).hexdigest()
+    return f"{doc_id}.sec.{digest}-{fingerprint}"
+
+
+def _source_locator(section_path: str, *, html_anchor: str) -> str:
+    page_match = re.search(r"(?:第\s*)?(\d+)\s*页|\bpage\s*(\d+)\b", section_path, flags=re.IGNORECASE)
+    if page_match:
+        return f"page:{next(value for value in page_match.groups() if value)}"
+    return f"anchor:{html_anchor}" if html_anchor else ""
 
 
 def _inherited_section_kind(direct_kind: str, section_stack: list[tuple[int, str, str]]) -> str:

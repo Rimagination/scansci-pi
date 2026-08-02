@@ -18,6 +18,7 @@ from typing import Any
 from .local_model_market import installed_models
 
 from .builtin_skills import default_skill_records
+from .artifact_plugins import default_plugin_records, enrich_builtin_plugins
 
 
 _CONFIG_NAME = ".scansci-notebook.json"
@@ -25,6 +26,9 @@ _SERVICE_NAME = "scansci-html-notebook"
 _SAFE_ID = re.compile(r"[^a-z0-9._-]+")
 _MAX_ITEMS = 128
 _MANAGED_GATEWAY_BASE_URL = "https://scansci-glm-gateway.932196440.workers.dev/v1"
+_MANAGED_PROVIDER_ID = "scansci-managed"
+_MANAGED_PROVIDER_NAME = "ScanSci"
+_DEFAULT_CHAT_MODEL_ID = "glm-4.7-flash"
 
 
 def _provider_preset(
@@ -68,6 +72,8 @@ def _model_preset(
     group: str,
     capabilities: list[str],
     context_window: str = "",
+    readiness: str = "production",
+    automatic_fallback: bool = False,
 ) -> dict[str, Any]:
     """Build a visible, editable model record without credentials."""
 
@@ -77,6 +83,11 @@ def _model_preset(
         "group": group,
         "context_window": context_window,
         "capabilities": capabilities,
+        # A routed model is not automatically a production fallback.  The
+        # release probe must verify its actual task quality before an operator
+        # grants it that role.
+        "readiness": readiness,
+        "automatic_fallback": bool(automatic_fallback),
     }
 
 
@@ -85,12 +96,69 @@ def _model_preset(
 # catalog, never a list of bundled or shared credentials.
 _MANAGED_MODEL_PRESETS = [
     _model_preset("glm-4.7-flash", "GLM-4.7 Flash", group="GLM", context_window="200K", capabilities=["reasoning", "tool", "coding"]),
-    _model_preset("Qwen/Qwen2.5-7B-Instruct", "Qwen2.5 7B Instruct", group="Qwen", capabilities=["coding"]),
+    # The gateway can route this standby model, but its current scientific
+    # writing probe is below ScanSci's release contract.  Keep the route
+    # visible to operations and probe it, without silently serving it as a
+    # replacement for the primary model.
+    _model_preset(
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen2.5 7B Instruct（待质量验证）",
+        group="Qwen",
+        context_window="32K",
+        capabilities=["reasoning", "tool", "coding"],
+        readiness="standby",
+    ),
 ]
 
 
+def managed_model_ids() -> tuple[str, ...]:
+    """Return every managed route shown in the product catalog."""
+
+    return tuple(str(model["id"]) for model in _MANAGED_MODEL_PRESETS)
+
+
+def managed_probe_model_ids() -> tuple[str, ...]:
+    """Return production routes that must pass the release health probe.
+
+    A route marked ``standby`` remains visible for operator evaluation, but it
+    must not turn an otherwise healthy release into a failed build before it
+    has passed ScanSci's scientific-writing acceptance contract.
+    """
+
+    return tuple(
+        str(model["id"])
+        for model in _MANAGED_MODEL_PRESETS
+        if str(model.get("readiness", "production")) == "production"
+    )
+
+
+def _managed_production_model_ids() -> set[str]:
+    """Return managed routes that may serve user-visible answers."""
+
+    return {
+        str(model["id"])
+        for model in _MANAGED_MODEL_PRESETS
+        if str(model.get("readiness", "production")) == "production"
+    }
+
+
+def managed_fallback_model_ids(model_id: str) -> tuple[str, ...]:
+    """Return only release-approved automatic fallbacks.
+
+    Merely being reachable through the Worker is deliberately insufficient:
+    a fallback must also pass ScanSci's structured research-writing probe.
+    """
+
+    selected = str(model_id or "").strip()
+    return tuple(
+        str(model["id"])
+        for model in _MANAGED_MODEL_PRESETS
+        if bool(model.get("automatic_fallback")) and str(model["id"]) != selected
+    )
+
+
 _PROVIDER_PRESETS: list[dict[str, Any]] = [
-    _provider_preset("scansci-managed", "ScanSciAI", category="ScanSci", base_url=_MANAGED_GATEWAY_BASE_URL, summary="Built-in managed models. Upstream credentials are held only by ScanSci's gateway.", auth_mode="managed", model_listing=False, models=_MANAGED_MODEL_PRESETS),
+    _provider_preset(_MANAGED_PROVIDER_ID, _MANAGED_PROVIDER_NAME, category="ScanSci", base_url=_MANAGED_GATEWAY_BASE_URL, summary="Built-in managed models. Upstream credentials are held only by ScanSci's gateway.", auth_mode="managed", model_listing=False, models=_MANAGED_MODEL_PRESETS),
     _provider_preset("openai", "OpenAI", category="国际模型", base_url="https://api.openai.com/v1", models=[_model_preset("gpt-5.2", "GPT-5.2", group="GPT", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("gpt-5.2-mini", "GPT-5.2 mini", group="GPT", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("text-embedding-3-large", "text-embedding-3-large", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("anthropic", "Anthropic", category="国际模型", kind="anthropic-compatible", base_url="https://api.anthropic.com/v1", models=[_model_preset("claude-sonnet-4-6", "Claude Sonnet 4.6", group="Claude", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("claude-opus-4-6", "Claude Opus 4.6", group="Claude", capabilities=["reasoning", "vision", "tool", "coding"])]),
     _provider_preset("gemini", "Google Gemini", category="国际模型", base_url="https://generativelanguage.googleapis.com/v1beta/openai", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding", "audio"]), _model_preset("gemini-3.5-flash", "Gemini 3.5 Flash", group="Gemini", capabilities=["reasoning", "vision", "tool"]), _model_preset("gemini-embedding-001", "Gemini Embedding", group="Embeddings", capabilities=["embedding"])]),
@@ -161,38 +229,37 @@ class SettingsError(ValueError):
 
 _DEFAULT_SETTINGS: dict[str, Any] = {
     "schema_version": 2,
-    "active_model": {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"},
+    "active_model": {"provider_id": _MANAGED_PROVIDER_ID, "model_id": _DEFAULT_CHAT_MODEL_ID},
     "providers": [
         {
-            "id": "scansci-managed",
-            "name": "ScanSciAI",
+            "id": _MANAGED_PROVIDER_ID,
+            "name": _MANAGED_PROVIDER_NAME,
             "kind": "openai-compatible",
             "base_url": _MANAGED_GATEWAY_BASE_URL,
             "enabled": True,
             "auth_mode": "managed",
             "models": [
-                {"id": "glm-4.7-flash", "name": "GLM-4.7 Flash", "group": "GLM", "context_window": "200K", "capabilities": ["reasoning", "tool", "coding"]},
-                {"id": "Qwen/Qwen2.5-7B-Instruct", "name": "Qwen2.5 7B Instruct", "group": "Qwen", "context_window": "", "capabilities": ["coding"]},
+                {"id": _DEFAULT_CHAT_MODEL_ID, "name": "GLM-4.7 Flash", "group": "GLM", "context_window": "200K", "capabilities": ["reasoning", "tool", "coding"]},
             ],
         },
         {
             "id": "local-evidence",
-            "name": "本地证据引擎",
+            "name": "离线基础检索（非模型）",
             "kind": "local",
             "base_url": "",
             "enabled": True,
             "models": [
-                {"id": "evidence-retrieval", "name": "证据检索", "group": "ScanSci", "context_window": "本地", "capabilities": ["embedding", "reranking"]},
+                {"id": "evidence-retrieval", "name": "关键词检索与词法重排（非模型）", "group": "离线回退", "context_window": "本地", "capabilities": ["embedding", "reranking"]},
             ],
         },
     ],
     "local_models": [
         {
             "id": "builtin-evidence",
-            "name": "ScanSci Evidence Engine",
+            "name": "离线基础检索（非模型）",
             "runtime": "builtin",
             "base_url": "",
-            "model_id": "evidence-retrieval",
+            "model_id": "local-hash-v1 / local-lexical-v1",
             "enabled": True,
         }
     ],
@@ -218,9 +285,22 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
             "enabled": False,
         },
     },
+    "onboarding": {
+        "welcome_dismissed": False,
+        "resource_setup_completed": False,
+        # Kept separately from the optional model download.  A user can start
+        # work without any local files, then resume the data-source walkthrough
+        # from Settings when they are ready to connect private material.
+        "data_setup_completed": False,
+    },
+    "appearance": {
+        "locale": "zh-CN",
+        "theme": "system",
+        "accent": "jade",
+    },
     "skills": default_skill_records(),
     "mcp_servers": [],
-    "plugins": [],
+    "plugins": default_plugin_records(),
 }
 
 
@@ -276,7 +356,7 @@ def configure_managed_glm_4_7_flash(workspace: str | Path) -> dict[str, Any]:
     """Enable ScanSci's zero-configuration GLM service for one workspace."""
 
     settings = _normalize_settings(_read_raw_settings(workspace))
-    provider = next((item for item in settings["providers"] if item["id"] == "scansci-managed"), None)
+    provider = next((item for item in settings["providers"] if item["id"] == _MANAGED_PROVIDER_ID), None)
     if provider is None:  # Defensive: the common catalog normally guarantees this.
         raise SettingsError("Managed ScanSci provider preset is unavailable")
 
@@ -284,7 +364,7 @@ def configure_managed_glm_4_7_flash(workspace: str | Path) -> dict[str, Any]:
     provider["base_url"] = _MANAGED_GATEWAY_BASE_URL
     provider["enabled"] = True
     provider["auth_mode"] = "managed"
-    preset = next(item for item in _PROVIDER_PRESETS if item["id"] == "scansci-managed")
+    preset = next(item for item in _PROVIDER_PRESETS if item["id"] == _MANAGED_PROVIDER_ID)
     available_model_ids = {str(model.get("id", "")) for model in provider["models"]}
     for model in reversed(preset["models"]):
         if model["id"] not in available_model_ids:
@@ -294,11 +374,11 @@ def configure_managed_glm_4_7_flash(workspace: str | Path) -> dict[str, Any]:
     # people upgrading ScanSci immediately see the ready-to-use default.
     settings["providers"] = [
         provider,
-        *(item for item in settings["providers"] if item["id"] != "scansci-managed"),
+        *(item for item in settings["providers"] if item["id"] != _MANAGED_PROVIDER_ID),
     ]
 
-    reference = "provider:scansci-managed:glm-4.7-flash"
-    settings["active_model"] = {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"}
+    reference = f"provider:{_MANAGED_PROVIDER_ID}:{_DEFAULT_CHAT_MODEL_ID}"
+    settings["active_model"] = {"provider_id": _MANAGED_PROVIDER_ID, "model_id": _DEFAULT_CHAT_MODEL_ID}
     settings["model_roles"].update({"reasoning": reference, "writing": reference, "slides": reference, "vision": ""})
     return save_settings(workspace, settings)
 
@@ -380,6 +460,41 @@ def get_document_service_api_key(workspace: str | Path, service_id: str) -> str:
         return ""
 
 
+def set_notion_api_token(workspace: str | Path, value: str) -> dict[str, Any]:
+    """Store the Notion integration token in the OS credential manager."""
+
+    secret = str(value or "").strip()
+    try:
+        import keyring
+
+        username = _notion_secret_name(workspace)
+        if secret:
+            keyring.set_password(_SERVICE_NAME, username, secret)
+        else:
+            try:
+                keyring.delete_password(_SERVICE_NAME, username)
+            except Exception:
+                pass
+    except Exception as exc:  # pragma: no cover - desktop keyring differs by OS
+        raise SettingsError(f"无法访问系统凭据管理器：{exc}") from exc
+    return load_settings(workspace)
+
+
+def get_notion_api_token(workspace: str | Path) -> str:
+    """Read the Notion token for an in-process API request only."""
+
+    try:
+        import keyring
+
+        return str(keyring.get_password(_SERVICE_NAME, _notion_secret_name(workspace)) or "")
+    except Exception:
+        return ""
+
+
+def notion_api_token_configured(workspace: str | Path) -> bool:
+    return bool(get_notion_api_token(workspace))
+
+
 def _read_raw_settings(workspace: str | Path) -> object:
     path = settings_path(workspace)
     if not path.is_file():
@@ -401,9 +516,11 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     )
     local_models = _normalize_local_models(payload.get("local_models", defaults["local_models"]))
     document_processing = _normalize_document_processing(payload.get("document_processing", defaults["document_processing"]))
+    onboarding = _normalize_onboarding(payload.get("onboarding", defaults["onboarding"]))
+    appearance = _normalize_appearance(payload.get("appearance", defaults["appearance"]))
     skills = _with_builtin_skills(_normalize_records(payload.get("skills", defaults["skills"]), kind="skill"))
     mcp_servers = _normalize_records(payload.get("mcp_servers", defaults["mcp_servers"]), kind="mcp")
-    plugins = _normalize_records(payload.get("plugins", defaults["plugins"]), kind="plugin")
+    plugins = _with_builtin_plugins(_normalize_records(payload.get("plugins", defaults["plugins"]), kind="plugin"))
     active = payload.get("active_model", defaults["active_model"])
     if not isinstance(active, dict):
         active = {}
@@ -412,7 +529,17 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     model_id = _model_id(active.get("model_id"), fallback=provider["models"][0]["id"])
     if not any(model["id"] == model_id for model in provider["models"]):
         model_id = provider["models"][0]["id"]
+    # Managed standby routes remain visible for diagnostics, but they are not
+    # release-approved conversation models.  Migrate stale workspace choices
+    # to the production default every time settings are loaded or saved so an
+    # old selection cannot silently serve a user-visible answer.
+    if provider["id"] == _MANAGED_PROVIDER_ID and model_id not in _managed_production_model_ids():
+        model_id = _DEFAULT_CHAT_MODEL_ID
     model_roles = _normalize_model_roles(payload.get("model_roles", defaults["model_roles"]))
+    for role, reference in list(model_roles.items()):
+        prefix = f"provider:{_MANAGED_PROVIDER_ID}:"
+        if reference.startswith(prefix) and reference.removeprefix(prefix) not in _managed_production_model_ids():
+            model_roles[role] = f"{prefix}{_DEFAULT_CHAT_MODEL_ID}"
     return {
         "schema_version": 2,
         "active_model": {"provider_id": provider["id"], "model_id": model_id},
@@ -420,6 +547,8 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
         "local_models": local_models,
         "model_roles": model_roles,
         "document_processing": document_processing,
+        "onboarding": onboarding,
+        "appearance": appearance,
         "skills": skills,
         "mcp_servers": mcp_servers,
         "plugins": plugins,
@@ -437,13 +566,19 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
         runtime = _text(item.get("runtime"), fallback="openai-compatible", limit=40).lower()
         if runtime not in {"builtin", "ollama", "lm-studio", "llama.cpp", "openai-compatible"}:
             runtime = "openai-compatible"
+        if identifier == "builtin-evidence" and runtime == "builtin":
+            name = "离线基础检索（非模型）"
+            model_id = "local-hash-v1 / local-lexical-v1"
+        else:
+            name = _text(item.get("name"), fallback=identifier, limit=100)
+            model_id = _text(item.get("model_id"), limit=160)
         rows.append(
             {
                 "id": identifier,
-                "name": _text(item.get("name"), fallback=identifier, limit=100),
+                "name": name,
                 "runtime": runtime,
                 "base_url": _text(item.get("base_url"), limit=500),
-                "model_id": _text(item.get("model_id"), limit=160),
+                "model_id": model_id,
                 "enabled": bool(item.get("enabled", True)),
             }
         )
@@ -516,6 +651,29 @@ def _normalize_model_roles(value: object) -> dict[str, str]:
     }
 
 
+def _normalize_onboarding(value: object) -> dict[str, bool]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        "welcome_dismissed": bool(source.get("welcome_dismissed", False)),
+        "resource_setup_completed": bool(source.get("resource_setup_completed", False)),
+        "data_setup_completed": bool(source.get("data_setup_completed", False)),
+    }
+
+
+def _normalize_appearance(value: object) -> dict[str, str]:
+    """Keep desktop presentation preferences small, portable, and predictable."""
+
+    source = value if isinstance(value, dict) else {}
+    locale = _text(source.get("locale"), fallback="zh-CN", limit=16)
+    theme = _text(source.get("theme"), fallback="system", limit=16).lower()
+    accent = _text(source.get("accent"), fallback="jade", limit=16).lower()
+    return {
+        "locale": locale if locale in {"zh-CN", "en"} else "zh-CN",
+        "theme": theme if theme in {"system", "light", "dark"} else "system",
+        "accent": accent if accent in {"jade", "ocean", "plum", "amber"} else "jade",
+    }
+
+
 def _normalize_document_processing(value: object) -> dict[str, Any]:
     """Validate the small public surface for OCR and scientific PDF parsing."""
 
@@ -525,7 +683,7 @@ def _normalize_document_processing(value: object) -> dict[str, Any]:
     mineru_source = source.get("mineru") if isinstance(source.get("mineru"), dict) else {}
 
     ocr_provider = _text(ocr_source.get("provider"), fallback=defaults["ocr"]["provider"], limit=32).lower()
-    if ocr_provider not in {"system", "custom"}:
+    if ocr_provider not in {"system", "paddle", "custom"}:
         ocr_provider = "system"
     language_source = ocr_source.get("languages") if isinstance(ocr_source.get("languages"), list) else []
     languages = [
@@ -570,10 +728,24 @@ def _normalize_providers(value: object) -> list[dict[str, Any]]:
         identifier = _unique_id(_safe_id(item.get("id"), fallback=fallback), used)
         models_source = item.get("models") if isinstance(item.get("models"), list) else []
         models = _normalize_models(models_source, fallback="evidence-retrieval" if kind == "local" else "model")
+        if identifier == "local-evidence" and kind == "local":
+            name = "离线基础检索（非模型）"
+            models = [
+                {
+                    **model,
+                    "name": "关键词检索与词法重排（非模型）",
+                    "group": "离线回退",
+                }
+                if str(model.get("id", "")) == "evidence-retrieval"
+                else model
+                for model in models
+            ]
+        else:
+            name = _text(item.get("name"), fallback="本地证据引擎" if kind == "local" else "未命名提供商", limit=80)
         rows.append(
             {
                 "id": identifier,
-                "name": _text(item.get("name"), fallback="本地证据引擎" if kind == "local" else "未命名提供商", limit=80),
+                "name": name,
                 "kind": kind,
                 "base_url": _text(item.get("base_url"), limit=500),
                 "enabled": bool(item.get("enabled", True)),
@@ -614,12 +786,29 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
             "auth_mode": preset["auth_mode"],
             "model_listing": preset["model_listing"],
         }
-        if row.get("id") == "scansci-managed":
-            refreshed["name"] = preset["name"]
-            known_model_ids = {str(model.get("id", "")) for model in refreshed["models"]}
+        if row.get("id") == _MANAGED_PROVIDER_ID:
+            # ScanSci is product-owned catalog data rather than a user-named
+            # custom provider. Refresh stale labels and model metadata from
+            # earlier workspaces without touching their active-model choice.
+            refreshed["name"] = _MANAGED_PROVIDER_NAME
+            refreshed["kind"] = preset["kind"]
+            refreshed["base_url"] = preset["base_url"]
+            existing_models = {
+                str(model.get("id", "")): model
+                for model in refreshed["models"]
+                if str(model.get("id", ""))
+            }
+            canonical_ids = {str(model.get("id", "")) for model in preset["models"]}
             refreshed["models"] = [
-                *refreshed["models"],
-                *(deepcopy(model) for model in preset["models"] if model["id"] not in known_model_ids),
+                {
+                    **existing_models.get(str(model["id"]), {}),
+                    **deepcopy(model),
+                }
+                for model in preset["models"]
+            ] + [
+                model
+                for model in refreshed["models"]
+                if str(model.get("id", "")) not in canonical_ids
             ]
         rows[index] = refreshed
     known_ids = {str(provider.get("id", "")) for provider in rows}
@@ -627,7 +816,7 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
         if preset["id"] in known_ids:
             continue
         row = deepcopy(preset)
-        row["enabled"] = False
+        row["enabled"] = preset["id"] == _MANAGED_PROVIDER_ID
         rows.append(row)
     return rows
 
@@ -680,6 +869,10 @@ def _normalize_models(value: object, *, fallback: str) -> list[dict[str, Any]]:
                 "group": _text(item.get("group"), fallback="默认模型", limit=80),
                 "context_window": _text(item.get("context_window"), fallback="", limit=40),
                 "capabilities": _normalize_capabilities(item.get("capabilities"), fallback=identifier),
+                "readiness": _text(item.get("readiness"), fallback="production", limit=24)
+                if _text(item.get("readiness"), fallback="production", limit=24) in {"production", "standby"}
+                else "production",
+                "automatic_fallback": bool(item.get("automatic_fallback")),
             }
         )
     if rows:
@@ -732,10 +925,26 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
                 row["transport"] = "stdio"
             row["endpoint"] = _text(item.get("endpoint"), limit=500)
             row["version"] = _text(item.get("version"), limit=80)
+            connector_kind = _text(item.get("connector_kind"), limit=32).lower()
+            row["connector_kind"] = connector_kind if connector_kind in {"", "zotero", "obsidian", "general"} else "general"
+            # Read-only is the product default.  A saved MCP cannot expose
+            # write-like tools to Pi until the user explicitly opts in.
+            row["allow_write"] = bool(item.get("allow_write", False))
+            # Deferred servers expose a compact search/call surface and only
+            # start the MCP process when the agent actually needs a tool.
+            # Keep direct mode as the migration-safe default for existing
+            # workspaces and connector integrations.
+            row["deferred"] = bool(item.get("deferred", False))
             tags = item.get("tags") if isinstance(item.get("tags"), list) else []
             row["tags"] = list(dict.fromkeys(_text(tag, limit=48) for tag in tags if _text(tag, limit=48)))[:12]
         elif kind == "plugin":
             row["source"] = _text(item.get("source"), limit=500)
+            row["builtin"] = bool(item.get("builtin", False))
+            row["icon"] = _text(item.get("icon"), limit=40)
+            skills = item.get("skills") if isinstance(item.get("skills"), list) else []
+            row["skills"] = list(dict.fromkeys(_text(value, limit=80) for value in skills if _text(value, limit=80)))[:12]
+            tool_names = item.get("tool_names") if isinstance(item.get("tool_names"), list) else []
+            row["tool_names"] = list(dict.fromkeys(_text(value, limit=80) for value in tool_names if _text(value, limit=80)))[:12]
         rows.append(row)
     if rows or kind not in {"skill"}:
         return rows
@@ -743,22 +952,49 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
 
 
 def _with_builtin_skills(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Migrate existing workspaces without overriding a user's skill choices.
+    """Refresh shipped Skill metadata without overriding user choices.
 
     The desktop app has already written settings files for earlier releases.
-    New shipped skills must therefore be appended when absent rather than only
-    appearing for a brand-new workspace.
+    Canonical metadata therefore needs to replace stale translated labels while
+    preserving per-workspace enablement.  Zotero used to be misclassified as a
+    Skill and is removed only when the record is the retired built-in package.
     """
 
-    known = {str(record.get("id", "")) for record in records}
-    return [
-        *records,
-        *(record for record in default_skill_records() if record["id"] not in known),
-    ]
+    canonical = {record["id"]: record for record in default_skill_records()}
+    refreshed: list[dict[str, Any]] = []
+    for record in records:
+        identifier = str(record.get("id", ""))
+        is_builtin = str(record.get("path", "")).startswith("builtin:") or record.get("source_type") == "builtin"
+        if identifier == "zotero" and is_builtin:
+            continue
+        shipped = canonical.get(identifier)
+        if shipped:
+            refreshed.append({**shipped, "enabled": bool(record.get("enabled", shipped["enabled"])), "uninstalled": bool(record.get("uninstalled", False))})
+        else:
+            refreshed.append(record)
+    known = {str(record.get("id", "")) for record in refreshed}
+    return [*refreshed, *(record for record in default_skill_records() if record["id"] not in known)]
+
+
+def _with_builtin_plugins(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Refresh built-in plugin metadata while retaining user enablement."""
+
+    canonical = {record["id"]: record for record in default_plugin_records()}
+    refreshed: list[dict[str, Any]] = []
+    for record in records:
+        identifier = str(record.get("id", ""))
+        shipped = canonical.get(identifier)
+        if shipped and record.get("builtin"):
+            refreshed.append({**shipped, "enabled": bool(record.get("enabled", shipped["enabled"])), "uninstalled": bool(record.get("uninstalled", False))})
+        else:
+            refreshed.append(record)
+    known = {str(record.get("id", "")) for record in refreshed}
+    return [*refreshed, *(record for record in default_plugin_records() if record["id"] not in known)]
 
 
 def _with_secret_status(settings: dict[str, Any], workspace: str | Path) -> dict[str, Any]:
     public = deepcopy(settings)
+    public["plugins"] = enrich_builtin_plugins(list(public.get("plugins", []) or []))
     for provider in public["providers"]:
         provider["api_key_configured"] = provider.get("auth_mode") == "managed" or (provider["kind"] != "local" and _has_provider_api_key(workspace, provider["id"]))
     document_processing = public["document_processing"]
@@ -791,6 +1027,11 @@ def _document_service_id(value: object) -> str:
 def _document_service_secret_name(workspace: str | Path, service_id: str) -> str:
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
     return f"document-service:{digest}:{service_id}"
+
+
+def _notion_secret_name(workspace: str | Path) -> str:
+    digest = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
+    return f"notion-integration:{digest}"
 
 
 def _has_document_service_api_key(workspace: str | Path, service_id: str) -> bool:

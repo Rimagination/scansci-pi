@@ -10,14 +10,48 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
-from scansci_html.app_settings import load_settings, save_settings
+from scansci_html.app_settings import load_settings, managed_probe_model_ids, save_settings
 from scansci_html.research_agent import ResearchAgentRuntime
 
 
-MODELS = ("glm-4.7-flash", "Qwen/Qwen2.5-7B-Instruct")
+# Probe only production managed models. Standby routes remain visible for
+# operator evaluation, but cannot make a release pass or fail until they have
+# been explicitly promoted after passing this structured response contract.
+MODELS = managed_probe_model_ids()
+
+
+_NUMBERED_SECTION_PATTERN = re.compile(
+    r"(?m)^\s*(?:#{1,4}\s*)?(?:第\s*)?(?:[一二三四五六]|[1-6])\s*(?:部分|[、.．:：])"
+)
+
+
+def _numbered_section_count(text: str) -> int:
+    """Count the numbered sections required by the release verification prompt."""
+
+    return len(_NUMBERED_SECTION_PATTERN.findall(text))
+
+
+def _numbered_section_bullet_counts(text: str) -> list[int]:
+    """Count executable checklist bullets inside each numbered top-level section.
+
+    The release prompt asks for six numbered parts with three checks in each.
+    This measures that explicit contract rather than applying a fragile global
+    character threshold to otherwise valid concise Chinese writing.
+    """
+
+    headings = list(_NUMBERED_SECTION_PATTERN.finditer(text))
+    counts: list[int] = []
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        section_body = text[heading.end():end]
+        counts.append(
+            len(re.findall(r"(?m)^\s*(?:[-*•]|[①②③④⑤⑥])\s+", section_body))
+        )
+    return counts
 
 
 def _run_stream(runtime: ResearchAgentRuntime, payload: dict[str, object]) -> dict[str, object]:
@@ -25,7 +59,19 @@ def _run_stream(runtime: ResearchAgentRuntime, payload: dict[str, object]) -> di
     events = list(runtime.chat_stream(payload))
     terminal = events[-1] if events else {}
     if terminal.get("type") != "RUN_FINISHED":
-        raise RuntimeError(str(terminal.get("message") or "ScanSci did not emit RUN_FINISHED"))
+        failure = dict(terminal.get("failure") or {})
+        diagnostic = {
+            "message": str(terminal.get("message") or "ScanSci did not emit RUN_FINISHED"),
+            "code": str(terminal.get("code") or ""),
+            "failure_stage": str(failure.get("stage_key") or ""),
+            # The runtime already redacts provider credentials before it puts
+            # detail on a terminal event.  Preserve that classification in
+            # release reports: otherwise a real upstream failure is reduced
+            # to the unhelpful generic "stage failed" message.
+            "failure_reason": str(failure.get("reason") or failure.get("code") or ""),
+            "failure_detail": str(failure.get("detail") or "")[:1000],
+        }
+        raise RuntimeError(json.dumps(diagnostic, ensure_ascii=False))
     result = dict(terminal.get("result") or {})
     message = dict(result.get("message") or {})
     return {
@@ -50,9 +96,10 @@ def verify_model(runtime: ResearchAgentRuntime, workspace: Path, model_id: str) 
         "chat_mode": "writing",
         "messages": [{
             "role": "user",
-            "content": (
+                "content": (
                 "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
-                "每部分至少包含三条可执行检查，不要省略结尾；最后一行必须单独写【回答完毕】。"
+                "每部分至少包含三条可执行检查；每条检查必须单独成行并以 '- ' 开头，"
+                "不要省略结尾；最后一行必须单独写【回答完毕】。"
             ),
         }],
     })
@@ -71,22 +118,39 @@ def verify_model(runtime: ResearchAgentRuntime, workspace: Path, model_id: str) 
     identity_text = str(identity["content"])
     long_text = str(long_answer["content"])
     skill_text = str(skill["content"])
+    long_answer_sections = _numbered_section_count(long_text)
+    long_answer_bullet_counts = _numbered_section_bullet_counts(long_text)
     checks = {
         "identity_knows_scansci": "ScanSci" in identity_text,
         "identity_knows_model": model_id.casefold() in identity_text.casefold() or model_id.split("/")[-1].casefold() in identity_text.casefold(),
         "identity_knows_skills": "good-question" in identity_text,
         "long_answer_finished": long_text.rstrip().endswith("【回答完毕】"),
-        "long_answer_substantial": len(long_text) >= 700,
+        "long_answer_has_six_sections": long_answer_sections >= 6,
+        "long_answer_has_three_checks_per_section": (
+            len(long_answer_bullet_counts) >= 6
+            and all(count >= 3 for count in long_answer_bullet_counts[:6])
+        ),
         "skill_followed": "核心研究问题" in skill_text and ("假设" in skill_text or "研究问题" in skill_text),
-        "trace_available": bool(long_answer["trace"]),
-        "streamed": long_answer["event_types"].count("TEXT_MESSAGE_CONTENT") >= 2,
+        # A plain writing answer deliberately has no artificial process card.
+        # The identity request reads live runtime facts, so it is the correct
+        # place to verify that meaningful execution traces reach the client.
+        "trace_available": bool(identity["trace"]),
+        # Structured answers are buffered until their required outline and end
+        # marker pass validation, then emitted once as a clean final response.
+        "delivered": long_answer["event_types"].count("TEXT_MESSAGE_CONTENT") >= 1,
     }
     return {
         "model_id": model_id,
         "passed": all(checks.values()),
         "checks": checks,
         "identity": {key: value for key, value in identity.items() if key != "content"},
-        "long_answer": {**{key: value for key, value in long_answer.items() if key != "content"}, "characters": len(long_text), "ending": long_text[-80:]},
+        "long_answer": {
+            **{key: value for key, value in long_answer.items() if key != "content"},
+            "characters": len(long_text),
+            "numbered_sections": long_answer_sections,
+            "checks_per_section": long_answer_bullet_counts,
+            "ending": long_text[-80:],
+        },
         "skill": {**{key: value for key, value in skill.items() if key != "content"}, "characters": len(skill_text), "head": skill_text[:120]},
     }
 

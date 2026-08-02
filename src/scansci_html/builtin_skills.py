@@ -38,7 +38,7 @@ SOFTWARE.
 BUILTIN_SKILLS: list[dict[str, Any]] = [
     {
         "id": "literature-search",
-        "name": "文献检索",
+        "name": "literature-search",
         "description": "在当前证据库中检索并定位原文。",
         "path": "builtin:literature-search",
         "enabled": True,
@@ -47,7 +47,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "evidence-review",
-        "name": "证据审阅",
+        "name": "evidence-review",
         "description": "核验引文、记录人工判断。",
         "path": "builtin:evidence-review",
         "enabled": True,
@@ -56,7 +56,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "good-question",
-        "name": "好问题",
+        "name": "good-question",
         "description": "从材料中收束重要、可检验且可证伪的核心研究问题。",
         "path": "builtin:good-question",
         "enabled": True,
@@ -65,7 +65,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "good-story",
-        "name": "好故事",
+        "name": "good-story",
         "description": "用证据支撑的张力、转折与结论组织科研叙事，避免过度宣称。",
         "path": "builtin:good-story",
         "enabled": True,
@@ -74,7 +74,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "scientific-slides",
-        "name": "科研幻灯片",
+        "name": "scientific-slides",
         "description": "将 PDF、Word、Markdown、TXT 或 HTML 直接整理为可编辑 PPTX。",
         "path": "builtin:scientific-slides",
         "enabled": True,
@@ -83,7 +83,7 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
     {
         "id": "web-access",
-        "name": "网页访问",
+        "name": "web-access",
         "description": "通过真实浏览器/CDP 处理搜索、网页抓取、登录态访问与页面交互。",
         "path": "builtin:web-access",
         "enabled": True,
@@ -161,4 +161,5 @@ def third_party_notices() -> dict[str, str]:
         "Rimagination/good-question": _RIMAGINATION_MIT_NOTICE,
         "Rimagination/good-story": _RIMAGINATION_MIT_NOTICE,
         "eze-is/web-access": "MIT License. Source: https://github.com/eze-is/web-access",
+        "OpenAI Zotero plugin": "MIT License. Source: https://github.com/openai/plugins/tree/main/plugins/zotero",
     }

@@ -9,12 +9,14 @@ import zipfile
 
 import fitz
 from pptx import Presentation
+from pptx.util import Inches
 
 from scansci_html.slide_studio import (
     _balanced_cover_lines,
     _display_source_name,
     _ground_model_adaptation_claim,
     _normalise_model_outline,
+    _slide_excerpt,
     _source_key_sentences,
     create_source_slide_deck,
     persist_slide_sources,
@@ -62,10 +64,36 @@ def test_pdf_source_creates_editable_pptx_without_a_library(tmp_path: Path):
     assert any("Research question" in shape.text for shape in presentation.slides[1].shapes if hasattr(shape, "text"))
 
 
-def test_selected_template_changes_editable_pptx_chrome_and_content_modules(tmp_path: Path):
+def test_selected_classic_template_routes_to_the_native_easyslides_renderer(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace.sqlite"
     source = _make_pdf(tmp_path / "study.pdf")
     persisted = persist_slide_sources(workspace, [{"name": source.name, "path": str(source)}])
+    calls: list[dict[str, object]] = []
+
+    def fake_classic_renderer(**kwargs):
+        calls.append(kwargs)
+        deck_path = Path(kwargs["deck_path"])
+        deck_path.parent.mkdir(parents=True, exist_ok=True)
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(3), Inches(0.5)).text = "研究背景"
+        presentation.save(deck_path)
+        plan_path = deck_path.with_suffix(".classic-plan.json")
+        plan = {"slides": [{"role": "cover"}]}
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {
+            "project_path": str(deck_path.parent / "projects" / "native-classic"),
+            "plan": plan,
+            "plan_path": str(plan_path),
+            "quality_gate": {"status": "pass", "blocking_count": 0},
+            "classic_text_fit": {"status": "pass"},
+            "visual_measure": {"status": "pass"},
+            "visual_review": {"status": "needs_review"},
+            "plugin": {"version": "fixture"},
+            "render_manifest": {"renderer": "easyslides-classic-shells"},
+        }
+
+    monkeypatch.setattr("scansci_html.slide_studio.render_classic_deck", fake_classic_renderer)
 
     output = create_source_slide_deck(
         workspace=workspace,
@@ -74,11 +102,13 @@ def test_selected_template_changes_editable_pptx_chrome_and_content_modules(tmp_
         template_id="defense_leftnav",
     )
     presentation = Presentation(output["pptx_path"])
-    content_shapes = presentation.slides[1].shapes
+    content_shapes = presentation.slides[0].shapes
 
     assert output["template_id"] == "defense_leftnav"
     assert output["template"]["primary_color"] == "#8B0012"
-    assert len(content_shapes) >= 12  # navigation chrome + editable content modules, not a single bullet box
+    assert output["renderer"] == "easyslides-classic-native"
+    assert output["quality_gate"]["status"] == "pass"
+    assert calls and calls[0]["template"]["id"] == "defense_leftnav"
     assert any("研究背景" in shape.text for shape in content_shapes if hasattr(shape, "text"))
 
 
@@ -142,14 +172,38 @@ def test_web_workflow_accepts_pdf_and_serves_pptx_without_a_notebook(tmp_path: P
 def test_presentation_ui_uses_stable_rendering_and_native_save_bridge():
     app_js = (Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "app.js").read_text(encoding="utf-8")
 
-    assert 'setContextPanel(run.workflow_type === "pdf_to_ppt" ? "none" : "sources")' in app_js
+    assert 'pdf_to_ppt: "none"' in app_js
     assert "const shouldFollow = distanceFromBottom < 72;" in app_js
     assert "continueTaskConversation" in app_js
     assert "}/messages`" in app_js
     assert "isTaskFollowUp" in app_js
-    assert "isPptRecreate" in app_js
-    assert "originalSlideSources" in app_js
+    assert "isPptRecreate" not in app_js
+    assert "originalSlideSources" not in app_js
     assert "taskConversationMarkup" in app_js
+    assert "const isTaskConversation = inputId === \"chatQuestionInput\"" in app_js
+    assert "const isTaskFollowUp = isTaskConversation" in app_js
+    assert "renderAssistantContent(message.content)" in app_js
+    assert '<a href=\"$2\" target=\"_blank\" rel=\"noopener noreferrer\">$1</a>' in app_js
+    assert 'input.dispatchEvent(new Event("input", { bubbles: true }));' in app_js
+    assert 'mode === "knowledge" && !selectedKnowledge.length && !isTaskFollowUp' in app_js
+    # Public academic/deep research no longer requires a selected local
+    # notebook.  Only the two evidence-bound shortcuts retain that guard.
+    assert '["novelty", "idea"].includes(mode) && !state.notebook && !isTaskFollowUp' in app_js
+    assert 'skills: extractSkillMentions(content)' in app_js
+    assert 'document.addEventListener("keyup", (event) =>' in app_js
+    assert 'renderSkillSuggestions(event.target);' in app_js
+    assert '!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key)' in app_js
+    assert "partialDownloadArtifactMarkup" in app_js
+    assert "继续下载并交付" in app_js
+    assert "taskOriginalPrompt" not in app_js
+    assert "原始任务" not in app_js
+    assert "任务续聊" not in app_js
+    assert 'aria-label="任务消息"' in app_js
+    assert 'run.error?.code === "app_restarted"' in app_js
+    assert '`/api/runs/${encodeURIComponent(id)}/resume`' in app_js
+    assert '["queued", "planning", "running", "verifying"].includes(String(run.status || ""))' in app_js
+    assert 'window.localStorage.setItem("scansci.active.task", run.run_id)' in app_js
+    assert "任务上下文 · 续聊" not in app_js
 
 
 def test_presentation_follow_up_route_targets_the_existing_run(tmp_path: Path, monkeypatch):
@@ -286,3 +340,46 @@ def test_offline_slide_fallback_filters_front_matter_and_author_contributions():
 
     assert any("multi-head attention" in item for item in sentences)
     assert all("@" not in item and "proper attribution" not in item for item in sentences)
+
+
+def test_offline_slide_fallback_filters_install_and_preview_commands():
+    source = {
+        "name": "README.md",
+        "text": (
+            "# ScanSci\n"
+            "ScanSci is an evidence-first research workspace for traceable scientific analysis.\n"
+            "Browser preview always serves this checkout at http://127.0.0.1:8781.\n"
+            "Run npm install and python -m scansci_html to start the application.\n"
+            "Windows 构建会将 Pi sidecar、Node.js runtime 与本地检索运行时放入应用目录。\n"
+            "It organizes source evidence, review boundaries, and editable research deliverables."
+        ),
+    }
+
+    sentences = _source_key_sentences(source, topic="ScanSci research workflow")
+
+    assert any("evidence-first" in item for item in sentences)
+    assert all(
+        "127.0.0.1" not in item and "npm install" not in item and "Windows 构建" not in item
+        for item in sentences
+    )
+
+
+def test_offline_slide_fallback_collapses_a_markdown_heading_repeated_in_extracted_text():
+    source = {
+        "name": "ScanSci README.md",
+        "text": "# ScanSci ScanSci 是一款 evidence-first 科研工作台，支持可追溯证据与可编辑交付物。",
+    }
+
+    sentences = _source_key_sentences(source, topic="ScanSci research workflow")
+
+    assert sentences[0].startswith("ScanSci 是一款")
+    assert "ScanSci ScanSci" not in sentences[0]
+
+
+def test_slide_excerpt_marks_a_visual_truncation_instead_of_returning_a_half_sentence():
+    value = "This deliberately long sentence has no early punctuation but still needs a visible and honest truncation marker"
+
+    excerpt = _slide_excerpt(value, limit=42)
+
+    assert excerpt.endswith("…")
+    assert len(excerpt) <= 43

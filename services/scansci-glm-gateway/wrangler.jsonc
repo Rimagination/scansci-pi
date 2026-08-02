@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "scansci-glm-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-19",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "vars": {
+    "DAILY_REQUEST_LIMIT": "400",
+    "MINUTE_REQUEST_LIMIT": "20",
+    "MAX_INPUT_CHARS": "48000",
+    "MAX_OUTPUT_TOKENS": "4096",
+    "UPSTREAM_TIMEOUT_MS": "75000"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RATE_LIMITER",
+        "class_name": "RateLimiter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RateLimiter"]
+    }
+  ]
+}

@@ -9,7 +9,12 @@ from .schemas import AnswerPayloadSchema
 from ..text_tokenization import lexical_tokens
 
 
-def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> dict[str, object]:
+def synthesize_answer(
+    question: str,
+    evidence_table: list[dict[str, Any]],
+    *,
+    query_plan: dict[str, Any] | None = None,
+) -> dict[str, object]:
     if not evidence_table:
         return {
             "question": question,
@@ -30,7 +35,7 @@ def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> di
 
     claims: list[dict[str, object]] = []
     seen_claims: dict[str, list[str]] = {}
-    ranked_rows = _rank_local_evidence(question, evidence_table)
+    ranked_rows = _rank_local_evidence(question, evidence_table, query_plan=query_plan)
     if len(evidence_table) > 1:
         ranked_rows = ranked_rows[: 1 if _is_direct_question(question) else 3]
     for row in ranked_rows:
@@ -65,19 +70,49 @@ def synthesize_answer(question: str, evidence_table: list[dict[str, Any]]) -> di
     }
 
 
-def _rank_local_evidence(question: str, evidence_table: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _rank_local_evidence(
+    question: str,
+    evidence_table: list[dict[str, Any]],
+    *,
+    query_plan: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     terms = _question_evidence_terms(question)
+    named_list = str((query_plan or {}).get("answer_type", "")) == "named_list"
     indexed = list(enumerate(evidence_table))
 
     def score(item: tuple[int, dict[str, Any]]) -> tuple[float, int]:
         index, row = item
         quote = " ".join(str(row.get("exact_quote", "")).split()).casefold()
         matched = sum(1.0 for term in terms if term in quote)
+        if named_list:
+            matched = min(2.0, matched) + _named_list_answer_bonus(quote)
         confidence = float(row.get("confidence", 0.0) or 0.0)
         length_penalty = max(0.0, (len(quote) - 420) / 700)
         return (matched + confidence - length_penalty, -index)
 
     return [row for _, row in sorted(indexed, key=score, reverse=True)]
+
+
+def _named_list_answer_bonus(quote: str) -> float:
+    cues = (
+        "we find",
+        "include",
+        "including",
+        "such as",
+        "whereas",
+        "others",
+        "parts of",
+        "first ",
+        "second ",
+        "third ",
+        "respectively",
+        "包括",
+        "分别",
+        "一是",
+        "二是",
+        "三是",
+    )
+    return min(4.0, 0.9 * sum(cue in quote for cue in cues))
 
 
 def _question_evidence_terms(question: str) -> set[str]:
@@ -174,18 +209,91 @@ def synthesize_answer_with_llm(
     evidence_table: list[dict[str, Any]],
     *,
     chat_client: ChatJsonClient,
+    query_plan: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     if not evidence_table:
         return synthesize_answer(question, evidence_table)
     compact_evidence = _compact_evidence_for_llm(evidence_table)
-    messages = [
+    target_language = _requested_answer_language(question, query_plan=query_plan)
+    is_synthesis = str((query_plan or {}).get("question_type", "")).strip().lower() == "synthesis"
+    known_quote_ids = {str(row.get("quote_id", "")) for row in evidence_table}
+    attempts = 2 if target_language == "zh" else 1
+    for attempt in range(attempts):
+        messages = _llm_synthesis_messages(
+            question,
+            compact_evidence,
+            target_language=target_language,
+            is_synthesis=is_synthesis,
+            retrying_language=attempt > 0,
+        )
+        payload = AnswerPayloadSchema.model_validate(chat_client.complete_json(messages, schema_name="answer_claims") or {})
+        claims = _validated_llm_claims(payload.answer, known_quote_ids)
+        if target_language != "zh" or _claims_are_natural_chinese(claims):
+            return {
+                "question": question,
+                "answer": claims,
+                "limitations": [str(item) for item in payload.limitations],
+                "insufficient_evidence": False if claims else True,
+            }
+
+    # The source material may be English even when the user asks in Chinese.
+    # Preserve the verified claims as a last-resort evidence answer instead of
+    # turning useful, cited material into an empty refusal. The caller marks
+    # this explicitly so the UI can explain the degraded presentation.
+    return {
+        "question": question,
+        "answer": claims,
+        "limitations": [
+            "生成模型未完成中文改写；以下保留经核验的原文证据摘录，便于继续核查。"
+        ],
+        "insufficient_evidence": False if claims else True,
+        "language_fallback": True,
+    }
+
+
+def _llm_synthesis_messages(
+    question: str,
+    evidence_table: list[dict[str, str]],
+    *,
+    target_language: str,
+    is_synthesis: bool,
+    retrying_language: bool,
+) -> list[dict[str, str]]:
+    language_rule = (
+        "你正在为中文科研用户撰写答案。所有结论必须使用自然、简洁的简体中文；需要转述英文证据，不能粘贴英文原句。"
+        "英文仅可作为不可替代的专有名词、缩写或术语括注。"
+        if target_language == "zh"
+        else "Answer in the same language as the question. "
+    )
+    synthesis_rule = (
+        "这是“研究进展/研究现状”问题。请写成紧凑的证据综述，而不是摘录列表或参考文献表。"
+        "围绕证据支持的研究方向、主要发现和局限组织结论；所有宽泛判断必须限定为本次检索到的资料，不得把少量文献说成整个领域。"
+        if target_language == "zh"
+        else "This is a research-status synthesis. Produce a compact evidence review, not a list of excerpts or bibliography. "
+        "Organize the claims around the evidence-supported research directions, findings, and limitations. "
+        "Scope every broad statement to the retrieved literature; do not present a small library sample as the whole field. "
+        if is_synthesis
+        else ""
+    )
+    retry_rule = (
+        "上一稿主体是英文原文摘录，未达到中文回答要求。现在必须把结论改写为简体中文，不要输出英文引文句或参考文献条目。"
+        if target_language == "zh"
+        else "The previous draft was rejected because it was dominated by source-language excerpts. "
+        "This retry MUST be a synthesis in the requested language, not a quotation or reference entry. "
+        if retrying_language
+        else ""
+    )
+    return [
         {
             "role": "system",
             "content": (
-                "Answer in the same language as the question. Use only relevant rows from the evidence table. "
-                "Return 1 to at most 4 concise, non-overlapping claims ordered by importance; never repeat a claim. "
-                "Every claim must be directly entailed by its exact supporting quote_ids. Do not infer the objective, "
-                "architecture or result of an entity that the cited quote does not name. Do not cite any other source."
+                language_rule
+                + synthesis_rule
+                + retry_rule
+                + "Use only relevant rows from the evidence table. Return 1 to at most 4 concise, non-overlapping claims "
+                "ordered by importance; never repeat a claim. Every claim must be directly entailed by its exact supporting "
+                "quote_ids. Do not infer the objective, architecture or result of an entity that the cited quote does not name. "
+                "Do not output raw quotations, a reference list, or uncited general background."
             ),
         },
         {
@@ -193,15 +301,17 @@ def synthesize_answer_with_llm(
             "content": json.dumps(
                 {
                     "question": question,
-                    "evidence_table": compact_evidence,
+                    "输出语言": "简体中文" if target_language == "zh" else "与问题相同",
+                    "写作任务": "研究现状证据综述" if is_synthesis else "证据约束回答",
+                    "evidence_table": evidence_table,
                 },
                 ensure_ascii=False,
             ),
         },
     ]
-    payload = AnswerPayloadSchema.model_validate(chat_client.complete_json(messages, schema_name="answer_claims") or {})
-    answer_claims = payload.answer
-    known_quote_ids = {str(row.get("quote_id", "")) for row in evidence_table}
+
+
+def _validated_llm_claims(answer_claims: list[Any], known_quote_ids: set[str]) -> list[dict[str, object]]:
     claims: list[dict[str, object]] = []
     seen_claim_texts: set[str] = set()
     for claim in answer_claims:
@@ -223,12 +333,23 @@ def synthesize_answer_with_llm(
         )
         if len(claims) >= 4:
             break
-    return {
-        "question": question,
-        "answer": claims,
-        "limitations": [str(item) for item in payload.limitations],
-        "insufficient_evidence": False if claims else True,
-    }
+    return claims
+
+
+def _requested_answer_language(question: str, *, query_plan: dict[str, Any] | None = None) -> str:
+    planned = str((query_plan or {}).get("language", "")).strip().lower()
+    if planned in {"zh", "zh-cn", "chinese"}:
+        return "zh"
+    return "zh" if re.search(r"[\u4e00-\u9fff]", question) else "other"
+
+
+def _claims_are_natural_chinese(claims: list[dict[str, object]]) -> bool:
+    text = " ".join(str(claim.get("text", "")) for claim in claims)
+    if not text.strip():
+        return True
+    chinese_characters = len(re.findall(r"[\u4e00-\u9fff]", text))
+    latin_characters = len(re.findall(r"[A-Za-z]", text))
+    return chinese_characters >= 2 and chinese_characters >= latin_characters * 0.04
 
 
 def _compact_evidence_for_llm(evidence_table: list[dict[str, Any]]) -> list[dict[str, str]]:

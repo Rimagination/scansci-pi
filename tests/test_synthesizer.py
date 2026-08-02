@@ -161,6 +161,34 @@ def test_synthesize_answer_with_llm_validates_quote_ids():
     }
 
 
+def test_synthesize_answer_with_llm_retries_when_a_chinese_question_returns_english_excerpts():
+    calls = []
+
+    class FakeChatClient:
+        def complete_json(self, messages, *, schema_name):
+            calls.append(messages)
+            if len(calls) == 1:
+                return {
+                    "answer": [{"claim_id": "c0001", "text": "Photovoltaic studies focus on soil effects.", "quote_ids": ["q0001"]}],
+                    "limitations": [],
+                }
+            assert "必须把结论改写为简体中文" in messages[0]["content"]
+            return {
+                "answer": [{"claim_id": "c0001", "text": "当前检索到的研究主要关注光伏设施对土壤环境的影响。", "quote_ids": ["q0001"]}],
+                "limitations": [],
+            }
+
+    answer = synthesize_answer_with_llm(
+        "总结当前光伏研究现状",
+        [{"quote_id": "q0001", "exact_quote": "Photovoltaic facilities can alter local soil conditions."}],
+        chat_client=FakeChatClient(),
+        query_plan={"language": "zh", "question_type": "synthesis"},
+    )
+
+    assert len(calls) == 2
+    assert answer["answer"][0]["text"] == "当前检索到的研究主要关注光伏设施对土壤环境的影响。"
+
+
 def test_synthesize_answer_with_llm_rejects_quote_ids_outside_evidence_table():
     class FakeChatClient:
         def complete_json(self, messages, *, schema_name):

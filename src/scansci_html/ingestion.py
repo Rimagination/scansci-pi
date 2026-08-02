@@ -104,6 +104,36 @@ def ingest_sources(
     return public_ingestion_job(job)
 
 
+def extract_local_document(
+    path: str | Path,
+    *,
+    output_dir: str | Path,
+    parser: str = "auto",
+) -> dict[str, Any]:
+    """Extract a referenced local file without copying the original document."""
+
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"文件不存在：{source_path}")
+    suffix = source_path.suffix.lower()
+    if suffix not in SUPPORTED_INGESTION_SUFFIXES:
+        raise ValueError(f"暂不支持 {suffix or '无扩展名'} 文件")
+    normalized_parser = str(parser or "auto").strip().lower()
+    if normalized_parser not in {"auto", "fast", "enhanced"}:
+        raise ValueError("parser must be auto, fast, or enhanced")
+    target = Path(output_dir).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    source = {
+        "source_id": f"source-{uuid4().hex[:12]}",
+        "name": source_path.name,
+        "path": str(source_path),
+        "suffix": suffix,
+        "size": source_path.stat().st_size,
+        "status": "persisted",
+    }
+    return _extract_source(source, parser=normalized_parser, output_dir=target)
+
+
 def persist_ingestion_sources(
     workspace: str | Path,
     values: object,
@@ -269,7 +299,12 @@ def ingestion_context(workspace: str | Path, job_id: str, *, limit: int = 80_000
     return "\n\n".join(pieces)
 
 
-def _extract_source(source: dict[str, Any], *, parser: str) -> dict[str, Any]:
+def _extract_source(
+    source: dict[str, Any],
+    *,
+    parser: str,
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
     path = Path(str(source["path"])).resolve()
     suffix = path.suffix.lower()
     warnings: list[str] = []
@@ -298,7 +333,7 @@ def _extract_source(source: dict[str, Any], *, parser: str) -> dict[str, Any]:
         page_sections = _pdf_pages(path)
         page_count = len(page_sections)
         paged_text = "\n\n".join(
-            f"## 第 {item['page']} 页\n\n{item['text']}" for item in page_sections if item.get("text")
+            f"# 第 {item['page']} 页\n\n{item['text']}" for item in page_sections if item.get("text")
         )
         if paged_text and parser != "enhanced":
             text = paged_text
@@ -313,9 +348,11 @@ def _extract_source(source: dict[str, Any], *, parser: str) -> dict[str, Any]:
         raise ValueError(f"未能从《{source.get('name', path.name)}》提取可用内容")
     if was_truncated:
         warnings.append("文档较长，当前会话仅载入前部内容")
-    text_path = path.with_name(f"{source['source_id']}.md")
+    extraction_root = Path(output_dir).resolve() if output_dir is not None else path.parent
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    text_path = extraction_root / f"{source['source_id']}.md"
     text_path.write_text(text, encoding="utf-8")
-    pages_path = path.with_name(f"{source['source_id']}.pages.json")
+    pages_path = extraction_root / f"{source['source_id']}.pages.json"
     pages_path.write_text(json.dumps(page_sections, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         **source,
@@ -353,6 +390,26 @@ def _docling_text(path: Path) -> str:
 
 
 def _pdf_pages(path: Path) -> list[dict[str, Any]]:
+    # PyMuPDF is substantially faster for ordinary text PDFs.  Keep pypdf as
+    # the compatibility fallback for installations without fitz or files it
+    # cannot open, while preserving the page-aware evidence structure.
+    try:
+        import fitz
+
+        document = fitz.open(str(path))
+        try:
+            if document.needs_pass and not document.authenticate(""):
+                raise ValueError("鍙楀瘑鐮佷繚鎶ょ殑 PDF 鏆備笉鏀寔")
+            return [
+                {"page": index, "text": _clean_text(page.get_text("text") or "")}
+                for index, page in enumerate(document, start=1)
+            ]
+        finally:
+            document.close()
+    except ValueError:
+        raise
+    except Exception:
+        pass
     reader = PdfReader(str(path))
     if reader.is_encrypted and not reader.decrypt(""):
         raise ValueError("受密码保护的 PDF 暂不支持")

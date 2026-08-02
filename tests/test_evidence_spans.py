@@ -86,6 +86,10 @@ def test_write_evidence_html_injects_sentence_anchors_without_overwriting_source
     assert style is not None
     style_text = style.get_text()
     assert "[data-evidence-id]:target" in style_text
+    assert "#caff4d" in style_text
+    assert "outline: none" in style_text
+    assert "box-shadow: none" in style_text
+    assert "#2457a6" not in style_text
     assert ".scansci-evidence-span::after" not in style_text
     assert "attr(data-evidence-short-id)" not in style_text
     assert ".scansci-evidence-row > :last-child::after" not in style_text
@@ -251,3 +255,29 @@ def test_extract_evidence_spans_reads_publication_year_from_meta():
     )
 
     assert spans[0].publication_year == 2022
+
+
+def test_extract_evidence_spans_keeps_hierarchical_section_identity_and_splits_chinese():
+    spans = extract_evidence_spans(
+        """
+        <article class="paper" data-doi="10.1234/chinese">
+          <h1>结构化证据论文</h1>
+          <h2>Results</h2>
+          <h3>2.1 样地观测</h3>
+          <p id="result-p1">处理组生物量显著增加。对照组没有显著变化。该结果在第二年仍然成立。</p>
+        </article>
+        """,
+        html_path="chinese.html",
+        min_sentence_length=6,
+    )
+
+    assert [span.text for span in spans] == [
+        "处理组生物量显著增加。",
+        "对照组没有显著变化。",
+        "该结果在第二年仍然成立。",
+    ]
+    assert spans[0].section_path == "结构化证据论文 / Results / 2.1 样地观测"
+    assert spans[0].section_level == 3
+    assert spans[0].section_id
+    assert spans[0].parent_section_id
+    assert spans[0].source_locator == "anchor:result-p1-s0001"

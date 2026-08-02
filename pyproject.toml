@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scansci-pi"
+name = "scansci"
 version = "0.2.0"
-description = "ScanSci research workbench powered by the Pi Agent SDK."
+description = "Evidence-first scientific research workbench with a Pi-powered agent runtime."
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12",
@@ -19,8 +19,10 @@ dependencies = [
   "playwright>=1.40",
   "pydantic>=2.0",
   "pypdf>=5.0",
+  "openpyxl>=3.1,<4",
   "python-docx>=1.1",
   "python-pptx>=1.0",
+  "reportlab>=4.0,<5",
   "pyzotero>=1.6,<2",
   "requests>=2.31",
   "sqlite-vec>=0.1.6,<0.2",
@@ -36,6 +38,12 @@ ie-model = [
   "torch>=2.0",
   "transformers>=4.40",
 ]
+local-gpu = [
+  "accelerate>=1.10,<2",
+  "bitsandbytes>=0.49,<0.50",
+  "torch>=2.13,<2.14",
+  "transformers>=5.14,<6",
+]
 desktop = [
   "pywebview>=6.0,<7.0",
   "pyinstaller>=6.0,<7.0",
@@ -43,18 +51,26 @@ desktop = [
 enhanced-document = [
   "docling>=2.70,<3",
 ]
+tor = [
+  "stem>=1.8,<2",
+  "PySocks>=1.7,<2",
+]
+evaluation = [
+  "deepagents>=0.6.12,<0.7",
+  "langchain-anthropic>=1.4,<2",
+  "langchain-openai>=1.3,<2",
+]
 
 [project.scripts]
 scansci = "scansci_html.cli:main"
 scansci-html = "scansci_html.cli:main"
 scansci-desktop = "scansci_html.desktop:main"
-scanscipi-desktop = "scansci_html.desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-scansci_html = ["web/*", "web/**/*", "builtin_skill_assets/*", "builtin_skill_assets/**/*"]
+scansci_html = ["web/*", "web/**/*", "builtin_skill_assets/*", "builtin_skill_assets/**/*", "runtime/latex/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

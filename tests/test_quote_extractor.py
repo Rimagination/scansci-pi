@@ -5,6 +5,7 @@ from scansci_html.qa.quote_extractor import (
     ExtractedQuote,
     extract_quotes,
     extract_quotes_with_llm,
+    is_substantive_evidence_hit,
     validate_quotes,
 )
 
@@ -52,6 +53,94 @@ def test_extract_quotes_selects_exact_evidence_text_from_ranked_hits():
             "confidence": 1.0,
         }
     ]
+
+
+def test_extract_quotes_skips_bibliography_entries_and_title_fragments():
+    hits = [
+        {
+            "evidence_id": "paper.s0001",
+            "text": "[24] Mohammadreza, A., Marc, K., Pavel, B., 2022. Bifacial photovoltaic technology.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002",
+            "text": "Ecohydrological effects of photovoltaic solar farms on soil microclimates: a modeling study.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002a",
+            "text": "Singh, G.K., 2013.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002b",
+            "text": "Energy 53, 1-13. https://doi.org/10.1016/j.energy.2013.02.057.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002c",
+            "text": "A risk-based multi-criteria spatial decision analysis for solar power plant site selection.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002d",
+            "text": "13, 9 (2022).",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002e",
+            "text": "EPJ Photovolt.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002f",
+            "text": "Energy 6, 742-754 (2021).",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002g",
+            "text": "National growth dynamics of wind and solar power compared to climate targets.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0002h",
+            "text": "Renewable and Sustainable Energy Reviews, 2013, 24: 544-556. ［24］Mardani A, et al.",
+            "matched_terms": ["photovoltaic"],
+        },
+        {
+            "evidence_id": "paper.s0003",
+            "section": "Results",
+            "text": "Photovoltaic arrays reduced daytime soil temperature variability in the observed plots.",
+            "matched_terms": ["photovoltaic", "soil"],
+            "score": 2.0,
+        },
+    ]
+
+    quotes = extract_quotes("What changed under photovoltaic arrays?", hits, max_quotes=3)
+
+    assert [quote.evidence_ids for quote in quotes] == [["paper.s0003"]]
+    assert not is_substantive_evidence_hit(hits[0])
+    assert not is_substantive_evidence_hit(hits[1])
+    assert not is_substantive_evidence_hit(hits[2])
+    assert not is_substantive_evidence_hit(hits[3])
+    assert not is_substantive_evidence_hit(hits[4])
+    assert not is_substantive_evidence_hit(hits[5])
+    assert not is_substantive_evidence_hit(hits[6])
+    assert not is_substantive_evidence_hit(hits[7])
+    assert not is_substantive_evidence_hit(hits[8])
+    assert not is_substantive_evidence_hit(hits[9])
+    assert is_substantive_evidence_hit(hits[10])
+
+
+def test_substantive_filter_keeps_concise_research_predicates():
+    statements = [
+        "BERT uses bidirectional self-attention to fuse left and right context.",
+        "The result supports a cortical activity interpretation.",
+        "The analysis links drought with lower biomass.",
+        "A second enabling characteristic involves tumor-promoting inflammation.",
+    ]
+
+    assert all(is_substantive_evidence_hit({"section": "Results", "text": text}) for text in statements)
 
 
 def test_extract_quotes_prefers_span_text_when_hit_contains_parent_context():

@@ -7,6 +7,14 @@ from scansci_html import research_agent
 from scansci_html import research_tools
 
 
+def test_model_root_uses_per_user_local_app_data(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("SCANSCI_MODEL_ROOT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert local_model_market.model_root() == tmp_path / "ScanSci" / "models"
+    assert local_model_market.hub_cache_root() == tmp_path / "ScanSci" / "models" / "HuggingFace" / "hub"
+
+
 def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
     snapshot = tmp_path / "HuggingFace" / "hub" / "models--Qwen--Qwen2.5-1.5B-Instruct" / "snapshots" / "abc"
@@ -152,6 +160,66 @@ def test_arxiv_download_uses_the_authoritative_public_archive_even_when_cli_exis
 
     assert result["source"] == "arXiv"
     assert result["files"] == [str(destination)]
+
+
+def test_public_fulltext_candidates_prioritize_unpaywall_and_europe_pmc(monkeypatch):
+    monkeypatch.setenv("SCANSCI_UNPAYWALL_EMAIL", "researcher@example.org")
+
+    def fake_request(url, *, timeout):
+        assert timeout == 12
+        if "api.unpaywall.org" in url:
+            return {
+                "best_oa_location": {
+                    "url_for_pdf": "https://repository.test/paper.pdf",
+                    "host_type": "repository",
+                },
+                "oa_locations": [],
+            }
+        if "europepmc" in url:
+            return {
+                "resultList": {
+                    "result": [
+                        {
+                            "pmcid": "PMC123",
+                            "fullTextUrlList": {
+                                "fullTextUrl": [
+                                    {
+                                        "documentStyle": "pdf",
+                                        "availability": "Open access",
+                                        "url": "https://europepmc.test/PMC123.pdf",
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+        if "openalex.org" in url:
+            return {}
+        if "crossref.org" in url:
+            return {"message": {}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(research_tools, "_request_json", fake_request)
+
+    candidates = research_tools._public_fulltext_candidates("10.1000/example", timeout=12)
+
+    assert candidates[:2] == [
+        {"url": "https://repository.test/paper.pdf", "source": "Unpaywall repository"},
+        {"url": "https://europepmc.test/PMC123.pdf", "source": "Europe PMC open access"},
+    ]
+
+
+def test_arxiv_doi_resolves_without_waiting_for_metadata_apis(monkeypatch):
+    monkeypatch.setattr(
+        research_tools,
+        "_request_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("metadata API should not run")),
+    )
+
+    candidates = research_tools._public_fulltext_candidates("10.48550/arXiv.1706.03762", timeout=12)
+
+    assert candidates == [{"url": "https://arxiv.org/pdf/1706.03762.pdf", "source": "arXiv"}]
 
 
 def test_cli_success_without_a_pdf_falls_back_to_public_archive(tmp_path: Path, monkeypatch):

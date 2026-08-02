@@ -3,8 +3,14 @@ import sqlite3
 from pathlib import Path
 
 from scansci_html import cli
-from scansci_html.evidence_doctor import check_evidence_links
-from scansci_html.evidence_store import export_spans_jsonl, index_evidence_library, index_markdown_library
+from scansci_html.evidence_doctor import assess_evidence_structure, check_evidence_links
+from scansci_html.evidence_store import (
+    build_library_overview,
+    ensure_library_overview,
+    export_spans_jsonl,
+    index_evidence_library,
+    index_markdown_library,
+)
 
 
 def test_index_evidence_library_writes_sqlite_fts_and_optional_sidecars(tmp_path: Path):
@@ -277,6 +283,89 @@ This reference sentence should not enter the evidence store.
     assert reference_hits == []
 
 
+def test_library_overview_uses_one_document_card_per_file_and_keeps_evidence_anchors(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "solar.md").write_text(
+        """# Solar ecology review
+
+## Abstract
+
+Photovoltaic sites can alter plant richness through shading, runoff, and maintenance regimes.
+
+## Results
+
+Plant responses varied by habitat and by the spatial arrangement of photovoltaic arrays.
+""",
+        encoding="utf-8",
+    )
+    (library / "biodiversity.md").write_text(
+        """# Biodiversity around solar farms
+
+## Abstract
+
+Solar farm biodiversity studies report different outcomes when grazing and vegetation management differ.
+
+## Discussion
+
+Cross-site comparison requires evidence that preserves the original study context and section.
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=10)
+
+    overview = build_library_overview(db_path)
+
+    assert overview["documents"] == 2
+    assert overview["document_cards"] == 2
+    assert overview["sections"] >= 4
+    assert overview["graph_nodes"] >= 4
+    assert overview["graph_edges"] >= 2
+    with sqlite3.connect(db_path) as connection:
+        cards = connection.execute(
+            "select title, summary, anchor_evidence_ids_json, evidence_count from document_cards order by title"
+        ).fetchall()
+        anchored_edges = connection.execute(
+            "select count(*) from knowledge_graph_edges where anchor_evidence_ids_json <> '[]'"
+        ).fetchone()[0]
+        evidence_count = connection.execute("select count(*) from evidence_spans").fetchone()[0]
+
+    assert len(cards) == 2
+    assert all(card[1] for card in cards)
+    assert all(json.loads(card[2]) for card in cards)
+    assert sum(card[3] for card in cards) == evidence_count
+    assert anchored_edges >= 2
+    # A second call must reuse the catalogue, not create a second card layer.
+    assert ensure_library_overview(db_path) == overview
+
+
+def test_incremental_markdown_index_reuses_unchanged_documents_and_versions_changed_source(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    first = library / "first.md"
+    second = library / "second.md"
+    first.write_text("# First\n\n## Results\n\nA stable evidence sentence remains reusable.", encoding="utf-8")
+    second.write_text("# Second\n\n## Results\n\nAn editable evidence sentence starts in its first version.", encoding="utf-8")
+    db_path = tmp_path / "evidence.sqlite"
+
+    initial = index_markdown_library(library, db_path=db_path, min_sentence_length=10, incremental=True)
+    build_library_overview(db_path)
+    second.write_text("# Second\n\n## Results\n\nAn editable evidence sentence now has a second version.", encoding="utf-8")
+    refreshed = index_markdown_library(library, db_path=db_path, min_sentence_length=10, incremental=True)
+
+    assert initial["changed_documents"] == 2
+    assert refreshed["reused_documents"] == 1
+    assert refreshed["changed_documents"] == 1
+    with sqlite3.connect(db_path) as connection:
+        fingerprints = connection.execute(
+            "select doc_id, source_fingerprint from document_index_revisions order by doc_id"
+        ).fetchall()
+        evidence = connection.execute("select text from evidence_spans order by evidence_id").fetchall()
+    assert len(fingerprints) == 2
+    assert any("second version" in row[0] for row in evidence)
+
+
 def test_index_markdown_library_does_not_treat_inline_formula_pipes_as_table_rows(tmp_path: Path):
     library = tmp_path / "markdown"
     library.mkdir()
@@ -302,6 +391,47 @@ The objective contains | x | and | y | terms, but this prose line is not a Markd
             "The objective contains | x | and | y | terms, but this prose line is not a Markdown table row.",
         )
     ]
+
+
+def test_index_markdown_library_ignores_dependency_directories(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "research-note.md").write_text(
+        "# Research note\n\nThe field observation is retained as traceable research evidence.",
+        encoding="utf-8",
+    )
+    dependency = library / "node_modules" / "package"
+    dependency.mkdir(parents=True)
+    (dependency / "README.md").write_text(
+        "# Package readme\n\nThis dependency documentation must not enter the evidence index.",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+
+    summary = index_markdown_library(library, db_path=db_path, min_sentence_length=10)
+
+    assert summary["documents"] == 1
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("select title from source_documents").fetchall() == [("Research note",)]
+
+
+def test_index_markdown_library_keeps_distinct_chinese_notes_with_the_same_filename(tmp_path: Path):
+    library = tmp_path / "vault"
+    first = library / "研究一"
+    second = library / "研究二"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "笔记.md").write_text("# 中文标题\n\n第一篇中文笔记包含可检索的实验观察。", encoding="utf-8")
+    (second / "笔记.md").write_text("# 中文标题\n\n第二篇中文笔记包含不同的实验观察。", encoding="utf-8")
+    db_path = tmp_path / "chinese-notes.sqlite"
+
+    summary = index_markdown_library(library, db_path=db_path, min_sentence_length=1)
+
+    assert summary["documents"] == 2
+    assert summary["duplicate_documents_skipped"] == 0
+    with sqlite3.connect(db_path) as connection:
+        doc_ids = [row[0] for row in connection.execute("select doc_id from source_documents order by doc_id")]
+    assert len(set(doc_ids)) == 2
 
 
 def test_export_spans_jsonl_exports_current_sqlite_rows(tmp_path: Path):
@@ -412,3 +542,88 @@ def test_cli_evidence_doctor_exits_nonzero_when_links_are_broken(tmp_path: Path,
     assert exit_code == 1
     assert payload["passed"] is False
     assert payload["missing_anchors"] == 1
+
+
+def test_markdown_pdf_style_text_splits_chinese_and_excludes_implicit_references(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    (library / "paper.md").write_text(
+        """---
+title: "PDF-style source"
+source_url: "C:/library/paper.pdf"
+---
+
+# 第 1 页
+
+研究显示处理组的土壤含水率明显提高。第二次测量也得到相同趋势。该结论支持后续试验设计。
+
+References
+
+(1) Smith J. A reference should never become retrievable evidence. Journal 1, 1-10.
+(2) Doe J. Another reference row.
+
+# 第 2 页
+
+(3) Roe J. A reference continued on the next PDF page must also be excluded.
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+
+    index_markdown_library(library, db_path=db_path, min_sentence_length=6)
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "select text, section_path, source_locator from evidence_spans order by sentence_index"
+        ).fetchall()
+        sections = connection.execute(
+            "select section_title, parent_section_id from document_sections order by section_level, section_title"
+        ).fetchall()
+
+    assert [row[0] for row in rows] == [
+        "研究显示处理组的土壤含水率明显提高。",
+        "第二次测量也得到相同趋势。",
+        "该结论支持后续试验设计。",
+    ]
+    assert {row[1] for row in rows} == {"第 1 页"}
+    assert {row[2] for row in rows} == {"page:1"}
+    assert sections == [("第 1 页", "")]
+
+    quality = assess_evidence_structure(db_path)
+    assert quality["passed"] is True
+    assert quality["sections"] == 1
+    assert quality["oversized_spans"] == 0
+    assert quality["reference_spans"] == 0
+    assert quality["source_text_mismatches"] == 0
+
+
+def test_evidence_quality_audit_rejects_oversized_fragments(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    # List items are intentionally atomic source evidence.  The doctor must
+    # catch an oversized item even when its source anchor is structurally valid.
+    (library / "long.md").write_text("# Long note\n\n- " + "x" * 1_300, encoding="utf-8")
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=6)
+
+    quality = assess_evidence_structure(db_path, max_span_characters=1_200)
+
+    assert quality["passed"] is False
+    assert quality["oversized_spans"] == 1
+    assert quality["issues"][0]["type"] == "oversized_span"
+
+
+def test_markdown_evidence_preserves_scientific_tilde_values(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    (library / "value.md").write_text(
+        "# Value note\n\nThe band gap remains ~0.3 eV after treatment.",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=6)
+
+    with sqlite3.connect(db_path) as connection:
+        text = connection.execute("select text from evidence_spans").fetchone()[0]
+
+    assert text == "The band gap remains ~0.3 eV after treatment."

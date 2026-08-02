@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package
+        run: python -m pip install -e .
+      - name: Run tests
+        run: python -m pytest tests -q
+      - name: Build sample evidence benchmark store
+        run: >
+          scansci index-v2
+          --library-dir .\bench\sample_library
+          --db .\bench\sample-evidence.sqlite
+          --inject-evidence-html
+          --min-sentence-length 10
+      - name: Check sample evidence links
+        run: >
+          scansci evidence-doctor
+          --db .\bench\sample-evidence.sqlite
+      - name: Validate sample gold questions
+        run: >
+          scansci bench-validate
+          --gold .\bench\gold_questions.sample.jsonl
+          --db .\bench\sample-evidence.sqlite
+          --min-questions 3
+          --min-per-answer-type 1
+          --require-answer-types single_paper_fact,unanswerable,conflict_evidence
+      - name: Run sample evidence benchmark gate
+        run: >
+          scansci bench
+          --db .\bench\sample-evidence.sqlite
+          --gold .\bench\gold_questions.sample.jsonl
+          --k 8
+          --min-retrieval-recall 0.8
+          --min-all-gold-retrieval-recall 0.8
+          --min-gold-evidence-recall 0.8
+          --min-citation-f1 0.8
+          --min-answerable-evidence-adequacy 0.8
+          --details-output .\bench\sample-benchmark-details.json
+          --details-html-output .\bench\sample-benchmark-details.html

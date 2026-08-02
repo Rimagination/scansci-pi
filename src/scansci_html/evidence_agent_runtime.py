@@ -269,6 +269,7 @@ class OpenAICompatibleActionDecider:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0,
+            "max_tokens": 256,
         }
         data = json.dumps(payload).encode("utf-8")
         endpoint = self.config.base_url.rstrip("/") + "/chat/completions"
@@ -280,7 +281,10 @@ class OpenAICompatibleActionDecider:
         req = request.Request(endpoint, data=data, headers=headers, method="POST")
         try:
             with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
+                encoded = response.read(1_000_001)
+                if len(encoded) > 1_000_000:
+                    raise RuntimeError("local model response exceeded 1 MB")
+                response_payload = json.loads(encoded.decode("utf-8"))
         except (OSError, URLError, json.JSONDecodeError) as error:
             raise RuntimeError(f"local model request failed: {error}") from error
         content = str(response_payload["choices"][0]["message"]["content"])

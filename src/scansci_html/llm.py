@@ -11,6 +11,38 @@ import requests
 
 
 _MANAGED_GATEWAY_SESSION = requests.Session()
+_DEFAULT_PROVIDER_INPUT_TOKENS = 48_000
+_STRUCTURED_PROVIDER_INPUT_TOKENS = 48_000
+# Structured-output operations share a strict two-request budget so a malformed
+# response cannot quietly multiply paid requests.
+_MAX_LOGICAL_REQUESTS = 2
+# A managed streaming turn can briefly return 429 while a previous gateway
+# worker drains its queue.  Allow one additional, bounded retry here without
+# weakening the structured-output budget above.
+_STREAM_LOGICAL_REQUESTS = 3
+
+
+def _estimate_provider_input_tokens(messages: object) -> int:
+    """Conservatively estimate serialized provider input before any paid call."""
+
+    try:
+        text = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        text = str(messages)
+    ascii_chars = sum(1 for char in text if ord(char) <= 0x7F)
+    non_ascii_chars = len(text) - ascii_chars
+    return (ascii_chars + 3) // 4 + non_ascii_chars
+
+
+def _ensure_provider_input_budget(messages: object, *, max_input_tokens: int) -> None:
+    estimated = _estimate_provider_input_tokens(messages)
+    limit = max(1_000, int(max_input_tokens))
+    if estimated > limit:
+        raise ValueError(
+            "Provider input budget exceeded before network request: "
+            f"estimated {estimated} tokens (limit {limit}). "
+            "Compress the conversation or narrow the attached material before retrying."
+        )
 
 
 def managed_gateway_session() -> requests.Session:
@@ -21,6 +53,20 @@ def managed_gateway_session() -> requests.Session:
     """
 
     return _MANAGED_GATEWAY_SESSION
+
+
+def _fresh_retry_session(active_session: Any) -> Any:
+    """Avoid retrying a failed managed-gateway stream on the same stale socket.
+
+    The managed client intentionally keeps a connection pool for normal desktop
+    traffic.  A proxy or worker can still close an idle keep-alive connection;
+    retrying that request through a one-shot session is safer than closing the
+    shared pool while another ScanSci turn may be streaming.
+    """
+
+    if active_session is _MANAGED_GATEWAY_SESSION:
+        return requests.Session()
+    return active_session
 
 
 def warm_managed_gateway_connection(base_url: str, *, timeout: float = 20.0) -> bool:
@@ -58,6 +104,12 @@ class CascadingChatJsonClient:
         self.session = getattr(primary, "session", None)
         self.thinking_mode = getattr(primary, "thinking_mode", None)
         self.model = getattr(primary, "model", "")
+        # A fallback model is already the second logical attempt. Prevent each
+        # provider from also performing its own two-request retry loop.
+        if len(self.clients) > 1:
+            for client in self.clients:
+                if hasattr(client, "logical_request_limit"):
+                    setattr(client, "logical_request_limit", 1)
 
     @property
     def active_model(self) -> str:
@@ -119,11 +171,16 @@ class OpenAICompatibleChatJsonClient:
         self.session = session or requests.Session()
         self.thinking_mode = thinking_mode if thinking_mode in {"enabled", "disabled"} else None
         self._rate_limited_until = 0.0
+        self.logical_request_limit = _MAX_LOGICAL_REQUESTS
 
     def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
         if time.monotonic() < self._rate_limited_until:
             raise RuntimeError("模型结构化响应暂时受限，已立即切换到本地证据流程。")
         structured_messages = _with_structured_output_instruction(messages, schema_name=schema_name)
+        _ensure_provider_input_budget(
+            structured_messages,
+            max_input_tokens=_STRUCTURED_PROVIDER_INPUT_TOKENS,
+        )
         request_body: dict[str, Any] = {
             "model": self.model,
             "messages": structured_messages,
@@ -167,6 +224,7 @@ class OpenAICompatibleChatJsonClient:
         # and then retrying the same section again at the workflow layer,
         # multiplies a slow gateway call without improving the accepted text.
         attempts = 1 if schema_name == "literature_review_section" else 2 if schema_name in retryable_schemas else 1
+        requests_used = 0
         for attempt in range(attempts):
             active_body = dict(request_body)
             if attempt:
@@ -191,8 +249,9 @@ class OpenAICompatibleChatJsonClient:
                     *structured_messages,
                 ]
             response: Any | None = None
-            for retry_index in range(3):
+            while requests_used < self.logical_request_limit:
                 try:
+                    requests_used += 1
                     response = self.session.post(
                         f"{self.base_url}/chat/completions",
                         headers={
@@ -207,7 +266,7 @@ class OpenAICompatibleChatJsonClient:
                     break
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
-                    if status not in {429, 502, 503, 504} or retry_index >= 2:
+                    if status not in {429, 502, 503, 504} or requests_used >= self.logical_request_limit:
                         raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
@@ -216,11 +275,11 @@ class OpenAICompatibleChatJsonClient:
                         requested_delay = 0
                     if status == 429:
                         self._rate_limited_until = time.monotonic() + min(120.0, max(30.0, requested_delay))
-                        if requested_delay > 8 or retry_index >= 1:
+                        if requested_delay > 8:
                             raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
                         delay = min(8.0, max(requested_delay, 2.0))
                     else:
-                        delay = min(12.0, max(requested_delay, float(2 ** (retry_index + 1))))
+                        delay = min(12.0, max(requested_delay, float(2 ** requests_used)))
                     if response is not None:
                         close = getattr(response, "close", None)
                         if callable(close):
@@ -252,6 +311,7 @@ class OpenAICompatibleChatJsonClient:
             thinking_mode=self.thinking_mode,
             max_tokens=max_tokens,
             temperature=0.1,
+            max_requests=self.logical_request_limit,
         )
         return str(result)
 
@@ -277,8 +337,13 @@ class AnthropicCompatibleChatJsonClient:
         self.model = model
         self.timeout = float(timeout)
         self.session = session or requests.Session()
+        self.logical_request_limit = 1
 
     def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
+        _ensure_provider_input_budget(
+            messages,
+            max_input_tokens=_STRUCTURED_PROVIDER_INPUT_TOKENS,
+        )
         system_parts = [item["content"] for item in messages if item.get("role") == "system"]
         conversation = [item for item in messages if item.get("role") in {"user", "assistant"}]
         response = self.session.post(
@@ -312,6 +377,7 @@ class AnthropicCompatibleChatJsonClient:
             session=self.session,
             max_tokens=max_tokens,
             temperature=0.1,
+            max_requests=self.logical_request_limit,
         )
         return str(result)
 
@@ -366,6 +432,9 @@ def complete_chat_text(
     include_usage: bool = False,
     max_tokens: int = 8192,
     temperature: float = 0.4,
+    max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
+    max_requests: int = _MAX_LOGICAL_REQUESTS,
+    use_litellm: bool = True,
 ) -> str | tuple[str, dict[str, int]]:
     """Return a plain conversational response without requiring a research library."""
 
@@ -377,9 +446,11 @@ def complete_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
+    request_limit = max(1, min(_MAX_LOGICAL_REQUESTS, int(max_requests)))
 
     name = (provider or "").strip().lower()
-    if session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
+    if use_litellm and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
         return _litellm_complete_chat(
             name,
             base_url=base_url,
@@ -389,6 +460,9 @@ def complete_chat_text(
             timeout=timeout,
             thinking_mode=thinking_mode,
             include_usage=include_usage,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_requests=request_limit,
         )
 
     client = session or requests.Session()
@@ -404,7 +478,7 @@ def complete_chat_text(
             if thinking_mode in {"enabled", "disabled"}:
                 request_body["thinking"] = {"type": thinking_mode}
             response = None
-            for retry_index in range(3):
+            for retry_index in range(request_limit):
                 try:
                     response = client.post(
                         f"{base_url.rstrip('/')}/chat/completions",
@@ -416,7 +490,7 @@ def complete_chat_text(
                     break
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
-                    if status not in {429, 502, 503, 504} or retry_index >= 2:
+                    if status not in {429, 502, 503, 504} or retry_index >= request_limit - 1:
                         raise
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
@@ -476,6 +550,11 @@ def stream_chat_text(
     timeout: float = 90.0,
     session: Any | None = None,
     thinking_mode: str | None = None,
+    max_tokens: int = 8192,
+    max_continuations: int = 3,
+    temperature: float = 0.4,
+    max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
+    max_requests: int = _STREAM_LOGICAL_REQUESTS,
 ) -> Iterator[dict[str, Any]]:
     """Yield OpenAI-compatible text deltas and a final usage event.
 
@@ -492,6 +571,8 @@ def stream_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
+    request_limit = max(1, min(_STREAM_LOGICAL_REQUESTS, int(max_requests)))
 
     name = (provider or "").strip().lower()
     if session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
@@ -503,6 +584,10 @@ def stream_chat_text(
             messages=messages,
             timeout=timeout,
             thinking_mode=thinking_mode,
+            max_tokens=max_tokens,
+            max_continuations=max_continuations,
+            temperature=temperature,
+            max_requests=request_limit,
         )
         return
     if name in {"anthropic-compatible", "anthropic"}:
@@ -516,6 +601,10 @@ def stream_chat_text(
             session=session,
             thinking_mode=thinking_mode,
             include_usage=True,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_input_tokens=max_input_tokens,
+            max_requests=request_limit,
         )
         text, usage = completed if isinstance(completed, tuple) else (completed, {})
         yield {"type": "delta", "content": text}
@@ -530,13 +619,17 @@ def stream_chat_text(
     total_usage: dict[str, int] = {}
     final_reason = ""
     final_incomplete = False
-    max_continuations = 3
-    for attempt in range(max_continuations + 1):
+    continuation_limit = max(0, int(max_continuations))
+    for attempt in range(continuation_limit + 1):
+        _ensure_provider_input_budget(
+            continuation_messages,
+            max_input_tokens=max_input_tokens,
+        )
         request_body: dict[str, Any] = {
             "model": model,
             "messages": continuation_messages,
-            "max_tokens": 8192,
-            "temperature": 0.4,
+            "max_tokens": max(64, int(max_tokens)),
+            "temperature": float(temperature),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -548,7 +641,7 @@ def stream_chat_text(
         attempt_usage: dict[str, int] = {}
         finish_reason = ""
         try:
-            for retry_index in range(3):
+            for retry_index in range(request_limit):
                 try:
                     response = client.post(
                         f"{base_url.rstrip('/')}/chat/completions",
@@ -561,8 +654,12 @@ def stream_chat_text(
                     break
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
-                    retryable = status in {429, 502, 503, 504}
-                    if not retryable or retry_index >= 2:
+                    # A network/TLS disconnect has no HTTP status.  It is
+                    # safe to retry once because no model text was received;
+                    # do not make users manually recover from a stale desktop
+                    # keep-alive connection.
+                    retryable = status is None or status in {429, 502, 503, 504}
+                    if not retryable or retry_index >= request_limit - 1:
                         raise
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
@@ -573,6 +670,7 @@ def stream_chat_text(
                     if response is not None:
                         response.close()
                         response = None
+                    client = _fresh_retry_session(client)
                     yield {
                         "type": "retry",
                         "reason": "rate_limit" if status == 429 else "temporary_upstream_error",
@@ -583,6 +681,35 @@ def stream_chat_text(
                     time.sleep(delay)
             content_type = str(dict(getattr(response, "headers", {}) or {}).get("Content-Type", "")).lower()
             if "text/event-stream" not in content_type:
+                # A managed worker may briefly return a non-SSE gateway page
+                # before it has attached the upstream stream.  Restart only
+                # before any text is delivered, so a retry can never duplicate
+                # part of a user-visible answer.
+                if not complete_text and request_limit > 1:
+                    yield {
+                        "type": "retry",
+                        "reason": "temporary_upstream_error",
+                        "status": None,
+                        "delay_seconds": 1.0,
+                        "attempt": 1,
+                    }
+                    time.sleep(1.0)
+                    yield from stream_chat_text(
+                        provider,
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        messages=messages,
+                        timeout=timeout,
+                        session=_fresh_retry_session(client),
+                        thinking_mode=thinking_mode,
+                        max_tokens=max_tokens,
+                        max_continuations=max_continuations,
+                        temperature=temperature,
+                        max_input_tokens=max_input_tokens,
+                        max_requests=1,
+                    )
+                    return
                 raise RuntimeError("The model service did not return a streaming response")
             # Some OpenAI-compatible gateways omit `charset=utf-8` for SSE.
             response.encoding = "utf-8"
@@ -625,6 +752,34 @@ def stream_chat_text(
                     attempt_text += fragment
                     yield {"type": "delta", "content": fragment}
         except requests.RequestException as error:
+            # Reading an SSE stream can fail after HTTP 200 (for example, a
+            # proxy closes an idle keep-alive connection).  If it fails before
+            # the first delta, restart the full request once on a fresh session.
+            if not attempt_text and not complete_text and request_limit > 1:
+                yield {
+                    "type": "retry",
+                    "reason": "temporary_upstream_error",
+                    "status": getattr(getattr(error, "response", None), "status_code", None),
+                    "delay_seconds": 1.0,
+                    "attempt": 1,
+                }
+                time.sleep(1.0)
+                yield from stream_chat_text(
+                    provider,
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    messages=messages,
+                    timeout=timeout,
+                    session=_fresh_retry_session(client),
+                    thinking_mode=thinking_mode,
+                    max_tokens=max_tokens,
+                    max_continuations=max_continuations,
+                    temperature=temperature,
+                    max_input_tokens=max_input_tokens,
+                    max_requests=1,
+                )
+                return
             raise RuntimeError(_public_model_error(error, prefix="模型流式响应暂时不可用")) from error
         finally:
             if response is not None:
@@ -639,7 +794,7 @@ def stream_chat_text(
             complete_text=complete_text,
             messages=messages,
         )
-        if not final_incomplete or attempt >= max_continuations or not attempt_text:
+        if not final_incomplete or attempt >= continuation_limit or not attempt_text:
             break
         yield {"type": "continuation", "attempt": attempt + 1}
         continuation_messages = [
@@ -648,8 +803,10 @@ def stream_chat_text(
             {
                 "role": "user",
                 "content": (
-                    "上一次回复未完整收束。请从断点直接继续，不要重复已有内容，"
-                    "不要写‘继续’等过渡语，并务必收束成一个完整答案。"
+                    "先检查上文是否已满足用户的全部章节与格式要求；若已满足，"
+                    "不要重复或扩展正文，只输出用户要求的结束标记并立即停止。"
+                    "若仍缺内容，请从断点直接继续，不要重复已有内容，不要写‘继续’等过渡语，"
+                    "并务必收束成一个完整答案。"
                     + _completion_marker_reminder(messages)
                 ),
             },
@@ -748,6 +905,9 @@ def _litellm_kwargs(
     messages: list[dict[str, Any]],
     timeout: float,
     thinking_mode: str | None,
+    max_tokens: int = 8192,
+    temperature: float = 0.4,
+    max_requests: int = _MAX_LOGICAL_REQUESTS,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": _litellm_model(provider, model),
@@ -755,10 +915,10 @@ def _litellm_kwargs(
         "api_key": api_key,
         "messages": messages,
         "timeout": timeout,
-        "temperature": 0.4,
-        "max_tokens": 8192,
+        "temperature": float(temperature),
+        "max_tokens": max(64, int(max_tokens)),
         "drop_params": True,
-        "max_retries": 1,
+        "max_retries": max(0, min(_MAX_LOGICAL_REQUESTS, int(max_requests)) - 1),
     }
     if thinking_mode in {"enabled", "disabled"}:
         payload["thinking"] = {"type": thinking_mode}
@@ -775,6 +935,9 @@ def _litellm_complete_chat(
     timeout: float,
     thinking_mode: str | None,
     include_usage: bool,
+    max_tokens: int = 8192,
+    temperature: float = 0.4,
+    max_requests: int = _MAX_LOGICAL_REQUESTS,
 ) -> str | tuple[str, dict[str, int]]:
     import litellm
 
@@ -788,6 +951,9 @@ def _litellm_complete_chat(
                 messages=messages,
                 timeout=timeout,
                 thinking_mode=thinking_mode,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                max_requests=max_requests,
             )
         )
     except Exception as error:  # LiteLLM normalizes provider-specific failures
@@ -814,6 +980,10 @@ def _litellm_stream_chat(
     messages: list[dict[str, Any]],
     timeout: float,
     thinking_mode: str | None,
+    max_tokens: int = 8192,
+    max_continuations: int = 3,
+    temperature: float = 0.4,
+    max_requests: int = _MAX_LOGICAL_REQUESTS,
 ) -> Iterator[dict[str, Any]]:
     import litellm
 
@@ -822,9 +992,9 @@ def _litellm_stream_chat(
     usage: dict[str, int] = {}
     final_reason = ""
     final_incomplete = False
-    max_continuations = 3
+    continuation_limit = max(0, int(max_continuations))
     try:
-        for attempt in range(max_continuations + 1):
+        for attempt in range(continuation_limit + 1):
             kwargs = _litellm_kwargs(
                 provider,
                 base_url=base_url,
@@ -833,6 +1003,9 @@ def _litellm_stream_chat(
                 messages=continuation_messages,
                 timeout=timeout,
                 thinking_mode=thinking_mode,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                max_requests=max_requests,
             )
             kwargs.update({"stream": True, "stream_options": {"include_usage": True}})
             attempt_text = ""
@@ -865,7 +1038,7 @@ def _litellm_stream_chat(
                 complete_text=complete_text,
                 messages=messages,
             )
-            if not final_incomplete or attempt >= max_continuations or not attempt_text:
+            if not final_incomplete or attempt >= continuation_limit or not attempt_text:
                 break
             yield {"type": "continuation", "attempt": attempt + 1}
             continuation_messages = [
@@ -874,7 +1047,9 @@ def _litellm_stream_chat(
                 {
                     "role": "user",
                     "content": (
-                        "上一次回复未完整收束。请从断点直接继续，不重复已有内容，并完成答案。"
+                        "先检查上文是否已满足用户的全部章节与格式要求；若已满足，"
+                        "不要重复或扩展正文，只输出用户要求的结束标记并立即停止。"
+                        "若仍缺内容，请从断点直接继续，不重复已有内容，并完成答案。"
                         + _completion_marker_reminder(messages)
                     ),
                 },
@@ -946,7 +1121,58 @@ def _public_model_error(error: BaseException, *, prefix: str) -> str:
     status = getattr(error, "status_code", None)
     if status is None:
         status = getattr(getattr(error, "response", None), "status_code", None)
+    normalized = str(error).lower()
+    provider_code = _provider_error_code(error)
+    request_id = _provider_request_id(error)
+    support_reference = f"（请求编号：{request_id}）" if request_id else ""
+    if status == 402 or "insufficient balance" in normalized or "insufficient credit" in normalized:
+        return "模型服务余额不足（HTTP 402）。请充值该服务商账户，或切换到其他可用模型。"
+    if status in {401, 403}:
+        return f"模型服务鉴权失败（HTTP {status}）。请检查 API Key、账户权限或服务地址。"
+    if status == 429:
+        if provider_code == "rate_limit_exceeded":
+            return (
+                "ScanSci 托管模型网关当前限流（HTTP 429）。已停止继续请求，请稍后重试。"
+                + support_reference
+            )
+        if provider_code == "upstream_rate_limited":
+            return (
+                "托管模型的上游服务当前限流（HTTP 429）。ScanSci 已停止继续请求，请稍后重试。"
+                + support_reference
+            )
+        return "模型服务当前限流（HTTP 429）。ScanSci 已停止继续请求，请稍后重试或切换模型。"
+    if provider_code == "upstream_timeout":
+        return "托管模型服务响应超时。ScanSci 已保留当前进度，请稍后重试。" + support_reference
+    if provider_code == "upstream_connection_failed":
+        return "暂时无法连接托管模型服务。请检查网络后重试。" + support_reference
     return f"{prefix}（HTTP {status}），请稍后重试。" if status else f"{prefix}，请稍后重试。"
+
+
+def _provider_error_code(error: BaseException) -> str:
+    """Read the gateway's safe machine-readable error code when available."""
+
+    response = getattr(error, "response", None)
+    payload_reader = getattr(response, "json", None)
+    if not callable(payload_reader):
+        return ""
+    try:
+        payload = payload_reader()
+    except (TypeError, ValueError, requests.RequestException):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    details = payload.get("error")
+    if not isinstance(details, dict):
+        return ""
+    return str(details.get("code", "")).strip()
+
+
+def _provider_request_id(error: BaseException) -> str:
+    """Return a safe gateway diagnostic id, never a provider response body."""
+
+    headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
+    value = str(headers.get("x-scansci-request-id", "")).strip()
+    return value if re.fullmatch(r"[A-Za-z0-9-]{8,80}", value) else ""
 
 
 def analyze_vision_images(
@@ -964,6 +1190,19 @@ def analyze_vision_images(
 
     if not images:
         raise ValueError("至少需要一张图片")
+    if len(images) > 4:
+        raise ValueError("A single vision request is limited to 4 images")
+    estimated_image_bytes = 0
+    for image in images:
+        encoded = str(image.get("data", ""))
+        estimated_bytes = (len(encoded) * 3) // 4
+        if estimated_bytes > 4 * 1024 * 1024:
+            raise ValueError("A single vision image exceeds the 4 MB request limit")
+        estimated_image_bytes += estimated_bytes
+    if estimated_image_bytes > 10 * 1024 * 1024:
+        raise ValueError("Vision images exceed the 10 MB total request limit")
+    if len(str(question or "")) > 20_000:
+        raise ValueError("The vision question exceeds the request input limit")
     if not base_url or not api_key or not model:
         raise ValueError("视觉模型的地址、密钥或模型 ID 尚未配置")
     prompt = (
@@ -986,7 +1225,12 @@ def analyze_vision_images(
         response = active_session.post(
             f"{base_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.2},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 2048,
+                "temperature": 0.2,
+            },
             timeout=float(timeout),
         )
         response.raise_for_status()
@@ -1121,9 +1365,10 @@ def _with_structured_output_instruction(
             "Stop immediately after the closing brace."
         ),
         "literature_review_section": (
-            'Return only JSON in this exact shape: {"text":"one concise synthesis paragraph",'
-            '"citation_ids":["1"]}. Do not add arrays of paragraphs or any other keys. Cite only supplied '
-            "citation_ids and stop immediately after the closing brace."
+            'Return only JSON in this exact shape: {"sentences":[{"text":"one complete sentence",'
+            '"citation_ids":["1"]}]}. Every sentence must carry only the supplied citation_ids that directly '
+            "support that sentence. Do not collect citations at paragraph end, do not add other keys, and stop "
+            "immediately after the closing brace."
         ),
         "literature_review_overview": (
             'Return only JSON with keys "title", "abstract", "comparison_table", "controversies", '
@@ -1149,7 +1394,7 @@ def _recover_structured_content(content: object, *, schema_name: str) -> dict[st
     """Recover the one safe contract emitted as cited Markdown by some models."""
 
     if schema_name == "literature_review_section":
-        return _recover_known_object_keys(content, ("text", "citation_ids"))
+        return _recover_known_object_keys(content, ("sentences", "text", "citation_ids"))
     if schema_name == "literature_review_overview":
         return _recover_known_object_keys(
             content,

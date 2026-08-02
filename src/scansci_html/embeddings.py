@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from hashlib import blake2b
+import importlib
 import math
 import os
 import re
@@ -9,7 +10,18 @@ from typing import Protocol
 
 import requests
 
+from .local_retrieval_runtime import (
+    model_device,
+    resolve_retrieval_device,
+    retrieval_inference_lock,
+)
 from .text_tokenization import lexical_tokens
+
+_MAX_REMOTE_EMBED_TEXTS = 10_000
+_MAX_REMOTE_EMBED_TOTAL_CHARS = 2_000_000
+_MAX_REMOTE_EMBED_TEXT_CHARS = 100_000
+_MAX_REMOTE_EMBED_BATCH_ITEMS = 128
+_MAX_REMOTE_EMBED_BATCH_CHARS = 500_000
 
 
 class EmbeddingProvider(Protocol):
@@ -31,6 +43,7 @@ class HashingEmbeddingProvider:
         if dimensions <= 0:
             raise ValueError("dimensions must be positive")
         self.dimensions = int(dimensions)
+        self.cache_key = "hashing-v1"
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         return [_normalize(_hashing_vector(text, self.dimensions)) for text in texts]
@@ -62,6 +75,41 @@ class OpenAICompatibleEmbeddingProvider:
         self.session = session or requests.Session()
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        normalized = [str(text) for text in texts]
+        if not normalized:
+            return []
+        if len(normalized) > _MAX_REMOTE_EMBED_TEXTS:
+            raise ValueError("Remote embedding request contains too many texts")
+        if any(len(text) > _MAX_REMOTE_EMBED_TEXT_CHARS for text in normalized):
+            raise ValueError("A remote embedding input exceeds the per-text character limit")
+        if sum(len(text) for text in normalized) > _MAX_REMOTE_EMBED_TOTAL_CHARS:
+            raise ValueError("Remote embedding request exceeds the total character budget")
+
+        vectors: list[list[float]] = []
+        batch: list[str] = []
+        batch_chars = 0
+        for text in normalized:
+            if batch and (
+                len(batch) >= _MAX_REMOTE_EMBED_BATCH_ITEMS
+                or batch_chars + len(text) > _MAX_REMOTE_EMBED_BATCH_CHARS
+            ):
+                vectors.extend(self._embed_batch(batch))
+                batch = []
+                batch_chars = 0
+            batch.append(text)
+            batch_chars += len(text)
+        if batch:
+            vectors.extend(self._embed_batch(batch))
+        if len(vectors) != len(normalized):
+            raise RuntimeError(
+                f"Embedding provider returned {len(vectors)} vectors for {len(normalized)} texts"
+            )
+        dimensions = {len(vector) for vector in vectors}
+        if 0 in dimensions or len(dimensions) != 1:
+            raise RuntimeError("Embedding provider returned empty or inconsistent vectors")
+        return vectors
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         response = self.session.post(
             f"{self.base_url}/embeddings",
             headers={
@@ -73,7 +121,12 @@ class OpenAICompatibleEmbeddingProvider:
         )
         response.raise_for_status()
         payload = response.json()
-        return [list(item["embedding"]) for item in payload.get("data", [])]
+        rows = list(payload.get("data", []) or [])
+        if len(rows) != len(texts):
+            raise RuntimeError(
+                f"Embedding provider returned {len(rows)} vectors for a batch of {len(texts)} texts"
+            )
+        return [[float(value) for value in list(item["embedding"])] for item in rows]
 
     def embed_query(self, query: str) -> list[float]:
         return self.embed_texts([query])[0]
@@ -84,19 +137,39 @@ class SentenceTransformersEmbeddingProvider:
         self,
         *,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cache_identity: str = "",
         model: Any | None = None,
         batch_size: int = 32,
         max_seq_length: int = 0,
         normalize_embeddings: bool = True,
+        device: str | None = None,
     ) -> None:
         self.model_name = model_name
-        self.model = model if model is not None else _load_sentence_transformer_model(model_name)
+        self.cache_identity = str(cache_identity or model_name).strip()
+        self.cache_key = f"sentence-transformers:{self.cache_identity}"
+        self.device = resolve_retrieval_device(device)
+        if model is not None:
+            self.model = model
+        else:
+            try:
+                self.model = _load_sentence_transformer_model(model_name, device=self.device)
+            except TypeError as error:
+                # Keep compatibility with lightweight test/integration loaders
+                # that predate the explicit device argument.
+                if "unexpected keyword argument 'device'" not in str(error):
+                    raise
+                self.model = _load_sentence_transformer_model(model_name)
+        if model is not None:
+            self.model = self.model.to(self.device) if callable(getattr(self.model, "to", None)) else self.model
+        self.device = model_device(self.model) or self.device
         self.batch_size = int(batch_size)
         self.max_seq_length = max(0, int(max_seq_length or 0))
         if self.max_seq_length and hasattr(self.model, "max_seq_length"):
             self.model.max_seq_length = self.max_seq_length
         self.normalize_embeddings = bool(normalize_embeddings)
-        dimension_getter = getattr(self.model, "get_sentence_embedding_dimension", None)
+        dimension_getter = getattr(self.model, "get_embedding_dimension", None)
+        if not callable(dimension_getter):
+            dimension_getter = getattr(self.model, "get_sentence_embedding_dimension", None)
         self.dimensions = int(dimension_getter() or 0) if callable(dimension_getter) else 0
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -114,10 +187,11 @@ class SentenceTransformersEmbeddingProvider:
             "normalize_embeddings": self.normalize_embeddings,
         }
         kwargs.update(extra_kwargs)
-        encoded = self.model.encode(
-            texts,
-            **kwargs,
-        )
+        with retrieval_inference_lock():
+            encoded = self.model.encode(
+                texts,
+                **kwargs,
+            )
         if hasattr(encoded, "tolist"):
             encoded = encoded.tolist()
         return [[float(value) for value in vector] for vector in encoded]
@@ -133,9 +207,11 @@ def build_embedding_provider(
     base_url: str = "",
     api_key: str = "",
     model: str = "",
+    cache_identity: str = "",
     dimensions: int = 128,
     batch_size: int = 32,
     max_seq_length: int = 0,
+    device: str | None = None,
 ) -> EmbeddingProvider:
     name = (provider or "local").strip().lower()
     if name in {"local", "hashing", "hash"}:
@@ -157,21 +233,24 @@ def build_embedding_provider(
         )
         return SentenceTransformersEmbeddingProvider(
             model_name=resolved_model,
+            cache_identity=cache_identity,
             batch_size=batch_size,
             max_seq_length=max_seq_length,
+            device=device,
         )
     raise ValueError(f"Unsupported embedding provider: {provider}")
 
 
-def _load_sentence_transformer_model(model_name: str) -> Any:
+def _load_sentence_transformer_model(model_name: str, *, device: str = "cpu") -> Any:
     try:
-        from sentence_transformers import SentenceTransformer
+        module = importlib.import_module("sentence_transformers.sentence_transformer.model")
+        SentenceTransformer = getattr(module, "SentenceTransformer")
     except ImportError as error:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "sentence-transformers is required for --embedding-provider sentence-transformers; "
             "install sentence-transformers or use --embedding-provider local"
         ) from error
-    return SentenceTransformer(model_name)
+    return SentenceTransformer(model_name, device=device)
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

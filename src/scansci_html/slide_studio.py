@@ -9,7 +9,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 import zipfile
 
@@ -23,6 +23,8 @@ from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Inches, Pt
 
 from .builtin_skills import SCIENTIFIC_SLIDES_CONTRACT
+from .easyslides_classic import render_classic_deck
+from .easyslides_plugin import render_semantic_deck
 from .slide_plan import build_slide_plan, safe_presentation_name, write_slide_plan
 from .slides_templates import get_slide_template
 
@@ -122,14 +124,98 @@ def create_source_slide_deck(
     topic: str = "",
     template_id: str = "",
     chat_client: _ChatJsonClient | None = None,
+    slides_root: str | Path | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     """Extract supplied material, plan a template-led deck, and export PPTX."""
 
+    _report_progress(on_progress, 0.06, "正在解析演示材料")
     extracted = [_extract_source(source) for source in sources]
-    template = get_slide_template(template_id) if str(template_id).strip() else None
+    template = get_slide_template(template_id, slides_root) if str(template_id).strip() else None
     theme = _template_theme(template)
+    _report_progress(on_progress, 0.20, "正在提炼论点与证据结构")
     outline, planning = _plan_deck(extracted, topic=topic, chat_client=chat_client, template=template)
     deck_path = _presentation_path(workspace, str(outline["title"]))
+
+    if template and str(template.get("generation_mode", "")) == "easyslides-semantic":
+        native = render_semantic_deck(
+            workspace=workspace,
+            deck_path=deck_path,
+            outline=outline,
+            sources=extracted,
+            template=template,
+            root=slides_root,
+            on_progress=on_progress,
+        )
+        _report_progress(on_progress, 1.0, "EasySlides 原生成品已完成")
+        return {
+            "ok": True,
+            "message": "已用 EasySlides 生成并质检可编辑 PPTX",
+            "file_path": str(deck_path),
+            "pptx_path": str(deck_path),
+            "download_name": deck_path.name,
+            "outline": outline,
+            "slide_plan": native["plan"],
+            "slide_plan_path": native["plan_path"],
+            "execution_lock_path": native["execution_lock_path"],
+            "project_path": native["project_path"],
+            "renderer": "easyslides-semantic-native",
+            "renderer_label": f"EasySlides {native['plugin'].get('version', '')} · 原生可编辑".strip(),
+            "render_mode": "native",
+            "quality_gate": native["quality_gate"],
+            "academic_qa": native.get("academic_qa", {}),
+            "visual_measure": native.get("visual_measure", {}),
+            "visual_review": native.get("visual_review", {}),
+            "execution_lock_validation": native.get("execution_lock_validation", {}),
+            "easyslides": native["plugin"],
+            "render_manifest": native["render_manifest"],
+            "slide_count": len(list(native["plan"].get("slides", []) or [])),
+            "source_count": len(extracted),
+            "sources": _source_summaries(extracted),
+            "template": template,
+            "template_id": str(template.get("id", "")),
+            "planning": planning,
+        }
+
+    if template and str(template.get("generation_mode", "")) == "easyslides-classic":
+        native = render_classic_deck(
+            workspace=workspace,
+            deck_path=deck_path,
+            outline=outline,
+            sources=extracted,
+            template=template,
+            root=slides_root,
+            on_progress=on_progress,
+        )
+        _report_progress(on_progress, 1.0, "EasySlides 正式模板成品已完成")
+        return {
+            "ok": True,
+            "message": "已用 EasySlides 正式模板生成并质检可编辑 PPTX",
+            "file_path": str(deck_path),
+            "pptx_path": str(deck_path),
+            "download_name": deck_path.name,
+            "outline": outline,
+            "slide_plan": native["plan"],
+            "slide_plan_path": native["plan_path"],
+            "project_path": native["project_path"],
+            "renderer": "easyslides-classic-native",
+            "renderer_label": f"EasySlides {native['plugin'].get('version', '')} · 正式模板原生可编辑".strip(),
+            "render_mode": "native",
+            "quality_gate": native["quality_gate"],
+            "classic_text_fit": native.get("classic_text_fit", {}),
+            "visual_measure": native.get("visual_measure", {}),
+            "visual_review": native.get("visual_review", {}),
+            "easyslides": native["plugin"],
+            "render_manifest": native["render_manifest"],
+            "slide_count": len(list(native["plan"].get("slides", []) or [])),
+            "source_count": len(extracted),
+            "sources": _source_summaries(extracted),
+            "template": template,
+            "template_id": str(template.get("id", "")),
+            "planning": planning,
+        }
+
+    _report_progress(on_progress, 0.54, "正在使用 ScanSci 兼容排版器生成 PPTX")
     slide_plan = build_slide_plan(outline, extracted)
     if template:
         slide_plan["template"] = template
@@ -137,6 +223,7 @@ def create_source_slide_deck(
     slide_plan_path = deck_path.with_name(f"{deck_path.stem}.slide-plan.json")
     write_slide_plan(slide_plan_path, slide_plan)
     _render_pptx(deck_path, outline, extracted, theme=theme)
+    _report_progress(on_progress, 1.0, "兼容版 PPTX 已完成")
     return {
         "ok": True,
         "message": "已从上传材料生成可编辑 PPTX",
@@ -146,23 +233,35 @@ def create_source_slide_deck(
         "outline": outline,
         "slide_plan": slide_plan,
         "slide_plan_path": str(slide_plan_path),
-        "renderer": "python-pptx",
+        "renderer": "scansci-python-pptx-compat",
+        "renderer_label": "ScanSci 兼容排版器",
+        "render_mode": "compatibility",
+        "quality_gate": {"status": "not_run", "reason": "该模板尚未接入 EasySlides 原生生产门禁"},
         "enhanced_renderer": "pptxgenjs-browser",
         "slide_count": len(list(outline.get("slides", []) or [])) + 1,
         "source_count": len(extracted),
-        "sources": [
-            {
-                "name": item["name"],
-                "kind": item["kind"],
-                "page_count": item["page_count"],
-                "warnings": item["warnings"],
-            }
-            for item in extracted
-        ],
+        "sources": _source_summaries(extracted),
         "template": template,
         "template_id": str(template.get("id", "")) if template else "",
         "planning": planning,
     }
+
+
+def _source_summaries(extracted: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": item["name"],
+            "kind": item["kind"],
+            "page_count": item["page_count"],
+            "warnings": item["warnings"],
+        }
+        for item in extracted
+    ]
+
+
+def _report_progress(callback: Callable[[float, str], None] | None, fraction: float, summary: str) -> None:
+    if callback is not None:
+        callback(max(0.0, min(1.0, float(fraction))), summary)
 
 
 def save_browser_rendered_deck(
@@ -202,7 +301,12 @@ def save_browser_rendered_deck(
     while target.exists():
         target = root / f"{stem}-{counter}.pptx"
         counter += 1
-    target.write_bytes(payload)
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {
         "ok": True,
         "file_path": str(target),
@@ -281,6 +385,7 @@ def _extract_source(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(record.get("id", source_path.stem)),
         "name": str(record.get("name", source_path.name)),
+        "path": str(source_path),
         "kind": _SUPPORTED_SUFFIXES[suffix],
         "page_count": page_count,
         "text": text,
@@ -346,8 +451,8 @@ def _normalise_model_outline(candidate: Any, *, fallback: dict[str, Any], source
             source_corpus,
         )
         layout = str(raw.get("layout", "")).strip().lower()
-        if layout not in {"cards", "comparison", "process", "branches"}:
-            layout = "cards"
+        if layout not in {"cards", "comparison", "process", "branches", "text", "text_focus"}:
+            layout = "text"
         bullets = [
             _ground_model_adaptation_claim(_slide_excerpt(item, limit=108), source_corpus)
             for item in list(raw.get("bullets", []) or [])
@@ -396,7 +501,8 @@ def _ground_model_adaptation_claim(text: str, source_corpus: str) -> str:
 def _rebalance_repetitive_layouts(slides: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Turn a one-layout model outline into a small visual story."""
 
-    if len(slides) < 4 or len({str(item.get("layout", "")) for item in slides}) >= 3:
+    layouts = {str(item.get("layout", "")) for item in slides}
+    if len(slides) < 4 or len(layouts) >= 3 or layouts.intersection({"text", "text_focus"}):
         return slides
     balanced: list[dict[str, Any]] = []
     last_index = len(slides) - 1
@@ -431,35 +537,54 @@ def _fallback_outline(sources: list[dict[str, Any]], topic: str) -> dict[str, An
             {
                 "title": source_title,
                 "takeaway": _slide_excerpt(key_sentences[0], limit=118),
-                "layout": "cards",
+                "layout": "text",
                 "bullets": [_slide_excerpt(item, limit=104) for item in (key_sentences[1:4] or key_sentences[:1])],
                 "source_pages": list(range(1, min(3, int(source.get("page_count", 1))) + 1)),
             }
         )
-        comparison_bullets.append(f"{source_title}：{_slide_excerpt(key_sentences[0], limit=78)}")
+        comparison_bullets.append(_labelled_slide_summary(source_title, key_sentences[0], limit=78))
     slides = [
         {
             "title": "研究范围与材料构成",
             "takeaway": f"本次演示围绕“{title}”整理 {len(sources)} 份上传材料。",
-            "layout": "cards",
+            "layout": "text",
             "bullets": [
-                f"{item['title']}：{_slide_excerpt(item['takeaway'], limit=68)}"
+                _labelled_slide_summary(item["title"], item["takeaway"], limit=68)
                 for item in source_slides[:5]
             ],
             "source_pages": [],
         },
         *source_slides,
-        {
-            "title": "材料之间可以直接比较什么",
-            "takeaway": "以下对比只复述各材料中已经出现的陈述，不把并列路线改写为单线替代关系。",
-            "layout": "cards",
-            "bullets": comparison_bullets[:5],
-            "source_pages": [],
-        },
+        *(
+            [
+                {
+                    "title": "材料之间可以直接比较什么",
+                    "takeaway": "以下对比只复述各材料中已经出现的陈述，不把并列路线改写为单线替代关系。",
+                    "layout": "text",
+                    "bullets": comparison_bullets[:5],
+                    "source_pages": [],
+                }
+            ]
+            if len(sources) > 1
+            else [
+                {
+                    "title": "从材料到可核验结论",
+                    "takeaway": "先保留材料原意，再组织要点、来源定位与证据边界。",
+                    "layout": "process",
+                    "bullets": [
+                        "定位材料中的完整陈述与关键定义。",
+                        "区分原文事实、解释和仍待验证的判断。",
+                        "让每个演示要点保留材料名称与页面位置。",
+                        "输出前复核数字、图表和结论适用范围。",
+                    ],
+                    "source_pages": [],
+                }
+            ]
+        ),
         {
             "title": "证据边界与下一步",
             "takeaway": "离线初稿保留来源边界；正式汇报前应复核关键数字与结论范围。",
-            "layout": "cards",
+            "layout": "text",
             "bullets": [
                 "所有要点均来自本次上传材料的可提取正文。",
                 "图表、公式和被截断的长句需要回到原 PDF 复核。",
@@ -495,7 +620,7 @@ def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
     candidates: list[tuple[float, int, str]] = []
     raw_sentences = re.split(r"(?<=[。！？.!?])\s+|\n+", str(source.get("text", "")))
     for index, sentence in enumerate(raw_sentences):
-        clean = " ".join(sentence.split()).strip()
+        clean = _clean_slide_source_line(sentence)
         had_page_marker = bool(re.match(r"^\[第\s*\d+\s*页\]", clean))
         clean = re.sub(r"^\[第\s*\d+\s*页\]\s*", "", clean)
         if len(clean) > 260:
@@ -510,7 +635,7 @@ def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
         folded = clean.casefold()
         if not 35 <= len(clean) <= 260:
             continue
-        if "@" in clean or any(
+        if "@" in clean or _looks_like_operational_noise(clean) or any(
             noise in folded
             for noise in (
                 "provided proper attribution",
@@ -528,6 +653,9 @@ def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
             continue
         score = sum(keyword in folded for keyword in keywords)
         score += 0.8 if any(cue in folded for cue in ("we propose", "we introduce", "we show", "achieves", "outperform", "uses", "model")) else 0
+        # In unstructured sources such as README files, the opening definition
+        # normally carries more presentation value than later build notes.
+        score += max(0.0, 1.25 - (index * 0.08))
         if had_page_marker and "question:" not in folded and "研究问题" not in folded:
             score -= 4
         if score <= 0:
@@ -536,8 +664,8 @@ def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
     candidates.sort(key=lambda item: (-item[0], item[1]))
     if not candidates:
         for index, sentence in enumerate(raw_sentences):
-            clean = " ".join(sentence.split()).strip()
-            if 35 <= len(clean) <= 260 and "@" not in clean:
+            clean = _clean_slide_source_line(sentence)
+            if 35 <= len(clean) <= 260 and "@" not in clean and not _looks_like_operational_noise(clean):
                 excerpt = _slide_excerpt(clean, limit=155)
                 if excerpt:
                     candidates.append((0.1, index, excerpt))
@@ -556,6 +684,63 @@ def _source_key_sentences(source: dict[str, Any], *, topic: str) -> list[str]:
     return output
 
 
+def _clean_slide_source_line(value: Any) -> str:
+    """Remove markup that is useful in a source file but noisy on a slide."""
+
+    text = str(value or "")
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"^\s*(?:[-*+] |\d+[.)]\s+)", "", text)
+    text = " ".join(text.split()).strip(" |")
+    return re.sub(r"^([A-Za-z][\w.-]{2,})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
+
+
+def _labelled_slide_summary(title: Any, summary: Any, *, limit: int) -> str:
+    label = _display_source_name(title)
+    excerpt = _slide_excerpt(summary, limit=limit)
+    first_token = label.split(maxsplit=1)[0] if label else ""
+    if first_token and excerpt.casefold().startswith(first_token.casefold() + " "):
+        excerpt = excerpt[len(first_token) :].lstrip(" ：:-—")
+    return f"{label}：{excerpt}" if label else excerpt
+
+
+def _looks_like_operational_noise(value: str) -> bool:
+    """Reject install, preview and shell instructions from offline slide prose."""
+
+    folded = str(value or "").casefold()
+    return any(
+        cue in folded
+        for cue in (
+            "127.0.0.1",
+            "localhost",
+            "start-process",
+            "browser preview",
+            "output preview",
+            "always serves this checkout",
+            "npm install",
+            "npm run",
+            "pip install",
+            "python -m",
+            "powershell",
+            "http://",
+            "https://",
+            "windows 构建",
+            "构建会将",
+            "用户无需单独安装",
+            "正式发布由",
+            "发布门禁",
+            "安装包",
+            "代码目录",
+            "在浏览器打开",
+            "兼容入口",
+            "scansci-html 命令",
+        )
+    )
+
+
 def _render_pptx(path: Path, outline: dict[str, Any], sources: list[dict[str, Any]], *, theme: dict[str, Any]) -> None:
     presentation = Presentation()
     presentation.slide_width = Inches(13.333)
@@ -570,7 +755,12 @@ def _render_pptx(path: Path, outline: dict[str, Any], sources: list[dict[str, An
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])
         _render_content_slide(slide, slide_data, index=index, total=total, sources=sources, theme=theme)
     path.parent.mkdir(parents=True, exist_ok=True)
-    presentation.save(str(path))
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp.pptx")
+    try:
+        presentation.save(str(temporary))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _render_cover(slide: Any, outline: dict[str, Any], sources: list[dict[str, Any]], *, theme: dict[str, Any]) -> None:
@@ -984,7 +1174,12 @@ def _presentation_path(workspace: str | Path, title: str) -> Path:
     root = Path(workspace).resolve().parent / "presentations"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = _SAFE_NAME.sub("_", title).strip("._ ")[:70] or "scansci_slides"
-    return root / f"{stem}_{stamp}.pptx"
+    candidate = root / f"{stem}_{stamp}.pptx"
+    counter = 2
+    while candidate.exists():
+        candidate = root / f"{stem}_{stamp}-{counter}.pptx"
+        counter += 1
+    return candidate
 
 
 def _sentences(value: str) -> list[str]:
@@ -1017,6 +1212,8 @@ def _slide_excerpt(value: Any, *, limit: int) -> str:
         for position, character in enumerate(window)
         if position >= max(36, int(limit * 0.55)) and (character.isspace() or character in "，,；;：:。.!?！？")
     ]
-    if not boundaries:
-        return ""
-    return f"{window[: boundaries[-1]].rstrip(' ，,；;：:')}…"
+    if boundaries:
+        clipped = window[: boundaries[-1]].rstrip(" ，,；;：:")
+    else:
+        clipped = window[:limit].rstrip(" ，,；;：:")
+    return f"{clipped}…" if clipped else ""

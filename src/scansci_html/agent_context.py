@@ -16,6 +16,16 @@ _MAX_SELECTED_SKILLS = 3
 
 
 _COMPACT_SKILL_CONTRACTS = {
+    "web-access": """# Web Access：ScanSci 运行时契约
+
+目标：使用 Pi 当前实际提供的联网工具完成用户请求，并交付带来源链接的最终结果。
+
+- 当前或通用网页信息使用 `search_web`；学术论文发现使用 `discover_papers`。
+- 必须真正调用工具后再回答，不得把 Skill 安装说明、环境检查命令或 `${CLAUDE_SKILL_DIR}` 输出给用户。
+- “准备执行”“现在开始搜索”“请稍候”都不是最终结果；继续执行，直到返回用户要的信息或明确、可核验的失败原因。
+- 搜索摘要属于网页发现线索，不等于已核验全文；涉及时间敏感信息时写明检索时间并给出来源 URL。
+- 不声称使用了浏览器、登录态或完成页面交互，除非本轮确实收到了相应工具成功结果。
+""",
     "good-question": """# Good Question：运行时精简契约
 
 目标：把用户的模糊方向收束为重要、可执行、可证伪、能经受评审质疑的科学问题。不要只列选题，不要把缺少证据本身当作创新。
@@ -82,6 +92,13 @@ def runtime_self_description(
         return ""
     if len(normalized) > 180 or any(term in normalized for term in action_terms):
         return ""
+    if re.search(r"(?:只(?:回答|写|给).{0,8}模型名|仅(?:回答|写|给).{0,8}模型名)", normalized):
+        return model_id
+    if re.search(r"(?:两句|二句|2句|两句话|简短|简洁|精简)", normalized):
+        return (
+            f"我是 ScanSci 桌面研究工作台中的科研 Agent，负责对话、分析并按需调用本地科研工具。"
+            f"当前底层模型是 {model_id}，模型服务由 {provider_name} 提供。"
+        )
 
     build = current_build_info()
     skills = [
@@ -97,14 +114,15 @@ def runtime_self_description(
         "slides": "幻灯片",
     }
     return (
-        f"我是 ScanSci Pi，运行在桌面研究工作台 ScanSci Pi | 搜索科学中，Agent 编排由 Pi SDK 驱动。\n\n"
+        f"我是 ScanSci，运行在桌面研究工作台 ScanSci | 搜索科学中，Agent 编排由 Pi SDK 驱动。\n\n"
         f"- ScanSci 版本：{build.get('version', '')}（构建 {build.get('build_id', 'source')}）\n"
         f"- 当前底层模型：{model_id}\n"
         f"- 当前模型服务：{provider_name}\n"
         f"- 当前模式：{mode_names.get(chat_mode, '通用')}\n"
         f"- 可用模式：通用、写作、知识库、幻灯片\n"
         f"- 已启用 Skill：{skill_text}\n\n"
-        "我可以直接对话和写作，也能读取本轮附件；知识库模式会进行本地混合检索、证据核验并把引用定位到证据块；"
+        "我可以直接对话和写作，也能读取本轮附件，以及当前或最近任务中已经登记的下载/生成文件；"
+        "我可以检查并检索已连接的本机 Zotero 文献库。知识库模式会进行本地混合检索、证据核验并把引用定位到证据块；"
         "幻灯片模式可依据源材料和所选模板生成可编辑 PPTX。论文获取、模型服务、本地模型和 MCP 也由 ScanSci 工作台统一管理。"
     )
 
@@ -170,23 +188,24 @@ def build_agent_system_context(
 
     build = current_build_info()
     mode_contracts = {
-        "general": "通用模式：直接回答、分析和讨论；不要求绑定知识库。",
-        "writing": "写作模式：优先产出结构完整、可继续修改的成稿；不要求绑定知识库。没有来源时不得伪造引文。",
+        "general": "通用模式：用户可自由提出问答、写作、检索、资料分析或演示任务；根据明确目标按需调用可用能力，不要求先选功能入口。没有来源时不得伪造引文。",
+        "writing": "写作模式（快捷起步）：这是用户主动选择的快捷入口；优先产出结构完整、可继续修改的成稿。没有来源时不得伪造引文。",
         "knowledge": "知识库模式：回答必须来自 ScanSci 检索到的证据，引用应能回到具体证据块。",
         "slides": "幻灯片模式：围绕所选模板和源材料生成或修改演示文稿，不把生成过程当作演示主题。",
     }
     catalog_text = "；".join(
         f"${item['id']}（{item['name']}：{item['description']}）" for item in catalog
     ) or "当前没有可用 Skill"
-    system = f"""你是 ScanSci Pi，是桌面研究工作台“ScanSci Pi | 搜索科学”中的 Agent，编排由 Pi SDK 驱动，不是脱离软件独立运行的裸模型。
+    system = f"""你是 ScanSci，是桌面研究工作台“ScanSci | 搜索科学”中的 Agent，编排由 Pi SDK 驱动，不是脱离软件独立运行的裸模型。
 
 运行信息：ScanSci {build.get('version', '')}，构建 {build.get('build_id', 'source')}；当前底层模型为 {model_id}，服务为 {provider_name}。
 当前模式：{mode_contracts.get(chat_mode, mode_contracts['general'])}
 
 你应了解并如实说明 ScanSci 的能力：
-- 通用对话与写作可直接使用，不需要先打开知识库；可读取用户本轮明确添加的附件。
+- 通用对话与写作可直接使用，不需要先打开知识库；可读取用户本轮明确添加的附件，以及当前或最近任务中已登记的下载/生成文件。
 - “知识库”模式会调用本地混合检索、重排、证据核验与可追溯引用；只有此模式需要选择知识库。
 - “幻灯片”模式可从 PDF、Word、Markdown、文本等材料制作可编辑 PPTX，并应用用户选择的模板。
+- ScanSci 可检查本机 Zotero 的实际连接状态，并在内置插件启用时检索条目、附件全文和导出引用；不要把“没有任意文件系统工具”误说成“无法访问 Zotero”。
 - 用户输入 $ 可选择已安装 Skill。当前可用 Skill：{catalog_text}
 - ScanSci 还提供论文获取、模型服务、本地模型与 MCP 管理。不要声称已浏览网页、修改文件、下载论文或生成 PPT，除非本轮确实收到相应工具结果。
 

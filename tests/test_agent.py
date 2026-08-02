@@ -35,6 +35,49 @@ def test_plan_query_identifies_comparison_and_core_terms():
     ]
 
 
+def test_plan_query_translates_photovoltaic_research_status_for_cross_language_retrieval():
+    plan = plan_query("总结一下当前光伏领域的研究现状")
+
+    assert plan["question_type"] == "synthesis"
+    assert plan["language"] == "zh"
+    assert {"photovoltaic", "solar photovoltaic", "pv"} <= set(plan["core_terms"])
+    assert any("photovoltaic" in str(route["query"]).lower() for route in plan["routes"])
+
+
+def test_causal_relation_gate_rejects_evidence_stitched_across_documents():
+    adequacy = {"is_sufficient": True, "followup_reason": "", "quote_count": 2, "document_count": 2}
+    hits = [
+        {"doc_id": "physics", "title": "Superconducting qubits", "text": "Qubits showed coherent dynamics."},
+        {"doc_id": "ecology", "title": "Amazonian forest", "text": "Tree mortality increased during drought."},
+    ]
+
+    gated = agent._apply_relation_grounding_gate(
+        "What evidence shows that superconducting qubits caused Amazonian tree mortality?",
+        hits,
+        adequacy,
+    )
+
+    assert gated["is_sufficient"] is False
+    assert gated["relation_grounding"]["supported_in_one_document"] is False
+
+
+def test_causal_relation_gate_accepts_one_document_containing_both_sides():
+    adequacy = {"is_sufficient": True, "followup_reason": "", "quote_count": 1, "document_count": 1}
+    hits = [
+        {
+            "doc_id": "experiment",
+            "title": "Qubit exposure and Amazonian tree mortality",
+            "text": "Superconducting qubit exposure caused higher tree mortality in the experiment.",
+        }
+    ]
+
+    assert agent._apply_relation_grounding_gate(
+        "Did superconducting qubits cause Amazonian tree mortality?",
+        hits,
+        adequacy,
+    ) == adequacy
+
+
 def test_model_retrieval_queries_preserve_cross_language_search_terms():
     class FakeChatClient:
         def complete_json(self, messages, *, schema_name):
@@ -390,6 +433,84 @@ def test_verify_citations_fails_uncited_or_unsupported_claims():
     assert result["unsupported_cited_claim_ids"] == ["c0003"]
 
 
+def test_answer_question_repairs_an_llm_answer_that_fails_strict_citation_verification(monkeypatch):
+    def fake_search_evidence_store(*_args, **_kwargs):
+        return [
+            {
+                "evidence_id": "doc1.s0001",
+                "doc_id": "doc1",
+                "title": "Photovoltaic field study",
+                "section": "Results",
+                "section_kind": "results",
+                "text": "Photovoltaic arrays increased shaded soil moisture during summer.",
+                "html_path": "paper.evidence.html",
+                "html_anchor": "doc1-s0001",
+                "score": 3.0,
+                "matched_terms": ["photovoltaic", "soil", "moisture"],
+            }
+        ]
+
+    class FakeChatClient:
+        def complete_json(self, _messages, *, schema_name):
+            if schema_name == "answer_claims":
+                return {
+                    "question": "光伏阵列对土壤水分有什么影响？",
+                    "answer": [
+                        {
+                            "claim_id": "c0001",
+                            "text": "光伏阵列让土壤完全失去水分。",
+                            "quote_ids": ["q0001"],
+                        }
+                    ],
+                    "limitations": [],
+                    "insufficient_evidence": False,
+                }
+            if schema_name == "claim_verification":
+                return {
+                    "claims": [
+                        {
+                            "claim_id": "c0001",
+                            "support_status": "unsupported",
+                            "verification_score": 0.0,
+                        }
+                    ]
+                }
+            raise AssertionError(schema_name)
+
+    monkeypatch.setattr(agent, "search_evidence_store", fake_search_evidence_store)
+    monkeypatch.setattr(
+        agent,
+        "_extract_quotes_for_provider",
+        lambda *_args, **_kwargs: [
+            agent.ExtractedQuote(
+                quote_id="q0001",
+                question="光伏阵列对土壤水分有什么影响？",
+                evidence_ids=["doc1.s0001"],
+                exact_quote="Photovoltaic arrays increased shaded soil moisture during summer.",
+                role="result",
+                claim_hint="Photovoltaic arrays increased shaded soil moisture.",
+                confidence=0.95,
+            )
+        ],
+    )
+
+    result = answer_question(
+        "unused.sqlite",
+        "光伏阵列对土壤水分有什么影响？",
+        limit=5,
+        answer_provider="llm",
+        verification_provider="llm",
+        chat_client=FakeChatClient(),
+    )
+
+    assert result["citation_verification"]["passed"] is True
+    assert result["citation_repair"]["attempted"] is True
+    assert result["citation_repair"]["applied"] is True
+    assert result["answer_generation"]["provider"] == "local-evidence"
+    assert result["reader_answer"]["citation_count"] == 1
+    assert "完全失去水分" not in result["reader_answer"]["text"]
+
+
 def test_reader_answer_prioritizes_question_relevant_supported_claims():
     answer = {
         "question": "What are the two emerging hallmarks of cancer proposed in this paper?",
@@ -613,7 +734,7 @@ def test_answer_question_reranks_fused_multi_query_candidates_once(monkeypatch):
     assert result["adequacy"]["is_sufficient"] is True
 
 
-def test_answer_question_expands_named_list_hits_to_parent_block(tmp_path: Path, monkeypatch):
+def test_answer_question_expands_named_list_hits_to_sentence_level_neighbors(tmp_path: Path, monkeypatch):
     library = tmp_path / "library"
     library.mkdir()
     (library / "paper.html").write_text(
@@ -670,12 +791,13 @@ def test_answer_question_expands_named_list_hits_to_parent_block(tmp_path: Path,
         query_variants=1,
     )
 
-    quote = result["quotes"][0]
-    evidence_row = result["evidence_table"][0]
-    assert "genomic instability" in quote["exact_quote"]
-    assert "tumor-promoting inflammation" in quote["exact_quote"]
-    assert evidence_row["parent_block_id"] == first_hit["block_id"]
-    assert len(evidence_row["parent_evidence_ids"]) == 3
+    quote_texts = [quote["exact_quote"] for quote in result["quotes"]]
+    evidence_rows = result["evidence_table"]
+    assert any("genomic instability" in text for text in quote_texts)
+    assert any("tumor-promoting inflammation" in text for text in quote_texts)
+    assert all("genomic instability" not in row["exact_quote"] or row["evidence_id"].endswith("s0002") for row in evidence_rows)
+    assert all(row["parent_block_id"] == first_hit["block_id"] for row in evidence_rows)
+    assert all(len(row["parent_evidence_ids"]) == 3 for row in evidence_rows)
     assert result["answer"]["answer"][0]["support_status"] == "supported"
 
 

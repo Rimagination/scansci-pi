@@ -9,6 +9,8 @@ existing research capabilities.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import wraps
+import json
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,11 @@ from .workspace import load_workspace_summary
 
 AgentFactory = Callable[..., Any]
 
+_MAX_DEEP_AGENT_INPUT_TOKENS = 48_000
+_MAX_DEEP_AGENT_TOOL_CALLS = 8
+_MAX_DEEP_AGENT_TOOL_BYTES = 16_000
+_DEEP_AGENT_RECURSION_LIMIT = 12
+
 
 class DeepAgentsUnavailable(RuntimeError):
     """Raised when the optional Deep Agents runtime has not been installed."""
@@ -37,25 +44,34 @@ class DeepAgentsConfigurationError(ValueError):
     """Raised when an active ScanSci provider cannot run a Deep Agent."""
 
 
-_SYSTEM_PROMPT = """You are ScanSci Research Agent, a scholarly task router.
+_SYSTEM_PROMPT = """You are ScanSci Research Agent, a scholarly evidence-first reasoning engine.
 
-First identify the requested deliverable, then choose the narrowest ScanSci
-tool that can produce it. You may plan multi-step research work and combine
-tool outputs, but never claim that an external action occurred unless a tool
-returned success. Paper Atlas is a discovery lead, not verified evidence.
+— RULES —
+1. **Plan**: Before calling any tool, decompose the request into the smallest
+   useful tool sequence. If the question is ambiguous, narrow it before acting.
+2. **Execute**: Call ONE tool at a time. Inspect its result before choosing the
+   next step. If a search returns zero hits, do not give up — broaden the query,
+   switch providers, or call `self_assess` to review your approach.
+3. **Verify**: Before delivering a scientific claim, check that every assertion
+   is backed by a tool result. If evidence is insufficient, state the gap rather
+   than guessing. Paper Atlas / discovery leads are leads, not verified facts.
+4. **Adjust**: After each tool result, ask yourself: is this enough to deliver?
+   Could a different tool or broader query produce better evidence? Use
+   `self_assess` to review your progress when uncertain.
+5. **Deliver**: For evidence-based conclusions, call `build_verified_answer`.
+   Its citation payload is the ONLY authoritative delivery path. For non-evidence
+   artefacts (journal metadata, workspace status, presentation outlines), call
+   the relevant tool and then `deliver_research_result`. Never put unverified
+   scientific claims in a non-evidence delivery.
 
-For a scientific claim about the active notebook or imported literature, call
-`build_verified_answer` before delivery. Its citation payload is the only
-authoritative way to deliver source-grounded conclusions. If evidence is
-insufficient, state the gap rather than guessing.
-
-For non-evidence deliverables such as discovery leads, journal/DOI metadata,
-citation audits, workspace status, or a presentation outline, call the relevant
-tool and then `deliver_research_result`. Do not put scientific conclusions in
-that delivery: it is a status or planning artefact, not a bypass around the
-evidence gate. Writing tools are intentionally not exposed here; downloads and
-project creation require an explicit user-approved workflow.
+— WHAT NOT TO DO —
+- Never claim an action succeeded unless a tool confirmed it.
+- Never promise to do work later; continue until you deliver or hit a concrete,
+  truthful blocking error.
+- Writing tools and project creation require explicit user approval; do not
+  suggest them unless the user asks.
 """
+
 
 _EVIDENCE_ONLY_PROMPT = """
 This request is explicitly evidence-only. Use local evidence and finish with
@@ -103,11 +119,19 @@ def build_deep_agent_model(
             from langchain_openai import ChatOpenAI
         except ImportError as error:  # pragma: no cover - exercised in packaged installs
             raise DeepAgentsUnavailable("Install the ScanSci Deep Agents dependencies first.") from error
-        options = {"model": model, "api_key": api_key, "base_url": base_url or None}
+        options = {
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url or None,
+            "max_retries": 0,
+            "max_tokens": 3072,
+            "timeout": 90,
+        }
         if native_options:
             options.update(native_options)
         else:
             options["temperature"] = 0
+        _register_scansci_harness_profile("openai", model)
         return ChatOpenAI(**options)
     if kind in {"anthropic", "anthropic-compatible"}:
         try:
@@ -121,7 +145,14 @@ def build_deep_agent_model(
         resolved_base_url = str(base_url or "").rstrip("/")
         if resolved_base_url == "https://api.anthropic.com/v1":
             resolved_base_url = "https://api.anthropic.com"
-        options = {"model": model, "api_key": api_key, "base_url": resolved_base_url or None}
+        options = {
+            "model": model,
+            "api_key": api_key,
+            "base_url": resolved_base_url or None,
+            "max_retries": 0,
+            "max_tokens": 3072,
+            "timeout": 90,
+        }
         if native_options:
             options.update(native_options)
         else:
@@ -140,11 +171,15 @@ class ScanSciDeepAgent:
         workspace: str | Path | None = None,
         model: Any,
         agent_factory: AgentFactory | None = None,
+        embedding_provider: Any | None = None,
+        reranker: Any | None = None,
     ) -> None:
         self.evidence_db = Path(evidence_db).resolve()
         self.workspace = Path(workspace).resolve() if workspace else None
         self.model = model
         self.agent_factory = agent_factory or _create_deep_agent
+        self.embedding_provider = embedding_provider
+        self.reranker = reranker
 
     def answer(
         self,
@@ -153,6 +188,7 @@ class ScanSciDeepAgent:
         limit: int = 8,
         thread_id: str = "",
         task_mode: str = "auto",
+        callbacks: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Run a research task with an evidence gate for scientific claims.
 
@@ -165,6 +201,12 @@ class ScanSciDeepAgent:
         clean_question = str(question or "").strip()
         if not clean_question:
             raise ValueError("question is required")
+        estimated_tokens = _estimate_input_tokens(clean_question)
+        if estimated_tokens > _MAX_DEEP_AGENT_INPUT_TOKENS:
+            raise ValueError(
+                "Deep Agent input exceeds the local provider-input budget "
+                f"({_MAX_DEEP_AGENT_INPUT_TOKENS} tokens); compact the request before retrying."
+            )
         normalized_mode = _normalize_task_mode(task_mode)
         if normalized_mode == "evidence" and not self.evidence_db.is_file():
             raise FileNotFoundError(f"Evidence store does not exist: {self.evidence_db}")
@@ -172,6 +214,7 @@ class ScanSciDeepAgent:
         audit: list[dict[str, Any]] = []
         finalized: list[dict[str, Any]] = []
         deliveries: list[dict[str, Any]] = []
+        tool_budget = {"remaining": _MAX_DEEP_AGENT_TOOL_CALLS}
         agent = self.agent_factory(
             model=self.model,
             tools=self._tools(
@@ -180,19 +223,26 @@ class ScanSciDeepAgent:
                 finalized=finalized,
                 deliveries=deliveries,
                 task_mode=normalized_mode,
+                tool_budget=tool_budget,
             ),
             system_prompt=_system_prompt(normalized_mode),
         )
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": clean_question}]},
-            config={"configurable": {"thread_id": thread_id or f"scansci-{id(self)}"}},
-        )
+        config: dict[str, Any] = {
+            "configurable": {"thread_id": thread_id or f"scansci-{id(self)}"},
+            "recursion_limit": _DEEP_AGENT_RECURSION_LIMIT,
+        }
+        if callbacks:
+            config["callbacks"] = callbacks
+        result = agent.invoke({"messages": [{"role": "user", "content": clean_question}]}, config=config)
         if finalized:
             response = dict(finalized[-1])
             finalization = "tool"
         elif deliveries:
             response = _research_delivery_response(clean_question, deliveries[-1])
             finalization = "research_delivery"
+        elif normalized_mode == "benchmark" and audit:
+            response = {"question": clean_question, "answer": _final_message_text(result)}
+            finalization = "model_after_tool"
         elif not self.evidence_db.is_file():
             raise RuntimeError(
                 "The Agent did not produce a research delivery, and no evidence store is available for a safe fallback."
@@ -217,6 +267,7 @@ class ScanSciDeepAgent:
         finalized: list[dict[str, Any]],
         deliveries: list[dict[str, Any]],
         task_mode: str,
+        tool_budget: dict[str, int],
     ) -> list[Callable[..., dict[str, Any]]]:
         evidence_db = self.evidence_db
         workspace = self.workspace
@@ -231,7 +282,14 @@ class ScanSciDeepAgent:
             if not evidence_db.is_file():
                 raise FileNotFoundError(f"Evidence store does not exist: {evidence_db}")
             requested_limit = max(1, min(20, int(result_limit)))
-            hits = search_evidence_store(evidence_db, query, limit=requested_limit, context_mode="sentence")
+            hits = search_evidence_store(
+                evidence_db,
+                query,
+                limit=requested_limit,
+                context_mode="sentence",
+                embedding_provider=self.embedding_provider,
+                reranker=self.reranker,
+            )
             payload = {
                 "query": str(query),
                 "hits": [_compact_evidence_hit(hit) for hit in hits],
@@ -259,7 +317,7 @@ class ScanSciDeepAgent:
             payload = self._verified_answer(question, max(1, min(20, int(result_limit))))
             finalized.append(payload)
             _record_tool(audit, "build_verified_answer", _answer_summary(payload))
-            return payload
+            return _compact_verified_answer_for_model(payload)
 
         def verify_doi(doi: str, expected_title: str = "") -> dict[str, Any]:
             """Verify DOI metadata against Crossref; use for bibliographic checks."""
@@ -401,9 +459,9 @@ class ScanSciDeepAgent:
             inspect_available_tools,
             build_presentation_outline,
         ]
-        if task_mode != "evidence":
+        if task_mode == "auto":
             tools.append(deliver_research_result)
-        return tools
+        return [_bounded_deep_tool(tool, tool_budget) for tool in tools]
 
     def _verified_answer(self, question: str, limit: int) -> dict[str, Any]:
         return answer_question(
@@ -415,6 +473,8 @@ class ScanSciDeepAgent:
             agentic_profile="custom",
             query_variants=1,
             max_followup_queries=1,
+            embedding_provider=self.embedding_provider,
+            reranker=self.reranker,
         )
 
 
@@ -424,6 +484,65 @@ def _create_deep_agent(**kwargs: Any) -> Any:
     except ImportError as error:  # pragma: no cover - exercised in packaged installs
         raise DeepAgentsUnavailable("Install the ScanSci Deep Agents dependencies first.") from error
     return create_deep_agent(**kwargs)
+
+
+def _estimate_input_tokens(text: str) -> int:
+    """Conservative local estimate used only as a pre-network safety gate."""
+
+    ascii_count = sum(1 for char in text if ord(char) < 128)
+    return ((ascii_count + 3) // 4) + (len(text) - ascii_count)
+
+
+def _bounded_deep_tool(
+    tool: Callable[..., dict[str, Any]],
+    budget: dict[str, int],
+) -> Callable[..., dict[str, Any]]:
+    """Apply one shared call budget and a hard payload cap to every agent tool."""
+
+    @wraps(tool)
+    def guarded(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        remaining = int(budget.get("remaining", 0) or 0)
+        if remaining <= 0:
+            raise RuntimeError(
+                "Deep Agent tool-call budget exhausted; deliver the verified results already collected."
+            )
+        budget["remaining"] = remaining - 1
+        return _bounded_deep_tool_payload(tool(*args, **kwargs))
+
+    return guarded
+
+
+def _bounded_deep_tool_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_deep_value(payload, depth=0)
+    if not isinstance(compact, dict):
+        compact = {"result": compact}
+    encoded = json.dumps(compact, ensure_ascii=False, default=str)
+    if len(encoded.encode("utf-8")) <= _MAX_DEEP_AGENT_TOOL_BYTES:
+        return compact
+    return {
+        "status": str(compact.get("status", "truncated")),
+        "truncated": True,
+        "reason": "Tool result exceeded the Deep Agent payload budget.",
+        "available_keys": list(compact)[:40],
+        "preview": encoded[:12_000],
+    }
+
+
+def _compact_deep_value(value: Any, *, depth: int) -> Any:
+    if depth >= 6:
+        return str(value)[:800]
+    if isinstance(value, dict):
+        return {
+            str(key)[:200]: _compact_deep_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_compact_deep_value(item, depth=depth + 1) for item in list(value)[:24]]
+    if isinstance(value, str):
+        return value[:4_000]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:4_000]
 
 
 def _compact_evidence_hit(hit: dict[str, Any]) -> dict[str, Any]:
@@ -453,15 +572,89 @@ def _answer_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_verified_answer_for_model(payload: dict[str, Any]) -> dict[str, Any]:
+    reader = dict(payload.get("reader_answer", {}) or {})
+    citations = []
+    for item in list(reader.get("citations", []) or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        citations.append(
+            {
+                "citation_id": str(item.get("citation_id", "")),
+                "evidence_id": str(item.get("evidence_id", "")),
+                "paper": str(item.get("paper", "")),
+                "doi": str(item.get("doi", "")),
+                "section": str(item.get("section", "")),
+                "exact_quote": " ".join(str(item.get("exact_quote", "")).split())[:700],
+                "source_href": str(item.get("source_href", "")),
+            }
+        )
+    answer = dict(payload.get("answer", {}) or {})
+    verification = dict(payload.get("citation_verification", {}) or {})
+    adequacy = dict(payload.get("adequacy", {}) or {})
+    return {
+        "question": str(payload.get("question", "")),
+        "reader_answer": {
+            "text": str(reader.get("text", ""))[:3000],
+            "citation_count": int(reader.get("citation_count", len(citations)) or 0),
+            "citations": citations,
+        },
+        "citation_verification": {
+            "passed": bool(verification.get("passed", False)),
+            "claim_count": int(verification.get("claim_count", 0) or 0),
+            "supported_claim_count": int(verification.get("supported_claim_count", 0) or 0),
+            "missing_quote_ids": list(verification.get("missing_quote_ids", []) or [])[:8],
+        },
+        "answer": {
+            "insufficient_evidence": bool(answer.get("insufficient_evidence", False)),
+            "limitations": list(answer.get("limitations", []) or [])[:6],
+        },
+        "adequacy": {
+            "is_sufficient": bool(adequacy.get("is_sufficient", False)),
+            "quote_count": int(adequacy.get("quote_count", 0) or 0),
+            "document_count": int(adequacy.get("document_count", 0) or 0),
+            "followup_reason": str(adequacy.get("followup_reason", ""))[:500],
+        },
+    }
+
+
 def _normalize_task_mode(task_mode: str) -> str:
     normalized = str(task_mode or "auto").strip().lower()
-    if normalized not in {"auto", "evidence"}:
-        raise ValueError("task_mode must be 'auto' or 'evidence'")
+    if normalized not in {"auto", "evidence", "benchmark"}:
+        raise ValueError("task_mode must be 'auto', 'evidence', or 'benchmark'")
     return normalized
 
 
 def _system_prompt(task_mode: str) -> str:
     return _SYSTEM_PROMPT + (_EVIDENCE_ONLY_PROMPT if task_mode == "evidence" else "")
+
+
+def _register_scansci_harness_profile(provider: str, model: str) -> None:
+    """Hide Deep Agents built-ins so A/B runs expose only ScanSci tools."""
+
+    try:
+        from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
+    except ImportError:
+        return
+    register_harness_profile(
+        f"{provider}:{model}",
+        HarnessProfile(
+            excluded_tools=frozenset(
+                {
+                    "write_todos",
+                    "ls",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "glob",
+                    "grep",
+                    "execute",
+                    "task",
+                }
+            ),
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        ),
+    )
 
 
 def _compact_workspace_summary(summary: dict[str, Any]) -> dict[str, Any]:

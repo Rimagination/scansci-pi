@@ -54,7 +54,10 @@ def test_deep_agent_finalizes_with_existing_citation_verifier(tmp_path: Path):
     )
 
     assert captured["model"] == "test-model"
-    assert captured["config"] == {"configurable": {"thread_id": "thread-1"}}
+    assert captured["config"] == {
+        "configurable": {"thread_id": "thread-1"},
+        "recursion_limit": 12,
+    }
     assert result["deep_agent"]["harness"] == "deepagents"
     assert result["deep_agent"]["finalization"] == "tool"
     assert result["deep_agent"]["tool_calls"][0]["name"] == "build_verified_answer"
@@ -152,6 +155,54 @@ def test_deep_agent_model_rejects_unknown_provider_without_optional_imports():
             api_key="key",
             model="model",
         )
+
+
+def test_deep_agent_rejects_oversized_question_before_agent_creation(tmp_path: Path):
+    called = False
+
+    def factory(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("agent factory must not run")
+
+    agent = ScanSciDeepAgent(
+        evidence_db=tmp_path / "missing.sqlite",
+        model="test-model",
+        agent_factory=factory,
+    )
+
+    with pytest.raises(ValueError, match="provider-input budget"):
+        agent.answer("研" * 48_001)
+
+    assert called is False
+
+
+def test_deep_agent_caps_tool_calls_and_large_payloads(tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, tools):
+            self.tools = tools
+
+        def invoke(self, payload, *, config):
+            inspect = next(tool for tool in self.tools if tool.__name__ == "inspect_available_tools")
+            first = inspect()
+            captured["payload_bytes"] = len(str(first).encode("utf-8"))
+            for _ in range(7):
+                inspect()
+            with pytest.raises(RuntimeError, match="tool-call budget exhausted"):
+                inspect()
+            return {"messages": [{"content": "Budget enforced."}]}
+
+    result = ScanSciDeepAgent(
+        evidence_db=tmp_path / "missing.sqlite",
+        workspace=None,
+        model="test-model",
+        agent_factory=lambda **kwargs: FakeAgent(kwargs["tools"]),
+    ).answer("Inspect tools", task_mode="benchmark")
+
+    assert int(captured["payload_bytes"]) < 16_000
+    assert result["deep_agent"]["finalization"] == "model_after_tool"
 
 
 def test_deep_agent_model_normalizes_the_public_anthropic_v1_base_url():
@@ -289,6 +340,57 @@ def test_research_runtime_uses_deep_agents_for_configured_provider(tmp_path: Pat
     }
     assert result["reader_answer"]["citations"][0]["reader_url"] == "/api/sources/paper/reader#results-p1"
     assert result["agent_runtime"] == {"thinking_level": "high", "evidence_budget": 6}
+
+
+def test_evidence_answer_defaults_to_product_owned_workflow_not_pi_tool_loop(tmp_path: Path, monkeypatch):
+    """A normal evidence turn must not wait for a provider-side tool loop."""
+
+    workspace = tmp_path / "workspace.sqlite"
+    evidence_db = _indexed_evidence(tmp_path)
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "provider", "model_id": "research-model"},
+            "providers": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "kind": "openai-compatible",
+                    "base_url": "https://example.invalid/v1",
+                    "models": [{"id": "research-model", "name": "Research model"}],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(research_agent_module, "get_provider_api_key", lambda *_args: "secret")
+
+    def pi_must_not_run(*_args, **_kwargs):
+        raise AssertionError("default evidence answers must skip the Pi planning loop")
+
+    observed: dict[str, object] = {}
+
+    class FakeJsonClient:
+        pass
+
+    def fake_json_client(*_args, **_kwargs):
+        return FakeJsonClient()
+
+    def fake_answer_question(_db, question, **kwargs):
+        observed["question"] = question
+        observed["options"] = kwargs
+        return {"reader_answer": {"text": "Grounded answer [1].", "citations": []}}
+
+    monkeypatch.setattr(research_agent_module.PiAgentClient, "stream_chat", pi_must_not_run)
+    monkeypatch.setattr(research_agent_module, "build_chat_json_client", fake_json_client)
+    monkeypatch.setattr(research_agent_module, "answer_question", fake_answer_question)
+
+    result = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db).answer_sync(
+        {"question": "What did the field study report?", "task_mode": "evidence"}
+    )
+
+    assert observed["question"] == "What did the field study report?"
+    assert isinstance(observed["options"]["chat_client"], FakeJsonClient)
+    assert result["pi_agent"]["harness"] == "provider-neutral-workflow"
 
 
 def test_research_runtime_uses_the_selected_vision_model_for_image_inputs(tmp_path: Path, monkeypatch):

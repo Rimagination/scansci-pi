@@ -71,6 +71,58 @@ def initialize_notebook(
     }
 
 
+def delete_notebook(workspace_path: str | Path, *, notebook_id: str) -> dict[str, object]:
+    """Remove one notebook record and every workspace artifact it owns.
+
+    This deliberately leaves linked source files alone.  A caller that owns an
+    isolated evidence index may remove that rebuildable cache separately.
+    """
+
+    workspace = Path(workspace_path)
+    resolved_notebook_id = _safe_object_id(notebook_id)
+    with sqlite3.connect(workspace) as connection:
+        _initialize_schema(connection)
+        row = connection.execute(
+            "select title from notebooks where notebook_id = ?",
+            (resolved_notebook_id,),
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"Notebook does not exist: {resolved_notebook_id}")
+        title = str(row[0])
+        citation_ids = [
+            str(item[0])
+            for item in connection.execute(
+                "select citation_record_id from citation_records where notebook_id = ?",
+                (resolved_notebook_id,),
+            ).fetchall()
+        ]
+        layer_ids = [
+            str(item[0])
+            for item in connection.execute(
+                "select layer_object_id from layers where notebook_id = ?",
+                (resolved_notebook_id,),
+            ).fetchall()
+        ]
+        if citation_ids:
+            placeholders = ", ".join("?" for _ in citation_ids)
+            connection.execute(f"delete from citation_audits where citation_record_id in ({placeholders})", citation_ids)
+        if layer_ids:
+            placeholders = ", ".join("?" for _ in layer_ids)
+            connection.execute(f"delete from layer_sources where layer_object_id in ({placeholders})", layer_ids)
+        connection.execute("delete from citation_records where notebook_id = ?", (resolved_notebook_id,))
+        connection.execute("delete from layers where notebook_id = ?", (resolved_notebook_id,))
+        connection.execute("delete from notes where notebook_id = ?", (resolved_notebook_id,))
+        connection.execute("delete from sources where notebook_id = ?", (resolved_notebook_id,))
+        connection.execute("delete from notebooks where notebook_id = ?", (resolved_notebook_id,))
+        connection.commit()
+    return {
+        "workspace_path": str(workspace),
+        "notebook_id": resolved_notebook_id,
+        "title": title,
+        "linked_files_preserved": True,
+    }
+
+
 def sync_sources_from_evidence_store(
     workspace_path: str | Path,
     evidence_db_path: str | Path,

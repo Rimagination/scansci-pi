@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory)]
     [string]$PackageUrl,
     [string]$OutputDir = "",
-    [string]$Channel = "stable"
+    [string]$Channel = "stable",
+    [string]$LocalRuntimeManifest = ""
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -36,6 +37,46 @@ $payload = [ordered]@{
         url = $PackageUrl
         sha256 = $sha256
         archive = [System.IO.Path]::GetFileName($archive)
+    }
+}
+if ($LocalRuntimeManifest) {
+    $componentPath = [System.IO.Path]::GetFullPath($LocalRuntimeManifest)
+    if (-not (Test-Path -LiteralPath $componentPath -PathType Leaf)) {
+        throw "Local runtime manifest was not found: $componentPath"
+    }
+    $component = Get-Content -Raw -LiteralPath $componentPath | ConvertFrom-Json
+    $componentParts = @($component.windows.parts)
+    $hasPackageSource = [bool]$component.windows.url -or $componentParts.Count -gt 0
+    if ($component.id -ne "local-transformers" -or -not $component.version -or -not $hasPackageSource -or -not $component.windows.sha256) {
+        throw "Local runtime manifest is incomplete."
+    }
+    $componentWindows = [ordered]@{
+        sha256 = [string]$component.windows.sha256
+        size = [long]$component.windows.size
+    }
+    if ($component.windows.url) {
+        $componentWindows.url = [string]$component.windows.url
+    }
+    if ($componentParts.Count -gt 0) {
+        $componentWindows.parts = @($componentParts | ForEach-Object {
+            if (-not $_.url -or -not $_.sha256 -or -not $_.size) {
+                throw "Local runtime multipart manifest is incomplete."
+            }
+            [ordered]@{
+                url = [string]$_.url
+                sha256 = [string]$_.sha256
+                size = [long]$_.size
+            }
+        })
+    }
+    if ($component.windows.diagnostics) {
+        $componentWindows.diagnostics = $component.windows.diagnostics
+    }
+    $payload.components = [ordered]@{
+        "local-transformers" = [ordered]@{
+            version = [string]$component.version
+            windows = $componentWindows
+        }
     }
 }
 $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+from uuid import uuid4
 
 
 SLIDE_PLAN_SCHEMA = "scansci.slide-plan.v1"
@@ -77,7 +78,12 @@ def write_slide_plan(path: str | Path, plan: dict[str, Any]) -> Path:
     validate_slide_plan(plan)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return target
 
 
@@ -88,4 +94,3 @@ def safe_presentation_name(value: object, *, fallback: str = "scansci_slides") -
 
 def _compact(value: object, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit].strip()
-

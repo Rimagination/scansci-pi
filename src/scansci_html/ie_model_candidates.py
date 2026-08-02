@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import importlib
 import json
 from pathlib import Path
 import re
@@ -119,7 +120,8 @@ def _build_token_classifier(
 ) -> Any:
     if pipeline_factory is None:
         try:
-            from transformers import pipeline
+            pipelines = importlib.import_module("transformers.pipelines")
+            pipeline = getattr(pipelines, "pipeline")
         except Exception as error:  # pragma: no cover - depends on optional local packages
             raise RuntimeError(
                 "transformers is required for ie-model-candidates; install the optional model dependencies first"
@@ -145,7 +147,7 @@ def _resolve_device(device: str) -> int:
     if normalized != "auto":
         return int(normalized)
     try:
-        import torch
+        torch = importlib.import_module("torch")
 
         return 0 if torch.cuda.is_available() else -1
     except Exception:  # pragma: no cover - depends on optional local packages

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import re
 from typing import Any, Iterable, Protocol
 
 from .schemas import ExtractedQuoteSchema
@@ -26,6 +27,133 @@ class ExtractedQuote:
         return asdict(self)
 
 
+_REFERENCE_SECTION_RE = re.compile(
+    r"(?:^|\s)(?:references?|bibliography|works\s+cited|literature\s+cited|参考文献|引用文献)(?:\s|$)",
+    re.IGNORECASE,
+)
+_REFERENCE_CUE_RE = re.compile(
+    r"\b(?:doi|et\s+al\.?|journal|vol(?:ume)?\.?|issue|pp?\.?|how\s+to\s+cite|citation|science\s+direct)\b",
+    re.IGNORECASE,
+)
+_REFERENCE_MARKER_RE = re.compile(r"(?:^|\s)[\[［]\s*\d{1,4}\s*[\]］](?:\s|$)")
+_AUTHOR_LIST_RE = re.compile(
+    r"^(?:[A-Z][A-Za-z'’\-]+(?:\s+[A-Z]\.)?[,;]\s*){2,}[A-Z][A-Za-z'’\-]+",
+)
+_NUMBERED_AUTHOR_REFERENCE_RE = re.compile(
+    r"^\s*\[\s*\d{1,4}\s*\]\s*[A-Z][A-Za-z'’\-]+\s*,\s*[A-Z](?:\.|\s*,)",
+)
+_AUTHOR_YEAR_REFERENCE_RE = re.compile(
+    r"^\s*[A-Z][A-Za-z'’\-]+\s*,\s*(?:[A-Z]\.){1,4}\s*,?\s*\d{4}[a-z]?\.?\s*$",
+)
+_REFERENCE_URL_RE = re.compile(r"\b(?:https?://\S+|doi\s*[:/]\s*\S+|doi\.org/\S+)", re.IGNORECASE)
+_AUTHOR_FRAGMENT_RE = re.compile(
+    r"^\s*[A-Z][A-Za-z'’\-]+\s*,\s*(?:(?:[A-Z]\.){1,4}|[A-Z][A-Za-z'’\-]+)(?:\s*,|\s*\.)?\s*$",
+)
+_VOLUME_PAGE_REFERENCE_RE = re.compile(
+    r"^\s*(?:\d{1,4}\s*,\s*)?\d{1,4}\s*(?:\([^)]{1,12}\))?\s*[,:;]?\s*\d{1,5}(?:\s*[–-]\s*\d{1,5})?\.?\s*$",
+)
+_VOLUME_YEAR_REFERENCE_RE = re.compile(r"^\s*\d{1,4}\s*,\s*\d{1,4}\s*\(\d{4}\)\.?\s*$")
+_JOURNAL_VOLUME_REFERENCE_RE = re.compile(
+    r"^\s*[A-Z][A-Za-z .-]{1,60}\s+\d{1,4}\s*,\s*\d{1,5}(?:\s*[–-]\s*\d{1,5})?\s*\(\d{4}\)\.?\s*$",
+)
+_COMPACT_AUTHOR_REFERENCE_RE = re.compile(r"^\s*(?:[A-Z]{2,}\s*[A-Z]{1,3}\s*,\s*){2,}")
+_PREDICATE_RE = re.compile(
+    r"\b(?:is|are|was|were|be|been|being|has|have|had|show(?:s|ed)?|find(?:s|ing)?|found|"
+    r"suggest(?:s|ed)?|indicat(?:e|es|ed|ing)|observ(?:e|es|ed|ing)|report(?:s|ed|ing)|"
+    r"reveal(?:s|ed|ing)|demonstrat(?:e|es|ed|ing)|increase(?:s|d|ing)?|decrease(?:s|d|ing)?|"
+    r"affect(?:s|ed|ing)?|result(?:s|ed|ing)?|investigat(?:e|es|ed|ing)|assess(?:es|ed|ing)?|"
+    r"evaluat(?:e|es|ed|ing)|explain(?:s|ed|ing)?|improv(?:e|es|ed|ing)|reduc(?:e|es|ed|ing)|"
+    r"yield(?:s|ed|ing)?|achiev(?:e|es|ed|ing)|predict(?:s|ed|ing)?|measur(?:e|es|ed|ing)|"
+    r"quantif(?:y|ies|ied|ying)|correlat(?:e|es|ed|ing)|associate(?:s|d|ing)?|"
+    # These ordinary research predicates are common in concise result
+    # sentences. They remain subject to the bibliography checks below.
+    r"deploy(?:s|ed|ing)?|use(?:s|d|ing)?|support(?:s|ed|ing)?|"
+    r"link(?:s|ed|ing)?|involv(?:e|es|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+_TITLE_LIKE_STUDY_RE = re.compile(
+    r"\b(?:a|an|the)?\s*(?:modelling|modeling|experimental|field|case|observational|review)\s+study\.?$",
+    re.IGNORECASE,
+)
+
+
+def is_substantive_evidence_hit(hit: dict[str, Any]) -> bool:
+    """Return whether a retrieval hit can support a scientific claim.
+
+    PDF text extraction frequently treats bibliography entries, cover-page
+    author lists, and article titles as ordinary paragraphs.  Those strings
+    can rank very highly for topical queries but are not findings.  Keeping
+    the filter here makes both local and LLM quote extraction share the same
+    evidence boundary.
+    """
+
+    text = " ".join(str(hit.get("text", "")).split()).strip()
+    if not text:
+        return False
+    section = " ".join(str(hit.get("section", "")).split()).strip()
+    context = " ".join(
+        str(value)
+        for value in (
+            hit.get("parent_text", ""),
+            hit.get("context_quote_text", ""),
+            text,
+        )
+        if str(value).strip()
+    )
+    if _REFERENCE_SECTION_RE.search(section):
+        return False
+    if re.search(r"\bhow\s+to\s+cite\b|\bjournal\s+item\b", context, re.IGNORECASE):
+        return False
+
+    has_reference_marker = bool(_REFERENCE_MARKER_RE.search(context))
+    has_reference_cue = bool(_REFERENCE_CUE_RE.search(context))
+    if has_reference_marker and has_reference_cue:
+        return False
+    if _NUMBERED_AUTHOR_REFERENCE_RE.match(text):
+        return False
+    if _AUTHOR_YEAR_REFERENCE_RE.match(text):
+        return False
+    if _AUTHOR_FRAGMENT_RE.match(text):
+        return False
+    if _VOLUME_PAGE_REFERENCE_RE.match(text):
+        return False
+    if _VOLUME_YEAR_REFERENCE_RE.match(text):
+        return False
+    if _JOURNAL_VOLUME_REFERENCE_RE.match(text):
+        return False
+    if _COMPACT_AUTHOR_REFERENCE_RE.match(text):
+        return False
+    if _AUTHOR_LIST_RE.match(text) and not _PREDICATE_RE.search(text):
+        return False
+
+    # OCR frequently splits a reference across separate evidence rows.  A
+    # journal/DOI tail such as ``Energy 53, 1-13. https://doi...`` has no
+    # author marker of its own, but it still cannot support a research claim.
+    if _REFERENCE_URL_RE.search(text) and not _PREDICATE_RE.search(text):
+        return False
+
+    # A source title, journal label, or publisher line is not evidence. For
+    # English-only fragments, require a factual predicate; actual scientific
+    # findings state an observation, relation, method, or measured result,
+    # whereas bibliography fragments do not.
+    english_words = re.findall(r"[A-Za-z][A-Za-z'’\-]*", text)
+    has_chinese = bool(re.search(r"[\u4e00-\u9fff]", text))
+    if re.search(r"\[\s*[JMR]\s*\]", text, re.IGNORECASE):
+        return False
+    if len(english_words) <= 2 and not has_chinese and not _PREDICATE_RE.search(text):
+        return False
+    if len(english_words) >= 3 and not has_chinese and not _PREDICATE_RE.search(text):
+        return False
+
+    # A bibliographic title is often split from its numbered author entry.
+    # When it arrives without the preceding line, identify the common
+    # "...: a modelling study" shape only when it contains no factual verb.
+    word_count = len(re.findall(r"[A-Za-z][A-Za-z'’\-]*", text))
+    if word_count >= 8 and _TITLE_LIKE_STUDY_RE.search(text) and not _PREDICATE_RE.search(text):
+        return False
+    return True
+
+
 def extract_quotes(
     question: str,
     evidence_hits: Iterable[dict[str, Any]],
@@ -37,7 +165,10 @@ def extract_quotes(
         evidence_id = str(hit.get("evidence_id", "")).strip()
         text = str(hit.get("text", "")).strip()
         matched_terms = list(hit.get("matched_terms", []) or [])
-        if not evidence_id or not text or not matched_terms:
+        if not evidence_id or not text or not matched_terms or not is_substantive_evidence_hit(hit):
+            continue
+        exact_quote = _exact_quote_text(hit)
+        if not is_substantive_evidence_hit({"text": exact_quote, "section": hit.get("section", "")}):
             continue
         selected.append(hit)
         if len(selected) >= max(0, int(max_quotes)):
@@ -70,7 +201,7 @@ def extract_quotes_with_llm(
     *,
     chat_client: ChatJsonClient,
 ) -> list[ExtractedQuote]:
-    hits = list(evidence_hits)
+    hits = [hit for hit in evidence_hits if is_substantive_evidence_hit(hit)]
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits if str(hit.get("evidence_id", ""))}
     messages = [
         {

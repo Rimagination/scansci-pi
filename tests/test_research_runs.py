@@ -1,8 +1,16 @@
+import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import scansci_html.research_agent as research_agent
+from scansci_html.deep_research_evidence import build_task_fulltext_evidence
+from scansci_html.evidence_store import index_evidence_library
+from scansci_html.pi_agent import PiAgentRunError
+from scansci_html.research_agent import ResearchAgentRuntime, _is_restart_request
 from scansci_html.research_runs import ResearchRunStore, StageSpec
+from scansci_html.workspace import initialize_notebook, sync_sources_from_evidence_store
 
 
 def _stages() -> list[StageSpec]:
@@ -12,6 +20,552 @@ def _stages() -> list[StageSpec]:
         StageSpec("verify", "核验证据", "verification", "scansci.evidence.verify"),
         StageSpec("deliver", "交付结果", "delivery"),
     ]
+
+
+def test_structured_recovery_preserves_pi_control_plane_failure() -> None:
+    recovery = research_agent._structured_recovery(
+        PiAgentRunError(
+            "route stalled",
+            failure={
+                "code": "agent_no_progress",
+                "message": "当前路线没有新结果",
+                "retryable": True,
+                "recovery_actions": [
+                    {"id": "change_strategy", "label": "更换路线", "kind": "change_strategy"},
+                ],
+            },
+        ),
+        stage_key="retrieve",
+    )
+
+    assert recovery["code"] == "agent_no_progress"
+    assert recovery["stage_key"] == "retrieve"
+    assert recovery["retryable"] is True
+    assert recovery["actions"][0]["id"] == "change_strategy"
+
+
+def test_direct_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    attempted_models: list[str] = []
+
+    def fake_stream(*_args, **kwargs):
+        model = str(kwargs["model"])
+        attempted_models.append(model)
+        if model == "glm-4.7-flash":
+            raise RuntimeError("HTTP 429 provider_rate_limited")
+        yield {"type": "delta", "content": "已由备用模型完成回答。"}
+        yield {"type": "done", "usage": {"total_tokens": 7}, "truncated": False}
+
+    monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
+    monkeypatch.setattr(
+        runtime,
+        "_managed_fallback_chat_request",
+        lambda request: research_agent.replace(request, model_id="Qwen/Qwen2.5-7B-Instruct"),
+    )
+
+    events = list(runtime.chat_stream({
+        "agent_harness": "direct",
+        "chat_mode": "general",
+        "messages": [{"role": "user", "content": "用一句话解释显著性水平。"}],
+    }))
+
+    assert attempted_models == ["glm-4.7-flash", "Qwen/Qwen2.5-7B-Instruct"]
+    finished = events[-1]
+    assert finished["type"] == "RUN_FINISHED"
+    assert finished["result"]["message"]["content"] == "已由备用模型完成回答。"
+    assert finished["result"]["model"] == {
+        "provider_id": "scansci-managed",
+        "model_id": "Qwen/Qwen2.5-7B-Instruct",
+    }
+    assert finished["result"]["agent_runtime"]["model_fallback"]["from_model"] == "glm-4.7-flash"
+    assert any(
+        event.get("name") == "process_trace"
+        and any(item.get("status") == "fallback" for item in event.get("value", []))
+        for event in events
+    )
+
+
+def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    attempted_models: list[str] = []
+
+    def fake_stream(*_args, **kwargs):
+        attempted_models.append(str(kwargs["model"]))
+        raise RuntimeError("invalid request: unsupported response schema")
+        yield  # pragma: no cover - keep this a generator for the streaming API
+
+    monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
+
+    events = list(runtime.chat_stream({
+        "agent_harness": "direct",
+        "chat_mode": "general",
+        "messages": [{"role": "user", "content": "用一句话解释显著性水平。"}],
+    }))
+
+    assert attempted_models == ["glm-4.7-flash"]
+    assert events[-1]["type"] == "RUN_ERROR"
+
+
+def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    attempted_models: list[str] = []
+
+    def fake_stream(*_args, **kwargs):
+        attempted_models.append(str(kwargs["model"]))
+        raise RuntimeError("HTTP 429 provider_rate_limited")
+        yield  # pragma: no cover - keep this a generator for the streaming API
+
+    monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
+
+    events = list(runtime.chat_stream({
+        "agent_harness": "direct",
+        "chat_mode": "general",
+        "messages": [{"role": "user", "content": "Explain statistical significance in one sentence."}],
+    }))
+
+    # Qwen is a reachable standby route, but it cannot become a user-visible
+    # automatic answer until it passes the same structured quality contract.
+    assert attempted_models == ["glm-4.7-flash"]
+    assert events[-1]["type"] == "RUN_ERROR"
+
+
+def test_pi_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    request = runtime._direct_chat_request({
+        "messages": [{"role": "user", "content": "请简要说明实验重复的重要性。"}],
+    })
+    attempted_models: list[str] = []
+
+    def fake_pi_model_events(chat_request, **_kwargs):
+        attempted_models.append(chat_request.model_id)
+        if chat_request.model_id == "glm-4.7-flash":
+            raise PiAgentRunError(
+                "managed upstream limit",
+                failure={"code": "provider_rate_limited", "reason": "rate_limit"},
+            )
+        yield {"type": "delta", "content": "备用 Pi 模型已完成。"}
+        yield {"type": "done", "usage": {}, "truncated": False}
+
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_model_events)
+    monkeypatch.setattr(
+        runtime,
+        "_managed_fallback_chat_request",
+        lambda chat_request: research_agent.replace(chat_request, model_id="Qwen/Qwen2.5-7B-Instruct"),
+    )
+
+    events = list(runtime._pi_events_with_compatibility_fallback(request))
+
+    assert attempted_models == ["glm-4.7-flash", "Qwen/Qwen2.5-7B-Instruct"]
+    fallback = next(event for event in events if event["type"] == "model.fallback")
+    assert fallback["to_model"] == "Qwen/Qwen2.5-7B-Instruct"
+    assert events[-1]["type"] == "done"
+
+
+def test_structured_recovery_makes_invalid_paper_search_output_retryable() -> None:
+    recovery = research_agent._structured_recovery(
+        RuntimeError("scansci-pdf 未返回有效的 JSON 检索结果"),
+        stage_key="search",
+    )
+
+    assert recovery["code"] == "paper_search_response_invalid"
+    assert recovery["stage_key"] == "search"
+    assert recovery["retryable"] is True
+    assert recovery["message"] == "文献检索服务返回了无法读取的结果，下载尚未开始。"
+    assert recovery["actions"] == [{"id": "retry", "label": "重新检索", "kind": "resume"}]
+
+
+def test_structured_recovery_distinguishes_no_downloadable_identifier_from_bad_json() -> None:
+    recovery = research_agent._structured_recovery(
+        RuntimeError("未找到可下载的 DOI 或 arXiv 文献；请缩小主题范围"),
+        stage_key="search",
+    )
+
+    assert recovery["code"] == "paper_search_no_downloadable_identifier"
+    assert recovery["retryable"] is True
+    assert "已完成检索" in recovery["message"]
+
+
+def test_runtime_backfills_conservative_contracts_for_existing_history(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    store = ResearchRunStore(workspace)
+    legacy = store.create_run(
+        notebook_id="",
+        workflow_type="paper_download_batch",
+        title="Legacy downloads",
+        input_payload={"identifiers": ["10.1/example"]},
+        stages=[StageSpec("execute", "Download", "tool")],
+    )
+    assert legacy["task_contract"] == {}
+
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    migrated = runtime.store.get_run(legacy["run_id"])
+
+    assert migrated["task_contract"]["risk_level"] == "reversible"
+    assert "download_and_index" in migrated["task_contract"]["allowed_tools"]
+
+
+def test_transient_stage_retry_continues_in_same_worker_instead_of_sticking_queued(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    runtime._pause_for_plan_review = False
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Retry safely",
+        input_payload={"question": "retry"},
+        stages=[StageSpec("plan", "Plan", "planner")],
+    )
+    calls = 0
+
+    def flaky_plan(_run):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary provider timeout")
+        return {"summary": "Recovered"}
+
+    monkeypatch.setattr(runtime, "_plan", flaky_plan)
+    runtime._execute_run(run["run_id"])
+
+    completed = runtime.store.get_run(run["run_id"])
+    assert calls == 2
+    assert completed["status"] == "completed"
+    assert completed["stages"][0]["attempt"] == 2
+
+
+def test_permanent_stage_error_is_not_retried(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    runtime._pause_for_plan_review = False
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Do not retry bad input",
+        input_payload={"question": "bad"},
+        stages=[StageSpec("plan", "Plan", "planner")],
+    )
+    calls = 0
+
+    def invalid_plan(_run):
+        nonlocal calls
+        calls += 1
+        raise ValueError("invalid user parameter")
+
+    monkeypatch.setattr(runtime, "_plan", invalid_plan)
+    runtime._execute_run(run["run_id"])
+
+    failed = runtime.store.get_run(run["run_id"])
+    assert calls == 1
+    assert failed["status"] == "failed"
+
+
+def test_run_store_redacts_credentials_from_durable_errors_and_tool_records(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Redact secrets",
+        input_payload={"question": "test"},
+        stages=[StageSpec("execute", "Execute", "tool")],
+    )
+    store.begin_run(run["run_id"])
+    store.start_stage(run["run_id"], "execute")
+    failed_call = store.begin_tool_call(
+        run["run_id"],
+        "execute",
+        tool_name="remote_tool",
+        input_payload={
+            "api_key": "sk-super-secret-value",
+            "url": "https://example.test/mcp?access_token=secret-query-value",
+        },
+    )
+    store.fail_tool_call(
+        failed_call,
+        RuntimeError("Authorization: Bearer bearer-secret-value"),
+    )
+    store.set_recovery(
+        run["run_id"],
+        {"detail": "password=plain-secret-value", "authorization": "Bearer hidden"},
+    )
+    store.fail_stage(
+        run["run_id"],
+        "execute",
+        RuntimeError("request failed with secret=another-secret-value"),
+    )
+
+    serialized = str(store.get_run(run["run_id"]))
+    for secret in (
+        "sk-super-secret-value",
+        "secret-query-value",
+        "bearer-secret-value",
+        "plain-secret-value",
+        "another-secret-value",
+    ):
+        assert secret not in serialized
+    assert "[REDACTED]" in serialized
+
+
+def test_run_store_keeps_a_redacted_durable_event_timeline(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Event timeline",
+        input_payload={"question": "test"},
+        stages=[StageSpec("execute", "Execute", "tool")],
+        metadata={"routing": {"origin": "freeform", "reason": "explicit_local_evidence"}},
+    )
+    store.begin_run(run["run_id"])
+    store.start_stage(run["run_id"], "execute")
+    call_id = store.begin_tool_call(
+        run["run_id"],
+        "execute",
+        tool_name="scansci.evidence.ask",
+        input_payload={"api_key": "sk-event-secret"},
+    )
+    store.complete_tool_call(call_id, {"ok": True})
+    store.complete_stage(run["run_id"], "execute", summary="Evidence retrieved")
+    completed = store.complete_run(run["run_id"])
+
+    event_types = [item["type"] for item in completed["events"]]
+    assert event_types == [
+        "task.created",
+        "task.started",
+        "stage.started",
+        "tool.started",
+        "tool.completed",
+        "stage.completed",
+        "task.completed",
+    ]
+    assert completed["event_count"] == len(event_types)
+    assert "sk-event-secret" not in str(completed["events"])
+
+
+def test_control_plane_registry_persists_background_branches_interactions_and_recovery(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    parent = store.create_run(
+        notebook_id="review",
+        workflow_type="ask",
+        title="Parent task",
+        input_payload={"question": "Compare the evidence"},
+        stages=_stages(),
+        background=True,
+        task_contract={
+            "contract_id": "contract-parent",
+            "autonomy": "read_only",
+            "risk_level": "read_only",
+            "allowed_tools": ["build_verified_answer"],
+        },
+    )
+    assert parent["task_contract"]["contract_id"] == "contract-parent"
+    message = store.append_message(parent["run_id"], role="user", content="Focus on methods")
+    branch = store.fork_run(
+        parent["run_id"],
+        branch_from_message_id=message["message_id"],
+        input_overrides={"question": "Compare only field methods"},
+    )
+    assert branch["parent_run_id"] == parent["run_id"]
+    assert branch["branch_from_message_id"] == message["message_id"]
+    assert branch["background"] is True
+    assert branch["task_contract"] == parent["task_contract"]
+    assert branch["messages"][0]["content"] == "Focus on methods"
+
+    waiting = store.set_interaction(
+        parent["run_id"],
+        {
+            "interaction_id": "plan-1",
+            "kind": "plan",
+            "summary": "Search, read and verify",
+        },
+    )
+    assert waiting["status"] == "needs_confirmation"
+    assert waiting["interaction"]["interaction_id"] == "plan-1"
+    resolved = store.resolve_interaction(
+        parent["run_id"],
+        interaction_id="plan-1",
+        response={"decision": "approve"},
+    )
+    assert resolved["status"] == "paused"
+    assert resolved["interaction"] == {}
+
+    recovered = store.set_recovery(
+        parent["run_id"],
+        {
+            "code": "stage_timeout",
+            "message": "Timed out",
+            "actions": [{"id": "retry", "kind": "resume"}],
+        },
+    )
+    assert recovered["recovery"]["code"] == "stage_timeout"
+    registry = store.task_registry()
+    assert registry["counts"]["total"] == 2
+    assert registry["counts"]["branches"] == 1
+    parent_entry = next(item for item in registry["tasks"] if item["run_id"] == parent["run_id"])
+    assert parent_entry["branch_count"] == 1
+    assert parent_entry["task_contract"]["risk_level"] == "read_only"
+
+
+def test_scientific_subagents_are_bounded_and_share_parent_evidence_scope(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    parent = runtime.store.create_run(
+        notebook_id="forest-library",
+        workflow_type="deep_research",
+        title="Forest productivity",
+        input_payload={"question": "Why do models underestimate tropical productivity?"},
+        stages=_stages(),
+        metadata={"thinking_level": "high"},
+    )
+    submitted: list[str] = []
+    monkeypatch.setattr(runtime, "_submit", submitted.append)
+
+    result = runtime.delegate_scientific_agents(
+        parent["run_id"],
+        {
+            "roles": [
+                "literature_scout",
+                "fulltext_analyst",
+                "evidence_auditor",
+                "synthesis_writer",
+            ]
+        },
+    )
+
+    assert result["accepted"] == 3
+    assert len(submitted) == 3
+    for child in result["children"]:
+        assert child["parent_run_id"] == parent["run_id"]
+        assert child["notebook_id"] == "forest-library"
+        assert child["background"] is True
+        assert child["metadata"]["runtime"] == "scansci-scientific-subagent.v1"
+        assert child["metadata"]["shared_evidence"]["parent_run_id"] == parent["run_id"]
+        assert child["task_contract"]["autonomy"] == "read_only"
+        assert child["task_contract"]["allow_external_write"] is False
+        assert "create_document" not in child["task_contract"]["allowed_tools"]
+        assert child["metadata"]["subagent"]["output_schema"]["schema_version"] == "scansci.subagent-result.v1"
+
+
+def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    parent = runtime.store.create_run(
+        notebook_id="library",
+        workflow_type="ask",
+        title="Parent",
+        input_payload={"question": "Compare evidence"},
+        stages=_stages(),
+    )
+    child = runtime.store.create_run(
+        notebook_id="library",
+        workflow_type="ask",
+        title="Scout",
+        input_payload={"question": "Scout"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+        metadata={
+            "runtime": "scansci-scientific-subagent.v1",
+            "subagent": {"role": "literature_scout", "label": "Scout"},
+        },
+        parent_run_id=parent["run_id"],
+    )
+    artifact = runtime.store.create_artifact(
+        child["run_id"],
+        artifact_type="evidence_answer",
+        title="Scout handoff",
+        summary="JSON handoff",
+        payload={
+            "reader_answer": {
+                "text": '{"role":"literature_scout","findings":["candidate paper"],"evidence_uris":["scansci://paper/10.1%2Fexample"],"uncertainties":[],"recommended_next_action":"verify DOI"}'
+            }
+        },
+    )
+    runtime.store.complete_run(child["run_id"], output_artifact_id=artifact["artifact_id"])
+
+    collected = runtime.collect_scientific_agents(parent["run_id"])
+
+    assert collected["complete"] is True
+    assert collected["completed"] == 1
+    assert collected["children"][0]["handoff_status"] == "valid"
+    assert collected["aggregated_findings"][0]["handoff"]["role"] == "literature_scout"
+    assert collected["evidence_uris"] == ["scansci://paper/10.1%2Fexample"]
+
+
+def test_advisor_action_forks_an_evidence_safe_follow_up(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="library",
+        workflow_type="ask",
+        title="Needs evidence",
+        input_payload={"question": "Claim"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+        task_contract={"task_profile": {"evidence_policy": "strict"}},
+    )
+    artifact = runtime.store.create_artifact(
+        run["run_id"], artifact_type="evidence_answer", title="Answer", summary="No links", payload={"text": "Claim"}
+    )
+    runtime.store.complete_run(run["run_id"], output_artifact_id=artifact["artifact_id"])
+    submitted: list[str] = []
+    monkeypatch.setattr(runtime, "_submit", submitted.append)
+
+    report = runtime.advisor_report(run["run_id"])
+    branch = runtime.apply_advisor_action(run["run_id"], {"action": report["recommended_next_action"]})
+
+    assert report["recommended_next_action"] == "run_evidence_verification"
+    assert branch["parent_run_id"] == run["run_id"]
+    assert submitted == [branch["run_id"]]
+    assert any(event["type"] == "advisor.action_requested" for event in runtime.store.get_run(run["run_id"])["events"])
+
+
+def test_completed_runtime_records_read_only_advisor_and_metrics_events(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    created = runtime.store.create_run(
+        notebook_id="review",
+        workflow_type="ask",
+        title="Advisor contract",
+        input_payload={"question": "Summarize the evidence"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+        task_contract={"task_profile": {"evidence_policy": "off"}},
+    )
+
+    def deliver(run: dict[str, object]) -> dict[str, object]:
+        return runtime.store.create_artifact(
+            str(run["run_id"]),
+            artifact_type="answer",
+            title="Answer",
+            summary="Completed",
+            payload={"text": "Completed"},
+        )
+
+    monkeypatch.setattr(runtime, "_deliver", deliver)
+    runtime._execute_run(str(created["run_id"]))
+
+    completed = runtime.store.get_run(str(created["run_id"]))
+    events = {item["type"]: item for item in completed["events"]}
+    assert completed["status"] == "completed"
+    assert events["advisor.reviewed"]["payload"]["verdict"] == "passed"
+    assert events["task.metrics"]["payload"]["status"] == "completed"
 
 
 def test_research_run_persists_stages_calls_artifacts_and_evidence(tmp_path: Path):
@@ -66,11 +620,728 @@ def test_research_run_persists_stages_calls_artifacts_and_evidence(tmp_path: Pat
     completed = store.complete_run(run_id, output_artifact_id=artifact["artifact_id"])
 
     assert completed["status"] == "completed"
+    assert completed["uri"] == f"scansci://run/{run_id}"
     assert completed["progress"] == 1
     assert completed["output_artifact"]["artifact_type"] == "evidence_answer"
+    assert completed["output_artifact"]["uri"].startswith(f"scansci://artifact/{run_id}/")
     assert completed["output_artifact"]["evidence_links"][0]["evidence_id"] == "doc.s0001"
+    assert completed["output_artifact"]["evidence_links"][0]["uri"] == "scansci://evidence/doc/doc.s0001"
     assert completed["tool_calls"][0]["status"] == "completed"
     assert store.list_runs(notebook_id="review")[0]["run_id"] == run_id
+
+
+def test_academic_search_workflow_persists_federated_discovery_artifact(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    # This contract test exercises the durable public-search workflow, not a
+    # user's optional configured planning model.  Keep it isolated from a
+    # developer machine's gateway credentials/rate limits so the release gate
+    # cannot turn an otherwise deterministic discovery result into a failure.
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_academic_discovery_stack",
+        lambda: SimpleNamespace(
+            embedding_provider="embedding-fixture",
+            reranker="reranker-fixture",
+            metadata={"embedding": "fixture", "reranker": "fixture", "fallback": False, "selection_reason": "academic-discovery"},
+        ),
+    )
+
+    def fake_search(query, **kwargs):
+        assert kwargs["provider_names"] == ["openalex", "pubmed"]
+        assert kwargs["query_variants"] == ["scientific retrieval"]
+        assert kwargs["required_terms"] == ["scientific retrieval"]
+        assert kwargs["embedding_provider"] == "embedding-fixture"
+        assert kwargs["reranker"] == "reranker-fixture"
+        return {
+            "query": query,
+            "count": 1,
+            "items": [{"title": "Grounded discovery", "doi": "10.1/example", "sources": ["openalex", "pubmed"]}],
+            "evidence_status": "discovery_leads",
+        }
+
+    monkeypatch.setattr(research_agent, "search_academic_papers", fake_search)
+    run = runtime.start(
+        {
+            "workflow_type": "academic_search",
+            "query": "scientific retrieval",
+            "providers": ["openalex", "pubmed"],
+        }
+    )
+    assert run["notebook_id"] == ""
+    assert run["task_contract"]["task_mode"] == "web"
+    assert run["task_contract"]["risk_level"] == "read_only"
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
+    assert completed["output_artifact"]["artifact_type"] == "academic_search_result"
+    assert completed["output_artifact"]["payload"]["evidence_status"] == "discovery_leads"
+    assert completed["output_artifact"]["payload"]["retrieval_runtime"]["fallback"] is False
+    assert completed["output_artifact"]["payload"]["search_plan"]["topic"] == "scientific retrieval"
+
+
+def test_academic_search_honours_a_reviewed_public_plan(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(
+        runtime,
+        "_academic_discovery_stack",
+        lambda: SimpleNamespace(embedding_provider=None, reranker=None, metadata={"selection_reason": "academic-discovery"}),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_search(_query, **kwargs):
+        observed.update(kwargs)
+        return {"query": _query, "count": 0, "items": [], "evidence_status": "discovery_leads"}
+
+    monkeypatch.setattr(research_agent, "search_academic_papers", fake_search)
+    run = runtime.start(
+        {
+            "workflow_type": "academic_search",
+            "query": "scientific retrieval",
+            "providers": ["openalex", "semantic-scholar"],
+            "search_plan": {
+                "query_variants": ["scientific retrieval evidence ranking"],
+                "providers": ["openalex", "semantic-scholar", "untrusted-provider"],
+            },
+        }
+    )
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+    plan = completed["output_artifact"]["payload"]["search_plan"]
+
+    assert observed["provider_names"] == ["openalex", "semantic-scholar"]
+    assert observed["query_variants"] == ["scientific retrieval evidence ranking"]
+    assert plan["reviewed_by_user"] is True
+    assert plan["source_scope"] == "public_academic_apis"
+    assert plan["local_knowledge_used"] is False
+
+
+def test_academic_search_inherits_the_year_and_aliases_inferred_from_the_request(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_academic_discovery_stack",
+        lambda: SimpleNamespace(embedding_provider=None, reranker=None, metadata={"selection_reason": "academic-discovery"}),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_search(_query, **kwargs):
+        observed.update(kwargs)
+        return {"query": _query, "count": 0, "items": [], "evidence_status": "discovery_leads"}
+
+    monkeypatch.setattr(research_agent, "search_academic_papers", fake_search)
+    request = (
+        "\u8bf7\u68c0\u7d22 2022 \u5e74\u4ee5\u6765\u5173\u4e8e\u300c"
+        "\u68c0\u7d22\u589e\u5f3a\u751f\u6210\u4e2d\u7684\u4e8b\u5b9e\u4e00\u81f4\u6027\u8bc4\u4f30"
+        "\u300d\u7684\u5173\u952e\u8bba\u6587\u3002"
+    )
+    run = runtime.start(
+        {
+            "workflow_type": "academic_search",
+            "query": request,
+            "raw_query": request,
+            "providers": ["openalex"],
+        }
+    )
+
+    runtime._execute_run(run["run_id"])
+
+    assert observed["year_from"] == 2022
+    assert observed["query_variants"] == [
+        "retrieval augmented generation factuality evaluation",
+        "RAG faithfulness evaluation",
+        "retrieval augmented generation factuality benchmark",
+    ]
+
+
+def test_academic_discovery_uses_precision_models_independent_of_local_library_size(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    observed: list[dict] = []
+    fixture = SimpleNamespace(
+        embedding_provider="semantic-fixture",
+        reranker="precision-reranker-fixture",
+        metadata={"selection_reason": "academic-discovery", "fallback": False},
+    )
+
+    def fake_stack(**kwargs):
+        observed.append(kwargs)
+        return fixture
+
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
+
+    assert runtime._academic_discovery_stack() is fixture
+    assert runtime._academic_discovery_stack() is fixture
+    assert observed == [{"quality_profile": "precision"}]
+
+
+def test_paper_download_batch_workflow_runs_per_item_and_reports_progress(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+
+    progress_seen: list[dict] = []
+
+    def fake_download_papers(identifiers, *, workspace, strategy="legal_only", timeout=180.0, on_progress=None, cancel_check=None, **kwargs):
+        items = [
+            {"identifier": ident, "status": "completed" if ident.endswith("0001") else "failed", "files": [], "error": ""}
+            for ident in identifiers
+        ]
+        state = {"items": [dict(i) for i in items], "completed": 1, "failed": 1, "total": 2}
+        if on_progress:
+            on_progress(state)
+            progress_seen.append(state)
+        return {
+            "ok": False,
+            "items": items,
+            "completed": 1,
+            "failed": 1,
+            "total": 2,
+            "files": [],
+            "output_dir": str(tmp_path / "downloads"),
+            "message": "批量完成：成功 1/2，失败 1",
+        }
+
+    monkeypatch.setattr(research_agent, "download_papers", fake_download_papers)
+
+    run = runtime.start(
+        {
+            "workflow_type": "paper_download_batch",
+            "identifiers": ["10.1038/s41586-024-00001-0", "10.1038/s41586-024-00002-9"],
+            "strategy": "legal_only",
+        }
+    )
+    assert run["task_contract"]["risk_level"] == "reversible"
+    assert "download_and_index" in run["task_contract"]["allowed_tools"]
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
+    execute_stage = next(s for s in completed["stages"] if s["key"] == "execute")
+    assert execute_stage["status"] == "completed"
+    assert execute_stage["output"]["total"] == 2
+    assert execute_stage["output"]["completed"] == 1
+    assert execute_stage["output"]["failed"] == 1
+    # The progress callback fired at least once during execution.
+    assert progress_seen, "on_progress should have been invoked by the executor"
+    assert completed["output_artifact"]["artifact_type"] == "downloaded_paper"
+    assert completed["output_artifact"]["summary"].startswith("批量完成")
+
+
+def test_paper_download_batch_rejects_missing_identifiers(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    with pytest.raises(ValueError, match="identifiers is required"):
+        runtime.start({"workflow_type": "paper_download_batch", "identifiers": []})
+    with pytest.raises(ValueError, match="identifiers is required"):
+        runtime.start({"workflow_type": "paper_download_batch"})
+
+
+def test_paper_search_download_searches_then_downloads_without_notebook(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+
+    monkeypatch.setattr(
+        research_agent,
+        "search_papers_for_download",
+        lambda query, **kwargs: {
+            "query": query,
+            "author": kwargs["author"],
+            "sort": kwargs["sort"],
+            "total": 2,
+            "identifiers": ["10.1038/nature02403", "10.1111/example"],
+            "items": [
+                {"title": "Leaf economics", "identifier": "10.1038/nature02403"},
+                {"title": "Global change", "identifier": "10.1111/example"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "download_papers",
+        lambda identifiers, **_kwargs: {
+            "ok": True,
+            "items": [{"identifier": value, "status": "completed", "files": [f"{value}.pdf"]} for value in identifiers],
+            "completed": 2,
+            "failed": 0,
+            "total": 2,
+            "files": ["a.pdf", "b.pdf"],
+            "output_dir": str(tmp_path / "downloads"),
+            "message": "批量完成：成功 2/2，失败 0",
+        },
+    )
+
+    run = runtime.start(
+        {
+            "workflow_type": "paper_search_download",
+            "author": "Peter B. Reich",
+            "query": "",
+            "limit": 20,
+            "sort": "cited_by_count",
+        }
+    )
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
+    assert completed["output_artifact"]["artifact_type"] == "downloaded_paper"
+    assert completed["output_artifact"]["payload"]["completed"] == 2
+    assert completed["output_artifact"]["payload"]["papers"][0]["title"] == "Leaf economics"
+
+
+def test_paper_search_download_requires_query_or_author(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    with pytest.raises(ValueError, match="query or author"):
+        runtime.start({"workflow_type": "paper_search_download"})
+
+
+def test_deep_research_plan_has_stage_summary_and_insufficient_evidence_is_not_verified(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: (_ for _ in ()).throw(ValueError("offline")))
+    run = {"workflow_type": "deep_research", "input": {"question": "What evidence exists?"}}
+
+    plan = runtime._plan(run)
+    verification = runtime._verify(
+        {
+            "stages": [
+                {
+                    "kind": "tool",
+                    "status": "completed",
+                    "output": {
+                        "answer": {"insufficient_evidence": True},
+                        "adequacy": {"is_sufficient": False},
+                        "citation_verification": {"passed": True},
+                        "reader_answer": {"citation_count": 0},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert plan["summary"]
+    assert len(plan["search_queries"]) >= 2
+    assert verification == {
+        "passed": False,
+        "no_unsupported_claims": True,
+        "insufficient_evidence": True,
+        "citation_count": 0,
+        "evidence_status": "",
+        "details": {"passed": True},
+    }
+
+
+def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    run = runtime.start(
+        {
+            "workflow_type": "deep_research",
+            "notebook_id": "should-not-be-used",
+            "question": "How should scientific RAG be evaluated?",
+        }
+    )
+
+    assert run["notebook_id"] == ""
+    assert run["task_contract"]["task_mode"] == "web"
+    assert "kb_search" not in run["task_contract"]["allowed_tools"]
+
+    plan = {
+        "title": "Scientific RAG evaluation",
+        "perspectives": [
+            {"title": "Methods", "question": "Which methods are evaluated?", "keywords": ["evaluation"]},
+            {"title": "Limits", "question": "Which limits are reported?", "keywords": ["limits"]},
+        ],
+    }
+    discovery = {
+        "items": [
+            {
+                "title": f"Study {index}",
+                "doi": f"10.1000/study-{index}",
+                "abstract": f"This is a traceable abstract for study {index}. It reports an evaluation method, dataset boundaries, and limitations for scientific retrieval grounded generation.",
+                "url": f"https://example.org/study-{index}",
+                "score": 0.9 - index / 10,
+            }
+            for index in range(1, 4)
+        ]
+    }
+    monkeypatch.setattr(runtime, "_stage_output", lambda _run, key: plan if key == "plan" else discovery)
+
+    result = runtime._external_deep_research_evidence(run)
+
+    assert result["phase"] == "external_abstracts"
+    assert result["evidence_status"] == "external_source_abstracts"
+    assert len(result["evidence"]) == 3
+    assert result["evidence"][0]["doc_id"].startswith("external:")
+    assert result["evidence"][0]["original_url"] == "https://example.org/study-1"
+    assert result["review_plan"]["sections"][0]["citation_ids"] == ["S1", "S2", "S3"]
+
+
+def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace.sqlite"
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.txt"
+    content = (
+        "Abstract\n\nThis paper contains a sufficiently detailed and traceable finding about evidence grounded scientific retrieval.\n\n"
+        "Results\n\nThe result compares retrieval methods across scientific questions and records concrete limitations for auditability.\n\n"
+        "Discussion\n\nThe report should cite original full text instead of relying only on published abstracts."
+    )
+    first.write_text(content, encoding="utf-8")
+    second.write_text(content.replace("retrieval methods", "ranking methods"), encoding="utf-8")
+    task_evidence = build_task_fulltext_evidence(
+        workspace,
+        "run-fulltext",
+        [
+            {"title": "One", "doi": "10.1000/one", "files": [str(first)]},
+            {"title": "Two", "doi": "10.1000/two", "files": [str(second)]},
+        ],
+        min_sentence_length=20,
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "library.sqlite")
+    run = {"run_id": "run-fulltext", "input": {"question": "How should scientific retrieval be audited?"}}
+    monkeypatch.setattr(
+        runtime,
+        "_stage_output",
+        lambda _run, key: {"task_evidence": task_evidence} if key == "acquire" else {},
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider="embedding-fixture",
+            reranker="reranker-fixture",
+            metadata={"embedding": "fixture", "reranker": "fixture"},
+        ),
+    )
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: "writing-client")
+    monkeypatch.setattr(
+        research_agent,
+        "retrieve_review_evidence",
+        lambda _db, _question, **_kwargs: {
+            "phase": "retrieval",
+            "evidence": [{"citation_id": "1"}, {"citation_id": "2"}, {"citation_id": "3"}],
+            "retrieval_summary": {"document_count": 2, "evidence_count": 3},
+        },
+    )
+
+    result = runtime._task_fulltext_deep_research_evidence(run)
+
+    assert result["phase"] == "retrieval"
+    assert result["evidence_status"] == "task_acquired_fulltext"
+    assert result["evidence_level"] == "fulltext"
+    assert result["source_scope"]["kind"] == "task_acquired_fulltext"
+    assert result["task_evidence"]["root"].startswith(str(tmp_path))
+
+
+def test_deep_research_auto_runs_past_planning_and_completes_honest_discovery_only_report(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    missing_evidence_db = tmp_path / "not-yet-indexed.sqlite"
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(runtime, "_requested_notebook", lambda _payload: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: missing_evidence_db)
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: (_ for _ in ()).throw(ValueError("offline")))
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider="embedding-fixture",
+            reranker="reranker-fixture",
+            metadata={"embedding": "fixture", "reranker": "fixture", "fallback": False},
+        ),
+    )
+    monkeypatch.setattr(research_agent, "build_academic_provider", lambda name: SimpleNamespace(source_name=name))
+    monkeypatch.setattr(
+        research_agent,
+        "run_discovery_loop",
+        lambda question, plan, **_kwargs: {
+            "question": question,
+            "plan": plan,
+            "items": [{"title": "Candidate only", "doi": "10.1/candidate", "sources": ["openalex"]}],
+            "count": 1,
+            "candidate_count": 1,
+            "deduplicated_count": 1,
+            "rounds": [{"round": 1, "queries": [{"query": question}]}],
+            "coverage": [],
+            "unresolved_gaps": [],
+            "provider_errors": {},
+            "evidence_status": "discovery_leads",
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_acquire_deep_research_fulltext",
+        lambda _run, _stage, call_id: {
+            "strategy": "legal_only",
+            "acquired": [],
+            "acquired_count": 0,
+            "failed": [],
+            "failed_count": 0,
+            "evidence_status": "existing_or_unavailable",
+        },
+    )
+
+    run = runtime.start(
+        {
+            "workflow_type": "deep_research",
+            "notebook_id": "review",
+            "question": "What evidence exists?",
+            "providers": ["openalex"],
+        }
+    )
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+    artifact = completed["output_artifact"]
+
+    assert completed["status"] == "completed"
+    assert completed["interaction"] == {}
+    assert artifact["artifact_type"] == "deep_research_report"
+    assert artifact["payload"]["phase"] == "discovery_only"
+    assert artifact["payload"]["answer"]["insufficient_evidence"] is True
+    assert artifact["payload"]["citation_verification"]["claim_count"] == 0
+    assert artifact["evidence_links"] == []
+    verify_stage = next(stage for stage in completed["stages"] if stage["key"] == "verify")
+    assert verify_stage["output"]["passed"] is False
+
+
+def test_novelty_check_persists_four_axis_fulltext_assessment(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.touch()
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    runtime._pause_for_plan_review = False  # skip plan approval gate in tests
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(runtime, "_requested_notebook", lambda _payload: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: "writing-client")
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider="embedding-fixture",
+            reranker="reranker-fixture",
+            metadata={"embedding": "fixture", "reranker": "fixture", "fallback": False},
+        ),
+    )
+    monkeypatch.setattr(research_agent, "build_academic_provider", lambda name: SimpleNamespace(source_name=name))
+    monkeypatch.setattr(
+        research_agent,
+        "plan_novelty_check",
+        lambda problem, novelty, **_kwargs: {
+            "problem": problem,
+            "claimed_novelty": novelty,
+            "axes": {
+                key: {"label": key, "statement": novelty, "terms": ["evidence"]}
+                for key in ("problem_framing", "core_mechanism", "key_insight", "application_domain")
+            },
+            "perspectives": [{"title": "Mechanism", "question": novelty, "keywords": ["evidence"]}],
+            "search_queries": ["query one", "query two", "query three"],
+            "planner": "fixture",
+        },
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "run_discovery_loop",
+        lambda question, plan, **_kwargs: {
+            "question": question,
+            "plan": plan,
+            "items": [{"title": "Prior A", "doi": "10.1/prior", "sources": ["openalex"]}],
+            "count": 1,
+            "candidate_count": 1,
+            "deduplicated_count": 1,
+            "rounds": [{"round": 1, "queries": [{"query": "query one"}]}],
+            "coverage": [],
+            "unresolved_gaps": [],
+            "provider_errors": {},
+            "evidence_status": "discovery_leads",
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_acquire_deep_research_fulltext",
+        lambda _run, _stage, call_id: {
+            "strategy": "legal_only",
+            "acquired_count": 1,
+            "failed_count": 0,
+            "evidence_status": "indexed_fulltext",
+        },
+    )
+    evidence = [
+        {
+            "citation_id": "1",
+            "evidence_id": "prior-a.s1",
+            "doc_id": "prior-a",
+            "paper": "Prior A",
+            "exact_quote": "Prior evidence.",
+            "html_anchor": "s1",
+        }
+    ]
+    monkeypatch.setattr(
+        research_agent,
+        "retrieve_review_evidence",
+        lambda *_args, **_kwargs: {
+            "phase": "retrieval",
+            "evidence": evidence,
+            "retrieval_summary": {"document_count": 1, "evidence_count": 1},
+        },
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "assess_novelty_evidence",
+        lambda *_args, **_kwargs: {
+            "phase": "novelty_assessment",
+            "status": "assessed",
+            "assessment_mode": "model_evidence_assessment",
+            "verdict": {"level": 3, "label": "中等重合风险", "not_proof_of_novelty": True},
+            "evidence_adequacy": {"sufficient": True},
+            "reader_answer": {
+                "text": "Prior A shows a medium overlap risk.",
+                "citation_count": 1,
+                "citations": evidence,
+            },
+            "citation_verification": {"passed": True, "claim_count": 1},
+        },
+    )
+
+    run = runtime.start(
+        {
+            "workflow_type": "novelty_check",
+            "notebook_id": "review",
+            "problem": "Ground scientific answers",
+            "novelty": "Bind every sentence to full-text evidence",
+            "providers": ["openalex", "openreview", "dblp"],
+        }
+    )
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
+    assert [stage["key"] for stage in completed["stages"]] == [
+        "plan",
+        "discover",
+        "acquire",
+        "research",
+        "assess",
+        "verify",
+        "deliver",
+    ]
+    assert completed["output_artifact"]["artifact_type"] == "novelty_assessment"
+    assert completed["output_artifact"]["payload"]["verdict"]["level"] == 3
+    assert completed["output_artifact"]["evidence_links"][0]["evidence_id"] == "prior-a.s1"
+    verify_stage = next(stage for stage in completed["stages"] if stage["key"] == "verify")
+    assert verify_stage["output"]["passed"] is True
+
+
+def test_research_idea_persists_quality_gates_and_requires_separate_novelty_check(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.touch()
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    runtime._pause_for_plan_review = False  # skip plan approval gate in tests
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(runtime, "_requested_notebook", lambda _payload: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "review", "sources": []})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: "writing-client")
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider="embedding-fixture",
+            reranker="reranker-fixture",
+            metadata={"embedding": "fixture", "reranker": "fixture", "fallback": False},
+        ),
+    )
+    monkeypatch.setattr(research_agent, "build_academic_provider", lambda name: SimpleNamespace(source_name=name))
+    plan = {
+        "direction": "Reduce unsupported scientific claims",
+        "constraints": ["one GPU"],
+        "problem_statement": "Unsupported claims remain after retrieval.",
+        "success_criterion": "Lower unsupported sentence rate.",
+        "search_queries": ["q1", "q2", "q3"],
+        "perspectives": [{"title": "Limits", "question": "What fails?", "keywords": ["failure"]}],
+    }
+    monkeypatch.setattr(research_agent, "plan_research_idea", lambda *_args, **_kwargs: dict(plan))
+    monkeypatch.setattr(
+        research_agent,
+        "run_discovery_loop",
+        lambda question, plan, **_kwargs: {
+            "question": question,
+            "plan": plan,
+            "items": [{"title": "Paper A", "doi": "10.1/a", "sources": ["openalex"]}],
+            "count": 1,
+            "candidate_count": 1,
+            "deduplicated_count": 1,
+            "rounds": [{"round": 1, "queries": [{"query": "q1"}]}],
+            "coverage": [],
+            "unresolved_gaps": [],
+            "provider_errors": {},
+            "evidence_status": "discovery_leads",
+        },
+    )
+    monkeypatch.setattr(runtime, "_acquire_deep_research_fulltext", lambda *_args, **_kwargs: {"acquired_count": 1, "failed_count": 0})
+    evidence = [{"citation_id": "1", "evidence_id": "a.s1", "doc_id": "a", "paper": "Paper A", "exact_quote": "Evidence."}]
+    monkeypatch.setattr(
+        research_agent,
+        "retrieve_review_evidence",
+        lambda *_args, **_kwargs: {"phase": "retrieval", "evidence": evidence, "retrieval_summary": {"document_count": 1, "evidence_count": 1}},
+    )
+    bottleneck = {"phase": "bottleneck_diagnosis", "status": "grounded", "bottleneck_statement": "Binding", "citation_ids": ["1"]}
+    candidate = {"phase": "candidate_generation", "status": "candidate", "title": "Claim lock", "core_mechanism": "Lock claims", "citation_ids": ["1"], "mechanism_steps": [{"id": "s1"}, {"id": "s2"}]}
+    coherence = {"phase": "coherence_audit", "status": "audited", "verdict": "pass"}
+    falsifiability = {"phase": "falsifiability_audit", "status": "audited", "passed": True}
+    implementability = {"phase": "implementability_audit", "status": "audited", "verdict": "ready"}
+    monkeypatch.setattr(research_agent, "diagnose_research_bottleneck", lambda *_args, **_kwargs: dict(bottleneck))
+    monkeypatch.setattr(research_agent, "generate_research_candidate", lambda *_args, **_kwargs: dict(candidate))
+    monkeypatch.setattr(research_agent, "audit_candidate_coherence", lambda *_args, **_kwargs: dict(coherence))
+    monkeypatch.setattr(research_agent, "audit_candidate_falsifiability", lambda *_args, **_kwargs: dict(falsifiability))
+    monkeypatch.setattr(research_agent, "audit_candidate_implementability", lambda *_args, **_kwargs: dict(implementability))
+    monkeypatch.setattr(
+        research_agent,
+        "assemble_research_idea_card",
+        lambda *_args, **_kwargs: {
+            "phase": "research_idea_card",
+            "status": "ready_for_novelty_check",
+            "title": "Claim lock",
+            "candidate": candidate,
+            "quality_gates": {
+                "grounded_bottleneck": True,
+                "single_candidate": True,
+                "coherence": True,
+                "falsifiability": True,
+                "implementability": True,
+                "citation_integrity": True,
+                "novelty": False,
+            },
+            "required_next_gate": {"workflow_type": "novelty_check"},
+            "reader_answer": {"text": "Ready for novelty check.", "citation_count": 1, "citations": evidence},
+            "citation_verification": {"passed": True, "claim_count": 1},
+        },
+    )
+
+    run = runtime.start(
+        {
+            "workflow_type": "research_idea",
+            "notebook_id": "review",
+            "direction": "Reduce unsupported scientific claims",
+            "constraints": "one GPU",
+            "providers": ["openalex", "openreview"],
+        }
+    )
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
+    assert [stage["key"] for stage in completed["stages"]] == [
+        "plan", "discover", "acquire", "evidence", "diagnose", "generate", "coherence", "falsify", "implement", "assemble", "verify", "deliver"
+    ]
+    assert completed["output_artifact"]["artifact_type"] == "research_idea_card"
+    assert completed["output_artifact"]["payload"]["quality_gates"]["novelty"] is False
+    assert completed["output_artifact"]["payload"]["required_next_gate"]["workflow_type"] == "novelty_check"
+    assert completed["output_artifact"]["evidence_links"][0]["evidence_id"] == "a.s1"
+    verify_stage = next(stage for stage in completed["stages"] if stage["key"] == "verify")
+    assert verify_stage["output"]["passed"] is True
+    assert verify_stage["output"]["novelty_checked"] is False
 
 
 def test_research_run_cancel_and_resume_preserves_completed_stages(tmp_path: Path):
@@ -98,6 +1369,171 @@ def test_research_run_cancel_and_resume_preserves_completed_stages(tmp_path: Pat
     assert resumed["current_stage"] == "retrieve"
     assert resumed["stages"][0]["status"] == "completed"
     assert resumed["stages"][1]["status"] == "pending"
+
+
+def test_research_run_persists_partial_stage_progress_and_cancelled_tool(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="review",
+        workflow_type="evidence_index",
+        title="Build index",
+        input_payload={},
+        stages=[StageSpec("build", "Build vectors", "tool", "scansci.evidence.index")],
+    )
+    store.begin_run(run["run_id"])
+    store.start_stage(run["run_id"], "build")
+    call_id = store.begin_tool_call(
+        run["run_id"],
+        "build",
+        tool_name="scansci.evidence.index",
+        input_payload={},
+    )
+
+    progress = store.update_stage_progress(
+        run["run_id"],
+        "build",
+        fraction=0.4,
+        summary="40/100",
+        output={"completed": 40, "total": 100},
+    )
+    store.cancel_tool_call(call_id, {"completed": 40, "total": 100})
+    cancelled = store.mark_cancelled(run["run_id"])
+
+    assert progress["progress"] == pytest.approx(0.4)
+    assert progress["stages"][0]["output"] == {"completed": 40, "total": 100}
+    assert cancelled["tool_calls"][0]["status"] == "cancelled"
+    resumed = store.prepare_resume(run["run_id"])
+    assert resumed["status"] == "queued"
+    assert resumed["stages"][0]["status"] == "pending"
+
+
+def test_evidence_index_workflow_cooperatively_cancels_and_resumes(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "large-evidence.sqlite"
+    evidence_db.write_bytes(b"0" * 1_000_001)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    runtime._pause_for_plan_review = False  # skip plan approval gate in tests
+    monkeypatch.setattr(
+        runtime,
+        "_notebook",
+        lambda notebook_id: {"notebook_id": notebook_id, "title": "光伏生态文献", "sources": []},
+    )
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(research_agent, "load_embedding_cache_rows", lambda _db: {"a": {"text": "A"}})
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(embedding_provider=object(), metadata={"embedding": "test"}),
+    )
+
+    calls = 0
+
+    def fake_prewarm(_db, _rows, *, progress_callback, cancel_requested, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            progress_callback(40, 100)
+            active = runtime.store.list_runs(notebook_id="review")[0]
+            runtime.store.request_cancel(active["run_id"])
+            assert cancel_requested() is True
+            return {"completed": 40, "total": 100, "cancelled": True}
+        progress_callback(100, 100)
+        return {"completed": 100, "total": 100, "cancelled": False}
+
+    monkeypatch.setattr(research_agent, "prewarm_embedding_cache", fake_prewarm)
+    run = runtime.start_evidence_index("review")
+    assert run is not None
+    assert run["title"] == "优化「光伏生态文献」的语义检索"
+    assert run["input"]["notebook_title"] == "光伏生态文献"
+    runtime._execute_run(run["run_id"])
+    cancelled = runtime.store.get_run(run["run_id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["progress"] == pytest.approx(0.4)
+    assert cancelled["stages"][0]["output"] == {
+        "completed": 40,
+        "total": 100,
+        "notebook_title": "光伏生态文献",
+    }
+    assert cancelled["tool_calls"][0]["status"] == "cancelled"
+
+    runtime.store.prepare_resume(run["run_id"])
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert completed["progress"] == 1
+    assert sorted(call["status"] for call in completed["tool_calls"]) == ["cancelled", "completed"]
+
+
+def test_evidence_index_never_persists_hash_fallback_as_qwen_vectors(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"0" * 1_000_001)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    runtime._pause_for_plan_review = False
+    monkeypatch.setattr(runtime, "_notebook", lambda notebook_id: {"notebook_id": notebook_id, "sources": []})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(research_agent, "load_embedding_cache_rows", lambda _db: {"a": {"text": "A"}})
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider=object(),
+            metadata={
+                "qwen_embedding_active": False,
+                "fallback": True,
+                "fallback_reasons": ["model unavailable locally"],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "prewarm_embedding_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fallback vectors must never be persisted")
+        ),
+    )
+
+    run = runtime.start_evidence_index("review")
+    assert run is not None
+    runtime._execute_run(run["run_id"])
+    failed = runtime.store.get_run(run["run_id"])
+
+    assert failed["status"] == "failed"
+    assert "不会写入伪语义索引" in failed["error"]["message"]
+
+
+def test_evidence_index_reports_vectors_migrated_from_a_previous_store(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"0" * 1_000_001)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    monkeypatch.setattr(
+        runtime,
+        "_notebook",
+        lambda notebook_id: {
+            "notebook_id": notebook_id,
+            "title": "光伏生态文献",
+            "sources": [],
+            "metadata": {
+                "vector_cache_migration": {
+                    "migrated_vectors": 128,
+                    "sources": [str(tmp_path / "legacy-evidence.sqlite")],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda *_args, **_kwargs: {"available": True, "total": 200, "completed": 128, "ready": False},
+    )
+
+    run = runtime.start_evidence_index("review")
+
+    assert run is not None
+    assert run["input"]["migrated_vectors"] == 128
+    assert run["input"]["migration_sources"] == [str(tmp_path / "legacy-evidence.sqlite")]
 
 
 def test_research_run_recovers_interrupted_process_as_paused(tmp_path: Path):
@@ -145,6 +1581,568 @@ def test_research_run_follow_up_messages_stay_with_the_original_run(tmp_path: Pa
     assert reopened["messages"][1]["usage"]["total_tokens"] == 17
     assert reopened["messages"][1]["processing_ms"] == 321
     assert store.list_runs()[0]["run_id"] == run["run_id"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("重来", True), ("请从头开始", True), ("restart from scratch", True), ("不要重来", False), ("继续解释", False)],
+)
+def test_restart_intent_is_explicit_and_does_not_match_negation(text: str, expected: bool):
+    assert _is_restart_request(text) is expected
+
+
+def test_direct_chat_routes_zotero_access_question_to_mandatory_status_tool():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[{"role": "user", "content": "你能访问我的 Zotero 吗？"}],
+    )
+
+    assert mode == "zotero-status"
+
+
+def test_download_follow_up_routes_comparison_to_registered_task_documents():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[{"role": "user", "content": "这些文献有什么共同点？"}],
+        run={"workflow_type": "paper_search_download"},
+    )
+
+    assert mode == "task-documents"
+
+
+def test_recent_download_and_index_phrase_routes_to_task_documents_without_selected_run():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[
+            {
+                "role": "user",
+                "content": "总结刚才下载并索引的论文，只比较当前任务中的文献。",
+            }
+        ],
+    )
+
+    assert mode == "task-documents"
+
+
+def test_download_follow_up_short_continue_reuses_prior_document_intent():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[
+            {"role": "user", "content": "这些文献有什么共同点？"},
+            {"role": "assistant", "content": "我会读取已下载文献后进行比较。"},
+            {"role": "user", "content": "继续"},
+        ],
+        run={"workflow_type": "paper_search_download"},
+    )
+
+    assert mode == "task-documents"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请搜索、下载并总结 Peter B. Reich 的论文",
+        "Find papers about forest drought and compare their conclusions",
+        "Download these papers as PDFs",
+    ],
+)
+def test_multi_step_paper_acquisition_routes_to_research_agent_tools(text: str):
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[{"role": "user", "content": text}],
+    )
+
+    assert mode == "research"
+
+
+def test_local_only_knowledge_request_wins_over_global_web_toggle():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        "on",
+        messages=[
+            {
+                "role": "user",
+                "content": "Use only the linked ScanSci knowledge base and run RAG. Do not use the public web.",
+            }
+        ],
+    )
+
+    assert mode == "knowledge"
+
+
+def test_knowledge_retrieval_and_real_presentation_are_composed():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "knowledge",
+        messages=[
+            {
+                "role": "user",
+                "content": "检索当前知识库，总结这些文献并创建一个实际可下载的 PPTX。",
+            }
+        ],
+    )
+
+    assert mode == "knowledge+slides"
+
+
+def test_downloaded_task_documents_and_presentation_are_composed():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[
+            {
+                "role": "user",
+                "content": "总结刚才下载的文献，并生成一个实际的 PPT 演示文稿。",
+            }
+        ],
+        run={"workflow_type": "paper_download_batch"},
+    )
+
+    assert mode == "task-documents+slides"
+
+
+def test_research_download_review_and_presentation_are_composed():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[
+            {
+                "role": "user",
+                "content": "搜索并下载 3 篇森林生产力论文，写综述并创建实际 PPTX。",
+            }
+        ],
+    )
+
+    assert mode == "research+slides"
+
+
+def test_exact_doi_download_routes_to_strict_research_mode():
+    mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        messages=[
+            {
+                "role": "user",
+                "content": "Download the exact DOI 10.2307/2679812, index it, then summarize it.",
+            }
+        ],
+    )
+
+    assert mode == "research"
+
+
+def test_follow_up_context_preserves_each_workflow_goal_and_mode():
+    run = {
+        "workflow_type": "novelty_check",
+        "title": "Novelty audit",
+        "input": {
+            "problem": "How can agents improve evidence retrieval?",
+            "novelty": "Adaptive evidence-budget routing",
+            "constraints": "Single machine and three months",
+        },
+        "output_artifact": {
+            "title": "Novelty assessment",
+            "summary": "Two related methods require comparison.",
+            "payload": {},
+        },
+    }
+    context = ResearchAgentRuntime._run_conversation_context(run)
+    assert "How can agents improve evidence retrieval?" in context
+    assert "Adaptive evidence-budget routing" in context
+    assert "Single machine and three months" in context
+    assert "Task mode: knowledge" in context
+    assert "Novelty assessment" in context
+
+
+def test_follow_up_context_names_registered_task_files(tmp_path: Path):
+    paper = tmp_path / "reich-paper.pdf"
+    run = {
+        "workflow_type": "paper_download_batch",
+        "title": "Peter B. Reich",
+        "input": {"identifiers": ["10.1/example"]},
+        "stages": [{"status": "completed", "output": {"files": [str(paper)]}}],
+        "output_artifact": {
+            "title": "Peter B. Reich",
+            "summary": "Downloaded paper",
+            "payload": {"files": [str(paper)]},
+        },
+    }
+
+    context = ResearchAgentRuntime._run_conversation_context(run)
+
+    assert "Registered task files: reich-paper.pdf" in context
+
+
+@pytest.mark.parametrize(
+    ("workflow", "expected_mode"),
+    [
+        ("pdf_to_ppt", "slides"),
+        ("ppt_outline", "slides"),
+        ("ask", "knowledge"),
+        ("literature_review", "knowledge"),
+        ("deep_research", "academic"),
+        ("novelty_check", "knowledge"),
+        ("writing", "writing"),
+        ("writing_task", "writing"),
+        ("paper_download", "general"),
+    ],
+)
+def test_follow_up_keeps_the_originating_workflow_mode(workflow: str, expected_mode: str):
+    assert ResearchAgentRuntime._run_chat_mode({"workflow_type": workflow}) == expected_mode
+
+
+def test_evidence_index_follow_up_reads_its_bound_library_catalog_without_task_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A completed index is durable library state, not a task attachment."""
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    run = runtime.store.create_run(
+        notebook_id="pv-ecology",
+        workflow_type="evidence_index",
+        title="优化「光伏生态文献」的语义检索",
+        input_payload={},
+        stages=[StageSpec("index", "建立索引", "tool")],
+    )
+    observed: dict[str, object] = {}
+
+    def catalog(*, notebook_ids: list[str], request: dict[str, object]):
+        observed["notebook_ids"] = notebook_ids
+        observed["request"] = request
+        return {
+            "operation": "list",
+            "library_titles": ["光伏生态文献"],
+            "match_terms": [],
+            "total_documents": 376,
+            "document_count": 376,
+            "items": [
+                {"title": "Solar ecology evidence"},
+                {"title": "Photovoltaic biodiversity review"},
+            ],
+        }
+
+    monkeypatch.setattr(runtime, "_knowledge_catalog_summary", catalog)
+    monkeypatch.setattr(
+        runtime,
+        "_complete_with_pi",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("catalog follow-up must not enter the task-document/Pi path")
+        ),
+    )
+
+    result = runtime.continue_run_conversation(
+        run["run_id"],
+        {"content": "这个知识库有什么？"},
+    )
+
+    assert observed["notebook_ids"] == ["pv-ecology"]
+    assert result["agent_runtime"]["harness"] == "knowledge-catalog"
+    assert "376 篇已索引资料" in result["message"]["content"]
+    assert "Solar ecology evidence" in result["message"]["content"]
+    assert [item["role"] for item in result["run"]["messages"]] == ["user", "assistant"]
+
+
+def test_evidence_index_catalog_follow_up_reads_the_real_bound_index(tmp_path: Path):
+    library_root = tmp_path / "pv-library"
+    library_root.mkdir()
+    (library_root / "ecology.html").write_text(
+        "<article><h1>Photovoltaic ecology review</h1><p>Ecological evidence for solar sites.</p></article>",
+        encoding="utf-8",
+    )
+    evidence_db = tmp_path / "evidence.sqlite"
+    index_evidence_library(library_root, db_path=evidence_db, inject_evidence_html=False, min_sentence_length=10)
+    workspace = tmp_path / "workspace.sqlite"
+    initialize_notebook(
+        workspace,
+        notebook_id="pv-ecology",
+        title="光伏生态文献",
+        root_path=library_root,
+    )
+    sync_sources_from_evidence_store(workspace, evidence_db, notebook_id="pv-ecology")
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db)
+    run = runtime.store.create_run(
+        notebook_id="pv-ecology",
+        workflow_type="evidence_index",
+        title="优化「光伏生态文献」的语义检索",
+        input_payload={},
+        stages=[StageSpec("index", "建立索引", "tool")],
+    )
+
+    result = runtime.continue_run_conversation(
+        run["run_id"],
+        {"content": "这个知识库有什么？"},
+    )
+
+    assert result["agent_runtime"]["harness"] == "knowledge-catalog"
+    assert "1 篇已索引资料" in result["message"]["content"]
+    assert "Photovoltaic ecology review" in result["message"]["content"]
+
+
+def test_catalog_query_counts_a_large_library_without_loading_every_document(tmp_path: Path):
+    evidence_db = tmp_path / "evidence.sqlite"
+    with sqlite3.connect(evidence_db) as connection:
+        connection.execute(
+            """
+            create table source_documents (
+                doc_id text primary key,
+                title text not null,
+                doi text,
+                source_url text not null,
+                publication_year integer,
+                html_path text not null,
+                evidence_html_path text not null
+            )
+            """
+        )
+        connection.executemany(
+            """
+            insert into source_documents
+            (doc_id, title, doi, source_url, publication_year, html_path, evidence_html_path)
+            values (?, ?, '', ?, ?, '', '')
+            """,
+            [
+                (f"doc-{index}", f"Library document {index}", f"file:///doc-{index}", 2020 + index % 5)
+                for index in range(80)
+            ],
+        )
+
+    total, matched, preview = ResearchAgentRuntime._catalog_rows_from_evidence_db(
+        evidence_db,
+        [],
+        preview_limit=50,
+    )
+
+    assert total == 80
+    assert matched == 80
+    assert len(preview) == 50
+
+
+def test_long_follow_up_history_is_compacted_without_losing_recent_turns():
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn-{index} " + "x" * 6000}
+        for index in range(30)
+    ]
+    compacted = ResearchAgentRuntime._follow_up_messages(messages, max_recent=10, max_chars=12_000)
+    assert compacted[0]["role"] == "system"
+    assert "turn-0" in compacted[0]["content"]
+    assert "turn-29" in compacted[-1]["content"]
+    assert len(compacted) == 11
+    assert sum(len(item["content"]) for item in compacted) <= 12_000
+
+
+def test_restart_request_restarts_terminal_run_in_place_without_model_call(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="paper_search_download",
+        title="Peter B. Reich",
+        input_payload={"author": "Peter B. Reich", "limit": 20},
+        stages=[StageSpec("search", "Search", "tool"), StageSpec("deliver", "Deliver", "delivery")],
+    )
+    runtime.store.complete_stage(run["run_id"], "search", summary="Previous search")
+    runtime.store.complete_stage(run["run_id"], "deliver", summary="Previous delivery")
+    runtime.store.complete_run(run["run_id"], output_artifact_id="artifact_old")
+    submitted: list[str] = []
+    monkeypatch.setattr(runtime, "_submit", lambda run_id: submitted.append(run_id))
+    monkeypatch.setattr(runtime, "_direct_chat_request", lambda _payload: (_ for _ in ()).throw(AssertionError("restart must not call the model")))
+
+    result = runtime.continue_run_conversation(run["run_id"], {"content": "重来"})
+
+    assert submitted == [run["run_id"]]
+    assert result["agent_runtime"]["restart"] is True
+    assert result["run"]["run_id"] == run["run_id"]
+    assert result["run"]["status"] == "queued"
+    assert result["run"]["progress"] == 0
+    assert result["run"]["output_artifact_id"] == ""
+    assert [item["role"] for item in result["run"]["messages"]][-2:] == ["user", "assistant"]
+    assert "Peter B. Reich" in result["run"]["messages"][-1]["content"]
+
+
+def test_prepare_restart_resets_all_stage_state_but_keeps_audit_rows(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Restart me",
+        input_payload={"question": "Keep the original question"},
+        stages=[StageSpec("plan", "Plan", "planner"), StageSpec("deliver", "Deliver", "delivery")],
+    )
+    store.complete_stage(run["run_id"], "plan", summary="Done once", output={"kept": True})
+    store.fail_stage(run["run_id"], "deliver", RuntimeError("temporary"))
+    restarted = store.prepare_restart(run["run_id"])
+
+    assert restarted["status"] == "queued"
+    assert restarted["current_stage"] == "plan"
+    assert restarted["output_artifact_id"] == ""
+    assert all(stage["status"] == "pending" for stage in restarted["stages"])
+    assert all(stage["summary"] == "" and stage["error_message"] == "" for stage in restarted["stages"])
+
+
+def test_resume_keeps_partial_download_checkpoint_visible(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="",
+        workflow_type="paper_download_batch",
+        title="Partial downloads",
+        input_payload={"identifiers": ["10.1/a", "10.1/b", "10.1/c"]},
+        stages=[StageSpec("execute", "Download", "tool")],
+    )
+    store.begin_run(run["run_id"])
+    store.start_stage(run["run_id"], "execute")
+    store.update_stage_progress(
+        run["run_id"],
+        "execute",
+        fraction=0.66,
+        summary="Saved 2/3",
+        output={
+            "completed": 2,
+            "failed": 1,
+            "items": [
+                {"identifier": "10.1/a", "status": "completed", "files": ["a.pdf"]},
+                {"identifier": "10.1/b", "status": "failed", "error": "timeout"},
+                {"identifier": "10.1/c", "status": "completed", "files": ["c.pdf"]},
+            ],
+        },
+    )
+    store.recover_interrupted_runs()
+
+    paused = store.get_run(run["run_id"])
+    assert paused["status"] == "paused"
+    assert paused["stages"][0]["output"]["items"][0]["files"] == ["a.pdf"]
+
+    resumed = store.prepare_resume(run["run_id"])
+    assert resumed["status"] == "queued"
+    assert resumed["stages"][0]["output"]["completed"] == 2
+
+
+def test_research_run_follow_ups_reuse_the_same_persistent_pi_session(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="linked-library",
+        workflow_type="pdf_to_ppt",
+        title="Deck from paper",
+        input_payload={"question": "Create a deck"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    observed_sessions: list[str | None] = []
+    observed_notebooks: list[str] = []
+
+    def fake_complete(request, *, task_mode=None, session_id=None, active_run_id=""):
+        observed_sessions.append(session_id)
+        observed_notebooks.append(request.notebook_id)
+        assert active_run_id == run["run_id"]
+        return (
+            f"Pi reply {len(observed_sessions)}",
+            {"total_tokens": 4},
+            {
+                "harness": "pi-agent-sdk",
+                "task_mode": task_mode,
+                "tool_calls": [],
+                "session": {
+                    "session_id": session_id,
+                    "session_file": "persistent.jsonl",
+                    "resumed": len(observed_sessions) > 1,
+                },
+                "compactions": [],
+                "compatibility_fallback": False,
+                "compatibility_error": "",
+            },
+        )
+
+    monkeypatch.setattr(runtime, "_complete_with_pi", fake_complete)
+
+    first = runtime.continue_run_conversation(run["run_id"], {"content": "Explain slide 3."})
+    second = runtime.continue_run_conversation(run["run_id"], {"content": "Now shorten it."})
+
+    expected_session = f"research-run-{run['run_id']}"
+    assert observed_sessions == [expected_session, expected_session]
+    assert observed_notebooks == ["linked-library", "linked-library"]
+    assert first["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert second["agent_runtime"]["session"]["resumed"] is True
+    assert [item["role"] for item in second["run"]["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        "ask",
+        "literature_review",
+        "deep_research",
+        "novelty_check",
+        "research_idea",
+        "ppt_outline",
+        "writing",
+        "writing_task",
+        "paper_download",
+        "paper_download_batch",
+        "paper_search_download",
+        "pdf_to_ppt",
+    ],
+)
+def test_multiple_feedback_turns_stay_in_one_run_for_every_workflow(tmp_path: Path, monkeypatch, workflow: str):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    payload = {"question": "原始任务", "author": "Peter B. Reich", "limit": 20, "identifiers": ["10.1/example"]}
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type=workflow,
+        title="Multi-turn task",
+        input_payload=payload,
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    observed_sessions: list[str | None] = []
+
+    def fake_complete(_request, *, task_mode=None, session_id=None, active_run_id=""):
+        observed_sessions.append(session_id)
+        assert active_run_id == run["run_id"]
+        return (
+            f"Reply {len(observed_sessions)} for {workflow}",
+            {"total_tokens": 4},
+            {"harness": "pi-agent-sdk", "task_mode": task_mode, "session": {"session_id": session_id}},
+        )
+
+    monkeypatch.setattr(runtime, "_complete_with_pi", fake_complete)
+
+    first = runtime.continue_run_conversation(run["run_id"], {"content": "第一轮反馈"})
+    second = runtime.continue_run_conversation(run["run_id"], {"content": "第二轮反馈"})
+
+    assert first["run"]["run_id"] == second["run"]["run_id"] == run["run_id"]
+    assert observed_sessions == [f"research-run-{run['run_id']}"] * 2
+    assert [item["content"] for item in second["run"]["messages"] if item["role"] == "user"] == [
+        "第一轮反馈",
+        "第二轮反馈",
+    ]
+    assert [item["role"] for item in second["run"]["messages"]] == ["user", "assistant", "user", "assistant"]
+
+
+def test_research_run_cancel_aborts_the_active_pi_session(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Cancelable Pi task",
+        input_payload={"question": "Find evidence"},
+        stages=_stages(),
+    )
+    runtime.store.begin_run(run["run_id"])
+    cancelled: list[bool] = []
+
+    class ActivePi:
+        def cancel(self):
+            cancelled.append(True)
+            return True
+
+    with runtime._active_pi_lock:
+        runtime._active_pi_clients[run["run_id"]] = ActivePi()
+
+    updated = runtime.cancel(run["run_id"])
+
+    assert cancelled == [True]
+    assert updated["cancel_requested"] is True
 
 
 def test_research_run_archive_restore_and_delete_are_persistent(tmp_path: Path):

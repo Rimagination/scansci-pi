@@ -10,13 +10,35 @@ from typing import Any
 from .app_update import APP_VERSION
 
 
+_PACKAGED_BUILD_INFO_KEYS = {
+    "version",
+    "build_id",
+    "built_at",
+    "commit",
+    "package_profile",
+    "runtime_manifest_url",
+    "cache_key",
+    "source_tree_sha256",
+    "release_source_sha256",
+}
+
+
 def current_build_info() -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parent
+    source_root = package_root.parent
     payload: dict[str, Any] = {
         "version": APP_VERSION,
         "build_id": "source",
         "built_at": "",
         "frozen": bool(getattr(sys, "frozen", False)),
         "executable": Path(sys.executable).name,
+        # The loopback health endpoint exposes this on purpose: it lets a
+        # preview, a diagnostic bundle, and the release gate prove which copy
+        # of ScanSci is actually serving the UI.  A version string alone does
+        # not distinguish two editable checkouts of the same version.
+        "package_root": str(package_root),
+        "runtime_kind": "packaged" if getattr(sys, "frozen", False) else "source",
+        "source_root": str(source_root) if not getattr(sys, "frozen", False) else "",
     }
     candidates = [
         Path(__file__).with_name("build-info.json"),
@@ -30,6 +52,12 @@ def current_build_info() -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(stored, dict):
-            payload.update({str(key): value for key, value in stored.items() if key in {"version", "build_id", "built_at", "commit"}})
+            payload.update(
+                {
+                    str(key): value
+                    for key, value in stored.items()
+                    if key in _PACKAGED_BUILD_INFO_KEYS
+                }
+            )
             break
     return payload

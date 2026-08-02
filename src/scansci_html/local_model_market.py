@@ -14,9 +14,10 @@ import re
 from typing import Any, Iterable
 from urllib import parse, request
 
+from .model_downloads import ModelInstallManager, download_snapshot
+
 
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_DEFAULT_ROOT = Path(r"F:\AI\Models")
 _CURATED = (
     {"id": "Qwen/Qwen2.5-1.5B-Instruct", "name": "Qwen2.5 1.5B Instruct", "kind": "chat", "size_hint": "约 3 GB", "description": "轻量中文对话，适合 CPU 或入门显卡。"},
     {"id": "Qwen/Qwen2.5-3B-Instruct", "name": "Qwen2.5 3B Instruct", "kind": "chat", "size_hint": "约 6 GB", "description": "本地中文通用对话的平衡选择。"},
@@ -27,9 +28,15 @@ _CURATED = (
 
 
 def model_root() -> Path:
-    """Return the preferred install location, retaining the existing default."""
+    """Return a writable per-user install location on every desktop."""
+
     configured = os.getenv("SCANSCI_MODEL_ROOT", "").strip()
-    return Path(configured) if configured else _DEFAULT_ROOT
+    if configured:
+        return Path(configured)
+    local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "ScanSci" / "models"
+    return Path.home() / ".scansci" / "models"
 
 
 def _env_paths(name: str) -> Iterable[Path]:
@@ -204,12 +211,27 @@ def _merge_catalog(rows: Any, installed: dict[str, dict[str, Any]], query: str) 
 def download_model(repo_id: str) -> dict[str, Any]:
     clean = str(repo_id or "").strip()
     if not _MODEL_ID.fullmatch(clean):
-        raise ValueError("Hugging Face 模型标识必须采用组织/模型名格式")
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise RuntimeError("缺少 huggingface_hub，无法下载模型") from exc
+        raise ValueError("模型标识必须采用“组织/模型名”格式")
     cache = hub_cache_root()
     cache.mkdir(parents=True, exist_ok=True)
-    path = snapshot_download(repo_id=clean, cache_dir=str(cache))
-    return {"ok": True, "id": clean, "path": str(path), "installed": next((item for item in installed_models() if item["id"] == clean), None)}
+    result = download_snapshot(clean, cache_root=cache, source="auto")
+    return {
+        **result,
+        "installed": next((item for item in installed_models() if item["id"] == clean), None),
+    }
+
+
+def create_install_manager() -> ModelInstallManager:
+    """Create the non-blocking installer used by the desktop API."""
+
+    def ready(model_id: str) -> bool:
+        return any(
+            str(item.get("id", "")).casefold() == str(model_id).casefold()
+            and bool(item.get("ready"))
+            for item in installed_models()
+        )
+
+    return ModelInstallManager(
+        cache_root=hub_cache_root(),
+        ready_checker=ready,
+    )

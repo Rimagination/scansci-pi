@@ -3,8 +3,14 @@ import sqlite3
 
 import pytest
 
-from scansci_html.evidence_store import index_evidence_library
+import scansci_html.retrieval as retrieval
+from scansci_html.evidence_store import build_library_overview, index_evidence_library
 from scansci_html.retrieval import search_evidence_store
+from scansci_html.vector_index import (
+    load_embedding_cache_rows,
+    prewarm_embedding_cache,
+    vector_cache_status,
+)
 
 
 def test_search_evidence_store_returns_reranked_sentence_hits_with_routes(tmp_path: Path):
@@ -368,3 +374,381 @@ def test_default_local_embeddings_are_cached_with_sqlite_vec(tmp_path: Path):
     assert second_trace[-1]["dense_backend"] == "sqlite-vec"
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("select count(*) from scansci_vector_cache_meta").fetchone()[0] == 1
+
+
+def test_stable_local_neural_provider_reuses_sqlite_vec_cache(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/neural-cache'><h1>Neural cache</h1>"
+        "<p>Clinical agent evidence is grounded in patient records.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+
+    class StableProvider:
+        dimensions = 2
+        cache_key = "sentence-transformers:test-model"
+
+        def __init__(self):
+            self.document_batches = 0
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            self.document_batches += 1
+            return [[1.0, 0.0] for _text in texts]
+
+    provider = StableProvider()
+    first_trace = []
+    search_evidence_store(db_path, "clinical evidence", embedding_provider=provider, trace=first_trace)
+    second_trace = []
+    search_evidence_store(db_path, "clinical evidence", embedding_provider=provider, trace=second_trace)
+    filtered_trace = []
+    filtered = search_evidence_store(
+        db_path,
+        "clinical evidence",
+        embedding_provider=provider,
+        filters={"doc_ids": ["10.1234_neural-cache"]},
+        trace=filtered_trace,
+    )
+
+    assert provider.document_batches == 1
+    assert first_trace[-1]["dense_backend"] == "sqlite-vec"
+    assert second_trace[-1]["dense_backend"] == "sqlite-vec"
+    assert filtered_trace[-1]["dense_backend"] == "sqlite-vec"
+    assert filtered[0]["doc_id"] == "10.1234_neural-cache"
+    with sqlite3.connect(db_path) as connection:
+        providers = {
+            row[0]
+            for row in connection.execute("select distinct provider from scansci_vector_cache_meta")
+        }
+    assert providers == {"sentence-transformers:test-model"}
+
+
+def test_prewarm_embedding_cache_cancels_after_committed_batch_and_resumes(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/resume'><h1>Resume cache</h1>"
+        "<p>First scientific evidence sentence. Second scientific evidence sentence. "
+        "Third scientific evidence sentence.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    rows = load_embedding_cache_rows(db_path)
+
+    class StableProvider:
+        dimensions = 2
+        cache_key = "sentence-transformers:resume-test"
+
+        def __init__(self):
+            self.document_sizes = []
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            self.document_sizes.append(len(texts))
+            return [[1.0, 0.0] for _text in texts]
+
+    completed = 0
+    first_provider = StableProvider()
+
+    def progress(done, _total):
+        nonlocal completed
+        completed = done
+
+    first = prewarm_embedding_cache(
+        db_path,
+        rows,
+        provider=first_provider,
+        cache_batch_size=2,
+        progress_callback=progress,
+        cancel_requested=lambda: completed >= 2,
+    )
+    assert first["cancelled"] is True
+    assert first["completed"] == 2
+    assert first_provider.document_sizes == [2]
+
+    second_provider = StableProvider()
+    second = prewarm_embedding_cache(db_path, rows, provider=second_provider, cache_batch_size=2)
+    assert second["cancelled"] is False
+    assert second["completed"] == 3
+    assert second["cached"] == 2
+    assert second_provider.document_sizes == [1]
+
+
+def test_vector_cache_status_counts_only_the_requested_model(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/status'><h1>Status</h1>"
+        "<p>One complete evidence sentence.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    rows = load_embedding_cache_rows(db_path)
+
+    class Provider:
+        dimensions = 2
+
+        def __init__(self, cache_key):
+            self.cache_key = cache_key
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            return [[1.0, 0.0] for _text in texts]
+
+    prewarm_embedding_cache(db_path, rows, provider=Provider("sentence-transformers:old"))
+    before = vector_cache_status(
+        db_path,
+        provider="sentence-transformers:new",
+        dimensions=2,
+    )
+    prewarm_embedding_cache(db_path, rows, provider=Provider("sentence-transformers:new"))
+    after = vector_cache_status(
+        db_path,
+        provider="sentence-transformers:new",
+        dimensions=2,
+    )
+
+    assert before["cached_vectors"] == 0
+    assert before["other_cached_vectors"] == 1
+    assert before["migration_required"] is True
+    assert after["cached_vectors"] == 1
+    assert after["other_cached_vectors"] == 1
+    assert after["ready"] is True
+    assert after["progress"] == 1.0
+
+
+def test_vector_generation_reuses_unchanged_rows_and_switches_after_validation(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/generation'><h1>Generation</h1>"
+        "<p>First stable evidence sentence. Second evidence sentence changes later.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+
+    class Provider:
+        dimensions = 2
+        cache_key = "sentence-transformers:generation-test"
+
+        def __init__(self):
+            self.document_texts = []
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            self.document_texts.extend(texts)
+            return [[1.0, 0.0] for _text in texts]
+
+    first_provider = Provider()
+    first_rows = load_embedding_cache_rows(db_path)
+    first = prewarm_embedding_cache(db_path, first_rows, provider=first_provider)
+    assert first["ready"] is True
+    assert len(first_provider.document_texts) == 2
+
+    changed_id = sorted(first_rows)[1]
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "update evidence_spans set text = ? where evidence_id = ?",
+            ("Second evidence sentence now contains revised findings.", changed_id),
+        )
+        connection.commit()
+
+    second_provider = Provider()
+    second_rows = load_embedding_cache_rows(db_path)
+    second = prewarm_embedding_cache(db_path, second_rows, provider=second_provider)
+    status = vector_cache_status(
+        db_path,
+        provider=Provider.cache_key,
+        dimensions=Provider.dimensions,
+    )
+
+    assert second["ready"] is True
+    assert second["embedded"] == 1
+    assert second["reused"] == 1
+    assert second_provider.document_texts == ["Second evidence sentence now contains revised findings."]
+    assert status["ready"] is True
+    assert status["serving_stale"] is False
+    with sqlite3.connect(db_path) as connection:
+        states = [
+            row[0]
+            for row in connection.execute(
+                """
+                select state from scansci_vector_index_generations
+                where logical_provider = ?
+                order by created_at
+                """,
+                (Provider.cache_key,),
+            )
+        ]
+    assert states == ["retired", "active"]
+
+
+def test_vector_generation_rejects_invalid_document_vectors_without_replacing_active(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/invalid-vector'><h1>Invalid vector</h1>"
+        "<p>Evidence must not activate an invalid vector generation.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    rows = load_embedding_cache_rows(db_path)
+
+    class InvalidProvider:
+        dimensions = 2
+        cache_key = "sentence-transformers:invalid-vector-test"
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            return [[0.0, 0.0] for _text in texts]
+
+    with pytest.raises(RuntimeError, match="向量缓存不可用"):
+        prewarm_embedding_cache(db_path, rows, provider=InvalidProvider())
+
+    status = vector_cache_status(
+        db_path,
+        provider=InvalidProvider.cache_key,
+        dimensions=InvalidProvider.dimensions,
+    )
+    assert status["ready"] is False
+    assert status["state"] == "failed"
+    assert status["active_generation_id"] == ""
+
+
+def test_search_evidence_store_adds_adjacent_answer_sentence_before_reranking(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/neighbor'><h1>Neighbor recall</h1>"
+        "<p>The study identifies fine-grained language representations. "
+        "They include grammatical relationships, parts of speech, and higher-order syntax.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+
+    class LeadOnlyProvider:
+        dimensions = 2
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            return [[1.0, 0.0] if "identifies" in text else [0.0, 1.0] for text in texts]
+
+    hits = search_evidence_store(
+        db_path,
+        "which fine-grained language properties does the study identify",
+        limit=2,
+        initial_limit=1,
+        per_document_limit=0,
+        embedding_provider=LeadOnlyProvider(),
+    )
+
+    assert len(hits) == 2
+    assert "grammatical relationships" in hits[1]["text"]
+    assert "neighbor-context" in hits[1]["routes"]
+    assert hits[1]["neighbor_of"] == [hits[0]["evidence_id"]]
+
+
+def test_search_evidence_store_uses_document_cards_before_bounded_raw_evidence_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "target.html").write_text(
+        "<article class='paper' data-doi='10.1234/card-target'><h1>Language Cortex</h1>"
+        "<h2>Results</h2><p>Language cortex activity increased after treatment.</p></article>",
+        encoding="utf-8",
+    )
+    (library / "other.html").write_text(
+        "<article class='paper' data-doi='10.1234/card-other'><h1>Fermentation</h1>"
+        "<h2>Results</h2><p>Fungal biomass increased after treatment.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    build_library_overview(db_path)
+
+    def reject_full_corpus_load(_db_path):
+        raise AssertionError("document-card retrieval must not load every evidence span")
+
+    monkeypatch.setattr(retrieval, "_load_evidence_spans", reject_full_corpus_load)
+    trace: list[dict[str, object]] = []
+    hits = search_evidence_store(
+        db_path,
+        "language cortex activity",
+        limit=1,
+        trace=trace,
+    )
+
+    assert [hit["evidence_id"] for hit in hits] == ["10.1234_card-target.s0001"]
+    assert trace[0]["stage"] == "document_card_recall"
+    assert trace[-1]["strategy"] == "document-card-first"
+    assert trace[-1]["catalog_documents"] == 2
+    assert trace[-1]["catalog_selected_documents"] >= 1
+
+
+def test_document_card_semantic_cache_routes_to_source_anchors(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "flora.html").write_text(
+        "<article data-doi='10.1234/flora'><h1>Vegetation outcome</h1><h2>Results</h2>"
+        "<p>Plant richness increased after grazing maintained the understory.</p></article>",
+        encoding="utf-8",
+    )
+    (library / "wind.html").write_text(
+        "<article data-doi='10.1234/wind'><h1>Wind outcome</h1><h2>Results</h2>"
+        "<p>Bird nesting varied with turbine spacing.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    build_library_overview(db_path)
+
+    class CardSemanticProvider:
+        dimensions = 2
+        cache_key = "test:card-semantic"
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            return [[1.0, 0.0] if "Vegetation" in text else [0.0, 1.0] for text in texts]
+
+    trace: list[dict[str, object]] = []
+    hits = search_evidence_store(
+        db_path,
+        "canopy response",
+        limit=1,
+        embedding_provider=CardSemanticProvider(),
+        trace=trace,
+    )
+
+    assert hits[0]["doc_id"] == "10.1234_flora"
+    card_trace = next(item for item in trace if item["stage"] == "document_card_recall")
+    assert "document-card-dense" in card_trace["top_documents"][0]["routes"]
+    assert any(item["stage"] == "lazy_graph_neighborhood" for item in trace)

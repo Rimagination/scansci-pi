@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from threading import Thread
 import time
@@ -15,6 +16,7 @@ from typing import Any
 from .app_update import AppUpdateService
 from .app_settings import load_settings
 from .llm import warm_managed_gateway_connection
+from .local_evidence_runtime import default_vector_cache_identity
 from .pi_agent import PiAgentClient
 from .webapp import create_notebook_server
 from .build_info import current_build_info
@@ -248,6 +250,51 @@ class ScanSciDesktopApi:
         )
         return [str(path) for path in list(result or [])]
 
+    @staticmethod
+    def _existing_local_path(raw_path: str) -> Path:
+        """Resolve a path supplied by a trusted local artifact record."""
+
+        path = Path(str(raw_path or "")).expanduser()
+        if not str(path).strip():
+            raise FileNotFoundError("缺少本地文件路径")
+        resolved = path.resolve(strict=True)
+        if resolved == Path(resolved.anchor):
+            raise ValueError("不能直接打开磁盘根目录")
+        return resolved
+
+    def open_local_path(self, raw_path: str) -> dict[str, Any]:
+        """Open a generated file or folder with the Windows default app."""
+
+        try:
+            target = self._existing_local_path(raw_path)
+            if os.name == "nt":
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+            return {"ok": True, "path": str(target), "kind": "folder" if target.is_dir() else "file"}
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return {"ok": False, "message": str(error)}
+
+    def reveal_local_path(self, raw_path: str) -> dict[str, Any]:
+        """Reveal a generated file in Explorer, or open the folder itself."""
+
+        try:
+            target = self._existing_local_path(raw_path)
+            if os.name == "nt":
+                if target.is_dir():
+                    os.startfile(str(target))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["explorer.exe", f"/select,{target}"])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
+            return {"ok": True, "path": str(target)}
+        except (FileNotFoundError, OSError, ValueError) as error:
+            return {"ok": False, "message": str(error)}
+
     def choose_presentation_sources(self) -> list[str]:
         """Pick source material for a standalone document-to-slides task."""
 
@@ -391,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
     default_workspace, default_evidence_db = _default_desktop_paths()
     parser.add_argument("--workspace", default=str(default_workspace), help="Path to the Notebook workspace SQLite store.")
     parser.add_argument("--evidence-db", default=str(default_evidence_db), help="Path to the SQLite evidence store.")
-    parser.add_argument("--title", default="搜索科学 Pi", help="Window title.")
+    parser.add_argument("--title", default="ScanSci | 搜索科学", help="Window title.")
     parser.add_argument(
         "--update-manifest-url",
         default=None,
@@ -464,6 +511,7 @@ def desktop_diagnostics(workspace: str | Path, evidence_db: str | Path) -> dict[
         pi_runtime = PiAgentClient.runtime_status()
     except Exception as error:
         pi_runtime = {"ready": False, "error": f"{type(error).__name__}: {error}"[:500]}
+    vector_identity = default_vector_cache_identity()
     report = {
         "ok": all(assets.values()) and all(modules.values()) and bool(pi_runtime.get("ready")),
         "build": current_build_info(),
@@ -472,7 +520,11 @@ def desktop_diagnostics(workspace: str | Path, evidence_db: str | Path) -> dict[
         "module_errors": module_errors,
         "pi_runtime": pi_runtime,
         "telemetry": diagnostics_summary(workspace_path),
-        "vector_cache": vector_cache_status(evidence_path),
+        "vector_cache": vector_cache_status(
+            evidence_path,
+            provider=str(vector_identity["provider"]),
+            dimensions=int(vector_identity["dimensions"]),
+        ),
     }
     return report
 

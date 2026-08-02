@@ -26,19 +26,79 @@ _MAX_PROMPT_EVIDENCE_ROWS = 30
 _MAX_PROMPT_QUOTE_BYTES = 900
 
 
+def _review_query_variant_budget(topic: str, section: dict[str, Any], query: str) -> int:
+    """Spend multi-query recall only on questions likely to need it.
+
+    Review planning already emits up to two section-specific searches.  A
+    second expansion inside every search adds latency and off-topic evidence
+    to simple factual sections, while comparisons and mechanism questions
+    benefit from the extra phrasing.
+    """
+
+    combined = " ".join(
+        str(value or "").strip()
+        for value in (topic, section.get("title", ""), section.get("objective", ""), query)
+    ).casefold()
+    complexity_cues = (
+        "compare",
+        "comparison",
+        "difference",
+        "mechanism",
+        "relationship",
+        "limitation",
+        "trade-off",
+        "versus",
+        " vs ",
+        "比较",
+        "对比",
+        "差异",
+        "机制",
+        "关系",
+        "局限",
+        "边界",
+        "为什么",
+        "如何",
+    )
+    if len(combined) >= 120 or any(cue in combined for cue in complexity_cues):
+        return 2
+    return 1
+
+
+def _normalize_writing_brief(value: dict[str, Any] | None) -> dict[str, str]:
+    """Keep presentation preferences bounded and separate from evidence rules."""
+
+    raw = dict(value or {})
+    audience = str(raw.get("audience", "researcher")).strip().lower()
+    tone = str(raw.get("tone", "academic")).strip().lower()
+    length = str(raw.get("length", "standard")).strip().lower()
+    return {
+        "audience": audience if audience in {"researcher", "general", "student"} else "researcher",
+        "tone": tone if tone in {"academic", "concise", "teaching"} else "academic",
+        "length": length if length in {"short", "standard", "long"} else "standard",
+        "focus": re.sub(r"\s+", " ", str(raw.get("focus", "")).strip())[:300],
+    }
+
+
 def retrieve_review_evidence(
     db_path: str | Path,
     question: str,
     *,
     chat_client: ChatJsonClient,
     limit: int = 14,
+    embedding_provider: Any | None = None,
+    reranker: Any | None = None,
+    retrieval_runtime: dict[str, Any] | None = None,
+    source_doc_ids: list[str] | None = None,
+    writing_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Plan a review and retrieve evidence independently for every section."""
 
     topic = str(question or "").strip()
     if not topic:
         raise ValueError("question is required")
-    plan = plan_literature_review(topic, chat_client=chat_client)
+    selected_doc_ids = list(dict.fromkeys(str(item).strip() for item in list(source_doc_ids or []) if str(item).strip()))
+    brief = _normalize_writing_brief(writing_brief)
+    plan = plan_literature_review(topic, chat_client=chat_client, writing_brief=brief)
     global_evidence: list[dict[str, Any]] = []
     evidence_index: dict[tuple[str, str], str] = {}
     section_results: list[dict[str, Any]] = []
@@ -49,6 +109,7 @@ def retrieve_review_evidence(
         section_citations: list[str] = []
         query_traces: list[dict[str, Any]] = []
         for query in list(section["queries"])[:_MAX_QUERIES_PER_SECTION]:
+            query_variant_budget = _review_query_variant_budget(topic, section, query)
             result = answer_question(
                 db_path,
                 query,
@@ -58,12 +119,15 @@ def retrieve_review_evidence(
                 min_documents=1,
                 adequacy_profile="manual",
                 agentic_profile="custom",
-                query_variants=2,
+                query_variants=query_variant_budget,
                 max_followup_queries=1,
                 paper_recall_limit=0,
                 per_document_limit=3,
                 answer_provider="local",
                 verification_provider="local",
+                embedding_provider=embedding_provider,
+                reranker=reranker,
+                filters={"doc_ids": selected_doc_ids} if selected_doc_ids else None,
             )
             added = 0
             for row in list(result.get("evidence_table", []) or []):
@@ -89,6 +153,7 @@ def retrieve_review_evidence(
                     "new_evidence_count": added,
                     "document_count": int(dict(result.get("adequacy", {}) or {}).get("document_count", 0) or 0),
                     "retrieval_queries": list(result.get("retrieval_queries", []) or []),
+                    "query_variant_budget": query_variant_budget,
                 }
             )
         section_results.append(
@@ -122,13 +187,30 @@ def retrieve_review_evidence(
         "retrieval_summary": {
             "section_count": len(section_results),
             "query_count": sum(len(section["query_traces"]) for section in section_results),
+            "expanded_query_count": sum(
+                int(trace.get("query_variant_budget", 1) or 1)
+                for section in section_results
+                for trace in section["query_traces"]
+            ),
             "evidence_count": len(global_evidence),
             "document_count": document_count,
         },
+        "retrieval_runtime": dict(retrieval_runtime or {}),
+        "source_scope": {
+            "mode": "selected" if selected_doc_ids else "all_notebook_sources",
+            "doc_ids": selected_doc_ids,
+            "document_count": len(selected_doc_ids) if selected_doc_ids else document_count,
+        },
+        "writing_brief": brief,
     }
 
 
-def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dict[str, Any]:
+def plan_literature_review(
+    question: str,
+    *,
+    chat_client: ChatJsonClient,
+    writing_brief: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Ask the writing model for a bounded outline and section search queries."""
 
     # This common three-paper comparison has an explicit user-supplied
@@ -155,7 +237,10 @@ def plan_literature_review(question: str, *, chat_client: ChatJsonClient) -> dic
         },
         {
             "role": "user",
-            "content": json.dumps({"review_question": question}, ensure_ascii=False),
+            "content": json.dumps(
+                {"review_question": question, "writing_brief": _normalize_writing_brief(writing_brief)},
+                ensure_ascii=False,
+            ),
         },
     ]
     try:
@@ -305,6 +390,7 @@ def synthesize_literature_review(
     question = str(research.get("question", "")).strip()
     plan = dict(research.get("review_plan", {}) or {})
     evidence = [dict(row) for row in list(research.get("evidence", []) or [])]
+    writing_brief = _normalize_writing_brief(dict(research.get("writing_brief", {}) or {}))
     all_known_ids = {str(row.get("citation_id", "")) for row in evidence if str(row.get("citation_id", ""))}
     if not question or not plan.get("sections") or len(all_known_ids) < 3:
         raise ValueError("综述检索结果不完整，无法进入写作阶段")
@@ -316,8 +402,22 @@ def synthesize_literature_review(
         prompt_plan,
         prompt_evidence,
         chat_client=chat_client,
+        writing_brief=writing_brief,
     )
-    document = _normalize_review_document(question, plan, raw, known_ids=known_ids)
+    delivered_section_ids = {
+        str(section.get("id", ""))
+        for section in list(raw.get("sections", []) or [])
+        if str(section.get("id", ""))
+    }
+    normalization_plan = {
+        **plan,
+        "sections": [
+            section
+            for section in list(plan.get("sections", []) or [])
+            if str(dict(section).get("id", "")) in delivered_section_ids
+        ],
+    }
+    document = _normalize_review_document(question, normalization_plan, raw, known_ids=known_ids)
     document, references = _compact_document_citations(
         document,
         evidence,
@@ -377,6 +477,10 @@ def synthesize_literature_review(
         "evidence_table": references,
         "retrieval_summary": dict(research.get("retrieval_summary", {}) or {}),
         "section_results": list(research.get("section_results", []) or []),
+        "writing_runtime": dict(raw.get("writing_runtime", {}) or {}),
+        "retrieval_runtime": dict(research.get("retrieval_runtime", {}) or {}),
+        "source_scope": dict(research.get("source_scope", {}) or {}),
+        "writing_brief": writing_brief,
     }
 
 
@@ -386,6 +490,7 @@ def _synthesize_review_in_parts(
     evidence: list[dict[str, str]],
     *,
     chat_client: ChatJsonClient,
+    writing_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fall back to bounded section calls when one deeply nested JSON fails."""
 
@@ -393,6 +498,8 @@ def _synthesize_review_in_parts(
     sections: list[dict[str, Any]] = []
     fallback_titles: list[str] = []
     coverage_gap_titles: list[str] = []
+    skipped_section_titles: list[str] = []
+    model_section_titles: list[str] = []
     text_completion = getattr(chat_client, "complete_text", None)
     for planned in list(plan.get("sections", []) or []):
         citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
@@ -414,6 +521,7 @@ def _synthesize_review_in_parts(
                 dict(planned),
                 section_evidence,
                 chat_client=chat_client,
+                writing_brief=writing_brief,
             )
         except ValueError:
             # A model-supplied citation outside the current whitelist is never
@@ -422,6 +530,7 @@ def _synthesize_review_in_parts(
             raw_section = {}
         except Exception:  # provider transport/schema failures use grounded fallback
             raw_section = {}
+        model_written = bool(raw_section)
         if _is_transformer_bert_gpt3_comparison(question):
             literal_section = _deterministic_grounded_review_section(
                 question,
@@ -430,6 +539,7 @@ def _synthesize_review_in_parts(
             )
             if literal_section:
                 raw_section = literal_section
+                model_written = False
         if not raw_section:
             fallback_titles.append(str(planned.get("title", "")))
             raw_section = _deterministic_grounded_review_section(
@@ -464,10 +574,8 @@ def _synthesize_review_in_parts(
             if deterministic_section:
                 raw_section = deterministic_section
         if not raw_section:
-            raise ValueError(
-                f"当前带锚点证据不足以支持章节“{planned.get('title', '')}”，"
-                "已停止写作，避免给证据空白附上误导性引用。"
-            )
+            skipped_section_titles.append(str(planned.get("title", "")))
+            continue
         raw_section, coverage_complete = _supplement_review_section_coverage(
             question,
             dict(planned),
@@ -495,17 +603,21 @@ def _synthesize_review_in_parts(
                 for subject in required_subjects
                 if not _subject_is_present(subject, str(raw_section.get("text", "")))
             ]
-            raise ValueError(
-                f"章节“{planned.get('title', '')}”没有覆盖全部指定比较对象"
-                f"（缺少：{'、'.join(missing_subjects)}），已停止写作，避免用偏题证据代替主体比较"
+            skipped_section_titles.append(
+                f"{planned.get('title', '')}（缺少：{'、'.join(missing_subjects)}）"
             )
+            continue
         if not coverage_complete:
             coverage_gap_titles.append(str(planned.get("title", "")))
-        paragraph = _normalized_cited_text(
-            raw_section,
-            known_ids=set(citation_ids),
-            field=f"章节“{planned.get('title', '')}”",
-        )
+        try:
+            paragraph = _normalized_cited_text(
+                raw_section,
+                known_ids=set(citation_ids),
+                field=f"章节“{planned.get('title', '')}”",
+            )
+        except ValueError:
+            skipped_section_titles.append(str(planned.get("title", "")))
+            continue
         if not _review_text_is_readable(str(paragraph.get("text", ""))):
             deterministic_section = _deterministic_grounded_review_section(
                 question,
@@ -513,24 +625,39 @@ def _synthesize_review_in_parts(
                 section_evidence,
             )
             if not deterministic_section:
-                raise ValueError(
-                    f"章节“{planned.get('title', '')}”的模型输出出现乱码或异常重复，已停止交付"
+                skipped_section_titles.append(str(planned.get("title", "")))
+                continue
+            model_written = False
+            try:
+                paragraph = _normalized_cited_text(
+                    deterministic_section,
+                    known_ids=set(citation_ids),
+                    field=f"章节“{planned.get('title', '')}”",
                 )
-            paragraph = _normalized_cited_text(
-                deterministic_section,
-                known_ids=set(citation_ids),
-                field=f"章节“{planned.get('title', '')}”",
-            )
+            except ValueError:
+                skipped_section_titles.append(str(planned.get("title", "")))
+                continue
         if re.search(r"[\u3400-\u9fff]", question):
             chinese_characters = len(re.findall(r"[\u3400-\u9fff]", str(paragraph.get("text", ""))))
             if chinese_characters < 45:
-                raise ValueError("中文综述写作模型暂时不可用，请稍后重试；系统不会把英文摘录伪装成中文综述")
+                skipped_section_titles.append(str(planned.get("title", "")))
+                continue
         sections.append(
             {
                 "id": str(planned.get("id", "")),
                 "title": str(planned.get("title", "")),
                 **paragraph,
             }
+        )
+        if model_written:
+            model_section_titles.append(str(planned.get("title", "")))
+
+    if len(sections) < 2:
+        if re.search(r"[\u3400-\u9fff]", question):
+            raise ValueError("中文综述写作模型暂时不可用，请稍后重试；系统不会把英文摘录伪装成中文综述")
+        raise ValueError(
+            "当前带锚点证据不足以形成至少两个受支持章节；"
+            "已停止写作，避免给证据空白附上误导性引用。"
         )
 
     sections, uncovered_documents = _supplement_review_source_coverage(
@@ -559,7 +686,24 @@ def _synthesize_review_in_parts(
             "这些来源不计入综述充分性。"
         )
         overview["limitations"] = limitations
-    return {**dict(overview), "sections": sections}
+    if skipped_section_titles:
+        limitations = list(overview.get("limitations", []) or [])
+        limitations.append(
+            f"计划章节“{'、'.join(skipped_section_titles)}”未通过严格证据校验，已从正文移除。"
+        )
+        overview["limitations"] = limitations
+    return {
+        **dict(overview),
+        "sections": sections,
+        "writing_runtime": {
+            "model_section_count": len(model_section_titles),
+            "model_sections": model_section_titles,
+            "fallback_section_count": len(fallback_titles),
+            "fallback_sections": fallback_titles,
+            "skipped_section_count": len(skipped_section_titles),
+            "skipped_sections": skipped_section_titles,
+        },
+    }
 
 
 def _synthesize_structured_review_section(
@@ -568,6 +712,7 @@ def _synthesize_structured_review_section(
     evidence: list[dict[str, str]],
     *,
     chat_client: ChatJsonClient,
+    writing_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate one concise cited paragraph with one bounded model request."""
 
@@ -584,18 +729,26 @@ def _synthesize_structured_review_section(
     if not evidence_rows:
         raise ValueError("review section has no evidence")
     required_subjects = _required_review_subjects(question, planned)
+    brief = _normalize_writing_brief(writing_brief)
+    length_ranges = {"short": "80 到 140", "standard": "120 到 240", "long": "220 到 380"}
+    audience_labels = {"researcher": "科研人员", "general": "跨学科读者", "student": "研究生"}
+    tone_labels = {"academic": "严谨学术", "concise": "简洁直接", "teaching": "解释清楚"}
     messages = [
         {
             "role": "system",
             "content": (
                 "你是证据约束的中文文献综述写作者。只使用给定 exact_quote 直接支持的事实，"
-                "围绕指定章节写一个 100 到 220 字的连贯中文段落。必须明确写出章节讨论的模型或方法名称；"
+                f"围绕指定章节写一个 {length_ranges[brief['length']]} 字的连贯中文段落。"
+                f"目标读者是{audience_labels[brief['audience']]}，采用{tone_labels[brief['tone']]}的表达。"
+                "写作偏好只影响表述，绝不能降低证据约束。必须明确写出章节讨论的模型或方法名称；"
                 "比较并行路线时不得改写成先后替代关系。不得引入外部知识、因果推断或证据中没有的评价。"
                 "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
                 "若证据指标是人类识别机器文本的准确率，必须明确写出识别者和识别任务，不得改写成模型生成准确率。"
                 "如果输入给出 required_subjects，正文必须逐一明确讨论其中每个对象；聚焦比较这些对象，不要用 T5、ELMo 或 OpenAI GPT 等旁支模型替代。"
-                "citation_ids 只能使用输入中的编号，并应覆盖段落全部实质性陈述。"
-                "返回 JSON：{text, citation_ids:[...]}。"
+                "把段落拆成若干完整句子；长篇模式优先写出比较、分歧和适用边界，而不是重复摘录。"
+                "每个句子的 citation_ids 只能使用输入中的编号，且只列直接支持该句的证据。"
+                "禁止把多句话共用的引用统一堆在段落末尾。"
+                "返回 JSON：{sentences:[{text, citation_ids:[...]}]}。"
             ),
         },
         {
@@ -608,6 +761,7 @@ def _synthesize_structured_review_section(
                         "objective": str(planned.get("objective", "")),
                         "required_subjects": required_subjects,
                     },
+                    "writing_brief": brief,
                     "evidence": evidence_rows,
                 },
                 ensure_ascii=False,
@@ -617,6 +771,17 @@ def _synthesize_structured_review_section(
     raw = chat_client.complete_json(messages, schema_name="literature_review_section") or {}
     known_ids = {str(row["citation_id"]) for row in evidence_rows}
     paragraph = _normalized_cited_text(raw, known_ids=known_ids, field=f"章节“{planned.get('title', '')}”")
+    cleaned_sentences: list[dict[str, Any]] = []
+    for sentence in _cited_sentence_items(paragraph):
+        sentence_text = _strip_review_excerpt_artifacts(
+            _strip_unrequested_model_detours(question, planned, str(sentence.get("text", "")))
+        )
+        if sentence_text and (
+            len(required_subjects) < 2
+            or _claim_addresses_review_section({"text": sentence_text}, planned)
+        ):
+            cleaned_sentences.append({**sentence, "text": sentence_text})
+    paragraph = _cited_text_from_sentences(cleaned_sentences)
     text = str(paragraph.get("text", "")).strip()
     if re.search(r"[\u3400-\u9fff]", question):
         chinese_characters = len(re.findall(r"[\u3400-\u9fff]", text))
@@ -624,29 +789,23 @@ def _synthesize_structured_review_section(
             raise ValueError("review section is not a substantive Chinese paragraph")
     if not _claim_addresses_review_section({"text": text}, planned):
         raise ValueError("review section does not address its planned subject")
-    text = _strip_review_excerpt_artifacts(_strip_unrequested_model_detours(question, planned, text))
     if not _review_text_is_readable(text):
         raise ValueError("review section contains corrupted or repetitive text")
-    required_subjects = _required_review_subjects(question, planned)
-    if len(required_subjects) >= 2:
-        parts = [
-            item.strip()
-            for item in re.split(r"(?<=[。！？!?])\s*|(?<=\.)\s+", text)
-            if item.strip()
-        ]
-        text = " ".join(
-            item for item in parts if _claim_addresses_review_section({"text": item}, planned)
-        ).strip()
     if not text:
         raise ValueError("review comparison section contains only unrelated model detours")
-    paragraph["text"] = text
     quote_text_by_id = {
         str(row["citation_id"]): str(row["exact_quote"])
         for row in evidence_rows
     }
-    if not _semantic_cues_are_grounded(
-        {"text": text, "quote_ids": list(paragraph.get("citation_ids", []) or [])},
-        quote_text_by_id,
+    if not all(
+        _semantic_cues_are_grounded(
+            {
+                "text": str(sentence.get("text", "")),
+                "quote_ids": list(sentence.get("citation_ids", []) or []),
+            },
+            quote_text_by_id,
+        )
+        for sentence in _cited_sentence_items(paragraph)
     ):
         raise ValueError("review section adds unsupported semantic claims")
     return paragraph
@@ -720,18 +879,19 @@ def _synthesize_verified_review_section(
                     translated = ""
                 if translated:
                     claim["text"] = translated
-    citation_ids = list(
-        dict.fromkeys(
-            str(quote_id)
-            for claim in supported
-            for quote_id in list(claim.get("quote_ids", []) or [])
-            if str(quote_id)
-        )
+    return _cited_text_from_sentences(
+        [
+            {
+                "text": _sentence_text(str(item.get("text", "")), chinese=True),
+                "citation_ids": [
+                    str(quote_id)
+                    for quote_id in list(item.get("quote_ids", []) or [])
+                    if str(quote_id)
+                ],
+            }
+            for item in supported
+        ]
     )
-    return {
-        "text": "".join(_sentence_text(str(item.get("text", "")), chinese=True) for item in supported),
-        "citation_ids": citation_ids,
-    }
 
 
 def _diverse_section_citation_ids(
@@ -985,22 +1145,7 @@ def _supplement_review_section_coverage(
         extension_text = str(extension.get("text", "")).strip()
         original_text = str(raw_section.get("text", "")).strip()
         if extension_text and extension_text.casefold() not in original_text.casefold():
-            raw_section = {
-                **raw_section,
-                "text": " ".join(item for item in (original_text, extension_text) if item),
-                "citation_ids": list(
-                    dict.fromkeys(
-                        [
-                            *citations,
-                            *[
-                                str(item)
-                                for item in list(extension.get("citation_ids", []) or [])
-                                if str(item) in evidence_by_id
-                            ],
-                        ]
-                    )
-                ),
-            }
+            raw_section = _merge_cited_texts(raw_section, extension)
     final_documents = {
         _review_document_key(evidence_by_id[citation_id])
         for citation_id in list(raw_section.get("citation_ids", []) or [])
@@ -1083,7 +1228,12 @@ def _synthesize_plain_review_section(
         quote_text_by_id,
     ):
         return {}
-    return {"text": text, "citation_ids": citation_ids}
+    return _cited_text_from_sentences(
+        [
+            {"text": sentence, "citation_ids": citation_ids}
+            for sentence in _split_review_sentences(text)
+        ]
+    )
 
 
 def _supplement_review_subject_coverage(
@@ -1100,7 +1250,6 @@ def _supplement_review_subject_coverage(
     if not required or _review_subject_coverage_complete(question, planned, str(raw_section.get("text", ""))):
         return raw_section, True
     text = str(raw_section.get("text", "")).strip()
-    citations = [str(item) for item in list(raw_section.get("citation_ids", []) or []) if str(item)]
     for subject in required:
         if _subject_is_present(subject, text):
             continue
@@ -1145,12 +1294,19 @@ def _supplement_review_subject_coverage(
         extension_text = str(extension.get("text", "")).strip()
         if extension_text and not _subject_is_present(subject, extension_text):
             extension_text = f"{subject}：{extension_text}"
-            extension = {**extension, "text": extension_text}
+            sentence_items = _cited_sentence_items(extension)
+            if sentence_items:
+                sentence_items[0] = {
+                    **sentence_items[0],
+                    "text": f"{subject}：{sentence_items[0].get('text', '')}",
+                }
+                extension = _cited_text_from_sentences(sentence_items)
+            else:
+                extension = {**extension, "text": extension_text}
         if not extension_text or not _subject_is_present(subject, extension_text):
             continue
-        text = " ".join(item for item in (text, extension_text) if item)
-        citations.extend(str(item) for item in list(extension.get("citation_ids", []) or []) if str(item))
-    raw_section = {**raw_section, "text": text, "citation_ids": list(dict.fromkeys(citations))}
+        raw_section = _merge_cited_texts(raw_section, extension)
+        text = str(raw_section.get("text", "")).strip()
     return raw_section, _review_subject_coverage_complete(question, planned, text)
 
 
@@ -1161,20 +1317,19 @@ def _deterministic_grounded_review_section(
 ) -> dict[str, Any]:
     """Build a concise Chinese fallback only from recognized source cues."""
 
-    sentences: list[str] = []
-    citation_ids: list[str] = []
+    sentences: list[dict[str, Any]] = []
     for subject in _required_review_subjects(question, planned):
         subject_evidence = [row for row in evidence if _evidence_matches_review_subject(subject, row)]
         grounded = _deterministic_grounded_subject_sentence(subject, planned, subject_evidence)
         text = str(grounded.get("text", "")).strip()
         if not text:
             continue
-        sentences.append(text)
-        citation_ids.extend(str(item) for item in grounded.get("citation_ids", []) if str(item))
-    output = " ".join(sentences).strip()
+        sentences.extend(_cited_sentence_items(grounded))
+    result = _cited_text_from_sentences(sentences)
+    output = str(result.get("text", "")).strip()
     if not output or not _review_text_is_readable(output):
         return {}
-    return {"text": output, "citation_ids": list(dict.fromkeys(citation_ids))}
+    return result
 
 
 def _deterministic_grounded_subject_sentence(
@@ -1291,7 +1446,12 @@ def _deterministic_grounded_subject_sentence(
                 )
         literal_text = " ".join(literal_sentences).strip()
         if literal_text and _review_text_is_readable(literal_text):
-            return {"text": literal_text, "citation_ids": list(dict.fromkeys(literal_citations))}
+            return _cited_text_from_sentences(
+                [
+                    {"text": text, "citation_ids": [citation_id]}
+                    for text, citation_id in zip(literal_sentences, literal_citations)
+                ]
+            )
 
     for row in ranked:
         citation_id = str(row.get("citation_id", ""))
@@ -1338,7 +1498,7 @@ def _deterministic_grounded_subject_sentence(
             elif re.search(r"\bgpt-?3\b", folded) and any(cue in folded for cue in ("175b", "parameters", "model capacity")):
                 text = "GPT-3 论文比较了多个参数规模，并将完整模型扩展到 1750 亿参数；实验同时报告不同规模下的零样本、单样本与少样本表现。"
         if text and _review_text_is_readable(text):
-            return {"text": text, "citation_ids": [citation_id]}
+            return _cited_text_from_sentences([{"text": text, "citation_ids": [citation_id]}])
     return {}
 
 
@@ -1400,15 +1560,7 @@ def _supplement_review_source_coverage(
         extension_text = str(extension.get("text", "")).strip()
         original_text = str(section.get("text", "")).strip()
         if extension_text and extension_text.casefold() not in original_text.casefold():
-            section["text"] = " ".join(item for item in (original_text, extension_text) if item)
-        section["citation_ids"] = list(
-            dict.fromkeys(
-                [
-                    *[str(item) for item in list(section.get("citation_ids", []) or []) if str(item)],
-                    *[str(item) for item in list(extension.get("citation_ids", []) or []) if str(item)],
-                ]
-            )
-        )
+            sections[index] = {**section, **_merge_cited_texts(section, extension)}
         used_documents.add(document)
     remaining = [item for item in available_documents if item not in used_documents]
     return sections, remaining
@@ -1848,8 +2000,7 @@ def _direct_evidence_section(
             used_sentences.add(normalized_sentence)
             if len(selected) >= max_items:
                 break
-    output_sentences: list[str] = []
-    output_citations: list[str] = []
+    output_sentences: list[dict[str, Any]] = []
     for citation_id, sentence in selected:
         sentence = re.sub(r"^\d+(?:\.\d+)*\s+(?:Conclusion|Fine-tuning BERT)\s+", "", sentence, flags=re.I)
         sentence = re.sub(r"\bself-\s+attention\b", "self-attention", sentence, flags=re.I)
@@ -1885,14 +2036,19 @@ def _direct_evidence_section(
         candidate = {"text": sentence, "citation_ids": [citation_id]}
         if not _claim_addresses_review_section(candidate, planned):
             continue
-        output_sentences.append(_sentence_text(sentence, chinese=bool(re.search(r"[\u3400-\u9fff]", question))))
-        output_citations.append(citation_id)
+        output_sentences.append(
+            {
+                "text": _sentence_text(sentence, chinese=bool(re.search(r"[\u3400-\u9fff]", question))),
+                "citation_ids": [citation_id],
+            }
+        )
     if not output_sentences:
         return {}
-    output_text = " ".join(output_sentences)
+    result = _cited_text_from_sentences(output_sentences)
+    output_text = str(result.get("text", ""))
     if not _review_text_is_readable(output_text):
         return {}
-    return {"text": output_text, "citation_ids": output_citations}
+    return result
 
 
 def _sentence_text(value: str, *, chinese: bool) -> str:
@@ -1920,44 +2076,55 @@ def _deterministic_review_overview(
         )
     )
     abstract_parts = [
-        (
-            _first_review_sentence(str(section.get("text", ""))),
-            [str(item) for item in list(section.get("citation_ids", []) or []) if str(item)],
-        )
+        _cited_sentence_items(section)[0]
         for section in sections
-        if str(section.get("text", "")).strip()
+        if _cited_sentence_items(section)
     ]
-    selected_abstract_parts: list[str] = []
+    selected_abstract_parts: list[dict[str, Any]] = []
     selected_abstract_keys: set[str] = set()
-    abstract_citation_ids: list[str] = []
-    for item, item_citation_ids in abstract_parts:
-        sentence = _sentence_text(item, chinese=True)
+    for item in abstract_parts:
+        sentence = _sentence_text(str(item.get("text", "")), chinese=True)
         sentence_key = re.sub(r"\s+", "", sentence).casefold()
         if not sentence_key or sentence_key in selected_abstract_keys:
             continue
-        candidate = " ".join([*selected_abstract_parts, sentence])
+        candidate = " ".join(
+            [*[str(part.get("text", "")) for part in selected_abstract_parts], sentence]
+        )
         if len(candidate) <= 420:
-            selected_abstract_parts.append(sentence)
+            selected_abstract_parts.append({**item, "text": sentence})
             selected_abstract_keys.add(sentence_key)
-            abstract_citation_ids.extend(item_citation_ids)
-    abstract_text = " ".join(selected_abstract_parts) or "当前资料库已形成带引用的分章节证据摘要。"
-    abstract_citation_ids = list(dict.fromkeys(abstract_citation_ids)) or citation_ids[:1]
-    rows = [
-        {
-            "cells": [
-                str(section.get("title", "")),
-                str(dict(planned).get("objective", "")),
-                str(section.get("text", "")),
-                "结论范围受当前资料库与带锚点证据覆盖限制。",
-            ],
-            "citation_ids": list(section.get("citation_ids", []) or []),
-        }
-        for section, planned in zip(sections[:3], list(plan.get("sections", []) or [])[:3])
-    ]
+    abstract = _cited_text_from_sentences(selected_abstract_parts)
+    if not abstract.get("text"):
+        abstract = _cited_text_from_sentences(
+            [
+                {
+                    "text": "当前资料库已形成带引用的分章节证据摘要。",
+                    "citation_ids": citation_ids[:1],
+                }
+            ]
+        )
+    planned_by_id = {
+        str(dict(planned).get("id", "")): dict(planned)
+        for planned in list(plan.get("sections", []) or [])
+    }
+    rows = []
+    for section in sections[:3]:
+        planned = planned_by_id.get(str(section.get("id", "")), {})
+        rows.append(
+            {
+                "cells": [
+                    str(section.get("title", "")),
+                    str(planned.get("objective", "")),
+                    str(section.get("text", "")),
+                    "结论范围受当前资料库与带锚点证据覆盖限制。",
+                ],
+                "citation_ids": list(section.get("citation_ids", []) or []),
+            }
+        )
     question_ids = citation_ids[-2:] or citation_ids[:1]
     return {
         "title": str(plan.get("title", "")).strip() or question,
-        "abstract": {"text": abstract_text, "citation_ids": abstract_citation_ids},
+        "abstract": abstract,
         "comparison_table": {
             "columns": ["研究主题", "综合目标", "主要发现", "证据边界"],
             "rows": rows,
@@ -2172,11 +2339,95 @@ def _normalize_review_document(
 def _normalized_cited_text(value: object, *, known_ids: set[str], field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field}必须包含正文和 citation_ids")
-    text = _strip_inline_citation_markers(str(value.get("text", "")))
-    citation_ids = _validated_citation_ids(value.get("citation_ids"), known_ids=known_ids, field=field)
+    raw_sentences = value.get("sentences") if isinstance(value.get("sentences"), list) else []
+    sentences: list[dict[str, Any]] = []
+    if raw_sentences:
+        for index, raw_sentence in enumerate(raw_sentences, start=1):
+            if not isinstance(raw_sentence, dict):
+                raise ValueError(f"{field}第 {index} 句必须包含正文和 citation_ids")
+            sentence_text = _strip_inline_citation_markers(str(raw_sentence.get("text", "")))
+            sentence_ids = _validated_citation_ids(
+                raw_sentence.get("citation_ids"),
+                known_ids=known_ids,
+                field=f"{field}第 {index} 句",
+            )
+            if not sentence_text:
+                raise ValueError(f"{field}第 {index} 句正文为空")
+            sentences.append({"text": sentence_text, "citation_ids": sentence_ids})
+    else:
+        text = _strip_inline_citation_markers(str(value.get("text", "")))
+        citation_ids = _validated_citation_ids(value.get("citation_ids"), known_ids=known_ids, field=field)
+        if not text:
+            raise ValueError(f"{field}正文为空")
+        # Backward compatibility for older providers and persisted artifacts.
+        # Their citations were paragraph-scoped, so retain that support scope on
+        # every sentence instead of inventing a narrower source assignment.
+        sentences = [
+            {"text": sentence, "citation_ids": list(citation_ids)}
+            for sentence in _split_review_sentences(text)
+        ]
+    return _cited_text_from_sentences(sentences)
+
+
+def _split_review_sentences(value: str) -> list[str]:
+    """Split review prose at real sentence boundaries, preserving decimals."""
+
+    text = " ".join(str(value or "").split()).strip()
     if not text:
-        raise ValueError(f"{field}正文为空")
-    return {"text": text, "citation_ids": citation_ids}
+        return []
+    parts = [
+        item.strip()
+        for item in re.split(r"(?<=[。！？!?])\s*|(?<=\.)(?=\s+[A-Z\u3400-\u9fff])", text)
+        if item.strip()
+    ]
+    return parts or [text]
+
+
+def _cited_text_from_sentences(sentences: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized: list[dict[str, Any]] = []
+    citation_ids: list[str] = []
+    for sentence in sentences:
+        text = " ".join(str(sentence.get("text", "")).split()).strip()
+        ids = list(
+            dict.fromkeys(
+                str(item)
+                for item in list(sentence.get("citation_ids", []) or [])
+                if str(item)
+            )
+        )
+        if not text or not ids:
+            continue
+        normalized.append({"text": text, "citation_ids": ids})
+        citation_ids.extend(ids)
+    return {
+        "text": " ".join(sentence["text"] for sentence in normalized),
+        "citation_ids": list(dict.fromkeys(citation_ids)),
+        "sentences": normalized,
+    }
+
+
+def _cited_sentence_items(value: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_sentences = value.get("sentences") if isinstance(value.get("sentences"), list) else []
+    if raw_sentences:
+        return [dict(item) for item in raw_sentences if isinstance(item, dict)]
+    ids = [str(item) for item in list(value.get("citation_ids", []) or []) if str(item)]
+    return [
+        {"text": sentence, "citation_ids": list(ids)}
+        for sentence in _split_review_sentences(str(value.get("text", "")))
+    ]
+
+
+def _merge_cited_texts(*values: dict[str, Any]) -> dict[str, Any]:
+    sentences: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        for sentence in _cited_sentence_items(value):
+            key = re.sub(r"\s+", "", str(sentence.get("text", ""))).casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            sentences.append(sentence)
+    return _cited_text_from_sentences(sentences)
 
 
 def _strip_inline_citation_markers(value: str) -> str:
@@ -2256,10 +2507,12 @@ def _document_citation_order(document: dict[str, Any]) -> list[str]:
     items.extend(list(document.get("open_questions", []) or []))
     items.extend(list(dict(document.get("comparison_table", {}) or {}).get("rows", []) or []))
     for item in items:
-        for citation_id in list(dict(item).get("citation_ids", []) or []):
-            value = str(citation_id)
-            if value not in ordered:
-                ordered.append(value)
+        units = _cited_sentence_items(dict(item)) if dict(item).get("text") else [dict(item)]
+        for unit in units:
+            for citation_id in list(unit.get("citation_ids", []) or []):
+                value = str(citation_id)
+                if value not in ordered:
+                    ordered.append(value)
     return ordered
 
 
@@ -2272,6 +2525,8 @@ def _remap_document_citations(document: dict[str, Any], mapping: dict[str, str])
     targets.extend(document["comparison_table"]["rows"])
     for target in targets:
         target["citation_ids"] = [mapping[str(item)] for item in target["citation_ids"]]
+        for sentence in list(target.get("sentences", []) or []):
+            sentence["citation_ids"] = [mapping[str(item)] for item in sentence["citation_ids"]]
 
 
 def _review_reader_answer(document: dict[str, Any], references: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2281,7 +2536,12 @@ def _review_reader_answer(document: dict[str, Any], references: list[dict[str, A
         source_items.extend(section["paragraphs"])
     source_items.extend(document["controversies"])
     source_items.extend(document["open_questions"])
-    for index, item in enumerate(source_items, start=1):
+    sentence_items = [
+        sentence
+        for item in source_items
+        for sentence in _cited_sentence_items(item)
+    ]
+    for index, item in enumerate(sentence_items, start=1):
         ids = list(item.get("citation_ids", []) or [])
         text = str(item.get("text", ""))
         sentences.append(
@@ -2305,12 +2565,17 @@ def _review_reader_answer(document: dict[str, Any], references: list[dict[str, A
 
 
 def _verify_review_document(document: dict[str, Any], references: list[dict[str, Any]]) -> dict[str, Any]:
-    items: list[dict[str, Any]] = [document["abstract"]]
+    prose_items: list[dict[str, Any]] = [document["abstract"]]
     for section in document["sections"]:
-        items.extend(section["paragraphs"])
+        prose_items.extend(section["paragraphs"])
+    prose_items.extend(document["controversies"])
+    prose_items.extend(document["open_questions"])
+    items = [
+        sentence
+        for item in prose_items
+        for sentence in _cited_sentence_items(item)
+    ]
     items.extend(document["comparison_table"]["rows"])
-    items.extend(document["controversies"])
-    items.extend(document["open_questions"])
     uncited = [index + 1 for index, item in enumerate(items) if not item.get("citation_ids")]
     gap_markers = (
         "当前带锚点证据不足",
@@ -2368,6 +2633,7 @@ def _normalize_evidence_row(value: object) -> dict[str, Any]:
         "context_text": str(row.get("context_text", "")),
         "html_path": str(row.get("html_path", "")),
         "html_anchor": str(row.get("html_anchor", "")),
+        "original_url": str(row.get("original_url", "")),
         "confidence": row.get("confidence", 0.0),
     }
 

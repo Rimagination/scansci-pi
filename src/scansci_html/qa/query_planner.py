@@ -522,6 +522,9 @@ TERM_EXPANSIONS = {
 }
 
 PHRASE_TRANSLATIONS = [
+    ("光伏", ["photovoltaic", "solar photovoltaic", "PV"]),
+    ("光伏发电", ["photovoltaic power generation", "solar photovoltaic", "PV"]),
+    ("光伏电站", ["photovoltaic power station", "solar farm", "PV plant"]),
     ("自注意力", ["self-attention", "attention"]),
     ("双向", ["bidirectional", "left", "right", "context"]),
     ("左侧上下文", ["left-to-right", "previous", "tokens", "causal"]),

@@ -1,0 +1,13 @@
+{
+  "name": "scansci-glm-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/**/*.test.js",
+    "check": "npx wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.31.0"
+  }
+}
+

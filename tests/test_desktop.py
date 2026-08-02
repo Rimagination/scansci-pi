@@ -114,6 +114,32 @@ def test_desktop_save_presentation_copy_uses_native_save_dialog(tmp_path: Path) 
     assert webview.window.dialog_calls[0]["save_filename"] == "Research deck.pptx"
 
 
+def test_desktop_local_artifact_bridge_opens_and_reveals_existing_file(monkeypatch, tmp_path: Path) -> None:
+    artifact = tmp_path / "paper.pdf"
+    artifact.write_bytes(b"%PDF-1.7")
+    opened: list[str] = []
+    revealed: list[list[str]] = []
+    monkeypatch.setattr(desktop.os, "name", "nt")
+    monkeypatch.setattr(desktop.os, "startfile", lambda path: opened.append(path), raising=False)
+    monkeypatch.setattr(desktop.subprocess, "Popen", lambda args: revealed.append(list(args)))
+    api = ScanSciDesktopApi(_FakeWindowModule())
+
+    opened_result = api.open_local_path(str(artifact))
+    revealed_result = api.reveal_local_path(str(artifact))
+
+    assert opened_result == {"ok": True, "path": str(artifact.resolve()), "kind": "file"}
+    assert revealed_result == {"ok": True, "path": str(artifact.resolve())}
+    assert opened == [str(artifact.resolve())]
+    assert revealed == [["explorer.exe", f"/select,{artifact.resolve()}"]]
+
+
+def test_desktop_local_artifact_bridge_rejects_missing_path(tmp_path: Path) -> None:
+    result = ScanSciDesktopApi(_FakeWindowModule()).open_local_path(str(tmp_path / "missing.pdf"))
+
+    assert result["ok"] is False
+    assert "missing.pdf" in result["message"]
+
+
 def test_desktop_titlebar_bridge_controls_the_native_window() -> None:
     webview = _FakeWindowModule()
     api = ScanSciDesktopApi(webview)

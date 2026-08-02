@@ -1,11 +1,20 @@
 import pytest
+import torch
+from types import SimpleNamespace
 
 from scansci_html.embeddings import (
     OpenAICompatibleEmbeddingProvider,
     SentenceTransformersEmbeddingProvider,
     build_embedding_provider,
 )
-from scansci_html.rerankers import CrossEncoderReranker, JinaReranker, LexicalReranker, build_reranker
+from scansci_html.rerankers import (
+    CrossEncoderReranker,
+    HybridPrefilterReranker,
+    JinaReranker,
+    LexicalReranker,
+    Qwen3Reranker,
+    build_reranker,
+)
 
 
 def test_build_embedding_provider_returns_local_hashing_provider():
@@ -48,6 +57,51 @@ def test_openai_compatible_embedding_provider_uses_configured_endpoint():
             30.0,
         )
     ]
+
+
+def test_openai_compatible_embedding_provider_rejects_mismatched_response():
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [1.0, 0.0]}]}
+
+    class FakeSession:
+        def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    provider = OpenAICompatibleEmbeddingProvider(
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="embed-model",
+        session=FakeSession(),
+    )
+
+    with pytest.raises(RuntimeError, match="1 vectors for a batch of 2"):
+        provider.embed_texts(["a", "b"])
+
+
+def test_openai_compatible_embedding_provider_rejects_oversized_input_before_network():
+    calls = 0
+
+    class FakeSession:
+        def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("network must not be called")
+
+    provider = OpenAICompatibleEmbeddingProvider(
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="embed-model",
+        session=FakeSession(),
+    )
+
+    with pytest.raises(ValueError, match="per-text character limit"):
+        provider.embed_texts(["x" * 100_001])
+
+    assert calls == 0
 
 
 def test_build_embedding_provider_requires_config_for_openai_compatible():
@@ -175,6 +229,36 @@ def test_build_reranker_returns_local_lexical_reranker():
     assert isinstance(build_reranker("local"), LexicalReranker)
 
 
+def test_hybrid_prefilter_preserves_dense_cross_language_hits_and_deduplicates_text():
+    reranker = HybridPrefilterReranker()
+    ranked = reranker.rerank(
+        "氮素如何影响植物生长？",
+        [
+            {
+                "evidence_id": "reference-a",
+                "text": "Reich PB, Peterson DW.",
+                "fts_score": 0.9,
+                "dense_score": 0.1,
+            },
+            {
+                "evidence_id": "answer-a",
+                "text": "Nitrogen availability increased plant growth across the fertility gradient.",
+                "fts_score": 0.0,
+                "dense_score": 0.92,
+            },
+            {
+                "evidence_id": "answer-duplicate",
+                "text": "Nitrogen availability increased plant growth across the fertility gradient.",
+                "fts_score": 0.0,
+                "dense_score": 0.91,
+            },
+        ],
+    )
+
+    assert [item["evidence_id"] for item in ranked] == ["answer-a", "reference-a"]
+    assert all("hybrid-prefilter" in item["routes"] for item in ranked)
+
+
 def test_cross_encoder_reranker_uses_model_scores_and_preserves_metadata():
     class FakeCrossEncoder:
         def predict(self, pairs, **kwargs):
@@ -280,6 +364,62 @@ def test_build_reranker_accepts_injected_jina_model():
 
     assert isinstance(reranker, JinaReranker)
     assert reranker.model_name == "jinaai/jina-reranker-v3"
+
+
+def test_qwen3_reranker_uses_yes_no_logits_instead_of_flat_cross_encoder_scores():
+    class FakeTokenizer:
+        def encode(self, _text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [1]
+
+        def convert_tokens_to_ids(self, token):
+            return {"yes": 3, "no": 4}[token]
+
+        def __call__(self, values, **_kwargs):
+            if isinstance(values, str):
+                return SimpleNamespace(input_ids=[self.convert_tokens_to_ids(values)])
+            return {
+                "input_ids": [
+                    [5] if "Beijing" in value else [6]
+                    for value in values
+                ]
+            }
+
+        def pad(self, payload, **_kwargs):
+            return {"input_ids": torch.tensor(payload["input_ids"], dtype=torch.long)}
+
+    class FakeModel:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.model = SimpleNamespace(norm=SimpleNamespace(weight=torch.ones(1)))
+
+        def __call__(self, *, input_ids):
+            logits = torch.zeros((len(input_ids), input_ids.shape[1], 8), dtype=torch.float32)
+            for index, row in enumerate(input_ids):
+                relevant = 5 in row.tolist()
+                logits[index, -1, 3] = 5.0 if relevant else 0.0
+                logits[index, -1, 4] = 0.0 if relevant else 5.0
+            return SimpleNamespace(logits=logits)
+
+    reranker = Qwen3Reranker(
+        tokenizer=FakeTokenizer(),
+        model=FakeModel(),
+        batch_size=2,
+        max_length=256,
+    )
+    ranked = reranker.rerank(
+        "What is the capital of China?",
+        [
+            {"evidence_id": "relevant", "text": "The capital is Beijing."},
+            {"evidence_id": "irrelevant", "text": "Gravity attracts bodies."},
+        ],
+    )
+
+    assert [row["evidence_id"] for row in ranked] == ["relevant", "irrelevant"]
+    assert ranked[0]["qwen3_score"] > 0.99
+    assert ranked[1]["qwen3_score"] < 0.01
+    assert ranked[0]["routes"] == ["qwen3-reranker"]
 
 
 def test_build_reranker_rejects_unknown_provider():

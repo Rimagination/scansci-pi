@@ -20,13 +20,16 @@ from scansci_html.literature_review import (
     _has_unrequested_model_detour,
     _required_review_subjects,
     _review_subject_coverage_complete,
+    _review_query_variant_budget,
     _review_text_is_readable,
     _strip_unrequested_model_detours,
     _semantic_cues_are_grounded,
     _subject_balanced_section_citation_ids,
     _strip_inline_citation_markers,
+    _synthesize_review_in_parts,
     _verify_review_document,
     plan_literature_review,
+    retrieve_review_evidence,
     synthesize_literature_review,
 )
 from scansci_html.research_agent import ResearchAgentRuntime
@@ -81,6 +84,63 @@ class FakeReviewClient:
             f"围绕{payload['section']['title']}，当前证据显示不同研究的对象、方法和结论需要结合证据边界综合解释；"
             "资料覆盖局限意味着不得将研究条件不同的发现直接合并成统一结论，也不能把资料库之外的推断写成已有证据。"
         )
+
+
+def test_review_query_expansion_is_conditional():
+    assert _review_query_variant_budget(
+        "What is the reported sample size?",
+        {"title": "Sample", "objective": "Report the sample size"},
+        "study sample size",
+    ) == 1
+    assert _review_query_variant_budget(
+        "比较两种 RAG 方法",
+        {"title": "机制差异", "objective": "比较检索和重排机制"},
+        "RAG retrieval reranking comparison",
+    ) == 2
+
+
+def test_review_retrieval_scopes_every_query_and_preserves_writing_brief(monkeypatch, tmp_path: Path):
+    calls: list[dict[str, object]] = []
+
+    def fake_answer(_db_path, query, **kwargs):
+        calls.append({"query": query, **kwargs})
+        index = len(calls)
+        return {
+            "evidence_table": [
+                {
+                    "evidence_id": f"paper-a.s{index}",
+                    "exact_quote": f"Grounded evidence {index}.",
+                    "doc_id": "paper-a" if index % 2 else "paper-b",
+                    "paper": "Paper A" if index % 2 else "Paper B",
+                    "section": "Results",
+                }
+            ],
+            "adequacy": {"document_count": 1},
+            "retrieval_queries": [query],
+        }
+
+    monkeypatch.setattr("scansci_html.literature_review.answer_question", fake_answer)
+    result = retrieve_review_evidence(
+        tmp_path / "evidence.sqlite",
+        "免疫治疗有哪些证据？",
+        chat_client=FakeReviewClient(),
+        source_doc_ids=["paper-a", "paper-b", "paper-a"],
+        writing_brief={"audience": "general", "tone": "teaching", "length": "long", "focus": "机制差异"},
+    )
+
+    assert calls
+    assert all(call["filters"] == {"doc_ids": ["paper-a", "paper-b"]} for call in calls)
+    assert result["source_scope"] == {
+        "mode": "selected",
+        "doc_ids": ["paper-a", "paper-b"],
+        "document_count": 2,
+    }
+    assert result["writing_brief"] == {
+        "audience": "general",
+        "tone": "teaching",
+        "length": "long",
+        "focus": "机制差异",
+    }
 
 
 def test_review_title_is_content_focused_instead_of_replaying_the_instruction():
@@ -145,6 +205,76 @@ def test_synthesis_builds_real_review_structure_and_compacts_citations():
     assert result["adequacy"]["is_sufficient"] is (
         result["adequacy"]["quote_count"] >= 3 and result["adequacy"]["document_count"] >= 2
     )
+
+
+def test_long_evidence_review_preserves_the_sentence_level_citation_contract():
+    research = _research_payload()
+    research["writing_brief"] = {"audience": "researcher", "tone": "academic", "length": "long"}
+
+    result = synthesize_literature_review(research, chat_client=FakeReviewClient())
+
+    assert result["writing_brief"]["length"] == "long"
+    assert result["citation_verification"]["passed"] is True
+    assert all(
+        sentence["citation_ids"]
+        for section in result["review_document"]["sections"]
+        for paragraph in section["paragraphs"]
+        for sentence in paragraph["sentences"]
+    )
+
+
+def test_evidence_review_is_scoped_to_the_local_knowledge_corpus():
+    """A NotebookLM-like evidence review must never silently add web evidence."""
+    assert ResearchAgentRuntime._workflow_task_mode("literature_review", {}) == "knowledge"
+
+
+def test_synthesis_preserves_external_source_links_without_a_local_reader():
+    research = _research_payload()
+    research["phase"] = "external_abstracts"
+    for index, row in enumerate(research["evidence"], start=1):
+        row["doc_id"] = f"external:run-1:{index}"
+        row["original_url"] = f"https://doi.org/10.1000/{index}"
+
+    result = synthesize_literature_review(
+        research,
+        chat_client=FakeReviewClient(),
+        reader_url_builder=None,
+    )
+
+    reference = result["review_document"]["references"][0]
+    assert reference["reader_url"] == ""
+    assert reference["original_url"].startswith("https://doi.org/10.1000/")
+
+
+def test_synthesis_preserves_sentence_level_citation_placement():
+    class SentenceCitationClient(FakeReviewClient):
+        def complete_json(self, messages, *, schema_name):
+            if schema_name == "literature_review_section":
+                payload = json.loads(messages[1]["content"])
+                citations = [item["citation_id"] for item in payload["evidence"]]
+                return {
+                    "sentences": [
+                        {
+                            "text": "当前证据描述了这一主题的研究对象、干预方法与具体评价设计，并保留了研究条件差异。",
+                            "citation_ids": [citations[0]],
+                        },
+                        {
+                            "text": "另一项证据界定了相应结论的适用范围、转化条件与外推边界，不能直接合并为统一结论。",
+                            "citation_ids": [citations[-1]],
+                        },
+                    ]
+                }
+            return super().complete_json(messages, schema_name=schema_name)
+
+    result = synthesize_literature_review(_research_payload(), chat_client=SentenceCitationClient())
+
+    paragraph = result["review_document"]["sections"][0]["paragraphs"][0]
+    assert len(paragraph["sentences"]) == 2
+    assert all(len(sentence["citation_ids"]) == 1 for sentence in paragraph["sentences"])
+    assert paragraph["sentences"][0]["citation_ids"] != paragraph["sentences"][1]["citation_ids"]
+    assert [sentence["text"] for sentence in result["reader_answer"]["sentences"][:2]] == [
+        sentence["text"] for sentence in result["review_document"]["abstract"]["sentences"][:2]
+    ]
 
 
 def test_synthesis_discards_hallucinated_citation_ids_before_safe_fallback():
@@ -222,6 +352,12 @@ def test_synthesis_compacts_large_evidence_before_calling_the_writer():
             return super().complete_json(messages, schema_name=schema_name)
 
     research = _research_payload()
+    research["writing_brief"] = {
+        "audience": "general",
+        "tone": "teaching",
+        "length": "long",
+        "focus": "解释机制差异",
+    }
     for row in research["evidence"]:
         row["exact_quote"] = "Very long exact evidence. " * 2000
         row["context_text"] = "Private parent context. " * 5000
@@ -234,6 +370,7 @@ def test_synthesis_compacts_large_evidence_before_calling_the_writer():
     assert len(body.encode("utf-8")) < 32_000
     assert "Private parent context" not in body
     assert "private/library" not in body
+    assert parsed["writing_brief"] == research["writing_brief"]
     assert all(len(item["exact_quote"].encode("utf-8")) <= 903 for item in parsed["evidence"])
 
 
@@ -387,16 +524,19 @@ def test_three_way_deterministic_fallback_stays_grounded_and_readable():
     evidence = [
         {
             "citation_id": "1",
+            "evidence_id": "doc-1.s1",
             "paper": "1706.03762",
             "exact_quote": "On the WMT 2014 task, the Transformer achieves 28.4 BLEU.",
         },
         {
             "citation_id": "2",
+            "evidence_id": "doc-2.s1",
             "paper": "1810.04805",
             "exact_quote": "BERT chooses a task-specific fine-tuning learning rate on the development set.",
         },
         {
             "citation_id": "3",
+            "evidence_id": "doc-3.s1",
             "paper": "2005.14165",
             "exact_quote": "GPT-3 Zero-shot, One-shot, and Few-shot results are reported for all tasks.",
         },
@@ -406,6 +546,7 @@ def test_three_way_deterministic_fallback_stays_grounded_and_readable():
 
     assert _review_subject_coverage_complete(question, planned, result["text"])
     assert result["citation_ids"] == ["1", "2", "3"]
+    assert [sentence["citation_ids"] for sentence in result["sentences"]] == [["1"], ["2"], ["3"]]
     assert "28.4" in result["text"]
     assert _review_text_is_readable(result["text"])
 
@@ -747,3 +888,89 @@ def test_three_retrieved_documents_require_three_cited_documents():
     assert result["adequacy"]["min_documents"] == 3
     assert result["adequacy"]["document_count"] == 3
     assert result["adequacy"]["is_sufficient"] is True
+
+
+def test_review_skips_one_unsupported_section_instead_of_discarding_supported_report() -> None:
+    class OfflineClient:
+        def complete_json(self, _messages, *, schema_name):
+            raise RuntimeError(f"offline: {schema_name}")
+
+        def complete_text(self, _messages, *, max_tokens=700):
+            raise RuntimeError(f"offline: {max_tokens}")
+
+    plan = {
+        "title": "Evidence-bounded RAG review",
+        "scope": "Only indexed evidence.",
+        "sections": [
+            {
+                "id": "benchmarks",
+                "title": "Performance benchmarks",
+                "objective": "Compare benchmark performance",
+                "citation_ids": ["1"],
+            },
+            {
+                "id": "limitations",
+                "title": "Citation reliability limitations",
+                "objective": "Identify citation limitations and factual risks",
+                "citation_ids": ["2"],
+            },
+            {
+                "id": "retrieval",
+                "title": "Retrieval architecture",
+                "objective": "Describe the retrieval architecture",
+                "citation_ids": ["3"],
+            },
+        ],
+    }
+    evidence = [
+        {
+            "citation_id": "1",
+            "doc_id": "doc-1",
+            "paper": "Architecture paper",
+            "evidence_id": "doc-1.s1",
+            "html_anchor": "s1",
+            "html_path": "doc-1.md",
+            "exact_quote": "The system combines a retriever with a language model for document-grounded generation.",
+        },
+        {
+            "citation_id": "2",
+            "doc_id": "doc-2",
+            "paper": "Reliability paper",
+            "evidence_id": "doc-2.s1",
+            "html_anchor": "s1",
+            "html_path": "doc-2.md",
+            "exact_quote": "A central limitation is citation hallucination and the risk of factual inaccuracy in generated reviews.",
+        },
+        {
+            "citation_id": "3",
+            "doc_id": "doc-3",
+            "paper": "Retrieval paper",
+            "evidence_id": "doc-3.s1",
+            "html_anchor": "s1",
+            "html_path": "doc-3.md",
+            "exact_quote": "The retrieval architecture indexes scientific documents and supplies selected passages to the generator.",
+        },
+    ]
+
+    result = _synthesize_review_in_parts(
+        "How reliable is RAG for scientific reviews?",
+        plan,
+        evidence,
+        chat_client=OfflineClient(),
+    )
+
+    assert [section["id"] for section in result["sections"]] == ["limitations", "retrieval"]
+    assert result["writing_runtime"]["skipped_sections"] == ["Performance benchmarks"]
+    assert "未通过严格证据校验" in result["limitations"][-1]
+
+    full = synthesize_literature_review(
+        {
+            "question": "How reliable is RAG for scientific reviews?",
+            "review_plan": plan,
+            "evidence": evidence,
+            "section_results": plan["sections"],
+            "retrieval_summary": {"section_count": 3, "document_count": 3, "evidence_count": 3},
+        },
+        chat_client=OfflineClient(),
+    )
+    assert [section["id"] for section in full["review_document"]["sections"]] == ["limitations", "retrieval"]

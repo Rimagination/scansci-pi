@@ -1,11 +1,14 @@
 .venv/
+venv/
 node_modules/
 .local/
 .env
 .env.*
 !.env.example
 __pycache__/
+*.py[cod]
 *.egg-info/
+src/*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -13,5 +16,66 @@ dist/
 build/
 coverage/
 *.log
+*.sqlite
+*.sqlite-*
 *.sqlite-shm
 *.sqlite-wal
+
+# Local worktrees and agent scratch
+.worktrees/
+worktrees/
+.codex_tmp/
+.codex-tmp/
+.agents/
+.tmp-*/
+tmp/
+tmp-*/
+tmp_*/
+
+# Large or local research artifacts
+external/
+models/
+downloaded-papers/
+html-papers/
+tmp-rag-eval/
+
+# Generated benchmark and release evidence
+bench/*.html
+bench/*.csv
+bench/*.jsonl
+!bench/real_library_gold_v1.jsonl
+bench/*.manifest.json
+bench/*.lock
+bench/*.partial.summary.json
+bench/*.partial.summary.md
+bench/*.chart.html
+releases/
+.scansci-diagnostics/
+
+# Local browser/runtime state
+agent-browser.json
+.scansci-browser-identity.json
+.scansci-notebook.json
+
+# Local ScanSci runtime state and evidence indexes
+.scansci/
+.scansci-library/
+.scansci-pi-agent/
+.pi-verification/
+evidence.libraries/
+
+# Browser and UI verification artifacts
+.playwright-cli/
+.zcode/
+
+# Generated installers, release candidates, and component bundles
+.release-candidate/
+internal-beta-releases/
+dist-components/
+output/
+b/
+
+# User downloads and one-off local validation outputs
+downloads/
+icon-no-white-border.png
+document.body.innerText.includes('warnings.warn')

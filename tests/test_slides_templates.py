@@ -7,7 +7,12 @@ import pytest
 
 from scansci_html import research_tools
 from scansci_html.research_tools import create_ppt_project
-from scansci_html.slides_templates import list_slide_templates, slide_template_asset
+from scansci_html.slides_templates import (
+    get_slide_template,
+    list_slide_templates,
+    resolve_slide_template_dir,
+    slide_template_asset,
+)
 from scansci_html.webapp import NotebookWebApp
 
 
@@ -48,6 +53,43 @@ design_tone: Professional and rigorous
     return root
 
 
+def _add_nsfc_template(root: Path) -> Path:
+    layouts = root / "templates" / "layouts"
+    index_path = layouts / "layouts_index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["nsfc_purple_semantic"] = {
+        "summary": "Purple semantic defense template.",
+        "keywords": ["nsfc", "defense"],
+    }
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    template = layouts / "nsfc_purple_semantic"
+    template.mkdir()
+    (template / "design_spec.md").write_text(
+        "---\ntemplate_id: nsfc_purple_semantic\ncanvas: ppt169\nmode: semantic\n---\n",
+        encoding="utf-8",
+    )
+    (template / "template_status.json").write_text(
+        json.dumps({"status": "production", "production_eligible": True}),
+        encoding="utf-8",
+    )
+    (template / "template.json").write_text(
+        json.dumps(
+            {
+                "display_name": "NSFC Purple Semantic",
+                "recommended_template_route": "semantic_named_slots",
+                "output_contract": "editable-native-pptx",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (template / "layouts.json").write_text('{"layouts":[]}', encoding="utf-8")
+    (template / "01_cover.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720"></svg>',
+        encoding="utf-8",
+    )
+    return template
+
+
 def test_active_easyslides_templates_expose_svg_previews(tmp_path: Path):
     root = _easy_slides_fixture(tmp_path)
 
@@ -82,6 +124,23 @@ def test_webapp_serves_template_catalog_and_preview(tmp_path: Path):
     assert preview_response.status == 200
     assert preview_response.content_type.startswith("image/svg+xml")
     assert preview_response.body.startswith(b"<svg")
+
+
+def test_nsfc_defense_is_the_public_id_for_the_installed_semantic_template(tmp_path: Path):
+    root = _easy_slides_fixture(tmp_path)
+    physical_template = _add_nsfc_template(root)
+
+    catalog = list_slide_templates(root)
+    nsfc = get_slide_template("nsfc_defense", root)
+    legacy = get_slide_template("nsfc_purple_semantic", root)
+
+    assert [item["id"] for item in catalog["templates"]] == ["academic_general", "nsfc_defense"]
+    assert nsfc["name"] == "NSFC 答辩"
+    assert nsfc["source_template_id"] == "nsfc_purple_semantic"
+    assert nsfc["generation_mode"] == "easyslides-semantic"
+    assert legacy["id"] == "nsfc_defense"
+    assert resolve_slide_template_dir("nsfc_defense", root) == physical_template.resolve()
+    assert slide_template_asset("nsfc_defense", "01_cover.svg", root).is_file()
 
 
 def test_create_ppt_project_installs_selected_easyslides_template(tmp_path: Path, monkeypatch):

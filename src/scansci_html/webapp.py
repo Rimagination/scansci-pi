@@ -8,6 +8,8 @@ JSON API backed by the existing SQLite workspace and evidence store.
 
 from __future__ import annotations
 
+import base64
+from copy import deepcopy
 from dataclasses import dataclass
 from html import escape as html_escape
 from http import HTTPStatus
@@ -17,25 +19,48 @@ import mimetypes
 from pathlib import Path
 import re
 import sqlite3
+from tempfile import TemporaryDirectory
+import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from uuid import uuid4
 import webbrowser
 
 from .app_settings import (
+    get_provider_api_key,
     load_settings,
     local_model_presets,
     provider_presets,
     save_settings,
+    set_notion_api_token,
     set_document_service_api_key,
     set_provider_api_key,
 )
 from .app_update import AppUpdateService
 from .build_info import current_build_info
+from .deep_research_evidence import task_evidence_reader_path
 from .image_attachments import attachment_asset
 from .ingestion import ingest_sources, ingestion_source_path, ingestion_source_text
-from .library_manager import connect_local_zotero, import_library_files, import_library_folder, register_zotero_library
-from .local_model_market import download_model, installed_models, market_catalog
+from .library_manager import (
+    connect_local_zotero,
+    import_library_files,
+    import_library_folder,
+    index_zotero_attachments,
+    notebook_evidence_db,
+    register_zotero_library,
+)
+from .knowledge_connectors import connector_catalog, test_connector
+from .notion_integration import sync_notion_library, test_notion_connection
+from .local_evidence_runtime import (
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    DEFAULT_LOCAL_RERANKER_MODEL,
+    default_vector_cache_identity,
+)
+from .local_model_market import create_install_manager, installed_models, market_catalog
+from .local_runtime_component import LocalRuntimeComponent
 from .mcp_marketplace import install_marketplace_server, marketplace_catalog, sync_official_registry
+from .pi_agent import PiAgentClient
 from .research_agent import ResearchAgentRuntime
 from .research_tools import (
     analyze_references,
@@ -55,7 +80,15 @@ from .slides_templates import list_slide_templates, slide_template_asset
 from .slide_studio import save_browser_rendered_deck
 from .telemetry import diagnostic_span, diagnostics_summary, export_diagnostics_bundle
 from .vector_index import vector_cache_status
-from .workspace import add_note_to_notebook, initialize_notebook, load_workspace_summary, record_citation_audit
+from .workspace import (
+    add_note_to_notebook,
+    delete_notebook,
+    initialize_notebook,
+    load_workspace_summary,
+    record_citation_audit,
+    set_notebook_root_path,
+    update_notebook_metadata,
+)
 
 
 # Pasted images are capped at 10 MiB and presentation sources at 30 MiB after
@@ -63,6 +96,67 @@ from .workspace import add_note_to_notebook, initialize_notebook, load_workspace
 # per-file validation runs.
 _MAX_REQUEST_BYTES = 170 * 1024 * 1024
 _ASSET_DIR = Path(__file__).with_name("web")
+_DEFAULT_CONTENT_SECURITY_POLICY = (
+    "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; "
+    "style-src 'self'; script-src 'self'; worker-src 'self' blob:; object-src 'none'; "
+    "base-uri 'self'; frame-ancestors 'none'"
+)
+_EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY = (
+    "default-src 'self' data: blob:; connect-src 'none'; img-src 'self' data: blob:; "
+    "style-src 'self' 'unsafe-inline'; script-src 'none'; object-src 'none'; "
+    "base-uri 'self'; frame-ancestors 'self'"
+)
+
+_EVIDENCE_READER_PALETTES = {
+    ("light", "jade"): {"highlight": "#caff4d", "ink": "#17210b", "surface": "#ffffff", "text": "#242b20"},
+    ("light", "ocean"): {"highlight": "#8eeeff", "ink": "#06242b", "surface": "#ffffff", "text": "#1d292c"},
+    ("light", "plum"): {"highlight": "#e7bdff", "ink": "#2d1237", "surface": "#ffffff", "text": "#2b242e"},
+    ("light", "amber"): {"highlight": "#ffe66a", "ink": "#2b2100", "surface": "#ffffff", "text": "#302916"},
+    ("dark", "jade"): {"highlight": "#b9ef45", "ink": "#162005", "surface": "#171a18", "text": "#edf1ec"},
+    ("dark", "ocean"): {"highlight": "#7bdbf0", "ink": "#052128", "surface": "#171a1c", "text": "#edf1f1"},
+    ("dark", "plum"): {"highlight": "#deb0ff", "ink": "#261132", "surface": "#1b181c", "text": "#f0ecf2"},
+    ("dark", "amber"): {"highlight": "#f5d65c", "ink": "#2b2100", "surface": "#1c1a16", "text": "#f2efe8"},
+}
+
+
+def _decorate_evidence_reader_html(text: str, query: str = "") -> str:
+    """Apply the current app appearance to evidence readers, including old indexes."""
+
+    params = parse_qs(query)
+    theme = str(params.get("theme", ["light"])[0] or "light").casefold()
+    accent = str(params.get("accent", ["jade"])[0] or "jade").casefold()
+    if theme not in {"light", "dark"}:
+        theme = "light"
+    if accent not in {"jade", "ocean", "plum", "amber"}:
+        accent = "jade"
+    palette = _EVIDENCE_READER_PALETTES[(theme, accent)]
+    style = f'''<style data-scansci-reader-theme="true">
+:root {{ color-scheme: {theme}; --scansci-evidence-highlight: {palette["highlight"]}; --scansci-evidence-ink: {palette["ink"]}; }}
+html, body {{ background: {palette["surface"]}; color: {palette["text"]}; }}
+[data-evidence-id] {{ scroll-margin-top: 6rem; }}
+[data-evidence-id]:target {{
+  background: var(--scansci-evidence-highlight) !important;
+  color: var(--scansci-evidence-ink) !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-color: transparent !important;
+  border-radius: 0 !important;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}}
+</style>'''
+    for marker in ("data-scansci-evidence-style", "data-scansci-reader-theme"):
+        text = re.sub(
+            rf"<style\b[^>]*\b{marker}\b[^>]*>.*?</style\s*>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    if re.search(r"</head\s*>", text, flags=re.IGNORECASE):
+        return re.sub(r"</head\s*>", lambda match: f"{style}{match.group(0)}", text, count=1, flags=re.IGNORECASE)
+    if re.search(r"<html\b[^>]*>", text, flags=re.IGNORECASE):
+        return re.sub(r"<html\b[^>]*>", lambda match: f"{match.group(0)}<head>{style}</head>", text, count=1, flags=re.IGNORECASE)
+    return f"<!doctype html><html><head>{style}</head><body>{text}</body></html>"
 
 
 def _diagnostic_route(path: str) -> str:
@@ -80,6 +174,111 @@ class WebResponse:
     status: int
     content_type: str
     body: bytes
+    content_security_policy: str = _DEFAULT_CONTENT_SECURITY_POLICY
+
+
+class LibraryImportManager:
+    """Run local document imports in the background with inspectable milestones.
+
+    The original source is never moved or altered.  The manager only makes the
+    already-rebuildable import pipeline observable to the first-run experience.
+    """
+
+    def __init__(self, runner: Any) -> None:
+        self._runner = runner
+        self._lock = threading.RLock()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._threads: dict[str, threading.Thread] = {}
+
+    def start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        kind = str(payload.get("library_kind", "folder") or "folder").strip().lower()
+        if kind not in {"folder", "obsidian", "zotero"}:
+            raise ValueError("后台资料接入当前支持本地文件夹、Obsidian Vault 和 Zotero")
+        path = str(payload.get("path", "") or "").strip()
+        if not path and kind != "zotero":
+            raise ValueError("请选择要接入的文件夹")
+        job_id = f"import-{uuid4().hex}"
+        now = int(time.time())
+        job = {
+            "job_id": job_id,
+            "state": "queued",
+            "library_kind": kind,
+            "path": path,
+            "notebook_id": str(payload.get("notebook_id", "") or "").strip(),
+            "phase": "准备接入资料",
+            "detail": "等待本地解析任务启动",
+            "progress": 0.0,
+            "error": "",
+            "result": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock:
+            self._jobs[job_id] = job
+            thread = threading.Thread(target=self._run, args=(job_id, dict(payload)), daemon=True)
+            self._threads[job_id] = thread
+            thread.start()
+            return deepcopy(job)
+
+    def status(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            if job_id not in self._jobs:
+                raise FileNotFoundError("资料接入任务不存在或已过期")
+            return deepcopy(self._jobs[job_id])
+
+    def _update(self, job_id: str, **changes: Any) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            if "progress" in changes:
+                # Milestones are monotonic, so the bar cannot jump backwards
+                # while a nested PDF/Markdown import starts its next stage.
+                changes["progress"] = max(float(job.get("progress", 0.0) or 0.0), float(changes["progress"] or 0.0))
+            job.update(changes)
+            job["updated_at"] = int(time.time())
+
+    def _run(self, job_id: str, payload: dict[str, Any]) -> None:
+        self._update(job_id, state="running", phase="检查资料", detail="正在建立安全的只读连接", progress=0.01)
+
+        def report(event: dict[str, Any]) -> None:
+            self._update(
+                job_id,
+                state="running",
+                phase=str(event.get("phase", "正在处理资料") or "正在处理资料"),
+                detail=str(event.get("detail", "") or ""),
+                progress=float(event.get("progress", 0.0) or 0.0),
+            )
+
+        try:
+            result = self._runner(payload, report)
+            self._update(
+                job_id,
+                state="completed",
+                phase="资料已可检索",
+                detail="文档、章节与原文证据片段已建立",
+                progress=1.0,
+                result=result,
+                error="",
+            )
+        except Exception as error:  # keep the original source untouched and expose an actionable failure
+            message = str(error).strip() or type(error).__name__
+            lowered = message.casefold()
+            if "ocr" in lowered or "扫描" in message:
+                guidance = "这批资料可能是扫描件。请在 设置 · 文档处理 中启用 OCR 后重试。"
+            elif "可提取正文" in message or "没有成功解析" in message:
+                guidance = "没有读到可用正文。请检查文件是否损坏、加密，或启用 OCR 后重试。"
+            elif "权限" in message or "access" in lowered or "permission" in lowered:
+                guidance = "ScanSci 没有读取该目录的权限。请换一个可访问的文件夹后重试。"
+            else:
+                guidance = "原文件没有被修改；检查提示后可直接重试。"
+            self._update(
+                job_id,
+                state="failed",
+                phase="资料接入未完成",
+                detail=guidance,
+                error=f"{type(error).__name__}: {message}"[:1200],
+            )
 
 
 class NotebookWebApp:
@@ -97,7 +296,30 @@ class NotebookWebApp:
         self.evidence_db = Path(evidence_db).resolve()
         self.slides_root = Path(slides_root).resolve() if slides_root is not None else None
         self.update_service = update_service or AppUpdateService()
-        self.research_agent = ResearchAgentRuntime(workspace=self.workspace, evidence_db=self.evidence_db)
+        # A dedicated component URL embedded in the lightweight package takes
+        # precedence over the application-update channel. The latter remains
+        # a compatibility fallback for combined release manifests.
+        self.local_runtime = LocalRuntimeComponent(
+            fallback_manifest_url=self.update_service.manifest_url or None
+        )
+        self.model_installs = create_install_manager()
+        self.library_imports = LibraryImportManager(self._run_library_import_job)
+        self._retrieval_setup_errors: dict[str, str] = {}
+        self._retrieval_setup_lock = threading.RLock()
+        self.research_agent = ResearchAgentRuntime(
+            workspace=self.workspace,
+            evidence_db=self.evidence_db,
+            runtime_facts_provider=self._local_resource_facts,
+        )
+
+    def _local_resource_facts(self) -> dict[str, Any]:
+        """Return a lazy, read-only snapshot for deterministic chat answers."""
+
+        return {
+            "runtime": self.local_runtime.status(),
+            "model_installs": self.model_installs.status(),
+            "installed_models": installed_models(),
+        }
 
     def dispatch(self, method: str, target: str, body: bytes = b"") -> WebResponse:
         parsed_target = urlparse(target)
@@ -148,12 +370,43 @@ class NotebookWebApp:
                 ".json": "application/json; charset=utf-8",
             }.get(Path(relative).suffix.lower(), "application/octet-stream")
             return self._static_tree_asset(relative, content_type)
+        if path.startswith("/provider-icons/"):
+            relative = unquote(path.removeprefix("/"))
+            content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
+            if content_type == "image/svg+xml":
+                content_type = "image/svg+xml; charset=utf-8"
+            return self._static_tree_asset(relative, content_type)
         if path == "/scansci-mark.png":
             return self._static_asset("scansci-mark.png", "image/png")
         if path == "/avatar-panda-male.png":
             return self._static_asset("avatar-panda-male.png", "image/png")
         if path == "/avatar-panda-female.png":
             return self._static_asset("avatar-panda-female.png", "image/png")
+        if path == "/avatar-panda-male-duo.png":
+            return self._static_asset("avatar-panda-male-duo.png", "image/png")
+        if path == "/avatar-panda-female-duo.png":
+            return self._static_asset("avatar-panda-female-duo.png", "image/png")
+        if path == "/avatar-panda-male-tight.png":
+            return self._static_asset("avatar-panda-male-tight.png", "image/png")
+        if path == "/avatar-panda-female-tight.png":
+            return self._static_asset("avatar-panda-female-tight.png", "image/png")
+        if path in {
+            "/knowledge-personal.svg",
+            "/zotero-logo.svg",
+            "/obsidian-logo.svg",
+            "/pdf-document.svg",
+        }:
+            return self._static_asset(path.removeprefix("/"), "image/svg+xml; charset=utf-8")
+        if path in {
+            "/codex-plugin-documents.png",
+            "/codex-plugin-pdf.png",
+            "/codex-plugin-spreadsheets.png",
+            "/codex-plugin-presentations.png",
+            "/codex-plugin-latex.png",
+        }:
+            return self._static_asset(path.removeprefix("/"), "image/png")
+        if path == "/notion-logo.png":
+            return self._static_asset("notion-logo.png", "image/png")
         if path == "/api/health":
             build = current_build_info()
             return self._json(
@@ -164,19 +417,30 @@ class NotebookWebApp:
                     "evidence_store_exists": self.evidence_db.exists(),
                     "version": build["version"],
                     "build_id": build["build_id"],
+                    "built_at": build["built_at"],
                     "frozen": build["frozen"],
                     "executable": build["executable"],
+                    "runtime_kind": build["runtime_kind"],
+                    "package_root": build["package_root"],
+                    "source_root": build["source_root"],
                 },
             )
         if path == "/api/diagnostics":
             summary = diagnostics_summary(self.workspace)
-            summary["vector_cache"] = vector_cache_status(self.evidence_db)
+            vector_identity = default_vector_cache_identity()
+            summary["vector_cache"] = vector_cache_status(
+                self.evidence_db,
+                provider=str(vector_identity["provider"]),
+                dimensions=int(vector_identity["dimensions"]),
+            )
             return self._json(HTTPStatus.OK, summary)
         if path == "/api/diagnostics/bundle":
             bundle = export_diagnostics_bundle(self.workspace)
             return WebResponse(HTTPStatus.OK, "application/zip", bundle.read_bytes())
         if path == "/api/workspace":
             return self._json(HTTPStatus.OK, load_workspace_summary(self.workspace))
+        if path == "/api/connectors":
+            return self._json(HTTPStatus.OK, connector_catalog(self.workspace))
         if path == "/api/settings":
             return self._json(HTTPStatus.OK, load_settings(self.workspace))
         if path == "/api/settings/presets":
@@ -190,6 +454,13 @@ class NotebookWebApp:
         if path == "/api/local-models/market":
             search = str(parse_qs(query).get("q", [""])[0] or "")
             return self._json(HTTPStatus.OK, market_catalog(search))
+        if path == "/api/local-models/install-status":
+            job_id = str(parse_qs(query).get("job_id", [""])[0] or "")
+            return self._json(HTTPStatus.OK, self.model_installs.status(job_id))
+        if path == "/api/local-runtime":
+            return self._json(HTTPStatus.OK, self.local_runtime.status())
+        if path == "/api/local-runtime/install-status":
+            return self._json(HTTPStatus.OK, self.local_runtime.install_status())
         if path == "/api/skills":
             return self._json(
                 HTTPStatus.OK,
@@ -204,6 +475,13 @@ class NotebookWebApp:
                 HTTPStatus.OK,
                 capability_snapshot(workspace=self.workspace, evidence_db=self.evidence_db),
             )
+        if path == "/api/pi/status":
+            return self._json(HTTPStatus.OK, self.research_agent.pi_status())
+        if path == "/api/chat/sessions":
+            return self._json(HTTPStatus.OK, self.research_agent.list_chat_sessions())
+        if path == "/api/chat/stats":
+            session_id = str(parse_qs(query).get("session_id", [""])[0] or "")
+            return self._json(HTTPStatus.OK, self.research_agent.chat_session_stats({"session_id": session_id}))
         if path == "/api/runs":
             params = parse_qs(query)
             view = str(params.get("view", ["active"])[0] or "active").strip().lower()
@@ -215,6 +493,10 @@ class NotebookWebApp:
             )
         if path == "/api/runs/catalog":
             return self._json(HTTPStatus.OK, {"workflows": self.research_agent.workflow_catalog()})
+        if path == "/api/tasks/registry":
+            return self._json(HTTPStatus.OK, self.research_agent.task_registry())
+        if path == "/api/agents/scientific":
+            return self._json(HTTPStatus.OK, self.research_agent.scientific_agent_catalog())
         if path == "/api/slides/templates":
             return self._json(HTTPStatus.OK, list_slide_templates(self.slides_root))
         if path == "/api/app/update":
@@ -226,6 +508,8 @@ class NotebookWebApp:
             return WebResponse(HTTPStatus.OK, "image/svg+xml; charset=utf-8", asset.read_bytes())
         if len(parts) == 3 and parts[:2] == ["api", "runs"]:
             return self._json(HTTPStatus.OK, self.research_agent.store.get_run(parts[2]))
+        if len(parts) == 6 and parts[:2] == ["api", "runs"] and parts[3] == "sources" and parts[5] == "reader":
+            return self._task_evidence_reader(parts[2], parts[4], query=query)
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "download":
             return self._download_run_artifact(parts[2])
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "preview":
@@ -235,8 +519,15 @@ class NotebookWebApp:
         if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "citations":
             notebook = self._notebook(parts[2])
             return self._json(HTTPStatus.OK, {"notebook_id": notebook["notebook_id"], "citations": notebook["citations"]})
+        if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "evidence-index":
+            return self._json(
+                HTTPStatus.OK,
+                self._evidence_index_status(parts[2]),
+            )
+        if len(parts) == 4 and parts[:3] == ["api", "library", "import-jobs"]:
+            return self._json(HTTPStatus.OK, self.library_imports.status(parts[3]))
         if len(parts) == 4 and parts[:2] == ["api", "sources"] and parts[3] == "reader":
-            return self._source_reader(parts[2])
+            return self._source_reader(parts[2], query=query)
         if len(parts) == 4 and parts[:2] == ["api", "sources"] and parts[3] == "original":
             return self._source_original(parts[2])
         if len(parts) == 3 and parts[:2] == ["api", "attachments"]:
@@ -267,10 +558,33 @@ class NotebookWebApp:
     def _post(self, path: str, body: bytes) -> WebResponse:
         payload = self._json_body(body)
         parts = self._path_parts(path)
+        if path == "/api/library/import-jobs":
+            return self._json(HTTPStatus.ACCEPTED, self.library_imports.start(payload))
+        if path == "/api/library/bind-folder":
+            return self._json(HTTPStatus.CREATED, self._bind_library_folder(payload))
         if path == "/api/ask":
             return self._ask(payload)
         if path == "/api/chat":
             return self._json(HTTPStatus.OK, self.research_agent.chat(payload))
+        if path == "/api/chat/compact":
+            return self._json(HTTPStatus.OK, self.research_agent.compact_chat(payload))
+        if path == "/api/chat/cancel":
+            return self._json(HTTPStatus.OK, {"ok": self.research_agent.cancel_chat(payload)})
+        if path == "/api/chat/steer":
+            return self._json(HTTPStatus.OK, self.research_agent.steer_chat(payload))
+        if path == "/api/chat/follow-up":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.follow_up_chat(payload))
+        if path == "/api/chat/interactions/respond":
+            return self._json(HTTPStatus.OK, self.research_agent.respond_chat_interaction(payload))
+        if len(parts) == 4 and parts[:2] == ["api", "chat"] and parts[2] == "session":
+            self.research_agent.close_chat_session(parts[3])
+            return self._json(HTTPStatus.OK, {"ok": True})
+        if path == "/api/connectors/test":
+            return self._json(HTTPStatus.OK, test_connector(self.workspace, str(payload.get("connector_kind", ""))))
+        if path == "/api/notion/test":
+            return self._json(HTTPStatus.OK, test_notion_connection(self.workspace, token=str(payload.get("token", "")).strip() or None))
+        if path == "/api/notion/token":
+            return self._json(HTTPStatus.OK, set_notion_api_token(self.workspace, str(payload.get("token", ""))))
         if path == "/api/ingestions":
             return self._json(
                 HTTPStatus.CREATED,
@@ -291,6 +605,10 @@ class NotebookWebApp:
                     "download_name": bundle.name,
                 },
             )
+        if path == "/api/academic-search/plan":
+            return self._json(HTTPStatus.OK, self.research_agent.preview_academic_search_plan(payload))
+        if path == "/api/task-routing/preview":
+            return self._json(HTTPStatus.OK, self.research_agent.preview_task_route(payload))
         if path == "/api/runs":
             return self._json(HTTPStatus.ACCEPTED, self.research_agent.start(payload))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "archive":
@@ -301,6 +619,34 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, self.research_agent.store.delete_run(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "messages":
             return self._json(HTTPStatus.OK, self.research_agent.continue_run_conversation(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "branch":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.branch_run(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.recover_run(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "advisor-action":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.apply_advisor_action(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "interaction":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.respond_run_interaction(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "delegate":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.delegate_scientific_agents(parts[2], payload))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "collect-agents":
+            return self._json(HTTPStatus.OK, self.research_agent.collect_scientific_agents(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "evidence-index":
+            notebook_id = parts[2]
+            install = self._ensure_retrieval_models(notebook_id)
+            run = (
+                self.research_agent.start_evidence_index(notebook_id)
+                if install.get("state") == "ready"
+                else None
+            )
+            return self._json(
+                HTTPStatus.ACCEPTED,
+                {
+                    "run": run,
+                    "model_install": install,
+                    "status": self._evidence_index_status(notebook_id, install=install),
+                },
+            )
         if path == "/api/settings":
             return self._save_settings(payload)
         if path == "/api/app/update/check":
@@ -312,6 +658,67 @@ class NotebookWebApp:
         if path == "/api/mcp/marketplace/install":
             result = install_marketplace_server(self.workspace, str(payload.get("id", "")))
             return self._json(HTTPStatus.CREATED if result["created"] else HTTPStatus.OK, result)
+        if path == "/api/mcp/test":
+            server_id = str(payload.get("server_id", "")).strip()
+            server = next(
+                (
+                    record
+                    for record in list(load_settings(self.workspace).get("mcp_servers", []) or [])
+                    if isinstance(record, dict) and str(record.get("id", "")) == server_id and not record.get("uninstalled")
+                ),
+                None,
+            )
+            if server is None:
+                raise FileNotFoundError(f"MCP server does not exist: {server_id}")
+            return self._json(
+                HTTPStatus.OK,
+                PiAgentClient.probe_mcp_server(workspace=self.workspace, server=dict(server)),
+            )
+        if path == "/api/library":
+            title = str(payload.get("title", "")).strip()
+            if not title:
+                raise ValueError("知识库名称不能为空")
+            if len(title) > 80:
+                raise ValueError("知识库名称最多 80 个字符")
+            created = initialize_notebook(
+                self.workspace,
+                notebook_id=f"kb_{uuid4().hex[:12]}",
+                title=title,
+                root_path=self.workspace.parent,
+                metadata={"library_kind": "empty", "created_by": "user"},
+            )
+            summary = load_workspace_summary(self.workspace, notebook_id=str(created["notebook_id"]))
+            notebook = next(iter(list(summary.get("notebooks", []) or [])), {})
+            return self._json(
+                HTTPStatus.CREATED,
+                {"ok": True, "notebook": notebook, "workspace": load_workspace_summary(self.workspace)},
+            )
+        if len(parts) == 4 and parts[:2] == ["api", "library"] and parts[3] == "delete":
+            notebook = self._notebook(parts[2])
+            library_kind = str(dict(notebook.get("metadata", {}) or {}).get("library_kind", "folder"))
+            if library_kind in {"zotero", "obsidian", "notion"}:
+                raise ValueError("外部数据源请在其连接设置中管理，不能从个人知识库中移除")
+            removed = delete_notebook(self.workspace, notebook_id=parts[2])
+            index_removed = False
+            index_path = notebook_evidence_db(self.evidence_db, parts[2])
+            for candidate in (index_path, Path(f"{index_path}-wal"), Path(f"{index_path}-shm")):
+                try:
+                    if candidate.is_file():
+                        candidate.unlink()
+                        index_removed = True
+                except OSError:
+                    # The index is rebuildable.  Keep a locked cache for a later
+                    # cleanup instead of failing a user-requested library removal.
+                    pass
+            return self._json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "removed": removed,
+                    "index_removed": index_removed,
+                    "workspace": load_workspace_summary(self.workspace),
+                },
+            )
         if path == "/api/library/folder":
             folder_path = str(payload.get("path", ""))
             notebook = self._requested_or_created_notebook(
@@ -320,15 +727,16 @@ class NotebookWebApp:
                 root_path=folder_path,
                 library_kind=str(payload.get("library_kind", "folder")),
             )
+            result = import_library_folder(
+                self.workspace,
+                self.evidence_db,
+                notebook_id=str(notebook["notebook_id"]),
+                folder_path=str(payload.get("path", "")),
+                library_kind=str(payload.get("library_kind", "folder")),
+            )
             return self._json(
                 HTTPStatus.OK,
-                import_library_folder(
-                    self.workspace,
-                    self.evidence_db,
-                    notebook_id=str(notebook["notebook_id"]),
-                    folder_path=str(payload.get("path", "")),
-                    library_kind=str(payload.get("library_kind", "folder")),
-                ),
+                self._with_evidence_index_run(result, notebook_id=str(notebook["notebook_id"])),
             )
         if path == "/api/library/zotero":
             zotero_path = str(payload.get("path", ""))
@@ -344,6 +752,7 @@ class NotebookWebApp:
                     self.workspace,
                     notebook_id=str(notebook["notebook_id"]),
                     folder_path=str(payload.get("path", "")),
+                    evidence_db=self.evidence_db,
                 ),
             )
         if path == "/api/library/zotero/local":
@@ -353,12 +762,41 @@ class NotebookWebApp:
                 root_path=self.workspace.parent,
                 library_kind="zotero",
             )
+            result = connect_local_zotero(
+                self.workspace,
+                notebook_id=str(notebook["notebook_id"]),
+                evidence_db=self.evidence_db,
+                index_attachments=False,
+            )
+            result["import_job"] = self.library_imports.start(
+                {
+                    "library_kind": "zotero",
+                    "notebook_id": str(notebook["notebook_id"]),
+                }
+            )
+            return self._json(HTTPStatus.ACCEPTED, result)
+        if path == "/api/library/notion":
+            root_page_id = str(payload.get("root_page_id", "")).strip()
+            notebook = self._requested_or_created_notebook(
+                payload,
+                title=str(payload.get("title", "Notion 知识库")).strip() or "Notion 知识库",
+                root_path=self.workspace.parent,
+                library_kind="notion",
+            )
+            token = str(payload.get("token", "")).strip() or None
+            if token:
+                set_notion_api_token(self.workspace, token)
+            result = sync_notion_library(
+                self.workspace,
+                self.evidence_db,
+                notebook_id=str(notebook["notebook_id"]),
+                root_page_id=root_page_id,
+                title=str(payload.get("title", "Notion 知识库")),
+                token=token,
+            )
             return self._json(
                 HTTPStatus.OK,
-                connect_local_zotero(
-                    self.workspace,
-                    notebook_id=str(notebook["notebook_id"]),
-                ),
+                self._with_evidence_index_run(result, notebook_id=str(notebook["notebook_id"])),
             )
         if path == "/api/library/files":
             paths = payload.get("paths")
@@ -371,17 +809,62 @@ class NotebookWebApp:
                 root_path=first_parent,
                 library_kind="files",
             )
+            result = import_library_files(
+                self.workspace,
+                self.evidence_db,
+                notebook_id=str(notebook["notebook_id"]),
+                file_paths=[str(path) for path in paths],
+            )
             return self._json(
                 HTTPStatus.OK,
-                import_library_files(
+                self._with_evidence_index_run(result, notebook_id=str(notebook["notebook_id"])),
+            )
+        if path == "/api/library/uploads":
+            files = payload.get("files")
+            if not isinstance(files, list) or not files:
+                raise ValueError("files must be a non-empty list")
+            if len(files) > 12:
+                raise ValueError("单次最多拖入 12 个文件")
+            notebook_id = str(payload.get("notebook_id", "")).strip()
+            if not notebook_id:
+                raise ValueError("请先创建或选择一个知识库")
+            notebook = self._notebook(notebook_id)
+            total_bytes = 0
+            with TemporaryDirectory(prefix="scansci-library-drop-") as temporary:
+                temporary_root = Path(temporary)
+                paths: list[str] = []
+                for index, item in enumerate(files):
+                    record = dict(item or {}) if isinstance(item, dict) else {}
+                    name = Path(str(record.get("name", ""))).name
+                    data_url = str(record.get("data_url", ""))
+                    if not name or "," not in data_url:
+                        raise ValueError("拖入的文件数据不完整")
+                    try:
+                        content = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+                    except Exception as error:
+                        raise ValueError(f"无法读取文件：{name}") from error
+                    total_bytes += len(content)
+                    if total_bytes > 120 * 1024 * 1024:
+                        raise ValueError("拖入文件总大小不能超过 120 MB")
+                    target = temporary_root / name
+                    if target.exists():
+                        target = temporary_root / f"{target.stem}-{index + 1}{target.suffix}"
+                    target.write_bytes(content)
+                    paths.append(str(target))
+                result = import_library_files(
                     self.workspace,
                     self.evidence_db,
                     notebook_id=str(notebook["notebook_id"]),
-                    file_paths=[str(path) for path in paths],
-                ),
+                    file_paths=paths,
+                )
+            return self._json(
+                HTTPStatus.OK,
+                self._with_evidence_index_run(result, notebook_id=str(notebook["notebook_id"])),
             )
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "api-key":
             return self._set_provider_api_key(parts[3], payload)
+        if len(parts) == 6 and parts[:3] == ["api", "settings", "providers"] and parts[4:] == ["api-key", "reveal"]:
+            return self._reveal_provider_api_key(parts[3], payload)
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "test":
             return self._test_provider(parts[3])
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "models":
@@ -400,18 +883,58 @@ class NotebookWebApp:
                 verify_doi_metadata(str(payload.get("doi", "")), expected_title=str(payload.get("title", ""))),
             )
         if path == "/api/local-models/download":
-            return self._json(HTTPStatus.OK, download_model(str(payload.get("id", ""))))
+            repo_id = str(payload.get("id", ""))
+            blocked = self._model_download_requires_runtime()
+            if blocked is not None:
+                return blocked
+            install = self.model_installs.start(
+                [repo_id],
+                job_id=f"model:{repo_id}",
+                source=str(payload.get("source", "auto") or "auto"),
+            )
+            return self._json(HTTPStatus.ACCEPTED, install)
+        if path == "/api/resources/retrieval/download":
+            blocked = self._model_download_requires_runtime()
+            if blocked is not None:
+                return blocked
+            install = self.model_installs.start(
+                [DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL],
+                job_id="retrieval-core",
+                source="auto",
+                on_complete=lambda _job: self._after_retrieval_models_ready(),
+            )
+            return self._json(HTTPStatus.ACCEPTED, install)
+        if path == "/api/local-runtime/install":
+            return self._json(HTTPStatus.ACCEPTED, self.local_runtime.start_install())
         if path == "/api/tools/paper-atlas/search":
             return self._json(HTTPStatus.OK, search_paper_atlas(str(payload.get("query", ""))))
         if path == "/api/tools/papers/download":
-            return self._json(
-                HTTPStatus.OK,
-                download_paper(
-                    str(payload.get("identifier", "")),
-                    workspace=self.workspace,
-                    strategy=str(payload.get("strategy", "legal_only")),
-                ),
+            result = download_paper(
+                str(payload.get("identifier", "")),
+                workspace=self.workspace,
+                strategy=str(payload.get("strategy", "oa_first")),
             )
+            files = [str(path) for path in list(result.get("files", []) or []) if str(path).strip()]
+            notebook_id = str(payload.get("notebook_id", "")).strip()
+            if not notebook_id:
+                notebooks = list(load_workspace_summary(self.workspace).get("notebooks", []) or [])
+                notebook_id = str(dict(notebooks[0]).get("notebook_id", "")) if notebooks else ""
+            if files and notebook_id:
+                try:
+                    result["imported"] = import_library_files(
+                        self.workspace,
+                        self.evidence_db,
+                        notebook_id=notebook_id,
+                        file_paths=files,
+                    )
+                    result["evidence_status"] = "indexed_fulltext"
+                    result = self._with_evidence_index_run(result, notebook_id=notebook_id)
+                except Exception as error:  # keep a successful download usable even if indexing fails
+                    result["evidence_status"] = "downloaded_unindexed"
+                    result["evidence_error"] = f"{type(error).__name__}: {error}"[:500]
+            elif files:
+                result["evidence_status"] = "downloaded_unindexed"
+            return self._json(HTTPStatus.OK, result)
         if path == "/api/studio/ppt/outline":
             notebook = self._requested_notebook(payload)
             return self._json(
@@ -518,6 +1041,28 @@ class NotebookWebApp:
         settings = set_provider_api_key(self.workspace, provider_id, str(payload.get("api_key", "")))
         return self._json(HTTPStatus.OK, settings)
 
+    def _reveal_provider_api_key(self, provider_id: str, payload: dict[str, Any]) -> WebResponse:
+        """Return a saved provider key only after an explicit local UI action.
+
+        Provider secrets remain absent from the normal settings contract.  The
+        desktop UI calls this POST route only when the person clicks the eye
+        control; all HTTP responses are already marked ``Cache-Control:
+        no-store`` by the loopback server.
+        """
+
+        if payload.get("reveal") is not True:
+            raise ValueError("需要明确确认后才能显示 API 密钥")
+        settings = load_settings(self.workspace)
+        provider = next((item for item in settings.get("providers", []) if item.get("id") == provider_id), None)
+        if provider is None:
+            raise FileNotFoundError("找不到模型提供商")
+        if provider.get("kind") == "local" or provider.get("auth_mode") == "managed":
+            raise ValueError("这个模型服务没有可显示的本机 API 密钥")
+        secret = get_provider_api_key(self.workspace, provider_id)
+        if not secret:
+            raise FileNotFoundError("尚未保存 API 密钥")
+        return self._json(HTTPStatus.OK, {"api_key": secret})
+
     def _set_document_service_api_key(self, service_id: str, payload: dict[str, Any]) -> WebResponse:
         settings = set_document_service_api_key(self.workspace, service_id, str(payload.get("api_key", "")))
         return self._json(HTTPStatus.OK, settings)
@@ -558,6 +1103,356 @@ class NotebookWebApp:
         if not notebooks:
             raise FileNotFoundError("当前工作区没有可用资料库")
         return dict(notebooks[0])
+
+    def _run_library_import_job(self, payload: dict[str, Any], report: Any) -> dict[str, Any]:
+        """Create or reuse a source container, then run its local import task."""
+
+        folder_path = str(payload.get("path", "") or "").strip()
+        library_kind = str(payload.get("library_kind", "folder") or "folder").strip().lower()
+        if library_kind == "zotero":
+            notebook = self._requested_or_created_notebook(
+                payload,
+                title="Zotero 文献库",
+                root_path=self.workspace.parent,
+                library_kind="zotero",
+            )
+            notebook_id = str(notebook["notebook_id"])
+            report(
+                {
+                    "phase": "正在读取 Zotero 文献",
+                    "detail": "元数据已显示，正在后台建立可检索全文",
+                    "progress": 0.08,
+                }
+            )
+            metadata_result = connect_local_zotero(
+                self.workspace,
+                notebook_id=notebook_id,
+                evidence_db=self.evidence_db,
+                index_attachments=False,
+            )
+            zotero_state = dict(metadata_result.get("zotero", {}) or {})
+            evidence_index = index_zotero_attachments(
+                self.workspace,
+                self.evidence_db,
+                notebook_id=notebook_id,
+                zotero_state=zotero_state,
+                progress=report,
+            )
+            zotero_state["evidence_index"] = evidence_index
+            update_notebook_metadata(
+                self.workspace,
+                notebook_id=notebook_id,
+                metadata={"library_kind": "zotero", "zotero": zotero_state},
+            )
+            summary = load_workspace_summary(self.workspace, notebook_id=notebook_id)
+            refreshed_notebook = next(iter(list(summary.get("notebooks", []) or [])), {})
+            report(
+                {
+                    "phase": "已完成 Zotero 全文索引",
+                    "detail": "文献元数据与可追溯证据已同步到 ScanSci",
+                    "progress": 0.93,
+                }
+            )
+            return self._with_evidence_index_run(
+                {
+                    "ok": True,
+                    "zotero": zotero_state,
+                    "notebook": refreshed_notebook,
+                    "workspace": load_workspace_summary(self.workspace),
+                },
+                notebook_id=notebook_id,
+            )
+        notebook = self._requested_or_created_notebook(
+            payload,
+            title=Path(folder_path).name or ("Obsidian 知识库" if library_kind == "obsidian" else "我的知识库"),
+            root_path=folder_path,
+            library_kind=library_kind,
+        )
+        notebook_id = str(notebook["notebook_id"])
+        try:
+            result = import_library_folder(
+                self.workspace,
+                self.evidence_db,
+                notebook_id=notebook_id,
+                folder_path=folder_path,
+                library_kind=library_kind,
+                progress=report,
+            )
+        except Exception as error:
+            # Binding is intentionally durable even when indexing is not.  A
+            # user should never have to select the same folder again merely
+            # because one parser or OCR pass failed.
+            update_notebook_metadata(
+                self.workspace,
+                notebook_id=notebook_id,
+                metadata={
+                    "local_binding": {
+                        "state": "bound",
+                        "index_state": "failed",
+                        "source_path": folder_path,
+                        "error": str(error)[:500],
+                    }
+                },
+            )
+            raise
+        update_notebook_metadata(
+            self.workspace,
+            notebook_id=notebook_id,
+            metadata={
+                "local_binding": {
+                    "state": "bound",
+                    "index_state": "ready",
+                    "source_path": folder_path,
+                    "error": "",
+                }
+            },
+        )
+        result["workspace"] = load_workspace_summary(self.workspace)
+        result["notebook"] = self._notebook(notebook_id)
+        return self._with_evidence_index_run(result, notebook_id=notebook_id)
+
+    def _bind_library_folder(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a local-folder connection before its expensive scan begins.
+
+        Folder selection is a connection decision, while parsing, evidence
+        materialisation and semantic indexing are recoverable background work.
+        Keeping those concerns apart prevents a long import from making the
+        selected source look as if it was never connected.
+        """
+
+        library_kind = str(payload.get("library_kind", "folder") or "folder").strip().lower()
+        if library_kind not in {"folder", "obsidian"}:
+            raise ValueError("文件夹绑定仅支持本地文件夹或 Obsidian Vault")
+        raw_path = str(payload.get("path", "") or "").strip()
+        if not raw_path:
+            raise ValueError("请选择要绑定的文件夹")
+        folder = Path(raw_path).expanduser().resolve()
+        if not folder.is_dir():
+            raise FileNotFoundError(f"文件夹不存在：{folder}")
+
+        title = folder.name or ("Obsidian 知识库" if library_kind == "obsidian" else "我的知识库")
+        notebook = self._requested_or_created_notebook(
+            payload,
+            title=title,
+            root_path=folder,
+            library_kind=library_kind,
+        )
+        notebook_id = str(notebook["notebook_id"])
+        # Existing personal libraries may be rebound to another directory.
+        # This only updates the local connection record; it never touches the
+        # original folder or changes the later import job into a foreground
+        # operation.
+        set_notebook_root_path(
+            self.workspace,
+            notebook_id=notebook_id,
+            root_path=folder,
+            metadata={
+                "library_kind": library_kind,
+                "local_binding": {
+                    "state": "bound",
+                    "index_state": "queued",
+                    "source_path": str(folder),
+                    "error": "",
+                },
+            },
+        )
+        import_job = self.library_imports.start(
+            {
+                **dict(payload),
+                "path": str(folder),
+                "library_kind": library_kind,
+                "notebook_id": notebook_id,
+            }
+        )
+        summary = load_workspace_summary(self.workspace)
+        return {
+            "ok": True,
+            "bound": True,
+            "notebook": self._notebook(notebook_id),
+            "workspace": summary,
+            "import_job": import_job,
+            # Keep the immediate binding response easy to consume by both the
+            # desktop UI and integrations that poll jobs directly.
+            "job_id": import_job["job_id"],
+            "job_state": import_job["state"],
+            "progress": import_job["progress"],
+        }
+
+    def _with_evidence_index_run(self, result: dict[str, Any], *, notebook_id: str) -> dict[str, Any]:
+        """Start semantic indexing only after explicitly prepared local components are ready."""
+
+        payload = dict(result)
+        install = self._ensure_retrieval_models(notebook_id)
+        payload["model_install"] = install
+        run = (
+            self.research_agent.start_evidence_index(notebook_id)
+            if install.get("state") == "ready"
+            else None
+        )
+        if run is not None:
+            payload["index_run"] = run
+        return payload
+
+    def _ensure_retrieval_models(self, notebook_id: str) -> dict[str, Any]:
+        """Describe retrieval readiness; never download models as an import side effect."""
+
+        current = self.research_agent.evidence_index_status(str(notebook_id))
+        if int(current.get("total", 0) or 0) <= 0:
+            return {
+                "job_id": "retrieval-core",
+                "state": "idle",
+                "reason": "empty_library",
+                "progress": 0.0,
+                "models": [
+                    DEFAULT_LOCAL_EMBEDDING_MODEL,
+                    DEFAULT_LOCAL_RERANKER_MODEL,
+                ],
+            }
+        runtime = self.local_runtime.status()
+        models = [DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL]
+        if not bool(runtime.get("installed")):
+            return {
+                "job_id": "retrieval-core",
+                "state": "blocked",
+                "reason": "runtime_required",
+                "progress": 0.0,
+                "models": models,
+                "local_runtime": runtime,
+            }
+        ready = {str(item.get("id", "")) for item in installed_models() if bool(item.get("ready"))}
+        if set(models).issubset(ready):
+            return {
+                "job_id": "retrieval-core",
+                "state": "ready",
+                "reason": "installed",
+                "progress": 1.0,
+                "models": models,
+            }
+        current_job = self.model_installs.status("retrieval-core")
+        if str(current_job.get("state", "idle")) in {"queued", "downloading", "failed"}:
+            return current_job
+        return {
+            "job_id": "retrieval-core",
+            "state": "idle",
+            "reason": "not_requested",
+            "progress": 0.0,
+            "models": models,
+        }
+
+    def _model_download_requires_runtime(self) -> WebResponse | None:
+        """Refuse model downloads that the current lightweight app cannot execute."""
+
+        runtime = self.local_runtime.status()
+        if bool(runtime.get("installed")):
+            return None
+        next_action = "install_runtime_component" if bool(runtime.get("install_available")) else "configure_local_runtime"
+        return self._json(
+            HTTPStatus.CONFLICT,
+            {
+                "error": {
+                    "code": "local_runtime_required",
+                    "message": "ScanSci 未开始下载模型。本地模型市场的权重需要 ScanSci 运行组件；请先安装受信任的运行组件。没有组件清单时，可连接外部运行时使用其已有模型，但不能下载无法执行的权重。",
+                },
+                "local_runtime": runtime,
+                "next_action": next_action,
+            },
+        )
+
+    def _after_retrieval_models_ready(self, notebook_id: str = "") -> None:
+        """Build pending semantic indexes only after an explicit, verified install."""
+
+        if not bool(self.local_runtime.status().get("installed")):
+            return
+        if notebook_id:
+            notebook_ids = [str(notebook_id)]
+        else:
+            notebook_ids = [
+                str(row.get("notebook_id", ""))
+                for row in list(load_workspace_summary(self.workspace).get("notebooks", []) or [])
+                if str(row.get("notebook_id", ""))
+            ]
+        for target_id in notebook_ids:
+            try:
+                current = self.research_agent.evidence_index_status(target_id)
+                if int(current.get("total", 0) or 0) <= 0:
+                    continue
+                with self._retrieval_setup_lock:
+                    self._retrieval_setup_errors.pop(target_id, None)
+                self.research_agent.start_evidence_index(target_id)
+            except Exception as error:  # one library must not block the others
+                with self._retrieval_setup_lock:
+                    self._retrieval_setup_errors[target_id] = f"{type(error).__name__}: {error}"[:1200]
+
+    def _evidence_index_status(
+        self,
+        notebook_id: str,
+        *,
+        install: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Combine vector, model-download, and runtime readiness truthfully."""
+
+        status = dict(self.research_agent.evidence_index_status(notebook_id))
+        model_install = dict(install or self.model_installs.status("retrieval-core"))
+        runtime = self.local_runtime.status()
+        with self._retrieval_setup_lock:
+            setup_error = self._retrieval_setup_errors.get(str(notebook_id), "")
+        status["model_install"] = model_install
+        status["local_runtime"] = runtime
+        install_state = str(model_install.get("state", "idle"))
+        if bool(status.get("ready")):
+            return status
+        if install_state in {"queued", "downloading"}:
+            status.update(
+                {
+                    "state": "installing",
+                    "progress": float(model_install.get("progress", 0.0) or 0.0),
+                    "error": "",
+                    "message": "正在通过国内 ModelScope 安装高质量检索组件",
+                }
+            )
+        elif install_state == "failed":
+            status.update(
+                {
+                    "state": "degraded",
+                    "error": str(model_install.get("error", "")),
+                    "message": "高质量检索组件安装失败，基础关键词检索仍可使用",
+                }
+            )
+        elif install_state == "blocked":
+            status.update(
+                {
+                    "state": "waiting_for_runtime",
+                    "progress": 0.0,
+                    "error": "",
+                    "message": "请先配置本地运行时；模型尚未下载，基础关键词检索仍可使用",
+                }
+            )
+        elif setup_error:
+            status.update(
+                {
+                    "state": "degraded",
+                    "error": setup_error,
+                    "message": "模型已下载，但本地推理运行时尚未就绪",
+                }
+            )
+        elif install_state == "ready" and not bool(runtime.get("installed")):
+            status.update(
+                {
+                    "state": "degraded",
+                    "error": "本地推理运行时尚未安装",
+                    "message": "模型已下载，但本地推理运行时尚未就绪",
+                }
+            )
+        elif install_state == "idle":
+            status.update(
+                {
+                    "state": "optional",
+                    "progress": 0.0,
+                    "error": "",
+                    "message": "基础关键词检索可用；配置运行时后可按需安装语义检索组件",
+                }
+            )
+        return status
 
     def _requested_or_created_notebook(
         self,
@@ -625,7 +1520,7 @@ class NotebookWebApp:
             raise FileNotFoundError(f"Notebook does not exist: {notebook_id}")
         return dict(notebooks[0])
 
-    def _source_reader(self, doc_id: str) -> WebResponse:
+    def _source_reader(self, doc_id: str, *, query: str = "") -> WebResponse:
         source = self._source(doc_id)
         source_path = self._source_html_path(source)
         if not source_path.exists():
@@ -635,14 +1530,49 @@ class NotebookWebApp:
             return WebResponse(
                 HTTPStatus.OK,
                 "text/html; charset=utf-8",
-                self._markdown_source_reader(doc_id, source, text).encode("utf-8"),
+                _decorate_evidence_reader_html(self._markdown_source_reader(doc_id, source, text), query).encode("utf-8"),
+                _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY,
             )
         base = f'<base href="/api/sources/{doc_id}/files/">'
         if re.search(r"<head\b[^>]*>", text, flags=re.IGNORECASE):
             text = re.sub(r"(<head\b[^>]*>)", r"\1" + base, text, count=1, flags=re.IGNORECASE)
         else:
             text = base + text
-        return WebResponse(HTTPStatus.OK, "text/html; charset=utf-8", text.encode("utf-8"))
+        return WebResponse(
+            HTTPStatus.OK,
+            "text/html; charset=utf-8",
+            _decorate_evidence_reader_html(text, query).encode("utf-8"),
+            _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY,
+        )
+
+    def _task_evidence_reader(self, run_id: str, doc_id: str, *, query: str = "") -> WebResponse:
+        """Serve only task-scoped Deep Research evidence, never a user library."""
+
+        run = self.research_agent.store.get_run(run_id)
+        if str(run.get("workflow_type", "")) != "deep_research":
+            raise FileNotFoundError("Task evidence is only available for Deep Research runs")
+        acquisition = next(
+            (
+                dict(stage.get("output", {}) or {})
+                for stage in list(run.get("stages", []) or [])
+                if str(dict(stage).get("key", "")) == "acquire"
+            ),
+            {},
+        )
+        task_evidence = dict(acquisition.get("task_evidence", {}) or {})
+        source_path = task_evidence_reader_path(
+            self.workspace,
+            run_id,
+            str(task_evidence.get("evidence_db", "") or ""),
+            doc_id,
+        )
+        text = source_path.read_text(encoding="utf-8", errors="replace")
+        return WebResponse(
+            HTTPStatus.OK,
+            "text/html; charset=utf-8",
+            _decorate_evidence_reader_html(text, query).encode("utf-8"),
+            _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY,
+        )
 
     def _markdown_source_reader(self, doc_id: str, source: dict[str, Any], full_text: str) -> str:
         """Render exact evidence anchors plus the complete converted source text."""
@@ -708,7 +1638,12 @@ class NotebookWebApp:
         if not original.is_absolute() or not original.is_file():
             raise FileNotFoundError("This source does not have a readable original file")
         content_type, _ = mimetypes.guess_type(str(original))
-        return WebResponse(HTTPStatus.OK, content_type or "application/octet-stream", original.read_bytes())
+        return WebResponse(
+            HTTPStatus.OK,
+            content_type or "application/octet-stream",
+            original.read_bytes(),
+            _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY,
+        )
 
     def _source(self, doc_id: str) -> dict[str, Any]:
         summary = load_workspace_summary(self.workspace)
@@ -828,6 +1763,10 @@ def create_notebook_server(
             self._dispatch()
 
         def _dispatch(self) -> None:
+            rejection = self._request_boundary_rejection()
+            if rejection is not None:
+                self._write_response(rejection)
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -843,6 +1782,43 @@ def create_notebook_server(
             response = app.dispatch(self.command, self.path, body)
             self._write_response(response)
 
+        def _request_boundary_rejection(self) -> WebResponse | None:
+            """Block DNS rebinding and cross-site POSTs against the loopback API."""
+
+            host_header = str(self.headers.get("Host", "") or "").strip()
+            if host_header:
+                host_name = (urlparse(f"//{host_header}").hostname or "").casefold()
+                if host_name not in {"127.0.0.1", "localhost", "::1"}:
+                    return NotebookWebApp._json_error(
+                        HTTPStatus.FORBIDDEN,
+                        "invalid_host",
+                        "The ScanSci local API accepts only loopback Host headers.",
+                    )
+            if self.command != "POST":
+                return None
+            origin = str(self.headers.get("Origin", "") or "").strip()
+            if not origin:
+                # Native desktop and local automation clients do not always
+                # send Origin. A browser cross-site request does.
+                return None
+            try:
+                parsed = urlparse(origin)
+                origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            except ValueError:
+                parsed = urlparse("")
+                origin_port = -1
+            if (
+                parsed.scheme != "http"
+                or (parsed.hostname or "").casefold() not in {"127.0.0.1", "localhost", "::1"}
+                or origin_port != int(self.server.server_port)
+            ):
+                return NotebookWebApp._json_error(
+                    HTTPStatus.FORBIDDEN,
+                    "cross_origin_request",
+                    "Cross-origin writes to the ScanSci local API are not allowed.",
+                )
+            return None
+
         def _write_response(self, response: WebResponse) -> None:
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
@@ -851,7 +1827,7 @@ def create_notebook_server(
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+                response.content_security_policy,
             )
             self.send_header("Cache-Control", "no-store")
             self.end_headers()

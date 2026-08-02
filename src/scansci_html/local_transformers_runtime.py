@@ -17,6 +17,12 @@ import time
 from typing import Any, Iterator
 
 from .local_model_market import installed_models
+from .local_model_inference import (
+    LoadedLocalModel,
+    generate_local_chat_stream,
+    load_local_chat_model,
+    local_runtime_status,
+)
 
 
 _HOST = "127.0.0.1"
@@ -38,6 +44,7 @@ class LocalTransformersRuntime:
         self._model: Any | None = None
         self._torch: Any | None = None
         self._device = "cpu"
+        self._loaded: LoadedLocalModel | None = None
 
     @property
     def base_url(self) -> str:
@@ -57,6 +64,7 @@ class LocalTransformersRuntime:
                 self._tokenizer = None
                 self._processor = None
                 self._loaded_model_id = ""
+                self._loaded = None
                 gc.collect()
             self._model_id = str(record["id"])
             self._model_path = Path(str(record["path"])).resolve()
@@ -82,6 +90,9 @@ class LocalTransformersRuntime:
                 self.wfile.write(body)
 
             def do_GET(self) -> None:  # noqa: N802
+                if self.path.rstrip("/") == "/health":
+                    self._json(HTTPStatus.OK, {"status": "ok", "model": runtime._model_id, **local_runtime_status(runtime._loaded)})
+                    return
                 if self.path.rstrip("/") == "/v1/models":
                     self._json(HTTPStatus.OK, {"object": "list", "data": [{"id": runtime._model_id, "object": "model"}]})
                     return
@@ -91,6 +102,7 @@ class LocalTransformersRuntime:
                 if self.path.rstrip("/") != "/v1/chat/completions":
                     self._json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not found"}})
                     return
+                cancel_event = threading.Event()
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -100,13 +112,15 @@ class LocalTransformersRuntime:
                     if str(payload.get("model", "")) != runtime._model_id:
                         raise ValueError("selected local model is no longer available")
                     stream = bool(payload.get("stream"))
+                    max_new_tokens = max(1, min(int(payload.get("max_tokens", 1024) or 1024), 2048))
                     if stream:
+                        runtime.prepare()
                         self.send_response(HTTPStatus.OK)
                         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                         self.send_header("Cache-Control", "no-cache")
-                        self.send_header("Connection", "keep-alive")
+                        self.send_header("Connection", "close")
                         self.end_headers()
-                        for part in runtime.generate_stream(messages):
+                        for part in runtime.generate_stream(messages, max_new_tokens=max_new_tokens, cancel_event=cancel_event):
                             event = {"choices": [{"delta": {"content": part}, "index": 0, "finish_reason": None}]}
                             self.wfile.write(f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8"))
                             self.wfile.flush()
@@ -114,11 +128,12 @@ class LocalTransformersRuntime:
                         self.wfile.write(f"data: {json.dumps(final)}\n\ndata: [DONE]\n\n".encode("utf-8"))
                         self.wfile.flush()
                         return
-                    text = "".join(runtime.generate_stream(messages))
+                    text = "".join(runtime.generate_stream(messages, max_new_tokens=max_new_tokens, cancel_event=cancel_event))
                     self._json(HTTPStatus.OK, {"id": f"local-{int(time.time())}", "object": "chat.completion", "model": runtime._model_id, "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]})
                 except (ValueError, RuntimeError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": {"message": str(exc)}})
-                except BrokenPipeError:  # pragma: no cover - user cancelled browser request
+                except (BrokenPipeError, ConnectionResetError):  # pragma: no cover - user cancelled browser request
+                    cancel_event.set()
                     return
                 except Exception as exc:  # pragma: no cover - backend dependencies vary by desktop
                     self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": f"Local model failed: {exc}"}})
@@ -131,73 +146,49 @@ class LocalTransformersRuntime:
         self._thread.start()
 
     def _load_model(self) -> None:
-        if self._model is not None:
+        if self._loaded is not None:
             return
         if self._model_path is None or not self._model_id:
             raise RuntimeError("No local model has been selected")
         try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError as exc:
-            raise RuntimeError("本地 Transformers 运行时未安装；请使用包含本地模型组件的 ScanSci 版本。") from exc
-
-        self._torch = torch
-        self._device = "cuda" if bool(torch.cuda.is_available()) else "cpu"
-        model_path = str(self._model_path)
-        # A 4B BF16 model does not fit on many 8 GB laptop GPUs.  CPU is slower
-        # but deterministic and avoids an opaque CUDA out-of-memory failure.
-        kwargs: dict[str, Any] = {"local_files_only": True, "low_cpu_mem_usage": True}
-        if self._device == "cuda":
-            kwargs["torch_dtype"] = torch.bfloat16
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-            self._model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-            self._model.to(self._device)
-            self._model.eval()
+            self._loaded = load_local_chat_model(self._model_path, self._model_id)
+            self._tokenizer = self._loaded.tokenizer
+            self._model = self._loaded.model
+            self._torch = self._loaded.torch
+            self._device = self._loaded.input_device
             self._loaded_model_id = self._model_id
         except Exception as exc:
+            self._loaded = None
             self._model = None
             self._tokenizer = None
             self._loaded_model_id = ""
             gc.collect()
             raise RuntimeError(f"无法加载 {self._model_id}：{exc}") from exc
 
-    def generate_stream(self, messages: list[dict[str, Any]]) -> Iterator[str]:
+    def prepare(self) -> None:
+        with self._lock:
+            self._load_model()
+
+    def generate_stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_new_tokens: int = 1024,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[str]:
         """Generate incremental text; first use may spend time loading weights."""
 
         with self._lock:
             self._load_model()
-            tokenizer = self._tokenizer
-            model = self._model
-            torch = self._torch
-            device = self._device
-            if tokenizer is None or model is None or torch is None:
+            loaded = self._loaded
+            if loaded is None:
                 raise RuntimeError("Local model did not initialize")
-            normalized = []
-            for item in messages[-16:]:
-                role = str(item.get("role", "user"))
-                content = item.get("content", "")
-                if isinstance(content, list):
-                    content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-                normalized.append({"role": role, "content": str(content)})
-            try:
-                prompt = tokenizer.apply_chat_template(normalized, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized) + "\nassistant:"
-            inputs = tokenizer(prompt, return_tensors="pt")
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            try:
-                from transformers import TextIteratorStreamer
-
-                streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-                worker = threading.Thread(target=model.generate, kwargs={**inputs, "max_new_tokens": 1024, "do_sample": True, "temperature": 0.6, "top_p": 0.9, "streamer": streamer}, daemon=True)
-                worker.start()
-                for text in streamer:
-                    if text:
-                        yield str(text)
-                worker.join(timeout=1)
-            except Exception as exc:
-                raise RuntimeError(f"本地模型生成失败：{exc}") from exc
+            yield from generate_local_chat_stream(
+                loaded,
+                messages,
+                max_new_tokens=max_new_tokens,
+                cancel_event=cancel_event,
+            )
 
 
 _RUNTIME = LocalTransformersRuntime()

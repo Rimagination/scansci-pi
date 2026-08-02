@@ -1,7 +1,48 @@
 import pytest
 import requests
 
-from scansci_html.llm import AnthropicCompatibleChatJsonClient, CascadingChatJsonClient, OpenAICompatibleChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, stream_chat_text
+from scansci_html.llm import (
+    AnthropicCompatibleChatJsonClient,
+    CascadingChatJsonClient,
+    OpenAICompatibleChatJsonClient,
+    _public_model_error,
+    analyze_vision_images,
+    build_chat_json_client,
+    complete_chat_text,
+    stream_chat_text,
+)
+
+
+def test_public_model_error_reports_exhausted_balance_actionably():
+    error = RuntimeError("Insufficient Balance")
+    error.status_code = 402  # type: ignore[attr-defined]
+
+    assert _public_model_error(error, prefix="模型服务不可用") == (
+        "模型服务余额不足（HTTP 402）。请充值该服务商账户，或切换到其他可用模型。"
+    )
+
+
+def test_public_model_error_distinguishes_gateway_and_upstream_rate_limits():
+    class GatewayResponse:
+        status_code = 429
+        headers = {"x-scansci-request-id": "b95e7079-0000-4000-8000-000000000001"}
+
+        def json(self):
+            return {"error": {"code": "rate_limit_exceeded"}}
+
+    class UpstreamResponse:
+        status_code = 429
+        headers = {"x-scansci-request-id": "b95e7079-0000-4000-8000-000000000002"}
+
+        def json(self):
+            return {"error": {"code": "upstream_rate_limited"}}
+
+    gateway_error = requests.HTTPError("HTTP 429", response=GatewayResponse())
+    upstream_error = requests.HTTPError("HTTP 429", response=UpstreamResponse())
+
+    assert "ScanSci 托管模型网关当前限流" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
+    assert "上游服务当前限流" in _public_model_error(upstream_error, prefix="模型服务暂时不可用")
+    assert "b95e7079-0000-4000-8000-000000000001" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
 
 
 def test_cascading_chat_client_latches_onto_healthy_fallback():
@@ -74,6 +115,50 @@ def test_cascading_chat_client_keeps_reachable_fallback_after_invalid_json():
     assert client.complete_text([]) == "可用的纯文本响应"
     assert primary.calls == 1
     assert fallback.calls == 2
+
+
+def test_cascading_clients_share_one_attempt_per_provider():
+    class FailingResponse:
+        status_code = 503
+        headers = {}
+
+        def raise_for_status(self):
+            error = requests.HTTPError("temporarily unavailable")
+            error.response = self
+            raise error
+
+        def close(self):
+            return None
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            return FailingResponse()
+
+    primary_session = Session()
+    fallback_session = Session()
+    primary = OpenAICompatibleChatJsonClient(
+        base_url="https://primary.test/v1",
+        api_key="secret",
+        model="primary",
+        session=primary_session,
+    )
+    fallback = OpenAICompatibleChatJsonClient(
+        base_url="https://fallback.test/v1",
+        api_key="secret",
+        model="fallback",
+        session=fallback_session,
+    )
+    client = CascadingChatJsonClient([primary, fallback])
+
+    with pytest.raises(RuntimeError):
+        client.complete_json([{"role": "user", "content": "hello"}], schema_name="quotes")
+
+    assert primary_session.calls == 1
+    assert fallback_session.calls == 1
 
 
 def test_openai_compatible_chat_json_client_parses_json_content():
@@ -231,6 +316,45 @@ def test_review_section_invalid_json_is_not_retried_by_the_transport_client():
         client.complete_json([{"role": "user", "content": "review"}], schema_name="literature_review_section")
 
     assert len(calls) == 1
+
+
+def test_review_section_contract_requires_citations_on_each_sentence():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"sentences":[{"text":"Supported sentence.","citation_ids":["1"]}]}'
+                        }
+                    }
+                ]
+            }
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout):
+            calls.append(json)
+            return FakeResponse()
+
+    client = OpenAICompatibleChatJsonClient(
+        base_url="https://example.test/v1", api_key="secret", model="chat-model", session=FakeSession()
+    )
+
+    result = client.complete_json(
+        [{"role": "system", "content": "Write a review section."}],
+        schema_name="literature_review_section",
+    )
+
+    assert result["sentences"][0]["citation_ids"] == ["1"]
+    contract = calls[0]["messages"][0]["content"]
+    assert '"sentences"' in contract
+    assert "Every sentence must carry" in contract
+    assert "Do not collect citations at paragraph end" in contract
 
 
 def test_build_chat_json_client_requires_openai_compatible_config():
@@ -726,6 +850,7 @@ def test_stream_chat_text_continues_when_provider_stops_before_required_marker()
 
     assert [event["type"] for event in events] == ["delta", "continuation", "delta", "done"]
     assert "【回答完毕】" in calls[1]["messages"][-1]["content"]
+    assert "只输出用户要求的结束标记" in calls[1]["messages"][-1]["content"]
     assert len(calls[1]["messages"]) == 3
     assert events[-1]["truncated"] is False
 
@@ -786,6 +911,173 @@ def test_stream_chat_text_retries_rate_limits_without_losing_the_reply(monkeypat
     assert events[1]["content"] == "recovered"
     assert events[-1]["truncated"] is False
     assert sleeps == [7.0]
+
+
+def test_stream_chat_text_retries_two_rate_limits_before_delivery(monkeypatch):
+    class RateLimitedResponse:
+        status_code = 429
+        headers = {"Retry-After": "0"}
+
+        def raise_for_status(self):
+            raise requests.HTTPError("rate limited", response=self)
+
+        def close(self):
+            return None
+
+    class SuccessResponse:
+        headers = {"Content-Type": "text/event-stream"}
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"recovered after two retries"}}]}',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                b"data: [DONE]",
+            ])
+
+        def close(self):
+            return None
+
+    responses = [RateLimitedResponse(), RateLimitedResponse(), SuccessResponse()]
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            return responses.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr("scansci_html.llm.time.sleep", sleeps.append)
+    events = list(stream_chat_text(
+        "openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        messages=[{"role": "user", "content": "hello"}],
+        session=FakeSession(),
+    ))
+
+    assert [event["type"] for event in events[:2]] == ["retry", "retry"]
+    assert events[2]["content"] == "recovered after two retries"
+    assert events[-1]["truncated"] is False
+    assert sleeps == [2.0, 4.0]
+
+
+def test_stream_chat_text_retries_a_statusless_connect_failure_before_delivery(monkeypatch):
+    class SuccessResponse:
+        headers = {"Content-Type": "text/event-stream"}
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"recovered"}}]}',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                b"data: [DONE]",
+            ])
+
+        def close(self):
+            return None
+
+    calls = []
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            calls.append(json)
+            if len(calls) == 1:
+                raise requests.ConnectionError("stale keep-alive connection")
+            return SuccessResponse()
+
+    sleeps = []
+    monkeypatch.setattr("scansci_html.llm.time.sleep", sleeps.append)
+    events = list(stream_chat_text(
+        "openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        messages=[{"role": "user", "content": "hello"}],
+        session=FakeSession(),
+    ))
+
+    assert events[0] == {
+        "type": "retry",
+        "reason": "temporary_upstream_error",
+        "status": None,
+        "delay_seconds": 2.0,
+        "attempt": 1,
+    }
+    assert events[1]["content"] == "recovered"
+    assert events[-1]["truncated"] is False
+    assert len(calls) == 2
+    assert sleeps == [2.0]
+
+
+def test_stream_chat_text_retries_a_broken_sse_before_the_first_delta(monkeypatch):
+    class BrokenResponse:
+        headers = {"Content-Type": "text/event-stream"}
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            raise requests.exceptions.ChunkedEncodingError("upstream closed stream")
+            yield b""  # pragma: no cover - keeps this a generator
+
+        def close(self):
+            return None
+
+    class SuccessResponse:
+        headers = {"Content-Type": "text/event-stream"}
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"recovered"}}]}',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                b"data: [DONE]",
+            ])
+
+        def close(self):
+            return None
+
+    responses = [BrokenResponse(), SuccessResponse()]
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            return responses.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr("scansci_html.llm.time.sleep", sleeps.append)
+    events = list(stream_chat_text(
+        "openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        messages=[{"role": "user", "content": "hello"}],
+        session=FakeSession(),
+    ))
+
+    assert events[0] == {
+        "type": "retry",
+        "reason": "temporary_upstream_error",
+        "status": None,
+        "delay_seconds": 1.0,
+        "attempt": 1,
+    }
+    assert events[1]["content"] == "recovered"
+    assert events[-1]["truncated"] is False
+    assert sleeps == [1.0]
 
 
 def test_anthropic_compatible_chat_json_client_parses_text_blocks():
@@ -853,4 +1145,68 @@ def test_openai_compatible_vision_request_embeds_local_image_data():
 
     assert text == "图中显示一条上升曲线。"
     assert calls[0][0] == "https://example.test/v1/chat/completions"
+    assert calls[0][2]["max_tokens"] == 2048
     assert calls[0][2]["messages"][0]["content"][1]["image_url"]["url"] == "data:image/png;base64,aGVsbG8="
+
+
+def test_plain_chat_rejects_oversized_input_before_network_request():
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("network must not be reached")
+
+    session = FakeSession()
+    with pytest.raises(ValueError, match="Provider input budget exceeded before network request"):
+        complete_chat_text(
+            "openai-compatible",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="chat-model",
+            messages=[{"role": "user", "content": "证据" * 60_000}],
+            session=session,
+        )
+
+    assert session.calls == 0
+
+
+def test_structured_chat_has_one_shared_two_request_budget(monkeypatch):
+    calls = []
+
+    class RetryableResponse:
+        status_code = 503
+        headers = {}
+
+    class InvalidResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            calls.append(kwargs.get("json"))
+            if len(calls) == 1:
+                error = requests.HTTPError("temporary")
+                error.response = RetryableResponse()
+                raise error
+            return InvalidResponse()
+
+    monkeypatch.setattr("scansci_html.llm.time.sleep", lambda _seconds: None)
+    client = OpenAICompatibleChatJsonClient(
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        session=FakeSession(),
+    )
+
+    with pytest.raises(RuntimeError):
+        client.complete_json(
+            [{"role": "user", "content": "return claims"}],
+            schema_name="answer_claims",
+        )
+
+    assert len(calls) == 2

@@ -8,7 +8,13 @@ from typing import Any
 
 from .evidence_table import build_evidence_table
 from .query_planner import plan_query, query_routes
-from .quote_extractor import ChatJsonClient, ExtractedQuote, extract_quotes, extract_quotes_with_llm
+from .quote_extractor import (
+    ChatJsonClient,
+    ExtractedQuote,
+    extract_quotes,
+    extract_quotes_with_llm,
+    is_substantive_evidence_hit,
+)
 from .synthesizer import synthesize_answer, synthesize_answer_with_llm
 from .verifier import apply_verification_policy, verify_answer_claims, verify_answer_claims_with_llm
 from ..query_fusion import fuse_ranked_hits
@@ -38,8 +44,16 @@ def answer_question(
     verification_provider: str = "local",
     query_rewrite_provider: str = "local",
     chat_client: ChatJsonClient | None = None,
+    filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     query_plan = plan_query(question)
+    if str(query_plan.get("question_type", "")).strip().lower() == "synthesis":
+        # A research-status question needs enough independent material to be a
+        # synthesis, rather than a polished paraphrase of a single excerpt.
+        if str(adequacy_profile).strip().lower() == "manual":
+            adequacy_profile = "auto"
+        query_variants = max(2, int(query_variants))
+        max_followup_queries = max(2, int(max_followup_queries))
     query_rewrite_generation = {"provider": "local", "fallback": False, "reason": ""}
     model_retrieval_queries: list[str] = []
     if _uses_llm(query_rewrite_provider):
@@ -70,7 +84,8 @@ def answer_question(
         min_quotes=min_quotes,
         min_documents=min_documents,
     )
-    filters = dict(query_plan.get("filters", {}) or {})
+    planned_filters = dict(query_plan.get("filters", {}) or {})
+    planned_filters.update(dict(filters or {}))
     initial_routes = _initial_retrieval_routes(
         question,
         query_plan,
@@ -85,7 +100,7 @@ def answer_question(
         initial_routes,
         limit=limit,
         per_document_limit=per_document_limit,
-        filters=filters,
+        filters=planned_filters,
         embedding_provider=embedding_provider,
         reranker=reranker,
         context_mode=context_mode,
@@ -106,6 +121,7 @@ def answer_question(
         min_documents=int(adequacy_thresholds["min_documents"]),
         profile=str(adequacy_thresholds["profile"]),
     )
+    adequacy = _apply_relation_grounding_gate(question, hits, adequacy)
     agentic_steps: list[dict[str, Any]] = [
         _agentic_trace_step(
             "initial_retrieval",
@@ -143,7 +159,7 @@ def answer_question(
                 [followup_route],
                 limit=limit,
                 per_document_limit=per_document_limit,
-                filters=filters,
+                filters=planned_filters,
                 embedding_provider=embedding_provider,
                 reranker=reranker,
                 context_mode=context_mode,
@@ -165,6 +181,7 @@ def answer_question(
                 min_documents=int(adequacy_thresholds["min_documents"]),
                 profile=str(adequacy_thresholds["profile"]),
             )
+            adequacy = _apply_relation_grounding_gate(question, hits, adequacy)
             agentic_steps.append(
                 _agentic_trace_step(
                     "followup_retrieval",
@@ -189,13 +206,18 @@ def answer_question(
             raise ValueError("chat_client is required when answer_provider is llm")
         answer_generation = {"provider": "llm", "fallback": False, "reason": ""}
         try:
-            answer = synthesize_answer_with_llm(question, evidence_table, chat_client=chat_client)
+            answer = synthesize_answer_with_llm(
+                question,
+                evidence_table,
+                chat_client=chat_client,
+                query_plan=query_plan,
+            )
         except (RuntimeError, ValueError) as error:
             # A compatible provider may ignore response_format or emit prose
             # without stable quote IDs.  Never discard an otherwise valid
             # evidence task: synthesize directly from the already validated
             # evidence table, then run the same verification gate below.
-            answer = synthesize_answer(question, evidence_table)
+            answer = synthesize_answer(question, evidence_table, query_plan=query_plan)
             answer_generation = {
                 "provider": "local-evidence",
                 "fallback": True,
@@ -219,7 +241,7 @@ def answer_question(
         verified_answer = apply_verification_policy(verified_answer)
     else:
         answer_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
-        answer = synthesize_answer(question, evidence_table)
+        answer = synthesize_answer(question, evidence_table, query_plan=query_plan)
         if _uses_llm(verification_provider):
             if chat_client is None:
                 raise ValueError("chat_client is required when verification_provider is llm")
@@ -236,7 +258,71 @@ def answer_question(
         else:
             verified_answer = verify_answer_claims(answer, evidence_table)
         verified_answer = apply_verification_policy(verified_answer)
+    if bool(adequacy.get("is_sufficient", False)) and _requires_chinese_claims(question, query_plan):
+        if not _verified_answer_has_chinese_claims(verified_answer):
+            # Citation integrity comes first: never discard supported material
+            # merely because a provider ignored the requested output language.
+            # The reader marks this as a transparent degradation instead.
+            verified_answer["language_fallback"] = True
+            limitations = list(verified_answer.get("limitations", []) or [])
+            notice = "生成模型未完成中文改写；以下保留经核验的原文证据摘录，便于继续核查。"
+            if notice not in limitations:
+                limitations.append(notice)
+            verified_answer["limitations"] = limitations
+            answer_generation = {
+                "provider": "evidence-excerpt-fallback",
+                "fallback": True,
+                "reason": "generated claims did not meet the requested Chinese answer language",
+            }
     citation_verification = verify_citations(verified_answer, evidence_table)
+    citation_repair = {
+        "attempted": False,
+        "applied": False,
+        "reason": "",
+    }
+    if bool(adequacy.get("is_sufficient", False)) and not bool(citation_verification.get("passed", False)):
+        failed_verification = citation_verification
+        citation_repair["attempted"] = True
+        repaired_answer = synthesize_answer(question, evidence_table, query_plan=query_plan)
+        repaired_answer = apply_verification_policy(verify_answer_claims(repaired_answer, evidence_table))
+        if _requires_chinese_claims(question, query_plan) and not _verified_answer_has_chinese_claims(repaired_answer):
+            repaired_answer["language_fallback"] = True
+            limitations = list(repaired_answer.get("limitations", []) or [])
+            notice = "生成模型的答案未通过逐条引用核验；以下自动改用经核验的原文证据摘录。"
+            if notice not in limitations:
+                limitations.append(notice)
+            repaired_answer["limitations"] = limitations
+        repaired_verification = verify_citations(repaired_answer, evidence_table)
+        if bool(repaired_verification.get("passed", False)):
+            citation_repair.update(
+                {
+                    "applied": True,
+                    "reason": "generated answer failed strict citation verification; rebuilt from validated evidence rows",
+                    "failed_verification": failed_verification,
+                }
+            )
+            repaired_answer["citation_repair"] = citation_repair
+            verified_answer = repaired_answer
+            citation_verification = repaired_verification
+            answer_generation = {
+                "provider": "local-evidence",
+                "fallback": True,
+                "reason": "strict citation verification repair",
+            }
+            verification_generation = {
+                "provider": "local-evidence",
+                "fallback": True,
+                "reason": "strict citation verification repair",
+            }
+        else:
+            citation_repair.update(
+                {
+                    "reason": "deterministic evidence repair also failed strict citation verification",
+                    "failed_verification": failed_verification,
+                    "repair_verification": repaired_verification,
+                }
+            )
+            verified_answer["citation_repair"] = citation_repair
     verified_answer["citation_verification"] = citation_verification
     reader_answer = build_reader_answer(verified_answer, evidence_table, query_plan=query_plan)
     verified_answer["reader_answer"] = reader_answer
@@ -274,6 +360,7 @@ def answer_question(
         "reader_answer": reader_answer,
         "verification": verified_answer.get("verification", {}),
         "citation_verification": citation_verification,
+        "citation_repair": citation_repair,
         "answer_generation": answer_generation,
         "verification_generation": verification_generation,
         "query_rewrite_generation": query_rewrite_generation,
@@ -297,6 +384,19 @@ def _insufficient_adequacy_answer(question: str, adequacy: dict[str, object]) ->
         ],
         "insufficient_evidence": True,
     }
+
+
+def _requires_chinese_claims(question: str, query_plan: dict[str, Any]) -> bool:
+    return str(query_plan.get("language", "")).strip().lower() == "zh" or bool(re.search(r"[\u4e00-\u9fff]", question))
+
+
+def _verified_answer_has_chinese_claims(answer: dict[str, Any]) -> bool:
+    text = " ".join(str(claim.get("text", "")) for claim in list(answer.get("answer", []) or []))
+    if not text.strip():
+        return True
+    chinese_characters = len(re.findall(r"[\u4e00-\u9fff]", text))
+    latin_characters = len(re.findall(r"[A-Za-z]", text))
+    return chinese_characters >= 2 and chinese_characters >= latin_characters * 0.04
 
 
 def assess_evidence_adequacy(
@@ -351,6 +451,67 @@ def assess_evidence_adequacy(
         "min_quotes": min_quotes,
         "min_documents": min_documents,
         "followup_reason": "",
+    }
+
+
+def _apply_relation_grounding_gate(
+    question: str,
+    hits: list[dict[str, Any]],
+    adequacy: dict[str, object],
+) -> dict[str, object]:
+    """Reject causal answers assembled from unrelated source fragments.
+
+    Dense retrieval can independently find one document for the proposed cause
+    and another for the proposed outcome.  That is useful recall, but it is not
+    evidence for the relation between them.  A causal question therefore needs
+    at least one retrieved document containing terms from both sides.
+    """
+
+    if not bool(adequacy.get("is_sufficient", False)):
+        return adequacy
+    match = re.search(
+        r"\b(?:shows?\s+that\s+)?(.+?)\s+(?:caused?|causes?|led\s+to|leads?\s+to|resulted\s+in|results?\s+in)\s+(.+?)[?.!]*$",
+        str(question or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return adequacy
+    ignored = {
+        "what", "which", "evidence", "library", "study", "studies", "paper", "papers",
+        "show", "shows", "showed", "that", "this", "these", "those", "from", "with",
+    }
+    left_terms = [term for term in lexical_tokens(match.group(1)) if len(term) >= 4 and term not in ignored]
+    right_terms = [term for term in lexical_tokens(match.group(2)) if len(term) >= 4 and term not in ignored]
+    if not left_terms or not right_terms:
+        return adequacy
+    text_by_document: dict[str, str] = {}
+    for hit in hits:
+        doc_id = str(hit.get("doc_id", "") or hit.get("evidence_id", ""))
+        text_by_document[doc_id] = " ".join(
+            [
+                text_by_document.get(doc_id, ""),
+                str(hit.get("title", "")),
+                str(hit.get("section", "")),
+                str(hit.get("text", "")),
+            ]
+        ).casefold()
+    grounded = any(
+        any(term in text for term in left_terms)
+        and any(term in text for term in right_terms)
+        for text in text_by_document.values()
+    )
+    if grounded:
+        return adequacy
+    return {
+        **adequacy,
+        "is_sufficient": False,
+        "followup_reason": "no single source supports both sides of the requested causal relation",
+        "relation_grounding": {
+            "relation": "causal",
+            "left_terms": left_terms[:8],
+            "right_terms": right_terms[:8],
+            "supported_in_one_document": False,
+        },
     }
 
 
@@ -731,24 +892,51 @@ def _expand_hits_with_neighbor_context(
     if not block_rows:
         return hits
     expanded_hits: list[dict[str, Any]] = []
+    seen_evidence_ids: set[str] = set()
     for hit in hits:
         block_id = str(hit.get("block_id", "")).strip()
         rows = block_rows.get(block_id, [])
         if len(rows) <= 1:
-            expanded_hits.append(hit)
+            evidence_id = str(hit.get("evidence_id", ""))
+            if evidence_id not in seen_evidence_ids:
+                expanded_hits.append(hit)
+                seen_evidence_ids.add(evidence_id)
             continue
         parent_text = " ".join(str(row.get("text", "")).strip() for row in rows if str(row.get("text", "")).strip())
         if not parent_text:
             expanded_hits.append(hit)
             continue
-        expanded = dict(hit)
-        expanded.setdefault("span_text", str(hit.get("text", "")).strip())
-        expanded["parent_text"] = parent_text
-        expanded["context_quote_text"] = parent_text
-        expanded["parent_block_id"] = block_id
-        expanded["parent_evidence_ids"] = [str(row.get("evidence_id", "")) for row in rows if str(row.get("evidence_id", ""))]
-        expanded["text"] = parent_text
-        expanded_hits.append(expanded)
+        parent_evidence_ids = [str(row.get("evidence_id", "")) for row in rows if str(row.get("evidence_id", ""))]
+        seed_position = int(hit.get("sentence_index", 0) or 0)
+        for row in rows:
+            evidence_id = str(row.get("evidence_id", ""))
+            if not evidence_id or evidence_id in seen_evidence_ids:
+                continue
+            distance = abs(int(row.get("sentence_index", 0) or 0) - seed_position)
+            # A block can be an entire PDF page or a reference list. Keeping
+            # every row from it turns one topical hit into unrelated sources.
+            # Two neighboring sentences preserve local context without
+            # treating the rest of the page as independently retrieved.
+            if distance > 2:
+                continue
+            expanded = dict(hit)
+            expanded.update(row)
+            expanded["parent_text"] = parent_text
+            expanded["parent_block_id"] = block_id
+            expanded["parent_evidence_ids"] = parent_evidence_ids
+            if distance:
+                expanded["score"] = max(0.0, float(hit.get("score", 0.0)) - 0.05 * distance)
+                routes = {str(route) for route in expanded.get("routes", []) or []}
+                routes.add("neighbor-context")
+                expanded["routes"] = sorted(routes)
+                # Contextual list continuations can legitimately omit the
+                # noun phrase from the lead sentence.  Keep them eligible for
+                # exact sentence quote extraction without pretending the
+                # neighboring text itself matched every inherited term.
+                expanded["matched_terms"] = list(expanded.get("matched_terms", []) or ["neighbor-context"])
+            seen_evidence_ids.add(evidence_id)
+            expanded_hits.append(expanded)
+    expanded_hits.sort(key=lambda item: (-float(item.get("score", 0.0)), str(item.get("evidence_id", ""))))
     return expanded_hits
 
 
@@ -786,12 +974,7 @@ def _load_context_block_rows(db_path: Path, block_ids: list[str]) -> dict[str, l
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
-            select
-              evidence_id,
-              block_id,
-              sentence_index,
-              char_start,
-              text
+            select *
             from evidence_spans
             where block_id in ({placeholders})
             order by block_id, sentence_index, char_start, evidence_id
@@ -816,9 +999,21 @@ def _search_evidence(
     context_mode: str,
     paper_recall_limit: int,
 ) -> list[dict[str, Any]]:
+    # References and bibliography tails often contain every query term, so a
+    # broad research-status query can otherwise spend its small result budget
+    # on non-evidence before quote extraction gets a chance to reject them.
+    # Fetch a modestly larger candidate window, reject those rows first, then
+    # apply source diversity and the requested limit.
+    resolved_limit = max(1, int(limit))
+    # Multi-route retrieval already expands each route to a sufficiently large
+    # fusion pool. Do not multiply it again here: doing so makes a broad local
+    # review re-rank thousands of extra spans for no recall benefit.
+    raw_limit = max(resolved_limit, 30)
     kwargs: dict[str, Any] = {
-        "limit": limit,
-        "per_document_limit": per_document_limit,
+        "limit": raw_limit,
+        # Source limits apply after bibliography filtering, otherwise a
+        # document with several reference rows can crowd out its findings.
+        "per_document_limit": 0,
         "filters": filters,
         "embedding_provider": embedding_provider,
         "reranker": reranker,
@@ -826,7 +1021,10 @@ def _search_evidence(
     }
     if paper_recall_limit > 0:
         kwargs["paper_recall_limit"] = paper_recall_limit
-    return search_evidence_store(db_path, query, **kwargs)
+    candidates = search_evidence_store(db_path, query, **kwargs)
+    substantive = [hit for hit in candidates if is_substantive_evidence_hit(hit)]
+    capped = _apply_agent_per_document_limit(substantive, per_document_limit=per_document_limit)
+    return capped[:resolved_limit]
 
 
 def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]]) -> dict[str, Any]:
@@ -871,6 +1069,36 @@ def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]
         for claim in claims
         if str(claim.get("support_status", "")) in {"supported", "partially_supported"}
     ]
+    claim_audit: list[dict[str, Any]] = []
+    for claim in claims:
+        claim_id = str(claim.get("claim_id", ""))
+        quote_ids = [str(item) for item in claim.get("quote_ids", []) or [] if str(item)]
+        rows = [row for quote_id in quote_ids for row in rows_by_quote_id.get(quote_id, [])]
+        support_status = str(claim.get("support_status", "not_enough_information"))
+        exact_anchor_ids = [
+            str(row.get("evidence_id", ""))
+            for row in rows
+            if str(row.get("evidence_id", ""))
+            and str(row.get("html_path", "")).strip()
+            and str(row.get("html_anchor", "")).strip()
+        ]
+        audit_status = (
+            "supported"
+            if support_status in {"supported", "partially_supported"}
+            and len(exact_anchor_ids) == len(rows)
+            and len(rows) == len(quote_ids)
+            else "needs_review"
+        )
+        claim_audit.append(
+            {
+                "claim_id": claim_id,
+                "support_status": support_status,
+                "audit_status": audit_status,
+                "quote_ids": quote_ids,
+                "evidence_ids": [str(row.get("evidence_id", "")) for row in rows if str(row.get("evidence_id", ""))],
+                "exact_anchor_evidence_ids": exact_anchor_ids,
+            }
+        )
     passed = (
         bool(claims)
         and not uncited_claim_ids
@@ -891,6 +1119,9 @@ def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]
         "missing_quote_ids": missing_quote_ids,
         "missing_source_anchor_evidence_ids": missing_source_anchors,
         "missing_exact_quote_evidence_ids": missing_exact_quotes,
+        "claim_evidence_audit": claim_audit,
+        "audited_claim_count": len(claim_audit),
+        "supported_anchor_claim_count": sum(1 for item in claim_audit if item["audit_status"] == "supported"),
     }
 
 
@@ -909,7 +1140,15 @@ def build_reader_answer(
     citations: list[dict[str, Any]] = []
     sentences: list[dict[str, Any]] = []
     question = str(answer.get("question", ""))
-    claims = _reader_ranked_claims(question, list(answer.get("answer", []) or []), rows_by_quote_id)
+    raw_claims = list(answer.get("answer", []) or [])
+    if str((query_plan or {}).get("answer_type", "")).strip().lower() == "named_list":
+        # The synthesizer/model has already ordered list answers by semantic
+        # usefulness.  Lexical re-ranking tends to promote a sentence that
+        # merely repeats the question over the sentence that contains the
+        # actual named items.
+        claims = raw_claims
+    else:
+        claims = _reader_ranked_claims(question, raw_claims, rows_by_quote_id)
     claims = _reader_limited_claims_for_question_type(question, claims, rows_by_quote_id, query_plan=query_plan)
 
     for claim in claims:
@@ -943,8 +1182,27 @@ def build_reader_answer(
         )
 
     text = " ".join(str(sentence.get("rendered_text", "")).strip() for sentence in sentences if sentence.get("rendered_text"))
+    is_synthesis = str((query_plan or {}).get("question_type", "")).strip().lower() == "synthesis"
+    document_ids = {
+        str(rows_by_quote_id.get(quote_id, {}).get("doc_id", "")).strip()
+        for sentence in sentences
+        for quote_id in list(sentence.get("quote_ids", []) or [])
+    }
+    document_ids.discard("")
+    scope_note = ""
+    if is_synthesis:
+        document_count = len(document_ids) or len(citations)
+        if re.search(r"[\u4e00-\u9fff]", question):
+            scope_note = f"以下归纳仅基于本次检索到的 {document_count} 篇资料，反映所选知识库中的相关证据，并不替代对整个领域的完整综述。"
+        else:
+            scope_note = f"This synthesis is limited to the {document_count} source(s) retrieved for this answer; it is not a complete review of the whole field."
+    if bool(answer.get("language_fallback", False)):
+        fallback_note = "生成模型未完成中文改写，以下保留带原文脚标的证据摘录。"
+        scope_note = f"{scope_note} {fallback_note}".strip()
     return {
         "style": "notebooklm_like_inline_citations",
+        "presentation": "synthesis" if is_synthesis else "answer",
+        "scope_note": scope_note,
         "text": text,
         "sentences": sentences,
         "citations": citations,
