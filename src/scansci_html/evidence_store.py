@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from hashlib import blake2b
+from hashlib import blake2b, sha256
 import json
 from pathlib import Path
 import re
@@ -22,6 +22,7 @@ from .evidence_spans import (
     write_evidence_html,
 )
 from .resolver import safe_identifier_part
+from .schema_migrations import Migration, apply_migrations, current_schema_version
 from .source_filters import is_ignored_library_path
 
 
@@ -48,6 +49,16 @@ SPAN_COLUMNS = (
     "section_level",
     "source_locator",
 )
+EVIDENCE_SCHEMA_NAME = "evidence_store"
+EVIDENCE_SCHEMA_VERSION = 3
+
+
+def _evidence_migrations() -> tuple[Migration, ...]:
+    return (
+        Migration(1, "evidence store baseline registry", lambda _connection: None),
+        Migration(2, "stable document content identity", _apply_evidence_identity_migration),
+        Migration(3, "stable document aliases and index versions", _apply_evidence_catalog_migration),
+    )
 
 
 def index_evidence_library(
@@ -84,10 +95,15 @@ def index_evidence_library(
             document_span = extracted_spans[0] if extracted_spans else None
             if document_span is None:
                 continue
-            if document_span.doc_id in seen_doc_ids:
+            identity_key, content_hash, stable_doc_id = _resolve_document_identity(
+                connection,
+                document_span,
+                source_path=html_file,
+            )
+            if stable_doc_id in seen_doc_ids:
                 duplicate_documents_skipped += 1
                 continue
-            seen_doc_ids.add(document_span.doc_id)
+            seen_doc_ids.add(stable_doc_id)
 
             if inject_evidence_html:
                 output_path = evidence_html_path_for(html_file)
@@ -95,6 +111,7 @@ def index_evidence_library(
                     html_file,
                     output_path=output_path,
                     min_sentence_length=min_sentence_length,
+                    document_id=stable_doc_id,
                 )
                 document_span = spans[0] if spans else None
                 spans = _spans_with_html_path(spans, output_path)
@@ -102,14 +119,29 @@ def index_evidence_library(
                     evidence_html_files += 1
             else:
                 output_path = None
-                spans = extracted_spans
+                spans = _rebind_document_spans(extracted_spans, stable_doc_id)
             if not spans:
                 continue
             documents += 1
             span_count += len(spans)
             document = document_span or spans[0]
+            if document.doc_id != stable_doc_id:
+                document = _rebind_document_spans([document], stable_doc_id)[0]
             fingerprint = _document_source_fingerprint(document, spans)
             if incremental and _document_fingerprint_matches(connection, document.doc_id, fingerprint):
+                _refresh_document_paths(
+                    connection,
+                    document,
+                    evidence_html_path=output_path,
+                    content_hash=content_hash,
+                )
+                _record_document_identity_alias(
+                    connection,
+                    identity_key=identity_key,
+                    doc_id=document.doc_id,
+                    content_hash=content_hash,
+                    source_path=html_file,
+                )
                 reused_documents += 1
                 continue
             if incremental and document.doc_id in existing_doc_ids:
@@ -119,12 +151,21 @@ def index_evidence_library(
             _insert_document(connection, document, output_path)
             _insert_spans(connection, spans)
             _record_document_fingerprint(connection, document.doc_id, fingerprint)
+            _record_document_identity_alias(
+                connection,
+                identity_key=identity_key,
+                doc_id=document.doc_id,
+                content_hash=content_hash,
+                source_path=html_file,
+            )
         if incremental:
             for removed_doc_id in existing_doc_ids - seen_doc_ids:
                 _delete_document_index_rows(connection, removed_doc_id)
                 removed_documents += 1
             if changed_documents or removed_documents:
                 _mark_vector_generations_stale(connection)
+        if not incremental or changed_documents or removed_documents:
+            _record_index_revision(connection)
         connection.commit()
     connection.close()
 
@@ -198,14 +239,36 @@ def index_markdown_library(
             document_span = spans[0] if spans else None
             if document_span is None:
                 continue
-            if document_span.doc_id in seen_doc_ids:
+            identity_key, content_hash, stable_doc_id = _resolve_document_identity(
+                connection,
+                document_span,
+                source_path=markdown_file,
+            )
+            spans = _rebind_document_spans(spans, stable_doc_id)
+            document_span = spans[0] if spans else None
+            if document_span is None:
+                continue
+            if stable_doc_id in seen_doc_ids:
                 duplicate_documents_skipped += 1
                 continue
-            seen_doc_ids.add(document_span.doc_id)
+            seen_doc_ids.add(stable_doc_id)
             documents += 1
             span_count += len(spans)
             fingerprint = _document_source_fingerprint(document_span, spans)
             if incremental and _document_fingerprint_matches(connection, document_span.doc_id, fingerprint):
+                _refresh_document_paths(
+                    connection,
+                    document_span,
+                    evidence_html_path=None,
+                    content_hash=content_hash,
+                )
+                _record_document_identity_alias(
+                    connection,
+                    identity_key=identity_key,
+                    doc_id=document_span.doc_id,
+                    content_hash=content_hash,
+                    source_path=markdown_file,
+                )
                 reused_documents += 1
                 continue
             if incremental and document_span.doc_id in existing_doc_ids:
@@ -215,12 +278,21 @@ def index_markdown_library(
             _insert_document(connection, document_span, None)
             _insert_spans(connection, spans)
             _record_document_fingerprint(connection, document_span.doc_id, fingerprint)
+            _record_document_identity_alias(
+                connection,
+                identity_key=identity_key,
+                doc_id=document_span.doc_id,
+                content_hash=content_hash,
+                source_path=markdown_file,
+            )
         if incremental:
             for removed_doc_id in existing_doc_ids - seen_doc_ids:
                 _delete_document_index_rows(connection, removed_doc_id)
                 removed_documents += 1
             if changed_documents or removed_documents:
                 _mark_vector_generations_stale(connection)
+        if not incremental or changed_documents or removed_documents:
+            _record_index_revision(connection)
         connection.commit()
     connection.close()
 
@@ -543,12 +615,13 @@ def _empty_library_overview() -> dict[str, int]:
         "graph_edges": 0,
         "evidence_spans": 0,
         "catalog_revision": 0,
+        "index_version": 0,
     }
 
 
 def _library_overview_stats(connection: sqlite3.Connection) -> dict[str, int]:
     revision_row = connection.execute(
-        "select catalog_revision from library_catalog_revisions where singleton = 1"
+        "select catalog_revision, index_version from library_catalog_revisions where singleton = 1"
     ).fetchone()
     return {
         "documents": int(connection.execute("select count(*) from source_documents").fetchone()[0] or 0),
@@ -558,6 +631,7 @@ def _library_overview_stats(connection: sqlite3.Connection) -> dict[str, int]:
         "graph_edges": int(connection.execute("select count(*) from knowledge_graph_edges").fetchone()[0] or 0),
         "evidence_spans": int(connection.execute("select count(*) from evidence_spans").fetchone()[0] or 0),
         "catalog_revision": int(revision_row[0] or 0) if revision_row else 0,
+        "index_version": int(revision_row[1] or 0) if revision_row else 0,
     }
 
 
@@ -567,10 +641,104 @@ def _record_catalog_revision(connection: sqlite3.Connection) -> None:
         update library_catalog_revisions
         set catalog_revision = catalog_revision + 1,
             card_schema_version = 2,
+            index_version = case
+                when index_version < catalog_revision + 1 then catalog_revision + 1
+                else index_version
+            end,
             updated_at = current_timestamp
         where singleton = 1
         """
     )
+
+
+def knowledge_base_snapshot(
+    db_path: str | Path,
+    *,
+    knowledge_base_id: str = "",
+) -> dict[str, object]:
+    """Capture a compact, durable identity for a bound evidence index.
+
+    The snapshot records counts and content/evidence digests rather than
+    copying source text into a conversation row.  It is intentionally
+    read-mostly: schema compatibility is ensured, but no vector or catalogue
+    rebuild is initiated here.
+    """
+
+    def empty_snapshot(*, error: str = "") -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "knowledge_base_id": str(knowledge_base_id or ""),
+            "index_version": 0,
+            "document_count": 0,
+            "summary_count": 0,
+            "section_count": 0,
+            "evidence_span_count": 0,
+            "vector_count": 0,
+            "evidence_snapshot": {"snapshot_id": "", "evidence_id_digest": "", "content_hashes_digest": ""},
+        }
+        if error:
+            snapshot["error"] = error
+        return snapshot
+
+    db = Path(db_path)
+    if not db.is_file():
+        return empty_snapshot()
+    try:
+        connection_context = sqlite3.connect(db)
+        with connection_context as connection:
+            _initialize_schema(connection)
+            revision = connection.execute(
+                "select index_version from library_catalog_revisions where singleton = 1"
+            ).fetchone()
+            index_version = int(revision[0] or 0) if revision else 0
+            documents = list(
+                connection.execute(
+                    "select doc_id, content_hash from source_documents order by doc_id"
+                )
+            )
+            content_digest = sha256()
+            for doc_id, content_hash in documents:
+                content_digest.update(f"{doc_id}\x1f{content_hash or ''}\n".encode("utf-8"))
+            evidence_digest = sha256()
+            evidence_count = 0
+            for evidence_id, doc_id, section_id, html_anchor in connection.execute(
+                "select evidence_id, doc_id, section_id, html_anchor from evidence_spans order by evidence_id"
+            ):
+                evidence_digest.update(
+                    f"{evidence_id}\x1f{doc_id}\x1f{section_id}\x1f{html_anchor}\n".encode("utf-8")
+                )
+                evidence_count += 1
+            vector_count = 0
+            table = connection.execute(
+                "select 1 from sqlite_master where type = 'table' and name = 'scansci_vector_cache_meta'"
+            ).fetchone()
+            if table:
+                vector_count = int(connection.execute("select count(*) from scansci_vector_cache_meta").fetchone()[0] or 0)
+            content_hashes_digest = content_digest.hexdigest()
+            evidence_id_digest = evidence_digest.hexdigest()
+            snapshot_id = sha256(
+                f"{index_version}\x1f{content_hashes_digest}\x1f{evidence_id_digest}".encode("utf-8")
+            ).hexdigest()
+            return {
+                "knowledge_base_id": str(knowledge_base_id or ""),
+                "index_version": index_version,
+                "document_count": len(documents),
+                "summary_count": int(connection.execute("select count(*) from document_cards").fetchone()[0] or 0),
+                "section_count": int(connection.execute("select count(*) from document_sections").fetchone()[0] or 0),
+                "evidence_span_count": evidence_count,
+                "vector_count": vector_count,
+                "evidence_snapshot": {
+                    "snapshot_id": snapshot_id,
+                    "evidence_id_digest": evidence_id_digest,
+                    "content_hashes_digest": content_hashes_digest,
+                    "evidence_span_count": evidence_count,
+                },
+            }
+    except sqlite3.DatabaseError:
+        # Legacy callers may point at a not-yet-created or placeholder path.
+        # Do not run DDL against a file SQLite cannot open; the durable run can
+        # still proceed and the next real index operation will report the
+        # actionable database error.
+        return empty_snapshot(error="invalid_database")
 
 
 def _extractive_document_summary(
@@ -772,6 +940,113 @@ def export_spans_jsonl(db_path: str | Path, output_path: str | Path) -> dict[str
     return {"spans": len(rows), "output_path": str(output)}
 
 
+def _apply_evidence_identity_migration(connection: sqlite3.Connection) -> None:
+    """Backfill stable source identity without rebuilding evidence rows."""
+
+    _ensure_column(connection, "source_documents", "source_version", "text not null default ''")
+    _ensure_column(connection, "source_documents", "content_hash", "text not null default ''")
+    rows = connection.execute(
+        "select doc_id, source_url, publication_year, html_path from source_documents"
+    ).fetchall()
+    for row in rows:
+        doc_id, source_url, publication_year, html_path = row
+        content_hash = _file_sha256(Path(str(html_path or "")))
+        source_version = str(source_url or "") or (str(publication_year or "") if publication_year else "")
+        connection.execute(
+            """
+            update source_documents
+            set source_version = case when source_version = '' then ? else source_version end,
+                content_hash = case when content_hash = '' then ? else content_hash end
+            where doc_id = ?
+            """,
+            (source_version, content_hash, str(doc_id)),
+        )
+
+
+def _apply_evidence_catalog_migration(connection: sqlite3.Connection) -> None:
+    """Add metadata needed for safe incremental rebinding.
+
+    This migration never touches evidence text or vector payloads.  Existing
+    document revisions are re-fingerprinted without the absolute source path,
+    so moving a local file does not masquerade as a new document.
+    """
+
+    _ensure_column(connection, "document_index_revisions", "index_version", "integer not null default 1")
+    _ensure_column(connection, "library_catalog_revisions", "index_version", "integer not null default 0")
+    connection.execute(
+        """
+        create table if not exists document_identity_aliases (
+            identity_key text primary key,
+            doc_id text not null,
+            source_kind text not null default 'local',
+            content_hash text not null default '',
+            last_path text not null default '',
+            created_at text not null default current_timestamp,
+            updated_at text not null default current_timestamp
+        )
+        """
+    )
+    connection.execute("create index if not exists idx_document_identity_doc on document_identity_aliases(doc_id)")
+    connection.execute("update document_index_revisions set index_version = 1 where index_version <= 0")
+    connection.execute(
+        """
+        update library_catalog_revisions
+        set index_version = case
+            when index_version < catalog_revision then catalog_revision
+            else index_version
+        end
+        where singleton = 1
+        """
+    )
+
+    # Rebuild only the small fingerprint metadata, not source/evidence/vector
+    # rows.  The old v2 fingerprint included local paths and would reject a
+    # legitimate rename even when the bytes were unchanged.
+    connection.execute("delete from document_index_revisions")
+    documents = connection.execute(
+        """
+        select doc_id, title, doi, source_url, publication_year, html_path
+        from source_documents
+        """
+    ).fetchall()
+    for row in documents:
+        doc_id = str(row[0] or "")
+        if not doc_id:
+            continue
+        fingerprint = _database_document_fingerprint(connection, row)
+        connection.execute(
+            """
+            insert into document_index_revisions(doc_id, source_fingerprint, index_version)
+            values (?, ?, 1)
+            """,
+            (doc_id, fingerprint),
+        )
+        content_hash = _file_sha256(Path(str(row[5] or "")))
+        if not content_hash:
+            content_hash = _stored_content_hash(connection, doc_id)
+        identity_key = _identity_key_from_values(
+            doi=str(row[2] or ""),
+            source_url=str(row[3] or ""),
+            content_hash=content_hash,
+            html_path=str(row[5] or ""),
+        )
+        if identity_key:
+            connection.execute(
+                """
+                insert or ignore into document_identity_aliases(
+                    identity_key, doc_id, source_kind, content_hash, last_path
+                ) values (?, ?, ?, ?, ?)
+                """,
+                (
+                    identity_key,
+                    doc_id,
+                    _identity_source_kind(identity_key),
+                    content_hash,
+                    str(row[5] or ""),
+                ),
+            )
+
+
 def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -782,7 +1057,9 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             source_url text not null,
             publication_year integer,
             html_path text not null,
-            evidence_html_path text not null
+            evidence_html_path text not null,
+            source_version text not null default '',
+            content_hash text not null default ''
         )
         """
     )
@@ -854,6 +1131,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         create table if not exists document_index_revisions (
             doc_id text primary key,
             source_fingerprint text not null,
+            index_version integer not null default 1,
             indexed_at text not null default current_timestamp
         )
         """
@@ -864,12 +1142,26 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             singleton integer primary key check(singleton = 1),
             catalog_revision integer not null default 0,
             card_schema_version integer not null default 0,
+            index_version integer not null default 0,
             updated_at text not null default current_timestamp
         )
         """
     )
     connection.execute(
         "insert or ignore into library_catalog_revisions(singleton, catalog_revision, card_schema_version) values (1, 0, 0)"
+    )
+    connection.execute(
+        """
+        create table if not exists document_identity_aliases (
+            identity_key text primary key,
+            doc_id text not null,
+            source_kind text not null default 'local',
+            content_hash text not null default '',
+            last_path text not null default '',
+            created_at text not null default current_timestamp,
+            updated_at text not null default current_timestamp
+        )
+        """
     )
     connection.execute(
         """
@@ -926,6 +1218,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    apply_migrations(connection, EVIDENCE_SCHEMA_NAME, _evidence_migrations(), target_version=EVIDENCE_SCHEMA_VERSION)
 
 
 def _clear_index(connection: sqlite3.Connection) -> None:
@@ -947,6 +1240,208 @@ def _existing_document_ids(connection: sqlite3.Connection) -> set[str]:
     }
 
 
+def _is_remote_source(value: str) -> bool:
+    return bool(re.match(r"^https?://", str(value or "").strip(), flags=re.IGNORECASE))
+
+
+def _fingerprint_source_marker(source_url: str, doi: str, publication_year: object) -> str:
+    """Return only identity metadata that should invalidate parsed evidence."""
+
+    if _is_remote_source(source_url):
+        return str(source_url).strip()
+    if str(doi or "").strip():
+        return str(doi).strip()
+    # A local path is deliberately excluded. Its bytes and parsed spans are
+    # fingerprinted separately, allowing a move/rename to reuse the index.
+    return str(publication_year or "").strip()
+
+
+def _identity_key_from_values(
+    *,
+    doi: str,
+    source_url: str,
+    content_hash: str,
+    html_path: str,
+) -> str:
+    normalized_doi = str(doi or "").strip().lower()
+    if normalized_doi:
+        return f"doi:{normalized_doi}"
+    normalized_url = str(source_url or "").strip().lower()
+    if _is_remote_source(normalized_url):
+        return f"url:{normalized_url}"
+    normalized_hash = str(content_hash or "").strip().lower()
+    if normalized_hash:
+        return f"content:{normalized_hash}"
+    normalized_path = str(html_path or "").strip().replace("\\", "/").lower()
+    return f"path:{normalized_path}" if normalized_path else ""
+
+
+def _identity_source_kind(identity_key: str) -> str:
+    return str(identity_key or "local").split(":", 1)[0] or "local"
+
+
+def _resolve_document_identity(
+    connection: sqlite3.Connection,
+    first_span: EvidenceSpan,
+    *,
+    source_path: Path,
+) -> tuple[str, str, str]:
+    content_hash = _file_sha256(source_path)
+    identity_key = _identity_key_from_values(
+        doi=str(first_span.doi or ""),
+        source_url=str(first_span.source_url or ""),
+        content_hash=content_hash,
+        html_path=str(source_path),
+    )
+    row = connection.execute(
+        "select doc_id from document_identity_aliases where identity_key = ?",
+        (identity_key,),
+    ).fetchone()
+    stable_doc_id = str(row[0]) if row and str(row[0] or "").strip() else str(first_span.doc_id)
+    return identity_key, content_hash, stable_doc_id
+
+
+def _rebind_document_spans(
+    spans: list[EvidenceSpan],
+    stable_doc_id: str,
+) -> list[EvidenceSpan]:
+    """Keep evidence IDs and section paths stable when a source is rebound."""
+
+    normalized_id = str(stable_doc_id or "").strip()
+    if not normalized_id:
+        return list(spans)
+    rebound: list[EvidenceSpan] = []
+    for span in spans:
+        section_path = str(span.section_path or span.section or "正文")
+        section_id = _section_id_for_path(normalized_id, section_path)
+        parent_path = " / ".join(part.strip() for part in section_path.split(" / ")[:-1] if part.strip())
+        parent_section_id = _section_id_for_path(normalized_id, parent_path) if parent_path else ""
+        block_suffix = str(span.block_id or "").rsplit(":", 1)[-1]
+        rebound.append(
+            replace(
+                span,
+                doc_id=normalized_id,
+                evidence_id=f"{normalized_id}.s{int(span.sentence_index):04d}",
+                block_id=f"{normalized_id}:{block_suffix}",
+                section_id=section_id,
+                parent_section_id=parent_section_id,
+            )
+        )
+    return rebound
+
+
+def _record_document_identity_alias(
+    connection: sqlite3.Connection,
+    *,
+    identity_key: str,
+    doc_id: str,
+    content_hash: str,
+    source_path: Path,
+) -> None:
+    if not str(identity_key or "").strip() or not str(doc_id or "").strip():
+        return
+    connection.execute(
+        """
+        insert into document_identity_aliases(
+            identity_key, doc_id, source_kind, content_hash, last_path, updated_at
+        ) values (?, ?, ?, ?, ?, current_timestamp)
+        on conflict(identity_key) do update set
+            doc_id = excluded.doc_id,
+            source_kind = excluded.source_kind,
+            content_hash = excluded.content_hash,
+            last_path = excluded.last_path,
+            updated_at = current_timestamp
+        """,
+        (
+            identity_key,
+            str(doc_id),
+            _identity_source_kind(identity_key),
+            str(content_hash or ""),
+            str(source_path),
+        ),
+    )
+
+
+def _refresh_document_paths(
+    connection: sqlite3.Connection,
+    first_span: EvidenceSpan,
+    *,
+    evidence_html_path: Path | None,
+    content_hash: str,
+) -> None:
+    """Update moved-source locators without reparsing unchanged evidence."""
+
+    document = connection.execute(
+        "select evidence_html_path from source_documents where doc_id = ?",
+        (str(first_span.doc_id),),
+    ).fetchone()
+    existing_evidence_path = str(document[0] or "") if document else ""
+    current_evidence_path = str(evidence_html_path.as_posix()) if evidence_html_path else existing_evidence_path
+    source_url = str(first_span.source_url or "")
+    connection.execute(
+        """
+        update source_documents
+        set source_url = ?, html_path = ?, evidence_html_path = ?,
+            source_version = ?, content_hash = case when ? <> '' then ? else content_hash end
+        where doc_id = ?
+        """,
+        (
+            source_url,
+            str(first_span.html_path or ""),
+            current_evidence_path,
+            _source_version_for_span(first_span, content_hash),
+            str(content_hash or ""),
+            str(content_hash or ""),
+            str(first_span.doc_id),
+        ),
+    )
+    span_path = current_evidence_path if current_evidence_path else str(first_span.html_path or "")
+    connection.execute(
+        "update evidence_spans set source_url = ?, html_path = ? where doc_id = ?",
+        (source_url, span_path, str(first_span.doc_id)),
+    )
+
+
+def _source_version_for_span(first_span: EvidenceSpan, content_hash: str = "") -> str:
+    source_url = str(first_span.source_url or "").strip()
+    if _is_remote_source(source_url):
+        return source_url
+    return str(content_hash or "").strip() or str(first_span.doi or first_span.publication_year or "")
+
+
+def _stored_content_hash(connection: sqlite3.Connection, doc_id: str) -> str:
+    row = connection.execute(
+        "select content_hash from source_documents where doc_id = ?",
+        (str(doc_id),),
+    ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _database_document_fingerprint(connection: sqlite3.Connection, document: sqlite3.Row | tuple[object, ...]) -> str:
+    doc_id, title, doi, source_url, publication_year, _html_path = document
+    digest = blake2b(digest_size=20)
+    digest.update(
+        "\x1f".join(
+            (
+                str(doc_id or ""),
+                str(title or ""),
+                str(doi or ""),
+                _fingerprint_source_marker(str(source_url or ""), str(doi or ""), publication_year),
+                str(publication_year or ""),
+            )
+        ).encode("utf-8")
+    )
+    for span in connection.execute(
+        """
+        select evidence_id, section_id, section_path, block_id, sentence_index, text
+        from evidence_spans where doc_id = ? order by evidence_id
+        """,
+        (str(doc_id),),
+    ):
+        digest.update("\x1e".join(str(value or "") for value in span).encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _document_source_fingerprint(first_span: EvidenceSpan, spans: list[EvidenceSpan]) -> str:
     """Fingerprint original parsed structure, not a generated summary.
 
@@ -963,7 +1458,11 @@ def _document_source_fingerprint(first_span: EvidenceSpan, spans: list[EvidenceS
                 str(first_span.doc_id),
                 str(first_span.title),
                 str(first_span.doi or ""),
-                str(first_span.source_url),
+                _fingerprint_source_marker(
+                    str(first_span.source_url or ""),
+                    str(first_span.doi or ""),
+                    first_span.publication_year,
+                ),
                 str(first_span.publication_year or ""),
             )
         ).encode("utf-8")
@@ -1007,13 +1506,7 @@ def _stored_document_fingerprint(connection: sqlite3.Connection, doc_id: str) ->
         """,
         (doc_id,),
     ).fetchall()
-    digest = blake2b(digest_size=20)
-    digest.update(
-        "\x1f".join(str(value or "") for value in document[:5]).encode("utf-8")
-    )
-    for span in spans:
-        digest.update("\x1e".join(str(value or "") for value in span).encode("utf-8"))
-    return digest.hexdigest()
+    return _database_document_fingerprint(connection, document)
 
 
 def _document_fingerprint_matches(connection: sqlite3.Connection, doc_id: str, fingerprint: str) -> bool:
@@ -1029,15 +1522,32 @@ def _document_fingerprint_matches(connection: sqlite3.Connection, doc_id: str, f
 
 
 def _record_document_fingerprint(connection: sqlite3.Connection, doc_id: str, fingerprint: str) -> None:
+    existing = connection.execute(
+        "select index_version from document_index_revisions where doc_id = ?",
+        (str(doc_id),),
+    ).fetchone()
+    index_version = max(1, int(existing[0] or 1)) if existing else 1
     connection.execute(
         """
-        insert into document_index_revisions(doc_id, source_fingerprint, indexed_at)
-        values (?, ?, current_timestamp)
+        insert into document_index_revisions(doc_id, source_fingerprint, index_version, indexed_at)
+        values (?, ?, ?, current_timestamp)
         on conflict(doc_id) do update set
           source_fingerprint = excluded.source_fingerprint,
+          index_version = excluded.index_version,
           indexed_at = current_timestamp
         """,
-        (doc_id, fingerprint),
+        (doc_id, fingerprint, index_version),
+    )
+
+
+def _record_index_revision(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        update library_catalog_revisions
+        set index_version = index_version + 1,
+            updated_at = current_timestamp
+        where singleton = 1
+        """
     )
 
 
@@ -1070,12 +1580,14 @@ def _mark_vector_generations_stale(connection: sqlite3.Connection) -> None:
 
 
 def _insert_document(connection: sqlite3.Connection, first_span: EvidenceSpan, evidence_html_path: Path | None) -> None:
+    content_hash = _file_sha256(Path(str(first_span.html_path or "")))
     connection.execute(
         """
         insert into source_documents (
-            doc_id, title, doi, source_url, publication_year, html_path, evidence_html_path
+            doc_id, title, doi, source_url, publication_year, html_path, evidence_html_path,
+            source_version, content_hash
         )
-        values (?, ?, ?, ?, ?, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             first_span.doc_id,
@@ -1085,6 +1597,8 @@ def _insert_document(connection: sqlite3.Connection, first_span: EvidenceSpan, e
             first_span.publication_year,
             first_span.html_path,
             evidence_html_path.as_posix() if evidence_html_path else "",
+            _source_version_for_span(first_span, content_hash),
+            content_hash,
         ),
     )
 
@@ -1445,3 +1959,16 @@ def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name:
     columns = {str(row[1]) for row in connection.execute(f"pragma table_info({table_name})")}
     if column_name not in columns:
         connection.execute(f"alter table {table_name} add column {column_name} {column_type}")
+
+
+def _file_sha256(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    digest = sha256()
+    try:
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return ""
+    return digest.hexdigest()

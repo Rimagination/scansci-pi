@@ -834,6 +834,9 @@ textarea::placeholder { color: #b6b7bd; }
 .source-panel-view p { margin: 3px 0 0; color: #86878d; font-size: 12px; }
 .source-panel-view p #sourceCount { color: var(--context-accent); font-weight: 700; }
 .source-count-unit { color: #86878d; font-weight: 400; }
+.knowledge-count-summary { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 8px; color: #8a8f8c; font-size: 9px; line-height: 1.4; }
+.knowledge-count-summary span { display: inline-flex; align-items: baseline; gap: 3px; white-space: nowrap; }
+.knowledge-count-summary b { color: #4d6258; font-size: 10px; font-weight: 650; }
 .source-filter { display: block; padding: 13px 15px 7px; }
 .source-filter input { width: 100%; height: 34px; padding: 0 10px; outline: none; border: 1px solid #e2e2e6; border-radius: 8px; color: var(--ink); background: #fff; font-size: 12px; }
 .source-filter input:focus { border-color: #b9c7bd; box-shadow: 0 0 0 3px rgba(34, 118, 70, .08); }
@@ -1819,6 +1822,10 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .download-task-copy small { overflow: hidden; color: var(--faint); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .download-task-progress { height: 4px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: var(--accent-surface-strong); }
 .download-task-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+.download-task-controls { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+.download-task-action { min-height: 26px; padding: 0 10px; border: 1px solid var(--accent-border); border-radius: 7px; color: var(--accent-ink); background: var(--accent-surface); font-size: 10px; font-weight: 650; }
+.download-task-action:hover { background: var(--accent-surface-strong); }
+.download-task-action.is-quiet { border-color: var(--rule); color: var(--muted); background: var(--surface); }
 .download-task-row.is-error .download-task-icon, .download-task-row.is-warning .download-task-icon { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, var(--surface)); }
 .download-task-row.is-error .download-task-copy header b, .download-task-row.is-warning .download-task-copy header b { color: var(--danger); }
 

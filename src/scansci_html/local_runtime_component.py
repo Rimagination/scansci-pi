@@ -35,6 +35,14 @@ RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 
 
+class LocalRuntimeInstallPaused(RuntimeError):
+    """Raised when the user pauses the optional runtime installation."""
+
+
+class LocalRuntimeInstallCancelled(RuntimeError):
+    """Raised when the user cancels the optional runtime installation."""
+
+
 class LocalRuntimeComponent:
     """Manage ScanSci's optional local Transformers sidecar after user approval."""
 
@@ -74,6 +82,7 @@ class LocalRuntimeComponent:
             "updated_at": int(time.time()),
         }
         self._install_thread: threading.Thread | None = None
+        self._install_control = ""
         self._download_sample: tuple[int, float, float] | None = None
         self._last_install_persist_at = 0.0
         self._load_install_job()
@@ -139,7 +148,7 @@ class LocalRuntimeComponent:
             updated_at = float(snapshot.get("updated_at", 0) or 0)
             age = max(0, round(time.time() - updated_at)) if updated_at else 0
             snapshot["last_update_seconds"] = age
-            snapshot["stalled"] = bool(snapshot.get("state") in {"queued", "installing"} and age >= 90)
+            snapshot["stalled"] = bool(snapshot.get("state") in {"queued", "installing", "pausing", "cancelling"} and age >= 90)
             return snapshot
 
     def start_install(self) -> dict[str, Any]:
@@ -162,6 +171,7 @@ class LocalRuntimeComponent:
                 "eta_seconds": None,
             }
             self._download_sample = None
+            self._install_control = ""
             self._persist_install_job(force=True)
             self._install_thread = threading.Thread(
                 target=self._install_in_background,
@@ -171,9 +181,79 @@ class LocalRuntimeComponent:
             self._install_thread.start()
             return dict(self._install_job)
 
+    def pause_install(self) -> dict[str, Any]:
+        return self._request_install_control("pause")
+
+    def cancel_install(self) -> dict[str, Any]:
+        return self._request_install_control("cancel")
+
+    def resume_install(self) -> dict[str, Any]:
+        return self._restart_install("resume")
+
+    def retry_install(self) -> dict[str, Any]:
+        return self._restart_install("retry")
+
+    def _request_install_control(self, action: str) -> dict[str, Any]:
+        with self._install_lock:
+            state = str(self._install_job.get("state", "idle"))
+            if state == "ready":
+                raise ValueError(f"本地运行组件当前状态不支持{('暂停' if action == 'pause' else '取消')}：{state}")
+            if state in {"failed", "cancelled"}:
+                if action == "cancel" and state == "cancelled":
+                    return self.install_status()
+                raise ValueError(f"本地运行组件当前状态不支持{('暂停' if action == 'pause' else '取消')}：{state}")
+            thread = self._install_thread
+            if thread is None or not thread.is_alive():
+                self._install_job.update(
+                    {
+                        "state": "paused" if action == "pause" else "cancelled",
+                        "phase": "paused" if action == "pause" else "cancelled",
+                        "message": (
+                            "安装已暂停；恢复时会继续使用已下载的组件归档"
+                            if action == "pause"
+                            else "安装已取消；已有组件归档会保留，重试时可续传"
+                        ),
+                        "error": "",
+                        "updated_at": int(time.time()),
+                    }
+                )
+                self._persist_install_job(force=True)
+                return self.install_status()
+            self._install_control = action
+            self._install_job.update(
+                {
+                    "state": "pausing" if action == "pause" else "cancelling",
+                    "message": "正在暂停组件安装…" if action == "pause" else "正在取消组件安装…",
+                    "updated_at": int(time.time()),
+                }
+            )
+            self._persist_install_job(force=True)
+            return self.install_status()
+
+    def _restart_install(self, action: str) -> dict[str, Any]:
+        with self._install_lock:
+            thread = self._install_thread
+            if thread is not None and thread.is_alive():
+                return self.install_status()
+            state = str(self._install_job.get("state", "idle"))
+            if state == "ready":
+                return self.install_status()
+            if state not in {"paused", "interrupted", "failed", "cancelled", "queued", "installing"}:
+                raise ValueError(f"本地运行组件当前状态不支持{action}：{state}")
+        return self.start_install()
+
+    def _check_install_control(self) -> None:
+        with self._install_lock:
+            action = self._install_control
+        if action == "pause":
+            raise LocalRuntimeInstallPaused("用户已暂停本地运行组件安装")
+        if action == "cancel":
+            raise LocalRuntimeInstallCancelled("用户已取消本地运行组件安装")
+
     def _install_in_background(self) -> None:
         try:
             result = self.install(progress_callback=self._update_install_progress)
+            self._check_install_control()
             with self._install_lock:
                 self._install_job.update(
                     {
@@ -190,6 +270,10 @@ class LocalRuntimeComponent:
                     }
                 )
                 self._persist_install_job(force=True)
+        except LocalRuntimeInstallPaused as exc:
+            self._finish_controlled_install("paused", str(exc))
+        except LocalRuntimeInstallCancelled as exc:
+            self._finish_controlled_install("cancelled", str(exc))
         except Exception as exc:
             with self._install_lock:
                 self._install_job.update(
@@ -204,6 +288,24 @@ class LocalRuntimeComponent:
                 )
                 self._persist_install_job(force=True)
 
+    def _finish_controlled_install(self, state: str, detail: str) -> None:
+        with self._install_lock:
+            self._install_control = ""
+            self._install_job.update(
+                {
+                    "state": state,
+                    "phase": state,
+                    "message": (
+                        "安装已暂停；恢复时会继续使用已下载的组件归档"
+                        if state == "paused"
+                        else "安装已取消；已有组件归档会保留，重试时可续传"
+                    ),
+                    "error": "" if state == "paused" else detail[:1200],
+                    "updated_at": int(time.time()),
+                }
+            )
+            self._persist_install_job(force=True)
+
     def _update_install_progress(
         self,
         phase: str,
@@ -211,6 +313,7 @@ class LocalRuntimeComponent:
         message: str,
         details: dict[str, Any] | None = None,
     ) -> None:
+        self._check_install_control()
         with self._install_lock:
             details = details or {}
             now = time.time()

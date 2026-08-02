@@ -10,10 +10,20 @@ from typing import Any, Iterable
 
 from .annotation_layers import load_annotation_layers
 from .resolver import safe_identifier_part
+from .schema_migrations import Migration, apply_migrations, current_schema_version
 
 
 SCHEMA_VERSION = "notebook_workspace.v1"
+WORKSPACE_SCHEMA_NAME = "notebook_workspace"
+WORKSPACE_SCHEMA_VERSION = 2
 DISPLAYABLE_CITATION_STATUSES = {"supported", "partial_support"}
+
+
+def _workspace_migrations() -> tuple[Migration, ...]:
+    return (
+        Migration(1, "notebook workspace baseline registry", lambda _connection: None),
+        Migration(2, "workspace terminology and recovery compatibility", lambda _connection: None),
+    )
 
 
 def initialize_notebook(
@@ -708,6 +718,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("create index if not exists idx_citation_records_note on citation_records(note_id)")
     connection.execute("create index if not exists idx_citation_records_evidence on citation_records(evidence_id)")
     connection.execute("create index if not exists idx_citation_audits_record on citation_audits(citation_record_id)")
+    apply_migrations(connection, WORKSPACE_SCHEMA_NAME, _workspace_migrations(), target_version=WORKSPACE_SCHEMA_VERSION)
 
 
 def _sync_citation_records_for_layer(
@@ -1016,6 +1027,7 @@ def _notebook_summary(connection: sqlite3.Connection, notebook: dict[str, Any]) 
         )
     citations = _citation_records(connection, notebook_id=notebook_id)
     citation_audit_count = sum(len(record.get("audits", []) or []) for record in citations)
+    knowledge_counts = _knowledge_store_counts(sources)
     return {
         "notebook_id": notebook_id,
         "title": str(notebook.get("title", "") or ""),
@@ -1032,11 +1044,61 @@ def _notebook_summary(connection: sqlite3.Connection, notebook: dict[str, Any]) 
             "citations": len(citations),
             "citation_audits": citation_audit_count,
         },
+        # Keep the legacy workspace counts stable for integrations while
+        # exposing the actual evidence hierarchy with unambiguous units.
+        "knowledge_counts": knowledge_counts,
         "sources": sources,
         "notes": notes,
         "layers": layers,
         "citations": citations,
     }
+
+
+def _knowledge_store_counts(sources: list[dict[str, object]]) -> dict[str, int]:
+    """Count durable knowledge layers without confusing spans with documents."""
+
+    counts = {
+        "documents": 0,
+        "summaries": 0,
+        "sections": 0,
+        "evidence_spans": 0,
+        "vectors": 0,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+    }
+    db_paths = sorted(
+        {
+            str(row.get("evidence_db_path", "") or "").strip()
+            for row in sources
+            if str(row.get("evidence_db_path", "") or "").strip()
+        }
+    )
+    tables = {
+        "documents": "source_documents",
+        "summaries": "document_cards",
+        "sections": "document_sections",
+        "evidence_spans": "evidence_spans",
+        "vectors": "scansci_vector_cache_meta",
+        "graph_nodes": "knowledge_graph_nodes",
+        "graph_edges": "knowledge_graph_edges",
+    }
+    for raw_path in db_paths:
+        try:
+            with sqlite3.connect(raw_path) as evidence_connection:
+                evidence_connection.execute("pragma query_only = on")
+                for key, table in tables.items():
+                    try:
+                        counts[key] += int(
+                            evidence_connection.execute(f"select count(*) from {table}").fetchone()[0] or 0
+                        )
+                    except sqlite3.Error:
+                        # Older stores are upgraded lazily; missing derived
+                        # tables therefore report zero instead of breaking the
+                        # workspace page.
+                        continue
+        except (OSError, sqlite3.Error):
+            continue
+    return counts
 
 
 def _rows(connection: sqlite3.Connection, query: str, params: tuple[object, ...]) -> list[dict[str, object]]:

@@ -74,6 +74,7 @@ def write_evidence_html(
     *,
     output_path: str | Path | None = None,
     min_sentence_length: int = 40,
+    document_id: str = "",
 ) -> list[EvidenceSpan]:
     source = Path(html_path)
     output = Path(output_path) if output_path else source.with_name(f"{source.stem}.evidence.html")
@@ -84,6 +85,7 @@ def write_evidence_html(
         source.read_text(encoding="utf-8"),
         html_path=source,
         min_sentence_length=min_sentence_length,
+        document_id=document_id,
     )
     _ensure_evidence_styles(soup)
     for annotation in annotations:
@@ -179,6 +181,7 @@ def _scan_evidence_spans(
     *,
     html_path: str | Path,
     min_sentence_length: int,
+    document_id: str = "",
 ) -> tuple[BeautifulSoup, list[EvidenceSpan], list[_BlockAnnotation]]:
     soup = BeautifulSoup(str(html_text or ""), "lxml")
     article = _article_root(soup)
@@ -187,7 +190,7 @@ def _scan_evidence_spans(
     doi = _attr(article, "data-doi")
     source_url = _attr(article, "data-source-url")
     publication_year = _publication_year(article, soup)
-    doc_id = safe_identifier_part(doi or source_url or Path(html_path).stem)
+    doc_id = str(document_id or "").strip() or safe_identifier_part(doi or source_url or Path(html_path).stem)
     normalized_path = Path(html_path).as_posix()
 
     spans: list[EvidenceSpan] = []

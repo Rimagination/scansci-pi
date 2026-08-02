@@ -115,6 +115,32 @@ def test_local_runtime_install_api_starts_background_job_and_exposes_progress(
     assert _payload(progress) == started
 
 
+@pytest.mark.parametrize("action", ["pause", "resume", "retry", "cancel"])
+def test_local_runtime_install_control_api_delegates_to_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    expected = {"job_id": "local-runtime", "state": "paused" if action == "pause" else "queued", "action": action}
+    calls: list[str] = []
+
+    def control() -> dict[str, object]:
+        calls.append(action)
+        return dict(expected)
+
+    monkeypatch.setattr(app.local_runtime, f"{action}_install", control)
+    response = app.dispatch(
+        "POST",
+        "/api/local-runtime/install-control",
+        json.dumps({"action": action}).encode("utf-8"),
+    )
+
+    assert response.status == 202
+    assert _payload(response) == expected
+    assert calls == [action]
+
+
 def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
@@ -122,6 +148,8 @@ def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_pa
 
     assert "renderDownloadActivity" in script
     assert "downloadJobTelemetry" in script
+    assert "control-download-task" in script
+    assert all(label in script for label in ("暂停", "恢复", "重试", "取消"))
     assert 'data-action="open-download-center"' in script
     assert "预计" in script
     assert "下载任务" in script
@@ -2960,6 +2988,32 @@ def test_resource_setup_starts_the_retrieval_download_only_after_runtime_is_read
     assert response.status == 202
     assert payload["job_id"] == "retrieval-core"
     assert calls == [(["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B"], "retrieval-core", "auto")]
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "retry", "cancel"])
+def test_model_download_control_api_delegates_to_persistent_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    expected = {"job_id": "retrieval-core", "state": "paused" if action == "pause" else "queued", "action": action}
+    calls: list[tuple[str, str]] = []
+
+    def control(job_id: str) -> dict[str, object]:
+        calls.append((action, job_id))
+        return dict(expected)
+
+    monkeypatch.setattr(app.model_installs, action, control)
+    response = app.dispatch(
+        "POST",
+        "/api/local-models/install-control",
+        json.dumps({"job_id": "retrieval-core", "action": action}).encode("utf-8"),
+    )
+
+    assert response.status == 202
+    assert _payload(response) == expected
+    assert calls == [(action, "retrieval-core")]
 
 
 def test_model_download_is_refused_before_a_lightweight_build_has_a_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

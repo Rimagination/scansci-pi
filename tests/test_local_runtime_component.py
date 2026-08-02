@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 from urllib.request import urlopen
 from zipfile import ZipFile
@@ -172,6 +173,69 @@ def test_runtime_component_installs_in_background_with_visible_progress(tmp_path
     assert finished["state"] == "ready"
     assert finished["progress"] == 1.0
     assert component.status()["installed"] is True
+
+
+def test_runtime_component_pause_resume_cancel_and_retry_are_persistent_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+
+    def build_fake(component: LocalRuntimeComponent, *, job_name: str) -> tuple[threading.Event, dict[str, int]]:
+        entered = threading.Event()
+        calls = {"count": 0}
+
+        def fake_install(progress_callback=None):
+            calls["count"] += 1
+            for index in range(20):
+                entered.set()
+                if progress_callback:
+                    progress_callback("download", index / 20, "下载官方组件", {"completed_bytes": index, "total_bytes": 20})
+                time.sleep(0.01)
+            return {"job_id": job_name, "installed": True}
+
+        monkeypatch.setattr(component, "install", fake_install)
+        return entered, calls
+
+    component = LocalRuntimeComponent(root=tmp_path / "paused", manifest_url="https://example.test/runtime.json")
+    entered, calls = build_fake(component, job_name="paused")
+    component.start_install()
+    assert entered.wait(1)
+    requested = component.pause_install()
+    assert requested["state"] in {"pausing", "paused"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and component.install_status()["state"] != "paused":
+        time.sleep(0.01)
+    assert component.install_status()["state"] == "paused"
+    resumed = component.resume_install()
+    assert resumed["state"] in {"queued", "installing"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and component.install_status()["state"] != "ready":
+        time.sleep(0.01)
+    assert component.install_status()["state"] == "ready"
+    assert calls["count"] == 2
+
+    cancelled = LocalRuntimeComponent(root=tmp_path / "cancelled", manifest_url="https://example.test/runtime.json")
+    entered_cancel, cancel_calls = build_fake(cancelled, job_name="cancelled")
+    cancelled.start_install()
+    assert entered_cancel.wait(1)
+    requested = cancelled.cancel_install()
+    assert requested["state"] in {"cancelling", "cancelled"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and cancelled.install_status()["state"] != "cancelled":
+        time.sleep(0.01)
+    assert cancelled.install_status()["state"] == "cancelled"
+    retried = cancelled.retry_install()
+    assert retried["state"] in {"queued", "installing"}
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and cancelled.install_status()["state"] != "ready":
+        time.sleep(0.01)
+    assert cancelled.install_status()["state"] == "ready"
+    assert cancel_calls["count"] == 2
 
 
 def test_runtime_component_download_resumes_an_existing_partial_file(
