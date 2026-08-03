@@ -1,44 +1,44 @@
 {
   "schema_version": 1,
-  "p0_objective": "让正式 ScanSci 桌面包保持轻量：不内置本地 AI 推理依赖或模型权重；用户可在明确确认后，从受信任的 HTTPS 组件清单按需安装运行组件和模型，并完成本地 RAG。",
+  "p0_objective": "修复可选研究检索组件的下载可靠性和本机状态问答：错误页不得写入模型文件，断点只能复用已校验片段，用户能直接知道哪个组件、模型和文件失败以及如何重试。",
   "acceptance": [
     {
-      "id": "stable-build-cache",
-      "requirement": "构建编号只标识交付物；PyInstaller workpath 由 Python、依赖与构建配置生成稳定缓存键，重复开发构建可以复用。"
+      "id": "local-status-routing",
+      "requirement": "询问当前、失败或卡住的组件、资源、模型、运行时、下载与安装任务时，必须进入本机状态问答，不得启动论文检索或下载工作流。"
+    },
+    {
+      "id": "deterministic-local-answer",
+      "requirement": "本机状态回答直接读取持久化任务记录，列出失败组件、模型、文件、来源、原因和重试位置，不依赖大模型猜测。"
+    },
+    {
+      "id": "verified-range-download",
+      "requirement": "模型二进制采用分段下载；写入前校验 HTTP 状态、Content-Type、Content-Length、Content-Range 和预期总大小，拒绝 HTML、JSON、XML 或截断响应。"
+    },
+    {
+      "id": "verified-resume",
+      "requirement": "只续传带有匹配校验元数据的临时片段；旧版遗留或来源不明的部分文件必须丢弃后重新下载。"
+    },
+    {
+      "id": "progress-semantics",
+      "requirement": "多模型资源任务分别显示整组完成度和当前模型进度，不得把整组 50% 与当前文件的少量字节并列成误导性状态。"
+    },
+    {
+      "id": "source-fallback",
+      "requirement": "继续支持官方 ModelScope 与 Hugging Face 镜像回退，并保留明确的实际来源与错误信息。"
     },
     {
       "id": "standard-package",
-      "requirement": "正式 ScanSci core 标准包不内置 torch、transformers、sentence-transformers、tensorflow 或任何模型快照；内置功能必须可在无本地 AI 组件时正常运行。"
-    },
-    {
-      "id": "runtime-component",
-      "requirement": "ScanSci Local Runtime 拥有独立版本、构建缓存、ZIP 与 SHA256 清单，可安装到 LOCALAPPDATA 后被多个主程序版本复用。"
-    },
-    {
-      "id": "runtime-first-use",
-      "requirement": "资料导入、打开对话、构建基础索引和检查状态均不得隐式下载运行组件或模型。只有用户明确点击安装运行组件、完成 SHA256 校验并启用后，界面才允许按需下载 Qwen 检索权重。"
-    },
-    {
-      "id": "model-directory-preserved",
-      "requirement": "F:\\AI\\Models、Hugging Face 缓存及自动发现目录继续作为用户数据，不复制进应用或运行时组件。"
-    },
-    {
-      "id": "existing-agent-routing",
-      "requirement": "GLM、Qwen 托管模型、Skill 路由和知识库问答保持通过原有 ResearchAgentRuntime。"
+      "requirement": "ScanSci core 包继续保持轻量，不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"
     },
     {
       "id": "package-identity",
-      "requirement": "验收记录中的 ExecutablePath、build_id、package_profile 与 SHA256 指向同一唯一构建。"
-    },
-    {
-      "id": "desktop-regression",
-      "requirement": "正式 EXE 的发送、参考文献栏规则、窗口最大化和资源完整性继续通过现有验收。"
+      "requirement": "应用版本、安装器版本、更新清单、build_id、package_profile 与 SHA256 必须指向同一唯一构建。"
     }
   ],
   "non_goals": [
     "本轮不新增聊天、知识库、PPT、模型市场或论文获取产品功能。",
-    "不克隆、迁移或重构到 OpenCode 架构。",
-    "不把用户模型权重打进 ScanSci 主程序或 Local Runtime。",
-    "不以浏览器源码预览、Mock 或单元测试替代正式 EXE 人工交互验收。"
+    "不把可选本地模型或推理依赖打进 ScanSci core 安装包。",
+    "不购买或要求代码签名证书。",
+    "不以放宽下载校验换取表面成功率。"
   ]
 }

@@ -17,22 +17,22 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
 _DEFAULT_RELEASE_NOTES = [
     {
-        "title": "桌面体验",
+        "title": "资源下载",
         "items": [
-            "新增右上角版本状态与更新卡片。",
-            "统一 ScanSci 窗口、任务栏与快捷方式图标。",
+            "修复研究检索组件可能把错误响应写成模型文件的问题。",
+            "断点续传只复用已校验片段，并分别显示整组与当前模型进度。",
         ],
     },
     {
-        "title": "研究工作流",
+        "title": "软件状态问答",
         "items": [
-            "幻灯片模式支持浏览并选择 EasySlides 模板。",
-            "资料库支持选择本地文件夹并导入研究文献。",
+            "询问失败的下载任务时，直接读取本机任务记录，不再误进论文检索。",
+            "回答会给出组件、模型、文件、来源、失败原因和重试位置。",
         ],
     },
 ]

@@ -29,8 +29,10 @@ DEFAULT_REVISION = "master"
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHUNK_BYTES = 1024 * 1024
+_HTTP_RANGE_BYTES = 16 * 1024 * 1024
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
 _RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0)
+_BINARY_MODEL_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
 
 
 class ModelDownloadError(RuntimeError):
@@ -47,6 +49,10 @@ class DownloadCancelled(ModelDownloadError):
 
 class ModelSourceUnavailable(ModelDownloadError):
     """Raised when one source cannot provide the requested public snapshot."""
+
+
+class InvalidModelResponse(ModelDownloadError):
+    """Raised when a mirror returns an error document instead of model bytes."""
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -236,7 +242,14 @@ def _install_manifest(
         return target
     partial.mkdir(parents=True, exist_ok=True)
     completed_bytes = sum(
-        min(max(0, int(item.get("size", 0) or 0)), _partial_file_size(partial / str(item["path"])))
+        min(
+            max(0, int(item.get("size", 0) or 0)),
+            _partial_file_size(
+                partial / str(item["path"]),
+                expected_size=max(0, int(item.get("size", 0) or 0)),
+                expected_sha256=str(item.get("sha256", "") or ""),
+            ),
+        )
         for item in files
     )
     for item in files:
@@ -311,11 +324,14 @@ def _download_file(
             progress_callback(expected_size or destination.stat().st_size)
         return expected_size or destination.stat().st_size
     partial = destination.with_name(destination.name + ".download")
+    partial_meta = destination.with_name(destination.name + ".download.json")
     if partial.is_file() and expected_size and partial.stat().st_size > expected_size:
         partial.unlink(missing_ok=True)
+        partial_meta.unlink(missing_ok=True)
     if partial.is_file() and _file_valid(partial, expected_size, expected_sha256):
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial.replace(destination)
+        partial_meta.unlink(missing_ok=True)
         if progress_callback:
             progress_callback(expected_size or destination.stat().st_size)
         return expected_size or destination.stat().st_size
@@ -324,44 +340,207 @@ def _download_file(
         # Range request at EOF would return 416 forever, so restart only this
         # corrupt file while retaining every other verified file.
         partial.unlink(missing_ok=True)
-    last_error: Exception | None = None
-    for delay in _RETRY_DELAYS_SECONDS:
-        if delay:
-            time.sleep(delay)
-        try:
+        partial_meta.unlink(missing_ok=True)
+
+    # Old releases could append a small HTML/JSON error response to the
+    # resumable file.  Only resume prefixes that this downloader has already
+    # validated as complete HTTP ranges; discard unverifiable legacy bytes.
+    if partial.is_file() and not _verified_partial_metadata(
+        partial_meta,
+        verified_bytes=partial.stat().st_size,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    ):
+        partial.unlink(missing_ok=True)
+        partial_meta.unlink(missing_ok=True)
+
+    integrity_restarts = 0
+    while True:
+        while not expected_size or not partial.is_file() or partial.stat().st_size < expected_size:
             offset = partial.stat().st_size if partial.is_file() else 0
-            headers = {"User-Agent": "ScanSci/0.2 model downloader"}
-            if offset:
-                headers["Range"] = f"bytes={offset}-"
-            response = request.urlopen(request.Request(url, headers=headers), timeout=60)  # noqa: S310
-            status = int(getattr(response, "status", 200) or 200)
-            if offset and status != 206:
-                response.close()
-                partial.unlink(missing_ok=True)
-                offset = 0
-                response = request.urlopen(  # noqa: S310
-                    request.Request(url, headers={"User-Agent": "ScanSci/0.2 model downloader"}),
-                    timeout=60,
-                )
+            last_error: Exception | None = None
+            payload: bytes | None = None
+            for delay in _RETRY_DELAYS_SECONDS:
+                if delay:
+                    time.sleep(delay)
+                try:
+                    payload = _fetch_download_chunk(
+                        url,
+                        destination=destination,
+                        offset=offset,
+                        expected_size=expected_size,
+                    )
+                    break
+                except (DownloadPaused, DownloadCancelled):
+                    raise
+                except InvalidModelResponse:
+                    # Retrying the same signed/error document wastes several
+                    # seconds and can never repair it.  Let auto mode switch
+                    # to the other official source immediately.
+                    raise
+                except Exception as exc:
+                    last_error = exc
+            if payload is None:
+                raise ModelDownloadError(f"{destination.name} 下载失败：{last_error}") from last_error
             mode = "ab" if offset else "wb"
-            with response, partial.open(mode) as output:
-                downloaded = offset
-                if progress_callback:
-                    progress_callback(downloaded)
-                while chunk := response.read(_CHUNK_BYTES):
-                    output.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback:
-                        progress_callback(downloaded)
-            if not _file_valid(partial, expected_size, expected_sha256):
-                raise ModelDownloadError(f"{destination.name} 下载后校验失败")
+            with partial.open(mode) as output:
+                output.write(payload)
+            downloaded = offset + len(payload)
+            _write_partial_metadata(
+                partial_meta,
+                verified_bytes=downloaded,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+            )
+            if progress_callback:
+                progress_callback(downloaded)
+            if not expected_size:
+                break
+
+        if _file_valid(partial, expected_size, expected_sha256):
             partial.replace(destination)
+            partial_meta.unlink(missing_ok=True)
             return destination.stat().st_size
-        except (DownloadPaused, DownloadCancelled):
-            raise
-        except Exception as exc:
-            last_error = exc
-    raise ModelDownloadError(f"{destination.name} 下载失败：{last_error}") from last_error
+        if integrity_restarts == 0:
+            # A correct-length file with a wrong digest cannot be repaired by
+            # appending.  Restart this file once from a fresh signed URL.
+            integrity_restarts += 1
+            partial.unlink(missing_ok=True)
+            partial_meta.unlink(missing_ok=True)
+            continue
+        partial.unlink(missing_ok=True)
+        partial_meta.unlink(missing_ok=True)
+        raise ModelDownloadError(
+            f"{destination.name} 完整性校验失败（预期 {expected_size} 字节）；已删除损坏的临时文件"
+        )
+
+
+def _fetch_download_chunk(
+    url: str,
+    *,
+    destination: Path,
+    offset: int,
+    expected_size: int,
+) -> bytes:
+    is_http = parse.urlparse(url).scheme.lower() in {"http", "https"}
+    remaining = max(0, expected_size - offset) if expected_size else 0
+    requested = min(_HTTP_RANGE_BYTES, remaining) if is_http and remaining else 0
+    headers = {
+        "User-Agent": "ScanSci/0.2 model downloader",
+        "Accept": "application/octet-stream,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+    }
+    if is_http and expected_size:
+        end = offset + requested - 1
+        headers["Range"] = f"bytes={offset}-{end}"
+    elif offset:
+        headers["Range"] = f"bytes={offset}-"
+
+    response = request.urlopen(request.Request(url, headers=headers), timeout=60)  # noqa: S310
+    with response:
+        status = int(getattr(response, "status", 200) or 200)
+        content_type = str(response.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        content_length = _header_int(response.headers.get("Content-Length"))
+        suffix = destination.suffix.lower()
+        if is_http and suffix in _BINARY_MODEL_SUFFIXES and (
+            content_type.startswith("text/")
+            or content_type in {"application/json", "application/xml", "application/problem+json"}
+        ):
+            raise InvalidModelResponse(
+                f"{destination.name} 下载源返回了 {content_type or '文本'} 错误页，而不是模型文件"
+            )
+
+        if is_http and expected_size:
+            if status == 206:
+                content_range = str(response.headers.get("Content-Range", "") or "")
+                match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range, re.IGNORECASE)
+                if not match or int(match.group(1)) != offset:
+                    raise InvalidModelResponse(
+                        f"{destination.name} 下载源返回了无效的断点范围：{content_range or '缺少 Content-Range'}"
+                    )
+                range_bytes = int(match.group(2)) - int(match.group(1)) + 1
+                if range_bytes != requested:
+                    raise InvalidModelResponse(
+                        f"{destination.name} 分段长度异常：预期 {requested} 字节，响应 {range_bytes} 字节"
+                    )
+                if match.group(3) != "*" and int(match.group(3)) != expected_size:
+                    raise InvalidModelResponse(
+                        f"{destination.name} 总大小异常：清单 {expected_size} 字节，响应 {match.group(3)} 字节"
+                    )
+            elif status == 200 and offset == 0 and expected_size <= _HTTP_RANGE_BYTES:
+                requested = expected_size
+            else:
+                raise InvalidModelResponse(
+                    f"{destination.name} 下载源不支持可靠断点续传（HTTP {status}）"
+                )
+            if content_length is not None and content_length != requested:
+                raise InvalidModelResponse(
+                    f"{destination.name} 响应大小异常：预期 {requested} 字节，只收到 {content_length} 字节"
+                )
+
+        chunks: list[bytes] = []
+        received = 0
+        limit = requested if requested else None
+        while limit is None or received < limit:
+            read_size = _CHUNK_BYTES if limit is None else min(_CHUNK_BYTES, limit - received)
+            chunk = response.read(read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+        if requested and received != requested:
+            raise InvalidModelResponse(
+                f"{destination.name} 响应提前结束：预期 {requested} 字节，只收到 {received} 字节"
+            )
+        return b"".join(chunks)
+
+
+def _header_int(value: object) -> int | None:
+    try:
+        return max(0, int(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _verified_partial_metadata(
+    path: Path,
+    *,
+    verified_bytes: int,
+    expected_size: int,
+    expected_sha256: str,
+) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        int(payload.get("verified_bytes", -1)) == int(verified_bytes)
+        and int(payload.get("expected_size", -1)) == int(expected_size)
+        and str(payload.get("expected_sha256", "")) == str(expected_sha256 or "")
+    )
+
+
+def _write_partial_metadata(
+    path: Path,
+    *,
+    verified_bytes: int,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "verified_bytes": int(verified_bytes),
+                "expected_size": int(expected_size),
+                "expected_sha256": str(expected_sha256 or ""),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _snapshot_complete(target: Path, files: Iterable[dict[str, Any]]) -> bool:
@@ -388,11 +567,19 @@ def _file_valid(path: Path, expected_size: int, expected_sha256: str) -> bool:
     return True
 
 
-def _partial_file_size(destination: Path) -> int:
-    if destination.is_file():
+def _partial_file_size(destination: Path, *, expected_size: int, expected_sha256: str) -> int:
+    if destination.is_file() and _file_valid(destination, expected_size, expected_sha256):
         return destination.stat().st_size
     partial = destination.with_name(destination.name + ".download")
-    return partial.stat().st_size if partial.is_file() else 0
+    partial_meta = destination.with_name(destination.name + ".download.json")
+    if partial.is_file() and _verified_partial_metadata(
+        partial_meta,
+        verified_bytes=partial.stat().st_size,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    ):
+        return partial.stat().st_size
+    return 0
 
 
 def _sha256(path: Path) -> str:
@@ -525,6 +712,8 @@ class ModelInstallManager:
                 "current_model": "",
                 "completed_models": ready,
                 "total_models": len(models),
+                "current_model_index": 0,
+                "current_model_progress": 0.0,
                 "completed_bytes": 0,
                 "total_bytes": 0,
                 "current_file": "",
@@ -686,6 +875,8 @@ class ModelInstallManager:
                             {
                                 "state": "downloading",
                                 "current_model": _model,
+                                "current_model_index": _index + 1,
+                                "current_model_progress": min(1.0, max(0.0, float(event.get("progress", 0.0) or 0.0))),
                                 "current_file": str(event.get("file", "")),
                                 "source": str(event.get("source", "")),
                                 "completed_bytes": completed_bytes,
@@ -696,7 +887,7 @@ class ModelInstallManager:
                                     0.999,
                                     (_index + float(event.get("progress", 0.0) or 0.0)) / max(1, len(models)),
                                 ),
-                                "message": f"正在下载 {_model}",
+                                "message": f"正在下载 {_model}（第 {_index + 1}/{len(models)} 个模型）",
                                 "updated_at": int(now),
                             }
                         )
@@ -721,6 +912,8 @@ class ModelInstallManager:
                     {
                         "state": "ready",
                         "current_model": "",
+                        "current_model_index": 0,
+                        "current_model_progress": 1.0,
                         "current_file": "",
                         "progress": 1.0,
                         "speed_bytes_per_second": 0.0,
@@ -748,7 +941,11 @@ class ModelInstallManager:
                 job.update(
                     {
                         "state": "failed",
-                        "message": "下载未完成，可重试并续传已下载内容",
+                        "message": (
+                            f"已完成 {len(list(job.get('completed_models', []) or []))}/"
+                            f"{max(1, int(job.get('total_models', 1) or 1))} 个模型；"
+                            "当前模型下载未完成，可重试"
+                        ),
                         "error": f"{type(exc).__name__}: {exc}"[:1200],
                         "updated_at": int(time.time()),
                     }
@@ -826,6 +1023,8 @@ class ModelInstallManager:
                     }
                 )
             job.setdefault("current_file", "")
+            job.setdefault("current_model_index", 0)
+            job.setdefault("current_model_progress", 0.0)
             job.setdefault("speed_bytes_per_second", 0.0)
             job.setdefault("eta_seconds", None)
             job.setdefault("message", "")

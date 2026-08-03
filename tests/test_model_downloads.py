@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import threading
@@ -10,6 +11,20 @@ import pytest
 
 from scansci_html import model_downloads
 from scansci_html.model_downloads import ModelInstallManager
+
+
+class _FakeResponse(io.BytesIO):
+    def __init__(self, payload: bytes, *, status: int, headers: dict[str, str]):
+        super().__init__(payload)
+        self.status = status
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+        return False
 
 
 def _file_record(source: Path, relative: str) -> dict[str, object]:
@@ -80,6 +95,80 @@ def test_auto_source_falls_back_from_modelscope_to_huggingface(tmp_path: Path, m
     assert result["source"] == "huggingface"
     assert result["fallback_used"] is True
     assert "modelscope:" in result["source_failures"][0]
+
+
+def test_binary_download_rejects_small_html_error_without_writing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"<html>mirror access denied</html>"
+    monkeypatch.setattr(
+        model_downloads.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _FakeResponse(
+            payload,
+            status=200,
+            headers={"Content-Type": "text/html", "Content-Length": str(len(payload))},
+        ),
+    )
+    destination = tmp_path / "model.safetensors"
+
+    with pytest.raises(model_downloads.InvalidModelResponse, match="错误页"):
+        model_downloads._download_file(
+            "https://modelscope.example/model.safetensors",
+            destination,
+            expected_size=1024 * 1024,
+            expected_sha256="",
+            progress_callback=None,
+        )
+
+    assert not destination.exists()
+    assert not (tmp_path / "model.safetensors.download").exists()
+
+
+def test_http_model_download_uses_verified_ranges_and_discards_legacy_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"verified-model-bytes"
+    ranges: list[str] = []
+    monkeypatch.setattr(model_downloads, "_HTTP_RANGE_BYTES", 5)
+    partial = tmp_path / "model.safetensors.download"
+    partial.write_bytes(b"<bad legacy response>")
+
+    def urlopen(request_object, **_kwargs):
+        header = request_object.get_header("Range")
+        ranges.append(header)
+        match = model_downloads.re.fullmatch(r"bytes=(\d+)-(\d+)", header)
+        assert match is not None
+        start, end = int(match.group(1)), int(match.group(2))
+        chunk = payload[start:end + 1]
+        return _FakeResponse(
+            chunk,
+            status=206,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+            },
+        )
+
+    monkeypatch.setattr(model_downloads.request, "urlopen", urlopen)
+    destination = tmp_path / "model.safetensors"
+
+    size = model_downloads._download_file(
+        "https://modelscope.example/model.safetensors",
+        destination,
+        expected_size=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        progress_callback=None,
+    )
+
+    assert size == len(payload)
+    assert destination.read_bytes() == payload
+    assert ranges[0] == "bytes=0-4"
+    assert ranges[-1] == f"bytes=15-{len(payload) - 1}"
+    assert not (tmp_path / "model.safetensors.download.json").exists()
 
 
 def test_install_manager_reports_background_progress_and_completion(tmp_path: Path) -> None:

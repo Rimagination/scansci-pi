@@ -78,9 +78,9 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     assert health["status"] == "ok"
     assert health["workspace_exists"] is True
     assert health["evidence_store_exists"] is True
-    assert health["version"] == "0.2.0"
+    assert health["version"] == "0.2.1"
     assert health["build_id"] == "source"
-    assert update["current_version"] == "0.2.0"
+    assert update["current_version"] == "0.2.1"
     assert update["state"] in {"idle", "current"}
     assert workspace["counts"]["sources"] == 1
     assert answer["question"] == "What did Galunisertib reduce?"
@@ -228,6 +228,13 @@ def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public
             json.dumps({"question": "请联网检索 2022 年以来 RAG 事实一致性评估的关键论文"}).encode("utf-8"),
         )
     )
+    local_status = _payload(
+        app.dispatch(
+            "POST",
+            "/api/task-routing/preview",
+            json.dumps({"question": "现在有一个失败的组件下载任务，你知道是什么吗"}).encode("utf-8"),
+        )
+    )
     created = _payload(
         app.dispatch(
             "POST",
@@ -239,6 +246,9 @@ def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
 
     assert direct["route"] == "direct_chat"
+    assert local_status["route"] == "direct_chat"
+    assert local_status["reason"] == "local_product_status"
+    assert local_status["workflow_type"] == ""
     assert routed["route"] == "durable_run"
     assert routed["workflow_type"] == "academic_search"
     assert routed["scope"] == "public_academic"
@@ -1174,6 +1184,60 @@ def test_local_resource_status_reads_device_facts_without_calling_a_model(
     assert "本地运行能力：可用（独立运行组件）" in answer
     assert "已发现本地模型：2 个，其中 1 个权重完整、可启动" in answer
     assert "Qwen3-Embedding-0.6B（42%）" in answer
+
+
+def test_failed_component_download_question_reports_the_actual_failed_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def model_must_not_run(*_args, **_kwargs):
+        raise AssertionError("failed download status must come from local job state")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", model_must_not_run)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+        runtime_facts_provider=lambda: {
+            "runtime": {
+                "installed": True,
+                "mode": "component",
+                "install_job": {"state": "idle", "progress": 0.0},
+            },
+            "model_installs": {
+                "active": None,
+                "jobs": [
+                    {
+                        "job_id": "retrieval-core",
+                        "state": "failed",
+                        "models": ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B"],
+                        "completed_models": ["Qwen/Qwen3-Embedding-0.6B"],
+                        "total_models": 2,
+                        "current_model": "Qwen/Qwen3-Reranker-0.6B",
+                        "current_file": "model.safetensors",
+                        "source": "modelscope",
+                        "error": "InvalidModelResponse: model.safetensors 响应大小异常，只收到 18432 字节",
+                        "updated_at": 123,
+                    }
+                ],
+            },
+            "installed_models": [],
+        },
+    )
+
+    events = list(runtime.chat_stream({
+        "messages": [{"role": "user", "content": "现在有一个失败的组件下载任务，你知道是什么吗"}],
+    }))
+
+    result = events[-1]["result"]
+    answer = result["message"]["content"]
+    assert result["agent_runtime"]["harness"] == "local-runtime-facts"
+    assert result["message"]["usage"]["total_tokens"] == 0
+    assert "最近失败任务：研究检索组件（已完成 1/2 个模型）" in answer
+    assert "失败模型：Qwen/Qwen3-Reranker-0.6B" in answer
+    assert "失败文件：model.safetensors" in answer
+    assert "当时使用：modelscope" in answer
+    assert "设置 → 资源配置 → 下载任务" in answer
 
 
 def test_notebook_webapp_allows_direct_chat_without_a_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -1112,8 +1112,8 @@ function renderAppUpdate() {
     installing: "正在更新",
     restarting: "正在重启",
     available: "有可用更新",
-    current: `v${update.current_version || "0.2.0"}`,
-    idle: `v${update.current_version || "0.2.0"}`,
+    current: `v${update.current_version || "0.2.1"}`,
+    idle: `v${update.current_version || "0.2.1"}`,
     error: "版本信息",
   };
   byId("appUpdateLabel").textContent = labels[status] || "版本信息";
@@ -1391,6 +1391,20 @@ function downloadJobTelemetry(job) {
   return parts.join(" · ");
 }
 
+function downloadJobProgressSummary(job) {
+  const completed = Array.isArray(job?.completed_models) ? job.completed_models.length : 0;
+  const total = Math.max(0, Number(job?.total_models || (Array.isArray(job?.models) ? job.models.length : 0)));
+  const stateName = String(job?.state || "");
+  if (total > 1) {
+    const modelProgress = Math.max(0, Math.min(100, Math.round(Number(job?.current_model_progress || 0) * 100)));
+    if (["queued", "downloading", "installing"].includes(stateName) && job?.current_model) {
+      return `已完成 ${completed}/${total} 个模型 · 当前模型 ${modelProgress}%`;
+    }
+    return `已完成 ${completed}/${total} 个模型`;
+  }
+  return `${Math.max(0, Math.min(100, Math.round(Number(job?.progress || 0) * 100)))}%`;
+}
+
 function downloadTaskEntries({ includeReady = false } = {}) {
   const entries = [];
   const runtimeJob = state.localRuntime?.install_job;
@@ -1428,7 +1442,8 @@ function downloadTaskRow(entry) {
   const status = downloadJobStatus(job);
   const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress || 0) * 100)));
   const telemetry = downloadJobTelemetry(job);
-  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(entry.kind === "runtime" ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${["queued", "downloading", "installing"].includes(job.state) ? ` · ${progress}%` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div>${downloadTaskControls(entry)}</div></article>`;
+  const progressSummary = downloadJobProgressSummary(job);
+  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(entry.kind === "runtime" ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${progressSummary ? ` · ${escapeHtml(progressSummary)}` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div>${downloadTaskControls(entry)}</div></article>`;
 }
 
 function renderDownloadActivity() {
@@ -1449,7 +1464,7 @@ function renderDownloadActivity() {
   host.hidden = false;
   const primary = entries[0];
   const count = entries.length;
-  host.innerHTML = `<button type="button" class="download-activity-card ${state.downloadStatusError ? "has-connection-error" : ""}" data-action="open-download-center"><span class="download-activity-symbol">${uiIcon(state.downloadStatusError ? "wifi-off" : primary?.kind === "runtime" ? "cpu" : "download")}</span><span class="download-activity-copy"><strong>${state.downloadStatusError ? "暂时无法读取下载进度" : escapeHtml(downloadJobTitle(primary.job, primary.kind))}</strong><small>${state.downloadStatusError ? "ScanSci 正在重试连接，下载任务不会因此被删除。" : escapeHtml([downloadJobStatus(primary.job).label, `${Math.round(Number(primary.job.progress || 0) * 100)}%`, downloadJobTelemetry(primary.job)].filter(Boolean).join(" · "))}</small></span>${count > 1 ? `<b>${count}</b>` : ""}<span class="download-activity-open">${uiIcon("chevron-right")}</span><span class="download-activity-progress"><i class="${progressWidthClass(Math.round(Number(primary?.job?.progress || 0) * 100))}"></i></span></button>`;
+  host.innerHTML = `<button type="button" class="download-activity-card ${state.downloadStatusError ? "has-connection-error" : ""}" data-action="open-download-center"><span class="download-activity-symbol">${uiIcon(state.downloadStatusError ? "wifi-off" : primary?.kind === "runtime" ? "cpu" : "download")}</span><span class="download-activity-copy"><strong>${state.downloadStatusError ? "暂时无法读取下载进度" : escapeHtml(downloadJobTitle(primary.job, primary.kind))}</strong><small>${state.downloadStatusError ? "ScanSci 正在重试连接，下载任务不会因此被删除。" : escapeHtml([downloadJobStatus(primary.job).label, downloadJobProgressSummary(primary.job), downloadJobTelemetry(primary.job)].filter(Boolean).join(" · "))}</small></span>${count > 1 ? `<b>${count}</b>` : ""}<span class="download-activity-open">${uiIcon("chevron-right")}</span><span class="download-activity-progress"><i class="${progressWidthClass(Math.round(Number(primary?.job?.progress || 0) * 100))}"></i></span></button>`;
   hydrateIcons(host);
 }
 
@@ -7178,7 +7193,7 @@ function renderAboutSettings() {
   const update = state.update || {};
   const isBusy = ["checking", "installing", "restarting"].includes(update.state);
   const hasUpdate = Boolean(update.available);
-  const version = update.current_version || "0.2.0";
+  const version = update.current_version || "0.2.1";
   const latestVersion = update.latest_version || version;
   const checkAction = hasUpdate && update.can_install ? "install-app-update" : "check-app-update";
   const checkLabel = isBusy ? (update.state === "installing" ? "正在更新" : "检查中") : (hasUpdate && update.can_install ? "立即更新" : "检查更新");

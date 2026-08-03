@@ -1,3 +1,5 @@
+import pytest
+
 from scansci_html.task_routing import route_freeform_task
 
 
@@ -57,3 +59,28 @@ def test_download_routes_exact_identifiers_without_treating_instructions_as_auth
 
     assert decision.workflow_type == "paper_download_batch"
     assert decision.input_payload["identifiers"] == ["10.1038/s41586-023-06735-9", "2301.00234"]
+
+
+def test_failed_component_download_question_stays_in_local_status_chat() -> None:
+    decision = route_freeform_task(
+        "现在有一个失败的组件下载任务，你知道是什么吗",
+        has_knowledge=False,
+    )
+
+    assert decision.route == "direct_chat"
+    assert decision.workflow_type == ""
+    assert decision.reason == "local_product_status"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "研究检索组件下载失败的原因是什么？",
+        "现在后台的模型下载到哪一步了？",
+        "Which local model download task failed?",
+    ],
+)
+def test_local_product_download_status_never_becomes_paper_search(query: str) -> None:
+    decision = route_freeform_task(query, has_knowledge=False)
+
+    assert decision.route == "direct_chat"

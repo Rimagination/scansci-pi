@@ -2615,6 +2615,7 @@ class ResearchAgentRuntime:
             re.search(
                 r"本地(?:资源|模型|运行时|运行组件|ai\s*组件)|"
                 r"(?:资源|模型|组件)(?:安装|下载|配置)|"
+                r"(?:下载|安装)(?:任务|组件)|"
                 r"local\s+(?:resources?|models?|runtime|components?)",
                 normalized,
                 re.IGNORECASE,
@@ -2622,8 +2623,9 @@ class ResearchAgentRuntime:
         )
         status_request = bool(
             re.search(
-                r"安装|下载|配置|状态|情况|进度|可用|就绪|有没有|是否|能否|能不能|看到|查看|"
-                r"install|download|config|status|progress|available|ready|inspect|see",
+                r"安装|下载|配置|状态|情况|进度|到哪(?:一)?步|到哪里|失败|错误|卡住|未完成|是什么|哪个|什么|原因|"
+                r"可用|就绪|有没有|是否|能否|能不能|知道|看到|查看|"
+                r"install|download|config|status|progress|failed|failure|error|stalled|available|ready|inspect|see",
                 normalized,
                 re.IGNORECASE,
             )
@@ -6000,6 +6002,16 @@ class ResearchAgentRuntime:
             models = [item for item in list(facts.get("installed_models", []) or []) if isinstance(item, dict)]
             ready_models = [item for item in models if bool(item.get("ready"))]
             active_install = installs.get("active") if isinstance(installs.get("active"), dict) else None
+            install_jobs = [
+                dict(item)
+                for item in list(installs.get("jobs", []) or [])
+                if isinstance(item, dict)
+            ]
+            failed_installs = sorted(
+                (item for item in install_jobs if str(item.get("state", "")) == "failed"),
+                key=lambda item: int(item.get("updated_at", 0) or 0),
+                reverse=True,
+            )
             runtime_mode = {
                 "component": "独立运行组件",
                 "embedded": "安装包内置运行时",
@@ -6021,6 +6033,28 @@ class ResearchAgentRuntime:
                 lines.append(f"- 当前下载：{target}（{progress}%）")
             else:
                 lines.append("- 当前下载：没有正在进行的模型安装任务")
+            if failed_installs:
+                failed = failed_installs[0]
+                title = "研究检索组件" if str(failed.get("job_id", "")) == "retrieval-core" else str(
+                    failed.get("job_id") or "本地模型组件"
+                )
+                completed = len(list(failed.get("completed_models", []) or []))
+                total = max(1, int(failed.get("total_models", 0) or len(list(failed.get("models", []) or [])) or 1))
+                current_model = str(failed.get("current_model", "") or "").strip()
+                current_file = Path(str(failed.get("current_file", "") or "")).name
+                source = str(failed.get("source", "") or "").strip()
+                detail = str(failed.get("error") or failed.get("message") or "下载未完成").strip()
+                if len(detail) > 360:
+                    detail = detail[:357].rstrip() + "…"
+                lines.append(f"- 最近失败任务：{title}（已完成 {completed}/{total} 个模型）")
+                if current_model:
+                    lines.append(f"  - 失败模型：{current_model}")
+                if current_file:
+                    lines.append(f"  - 失败文件：{current_file}")
+                if source:
+                    lines.append(f"  - 当时使用：{source}")
+                lines.append(f"  - 原因：{detail}")
+                lines.append("  - 操作：打开“设置 → 资源配置 → 下载任务”后点击“重试”")
             install_job = dict(runtime.get("install_job", {}) or {})
             if str(install_job.get("state", "idle")) in {"queued", "installing"}:
                 progress = round(float(install_job.get("progress", 0.0) or 0.0) * 100)

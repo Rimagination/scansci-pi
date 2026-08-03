@@ -41,7 +41,9 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     assert '"torch.testing._internal",' not in script
     assert '"torch.testing",' not in script
     assert 'import torch, transformers, sentence_transformers, sentencepiece' in script
-    assert '"torch"' in script.split('if ($PackageProfile -eq "core")', 1)[1]
+    core_excludes = script.split('if ($PackageProfile -eq "core")', 1)[1]
+    assert '"torch"' in core_excludes
+    assert '"pyarrow"' in core_excludes
     assert '"__main__"' in script
     assert 'LITELLM_LOCAL_MODEL_COST_MAP' in script
     assert 'freeze_pyinstaller_spec.py' in script

@@ -8,7 +8,7 @@ param(
     [string]$PackageProfile = "core",
     [string]$OutputDir = "",
     [string]$Name = "ScanSci",
-    [string]$Version = "0.2.0",
+    [string]$Version = "0.2.1",
     [string]$BuildId = "",
     # Populated only by scripts/release_gate.py. This binds an auditable
     # release candidate to the exact source fingerprint that passed its gate.
@@ -281,6 +281,11 @@ if ($PackageProfile -eq "core") {
         "llvmlite",
         "numba",
         "openai_whisper",
+        # fsspec exposes an optional Arrow filesystem integration. When
+        # pyarrow happens to be installed on the build machine, PyInstaller's
+        # hook otherwise collects the entire Arrow SDK (including development
+        # headers) even though ScanSci core never imports or uses it.
+        "pyarrow",
         "safetensors",
         "sentence_transformers",
         "sentencepiece",

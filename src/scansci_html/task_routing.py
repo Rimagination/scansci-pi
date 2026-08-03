@@ -37,6 +37,18 @@ _DOWNLOAD = re.compile(
     r"(?:下载|获取全文|获取\s*pdf|下载\s*pdf|download|get\s+(?:the\s+)?(?:pdf|full\s*text))",
     re.IGNORECASE,
 )
+_LOCAL_PRODUCT_STATUS = re.compile(
+    r"(?:"
+    r"(?:当前|现在|刚才|已有|有一个|这个|后台|失败的?|未完成的?|卡住的?).{0,20}"
+    r"(?:组件|资源|模型|运行时|下载|安装|任务).{0,20}"
+    r"(?:是什么|是哪一个|哪个|什么|情况|状态|进度|到哪(?:一)?步|到哪里|原因|为什么|怎么回事|知道|看到|查看)"
+    r"|(?:组件|资源|模型|运行时|下载|安装).{0,12}(?:任务|失败|错误|状态|进度|情况).{0,20}"
+    r"(?:是什么|是哪一个|哪个|什么|情况|状态|进度|到哪(?:一)?步|到哪里|原因|为什么|怎么回事|知道|看到|查看)?"
+    r"|(?:failed|stalled|current|active).{0,20}(?:component|resource|model|runtime|download|install|task)"
+    r"|(?:component|resource|model|runtime|download|install).{0,20}(?:status|progress|failure|error|task)"
+    r")",
+    re.IGNORECASE,
+)
 _PRESENTATION = re.compile(r"(?:ppt|幻灯片|演示文稿|汇报(?:材料|幻灯片)?|presentation\s*(?:deck)?|slides?)", re.IGNORECASE)
 _LOCAL_EVIDENCE = re.compile(
     r"(?:知识库|资料库|本地资料|本地文献|我的文献|原文证据|逐句引用|"
@@ -93,6 +105,12 @@ def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
     request = _SPACE.sub(" ", str(text or "").strip())
     if not request:
         return FreeformTaskRoute(route="direct_chat", reason="empty_request")
+
+    # Questions about ScanSci itself must reach the deterministic local-facts
+    # responder.  In particular, the word "下载" in "失败的组件下载任务"
+    # describes application state; it is not an instruction to find a paper.
+    if _LOCAL_PRODUCT_STATUS.search(request):
+        return FreeformTaskRoute(route="direct_chat", reason="local_product_status")
 
     identifiers = _paper_identifiers(request)
     if _DOWNLOAD.search(request):
