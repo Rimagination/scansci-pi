@@ -2833,7 +2833,6 @@ def test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools(tmp_path: 
             json.dumps({"server_id": "fixture-mcp"}).encode("utf-8"),
         )
     )
-
     assert tested["server_count"] == 1
     assert tested["tool_count"] == 1
     assert tested["tools"][0]["name"] == "mcp__fixture-mcp__search_library"
