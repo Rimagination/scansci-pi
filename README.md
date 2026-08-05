@@ -2,51 +2,82 @@
 
 ![ScanSci Pi product banner](assets/scansci-pi-banner.png)
 
-ScanSci Pi 是一个证据优先的科研 AI 工作台：把论文检索、证据核验、研究问答和交付物生成串成可恢复的工作流。
+ScanSci Pi 是一个证据优先的科研 AI 工作台：帮助你找论文、读资料、核验证据、写研究结论，并生成可交付的文档、表格和演示文稿。
 
-- 证据可追溯：关键结论回到原文、引用和定位信息。
-- 任务可恢复：支持会话续接、自动纠错重试、上下文压缩和 checkpoint。
-- 模型可切换：统一兼容 Chat Completions、Responses 和 Anthropic 接口。
-- 结果可交付：支持文献综述、科研问答、文档、表格和演示文稿生成。
+## 你可以用它做什么
 
-ScanSci 是一款 evidence-first 科研工作台：围绕本地论文与合法可访问的学术来源，完成检索、证据提取、科研问答、综述写作和幻灯片生成，并让关键结论能够回到原文证据。
+- 从多个学术来源发现论文，并继续获取和整理全文。
+- 在本地论文库中搜索句子级证据，回答问题或撰写综述。
+- 对结论绑定原文、引用和定位信息，证据不足时明确说明。
+- 把研究结果整理成文档、表格、PDF 或演示文稿。
 
-本仓库是统一产品的代码基线。Pi Agent SDK 负责模型会话、工具选择、流式输出、取消、恢复与上下文压缩；Python ScanSci Core 继续拥有项目、证据库、任务状态、引用验证和交付物。Pi 是内部运行时，不是第二个产品品牌。
+## 你可能最关心的问题
 
-## 公开测试版
+### 结论可靠吗？
 
-Windows 安装包从 [GitHub Releases](https://github.com/Rimagination/scansci-pi/releases) 分发。安装前请核对发布页提供的 SHA-256；当前测试版尚未使用公开信任的代码签名证书，Windows 可能显示“未知发布者”或 SmartScreen 提示。
+ScanSci 优先使用可定位的原文证据。标题、摘要或搜索片段会明确标记为线索，不会自动冒充全文证据。
 
-请勿在公开 Issue 中提交 API 密钥、Access Token、私有文档全文、未脱敏的聊天记录或诊断日志。
+### 中途失败会怎样？
 
-## 设计约束
+任务支持会话续接、自动纠错重试、上下文压缩和 checkpoint。已经完成的阶段会保留，不需要每次从头开始。
 
-- 干净的结构化 HTML 优先，PDF、OCR 与 MinerU 作为回退。
-- 研究性结论必须通过 Agent 外部的引用门禁；证据不足时明确说明。
-- 句子级引用紧跟对应陈述，并可回到来源、定位原文。
-- Pi 只获得 ScanSci 白名单科研工具；内置 shell 和文件修改工具默认关闭。
-- Deep Agents 仅保留为同模型、同证据、同工具的评测基线，不进入正式产品路径。
-- 项目业务状态不存放在 Agent 框架会话中。
+### 可以使用不同的模型和接口吗？
 
-## 本地运行
+可以。运行时统一支持 Chat Completions、Responses 和 Anthropic 接口，也可以接入兼容 OpenAI API 的网关。
+
+### 会不会随意修改文件或泄露密钥？
+
+Agent 默认只能使用 ScanSci 白名单科研工具，shell 和任意文件修改工具默认关闭。请不要在公开 Issue 中提交 API 密钥、Access Token、私有文档全文或未脱敏日志。
+
+## 为什么适合科研工作
+
+- 证据可追溯：关键结论可以回到来源和原文位置。
+- 过程可恢复：研究任务、工具调用和交付物状态可持续保存。
+- 结果可验证：引用验证、证据门禁和交付物检查位于 Agent 会话之外。
+- 工具可扩展：Pi 负责模型会话，Python Core 负责证据库、任务状态和交付物。
+
+## 快速开始
+
+### Windows 用户
+
+测试版安装包从 [GitHub Releases](https://github.com/Rimagination/scansci-pi/releases) 获取。安装前请核对发布页提供的 SHA-256；当前测试版可能显示“未知发布者”或 SmartScreen 提示。
+
+### 从源码运行
 
 ```powershell
-# Browser preview: always serves this checkout, even if another editable
-# ScanSci installation exists on this computer.
-python scripts/scansci_preview_entry.py --workspace workspace.sqlite --evidence-db html-papers/evidence.sqlite --host 127.0.0.1 --port 8781
+python -m pip install -e ".[desktop]"
 
-# Native desktop shell from this checkout.
+# 启动浏览器预览
+python scripts/scansci_preview_entry.py `
+  --workspace workspace.sqlite `
+  --evidence-db html-papers/evidence.sqlite `
+  --host 127.0.0.1 --port 8781
+
+# 启动桌面窗口
 python scripts/scansci_desktop_entry.py
 ```
 
-在浏览器打开前，可用 `python scripts/scansci_preview_entry.py --identity` 确认当前预览所用的代码目录；`/api/health` 也会返回相同的运行来源。
-
-## 测试
+## 开发与测试
 
 ```powershell
 $env:PYTHONPATH = "src"
 python -m pytest -q
 ```
+
+运行时诊断：
+
+```powershell
+scansci doctor capabilities --root . --json
+```
+
+## 技术说明
+
+- Pi sidecar：负责模型会话、工具选择、流式输出、取消、恢复和上下文压缩。
+- Python ScanSci Core：负责项目、证据库、任务状态、引用验证和交付物。
+- 统一传输层：在 Chat Completions、Responses 和 Anthropic 之间复用重试、SSE 和错误归一化。
+- 可选 harness：PydanticAI、OpenAI Agents SDK 和 LangGraph 只在需要时安装，不影响默认启动路径。
+
+更多运行时治理说明见 [Agent Harness P0-P2 实现说明](docs/agent-harness-p0-p2.zh.md)。
 
 ## Windows 构建
 
@@ -56,12 +87,4 @@ powershell -ExecutionPolicy Bypass -File scripts/build_desktop.ps1 `
   -Mode onedir -PackageProfile full -Name ScanSci
 ```
 
-构建会将 Pi sidecar、Node.js runtime 与本地检索推理运行时放入 ScanSci 应用目录，用户无需单独安装 Python、PyTorch 或全局 Pi。Qwen 检索权重在首次导入资料时从 ModelScope 国内源按需安装；`core` profile 仅用于同时提供独立运行时镜像的轻量渠道。
-
-正式发布由 `scripts/release_gate.ps1` 驱动，发布合同位于 `config/release-gate.json`。迁移背景见 [统一实施计划](docs/implementation-plan.md)，原版产品与证据设计文档已迁入 `docs/`。
-
-`release` 门禁还会编译 Inno Setup Windows 安装包，并在临时隔离目录中执行安装、已安装 EXE 诊断和卸载验证。公开分发仍需由发行方完成 Authenticode 签名、安全扫描和生产网关运维验收；详见 [发布工作流](docs/release-workflow.zh.md)。
-
-## 兼容入口
-
-Python 包仍保留 `scansci-html` 命令，供既有脚本继续使用；正式桌面入口和产品名称统一为 `ScanSci`。
+正式发布由 `scripts/release_gate.ps1` 驱动，详见 [发布工作流](docs/release-workflow.zh.md)。
