@@ -1,5 +1,7 @@
 # ScanSci
 
+![ScanSci Pi product banner](assets/scansci-pi-banner.png)
+
 ScanSci 是一款 evidence-first 科研工作台：围绕本地论文与合法可访问的学术来源，完成检索、证据提取、科研问答、综述写作和幻灯片生成，并让关键结论能够回到原文证据。
 
 本仓库是统一产品的代码基线。Pi Agent SDK 负责模型会话、工具选择、流式输出、取消、恢复与上下文压缩；Python ScanSci Core 继续拥有项目、证据库、任务状态、引用验证和交付物。Pi 是内部运行时，不是第二个产品品牌。

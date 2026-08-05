@@ -59,8 +59,10 @@ from .research_ideation import (
 from .embeddings import HashingEmbeddingProvider
 from .rerankers import LexicalReranker
 from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
+from .model_transport import select_api_surface
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .pi_agent import PiAgentClient, PiAgentRunError
+from .run_manifest import RunManifest
 from .qa.agent import answer_question
 from .research_runs import ResearchRunStore, StageSpec, classify_error, redact_sensitive_text
 from .research_subagents import (
@@ -646,6 +648,17 @@ def _direct_thinking_mode(chat_request: "_DirectChatRequest") -> str | None:
     if chat_request.provider_id == "scansci-managed" and chat_request.model_id == "glm-4.7-flash":
         return "disabled"
     return chat_request.thinking_mode
+
+
+def _model_transport_kwargs(chat_request: "_DirectChatRequest") -> dict[str, Any]:
+    """Forward the selected provider capability contract to model calls."""
+
+    return {
+        "api_surface": chat_request.api_surface,
+        "provider_id": chat_request.provider_id,
+        "responses_enabled": chat_request.responses_enabled,
+        "previous_response_id": chat_request.previous_response_id,
+    }
 
 
 def _repair_scientific_rewrite(user_text: str, answer: str) -> str:
@@ -1325,6 +1338,9 @@ class _DirectChatRequest:
     base_url: str
     api_key: str
     model_id: str
+    api_surface: str
+    responses_enabled: bool
+    previous_response_id: str | None
     thinking_mode: str | None
     session: Any | None
     chat_mode: str
@@ -1332,6 +1348,7 @@ class _DirectChatRequest:
     selected_skills: list[dict[str, Any]]
     notebook_id: str
     notebook_ids: list[str]
+    manifest: RunManifest | None = None
 
 
 class _DurableModelClient:
@@ -2418,6 +2435,14 @@ class ResearchAgentRuntime:
                                 base_url=str(provider.get("base_url", "")),
                                 api_key=api_key,
                                 model_id=str(active.get("model_id", "")),
+                                api_surface=select_api_surface(
+                                    str(provider.get("api_surface", "chat_completions")),
+                                    provider_kind=str(provider.get("kind", "")),
+                                    provider_id=str(provider.get("id", "")),
+                                    model=str(active.get("model_id", "")),
+                                    responses_enabled=bool(provider.get("responses_enabled", False)),
+                                ),
+                                responses_enabled=bool(provider.get("responses_enabled", False)),
                                 messages=[
                                     {
                                         "role": "system",
@@ -2472,6 +2497,9 @@ class ResearchAgentRuntime:
                         model=str(active.get("model_id", "")),
                         session=managed_gateway_session() if managed else None,
                         thinking_mode="disabled" if managed else None,
+                        api_surface=str(provider.get("api_surface", "chat_completions")),
+                        provider_id=str(provider.get("id", "")),
+                        responses_enabled=bool(provider.get("responses_enabled", False)),
                     )
                     answer_options = {
                         "answer_provider": "llm",
@@ -3051,6 +3079,8 @@ class ResearchAgentRuntime:
                 base_url=chat_request.base_url,
                 api_key=chat_request.api_key,
                 model_id=chat_request.model_id,
+                api_surface=chat_request.api_surface,
+                responses_enabled=chat_request.responses_enabled,
                 messages=chat_request.messages,
                 thinking_level=chat_request.thinking_level,
                 task_mode=resolved_task_mode,
@@ -3162,6 +3192,7 @@ class ResearchAgentRuntime:
                     chat_request.selected_skills,
                 ),
                 temperature=0.2,
+                **_model_transport_kwargs(chat_request),
             ):
                 if event.get("type") == "delta" and str(event.get("content", "")):
                     visible_output_started = True
@@ -3383,6 +3414,7 @@ class ResearchAgentRuntime:
                 ),
                 temperature=0.2,
                 max_requests=1,
+                **_model_transport_kwargs(chat_request),
             )
 
     def _complete_with_pi(
@@ -3686,6 +3718,7 @@ class ResearchAgentRuntime:
             chat_request = _apply_direct_chat_profile(chat_request, task_profile)
         agent_runtime: dict[str, Any] = {
             "harness": "local-runtime-facts" if local_facts else "direct-provider",
+            "api_surface": chat_request.api_surface,
             "task_mode": pi_task_mode,
             "evidence_policy": str(task_profile.get("evidence_policy", self._evidence_policy(pi_task_mode))),
             "task_profile": task_profile,
@@ -3714,20 +3747,21 @@ class ResearchAgentRuntime:
                     raise RuntimeError(
                         "ScanSci 未能完成本轮必需的工具调用；为避免编造能力或结果，本轮不会退化为裸模型回答"
                     ) from error
-                completion = complete_chat_text(
-                    chat_request.provider_kind,
-                    base_url=chat_request.base_url,
-                    api_key=chat_request.api_key,
-                    model=chat_request.model_id,
+                    completion = complete_chat_text(
+                        chat_request.provider_kind,
+                        base_url=chat_request.base_url,
+                        api_key=chat_request.api_key,
+                        model=chat_request.model_id,
                     messages=chat_request.messages,
                     thinking_mode=_direct_thinking_mode(chat_request),
                     session=chat_request.session,
                     include_usage=True,
                     timeout=45.0,
-                    max_requests=1,
-                    max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                    temperature=0.2,
-                )
+                        max_requests=1,
+                        max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
+                        temperature=0.2,
+                        **_model_transport_kwargs(chat_request),
+                    )
                 if isinstance(completion, tuple):
                     text, usage = completion
                 else:
@@ -3755,6 +3789,7 @@ class ResearchAgentRuntime:
                 timeout=45.0,
                 max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
                 temperature=0.2,
+                **_model_transport_kwargs(chat_request),
             )
             if isinstance(completion, tuple):
                 text, usage = completion
@@ -3998,6 +4033,7 @@ class ResearchAgentRuntime:
                                 chat_request.selected_skills,
                             ),
                             temperature=0.2,
+                            **_model_transport_kwargs(chat_request),
                         )
                         if isinstance(completion, tuple):
                             text, usage = completion
@@ -4034,6 +4070,7 @@ class ResearchAgentRuntime:
                         chat_request.selected_skills,
                     ),
                     temperature=0.2,
+                    **_model_transport_kwargs(chat_request),
                 )
                 if isinstance(completion, tuple):
                     text, usage = completion
@@ -4059,6 +4096,17 @@ class ResearchAgentRuntime:
             # The user turn is deliberately retained; no fabricated assistant
             # turn is written when a network/model request fails.
             raise
+        if chat_request.manifest is not None:
+            chat_request.manifest.finish(
+                status="completed",
+                total_tokens=sum(
+                    int(value)
+                    for value in usage.values()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                ),
+                tool_calls=len(list(agent_runtime.get("tool_calls", []) or [])),
+                compatibility_fallback=bool(agent_runtime.get("compatibility_fallback", False)),
+            )
         return {
             "run": self.store.get_run(run_id),
             "message": message,
@@ -4708,6 +4756,7 @@ class ResearchAgentRuntime:
                         ),
                         temperature=0.2,
                         max_requests=1,
+                        **_model_transport_kwargs(chat_request),
                     ):
                         if retry_event.get("type") == "delta":
                             retry_content = str(retry_event.get("content", ""))
@@ -5425,6 +5474,7 @@ class ResearchAgentRuntime:
                     timeout=90.0,
                     max_tokens=max(1_200, _direct_output_budget(question, chat_request.selected_skills)),
                     temperature=0.35,
+                    **_model_transport_kwargs(chat_request),
                     # This OpenAI-compatible call needs no provider adapter.
                     # Avoid importing LiteLLM's broad optional provider graph
                     # before the only user-visible writing request.
@@ -6244,6 +6294,32 @@ class ResearchAgentRuntime:
             raise ValueError("当前对话模型尚未配置 API Key")
 
         model_id = str(active.get("model_id", "")).strip()
+        responses_enabled = bool(provider.get("responses_enabled", False))
+        requested_api_surface = str(
+            payload.get("api_surface", provider.get("api_surface", "chat_completions"))
+            or "chat_completions"
+        ).strip().lower()
+        api_surface = select_api_surface(
+            requested_api_surface,
+            provider_kind=provider_kind,
+            provider_id=provider_id,
+            model=model_id,
+            responses_enabled=responses_enabled,
+        )
+        manifest: RunManifest | None = None
+        try:
+            manifest = RunManifest.start(
+                self.workspace,
+                harness="direct-provider",
+                provider=provider_id,
+                model=model_id,
+                api_surface=api_surface,
+                session_id=str(payload.get("pi_session_id", "") or ""),
+                prompt=str(messages[-1].get("content", "")),
+                timeout_seconds=45.0,
+            )
+        except OSError:
+            manifest = None
         chat_mode = str(payload.get("chat_mode", "general") or "general").strip().lower()
         if chat_mode not in {"general", "writing", "knowledge", "slides"}:
             chat_mode = "general"
@@ -6327,6 +6403,9 @@ class ResearchAgentRuntime:
             base_url=str(provider.get("base_url", "")),
             api_key=api_key,
             model_id=model_id,
+            api_surface=api_surface,
+            responses_enabled=responses_enabled,
+            previous_response_id=(str(payload.get("previous_response_id", "")).strip() or None),
             thinking_mode=thinking_mode,
             session=managed_gateway_session() if managed else None,
             chat_mode=chat_mode,
@@ -6338,6 +6417,7 @@ class ResearchAgentRuntime:
                 for value in list(payload.get("notebook_ids", []) or [])
                 if str(value).strip()
             ][:12],
+            manifest=manifest,
         )
 
     @staticmethod
@@ -8045,6 +8125,9 @@ class ResearchAgentRuntime:
                 timeout=35.0 if managed else 60.0,
                 session=managed_gateway_session() if managed else None,
                 thinking_mode="disabled" if managed else None,
+                api_surface=str(provider.get("api_surface", "chat_completions")),
+                provider_id=provider_id,
+                responses_enabled=bool(provider.get("responses_enabled", False)),
             )
             if not managed:
                 return self._wrap_model_client(primary_client)
@@ -8236,6 +8319,9 @@ class ResearchAgentRuntime:
                 # hidden chain of thought. This is supported by the managed
                 # GLM gateway; other providers keep their own default.
                 thinking_mode="disabled" if str(provider.get("auth_mode", "")) == "managed" else None,
+                api_surface=str(provider.get("api_surface", "chat_completions")),
+                provider_id=provider_id,
+                responses_enabled=bool(provider.get("responses_enabled", False)),
             ))
         if reference.startswith("local:"):
             local_id = reference.removeprefix("local:")

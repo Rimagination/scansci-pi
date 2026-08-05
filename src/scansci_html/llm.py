@@ -7,7 +7,18 @@ import re
 import time
 from typing import Any, Iterator, Protocol
 
+from pydantic import ValidationError
 import requests
+
+from .model_transport import (
+    CHAT_COMPLETIONS,
+    RESPONSES,
+    ModelRequest,
+    complete_model,
+    select_api_surface,
+    stream_model_events,
+)
+from .qa.schemas import AnswerPayloadSchema, ClaimVerificationPayloadSchema
 
 
 _MANAGED_GATEWAY_SESSION = requests.Session()
@@ -20,6 +31,138 @@ _MAX_LOGICAL_REQUESTS = 2
 # worker drains its queue.  Allow one additional, bounded retry here without
 # weakening the structured-output budget above.
 _STREAM_LOGICAL_REQUESTS = 3
+
+
+class StructuredOutputError(ValueError):
+    """A bounded, safe-to-repeat structured-output failure.
+
+    The raw model response is intentionally not stored here.  Retry prompts
+    need a compact diagnosis, not another copy of potentially large evidence
+    or user text.
+    """
+
+    def __init__(self, schema_name: str, *, category: str, detail: str = "") -> None:
+        self.schema_name = str(schema_name or "unknown")
+        self.category = str(category or "invalid_output")
+        self.detail = str(detail or "")[:240]
+        message = f"Model did not return valid {self.schema_name} JSON"
+        if self.detail:
+            message += f" ({self.category}: {self.detail})"
+        super().__init__(message)
+
+
+_STRUCTURED_RETRYABLE_SCHEMAS = frozenset(
+    {
+        "answer_claims",
+        "claim_verification",
+        "retrieval_queries",
+        "evidence_grounded_literature_review",
+        "literature_review_overview",
+        "scansci_scientific_slides",
+    }
+)
+_STRUCTURED_SCHEMA_MODELS: dict[str, type[Any]] = {
+    "answer_claims": AnswerPayloadSchema,
+    "claim_verification": ClaimVerificationPayloadSchema,
+}
+
+
+def _structured_attempt_limit(schema_name: str) -> int:
+    """Return the correction budget for one logical structured request."""
+
+    normalized = str(schema_name or "").strip()
+    # Section JSON is already repaired and validated by the workflow layer;
+    # retrying here would multiply slow synthesis calls without new evidence.
+    if normalized == "literature_review_section":
+        return 1
+    return 2 if normalized in _STRUCTURED_RETRYABLE_SCHEMAS else 1
+
+
+def _validation_error_detail(error: ValidationError) -> str:
+    """Summarize validation paths without echoing model-provided values."""
+
+    details: list[str] = []
+    for item in error.errors()[:3]:
+        location = ".".join(str(part) for part in item.get("loc", ())) or "root"
+        error_type = str(item.get("type", "invalid"))
+        details.append(f"{location}:{error_type}")
+    return "; ".join(details) or "schema validation failed"
+
+
+def _validate_structured_payload(payload: Any, *, schema_name: str) -> Any:
+    """Validate known contracts before returning them to workflow code."""
+
+    if not isinstance(payload, dict):
+        raise StructuredOutputError(schema_name, category="shape", detail="root must be an object")
+    model_type = _STRUCTURED_SCHEMA_MODELS.get(str(schema_name or ""))
+    if model_type is None:
+        return payload
+    try:
+        validated = model_type.model_validate(payload)
+    except ValidationError as error:
+        raise StructuredOutputError(
+            schema_name,
+            category="schema_validation",
+            detail=_validation_error_detail(error),
+        ) from error
+    return validated.model_dump(mode="python")
+
+
+def _json_failure_category(content: object) -> tuple[str, str]:
+    text = str(content or "").strip()
+    if not text:
+        return "empty", "no model content"
+    if "{" in text and _open_json_delimiters(text):
+        return "truncated_json", "unclosed JSON object"
+    return "invalid_json", "response was not a complete JSON object"
+
+
+def _parse_and_validate_structured_content(content: object, *, schema_name: str) -> Any:
+    """Parse, narrowly recover, and validate one structured model response."""
+
+    try:
+        parsed = _parse_json_content(content)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        recovered = _recover_structured_content(content, schema_name=schema_name)
+        if recovered is not None:
+            return _validate_structured_payload(recovered, schema_name=schema_name)
+        category, detail = _json_failure_category(content)
+        raise StructuredOutputError(schema_name, category=category, detail=detail) from error
+    return _validate_structured_payload(parsed, schema_name=schema_name)
+
+
+def _structured_retry_instruction(
+    schema_name: str,
+    failure: StructuredOutputError,
+    *,
+    attempt: int,
+) -> str:
+    """Build a targeted correction prompt from a redacted failure class."""
+
+    contract_hint = {
+        "answer_claims": (
+            'Return an object with "answer" as a list of items containing non-empty '
+            'claim_id, text, and quote_ids; keep quote_ids from the supplied evidence only.'
+        ),
+        "claim_verification": (
+            'Return "claims" as a list with one item per supplied claim_id; use only the '
+            'allowed support_status values and a verification_score between 0 and 1.'
+        ),
+        "retrieval_queries": 'Return an object whose "queries" value is a list of short strings.',
+        "evidence_grounded_literature_review": (
+            'Keep the planned sections and every factual paragraph tied to supplied citation_ids.'
+        ),
+        "literature_review_overview": (
+            'Keep the required top-level keys and return comparison rows, controversies, and open questions in their specified shapes.'
+        ),
+    }.get(str(schema_name or ""), "Follow the structured contract already present in the system instruction.")
+    final_attempt = " This is the final correction attempt." if attempt > 1 else ""
+    return (
+        "The previous structured response was invalid. "
+        f"Failure class: {failure.category}; diagnosis: {failure.detail}. "
+        f"{contract_hint} Output one complete JSON object only, without Markdown fences or commentary, "
+        f"and stop immediately after the closing brace.{final_attempt}"
+    )
 
 
 def _estimate_provider_input_tokens(messages: object) -> int:
@@ -210,37 +353,23 @@ class OpenAICompatibleChatJsonClient:
         }
         if self.thinking_mode:
             request_body["thinking"] = {"type": self.thinking_mode}
-        retryable_schemas = {
-            "answer_claims",
-            "claim_verification",
-            "retrieval_queries",
-            "evidence_grounded_literature_review",
-            "literature_review_section",
-            "literature_review_overview",
-            "scansci_scientific_slides",
-        }
         # Review synthesis already validates every paragraph and has a
         # grounded evidence fallback. Retrying malformed section JSON here,
         # and then retrying the same section again at the workflow layer,
         # multiplies a slow gateway call without improving the accepted text.
-        attempts = 1 if schema_name == "literature_review_section" else 2 if schema_name in retryable_schemas else 1
+        attempts = _structured_attempt_limit(schema_name)
         requests_used = 0
+        last_failure: StructuredOutputError | None = None
         for attempt in range(attempts):
             active_body = dict(request_body)
             if attempt:
                 active_body["temperature"] = 0
-                retry_instruction = (
-                    "The previous structured response was invalid or truncated. Produce a fresh result now. "
-                    "Return no more than three non-repeating items, output one complete JSON object only, "
-                    "and stop immediately after its closing brace."
+                retry_instruction = _structured_retry_instruction(
+                    schema_name,
+                    last_failure
+                    or StructuredOutputError(schema_name, category="invalid_output", detail="previous attempt failed"),
+                    attempt=attempt,
                 )
-                if schema_name == "evidence_grounded_literature_review":
-                    retry_instruction = (
-                        "The previous literature-review JSON was invalid or truncated. Produce a fresh compact result now. "
-                        "Keep every planned section, use exactly one concise paragraph per section, at most three comparison "
-                        "rows, at most two controversies, and exactly two open questions. Output one complete JSON object "
-                        "only and stop immediately after its closing brace."
-                    )
                 active_body["messages"] = [
                     {
                         "role": "system",
@@ -288,14 +417,30 @@ class OpenAICompatibleChatJsonClient:
                     time.sleep(delay)
             if response is None:
                 raise RuntimeError("模型结构化响应暂时不可用，请稍后重试。")
-            content = response.json()["choices"][0]["message"]["content"]
             try:
-                return _parse_json_content(content)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                recovered = _recover_structured_content(content, schema_name=schema_name)
-                if recovered is not None:
-                    return recovered
-        raise ValueError(f"Model did not return valid {schema_name} JSON") from None
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                return _parse_and_validate_structured_content(content, schema_name=schema_name)
+            except StructuredOutputError as error:
+                last_failure = error
+                if requests_used >= self.logical_request_limit and attempt + 1 < attempts:
+                    raise RuntimeError(
+                        "Structured-output retry budget was consumed by transport retries"
+                    ) from error
+                if attempt + 1 >= attempts:
+                    raise
+            except (TypeError, ValueError, KeyError, IndexError, json.JSONDecodeError) as error:
+                category, detail = _json_failure_category(error)
+                last_failure = StructuredOutputError(schema_name, category=category, detail=detail)
+                if requests_used >= self.logical_request_limit and attempt + 1 < attempts:
+                    raise RuntimeError(
+                        "Structured-output retry budget was consumed by transport retries"
+                    ) from error
+                if attempt + 1 >= attempts:
+                    raise last_failure from error
+        if last_failure is not None:
+            raise last_failure
+        raise StructuredOutputError(schema_name, category="invalid_output", detail="no usable response")
 
     def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
         if time.monotonic() < self._rate_limited_until:
@@ -382,6 +527,114 @@ class AnthropicCompatibleChatJsonClient:
         return str(result)
 
 
+class OpenAIResponsesJsonClient:
+    """Structured-output client backed by the OpenAI Responses surface."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        provider_id: str = "",
+        responses_enabled: bool = False,
+        timeout: float = 60.0,
+        session: Any | None = None,
+        thinking_mode: str | None = None,
+    ) -> None:
+        self.base_url = str(base_url or "").rstrip("/")
+        self.api_key = str(api_key or "")
+        self.model = str(model or "")
+        self.provider_id = str(provider_id or "")
+        self.responses_enabled = bool(responses_enabled)
+        self.timeout = float(timeout)
+        self.session = session
+        self.thinking_mode = thinking_mode if thinking_mode in {"enabled", "disabled"} else None
+        self.logical_request_limit = _MAX_LOGICAL_REQUESTS
+        if not self.base_url or not self.api_key or not self.model:
+            raise ValueError("base_url, api_key, and model are required for OpenAI Responses")
+
+    def complete_json(self, messages: list[dict[str, str]], *, schema_name: str) -> Any:
+        structured_messages = _with_structured_output_instruction(messages, schema_name=schema_name)
+        attempts = min(
+            _structured_attempt_limit(schema_name),
+            max(1, min(_MAX_LOGICAL_REQUESTS, int(self.logical_request_limit))),
+        )
+        last_failure: StructuredOutputError | None = None
+        for attempt in range(attempts):
+            active_messages = structured_messages
+            if attempt:
+                active_messages = [
+                    {
+                        "role": "system",
+                        "content": _structured_retry_instruction(
+                            schema_name,
+                            last_failure
+                            or StructuredOutputError(
+                                schema_name,
+                                category="invalid_output",
+                                detail="previous attempt failed",
+                            ),
+                            attempt=attempt,
+                        ),
+                    },
+                    *structured_messages,
+                ]
+            _ensure_provider_input_budget(
+                active_messages,
+                max_input_tokens=_STRUCTURED_PROVIDER_INPUT_TOKENS,
+            )
+            result = complete_model(
+                ModelRequest(
+                    provider_kind="openai-compatible",
+                    provider_id=self.provider_id,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    model=self.model,
+                    messages=active_messages,
+                    api_surface=RESPONSES,
+                    responses_enabled=self.responses_enabled,
+                    timeout=self.timeout,
+                    max_tokens=4096,
+                    temperature=0.0,
+                    thinking_mode=self.thinking_mode,
+                    response_format={"type": "json_object"},
+                    # The outer loop owns the shared correction budget. A
+                    # single transport request per correction keeps one bad
+                    # response from multiplying into four paid calls.
+                    max_requests=1,
+                    session=self.session,
+                )
+            )
+            try:
+                return _parse_and_validate_structured_content(result.text, schema_name=schema_name)
+            except StructuredOutputError as error:
+                last_failure = error
+                if attempt + 1 >= attempts:
+                    raise
+        raise last_failure or StructuredOutputError(schema_name, category="invalid_output", detail="no usable response")
+
+    def complete_text(self, messages: list[dict[str, str]], *, max_tokens: int = 700) -> str:
+        result = complete_model(
+            ModelRequest(
+                provider_kind="openai-compatible",
+                provider_id=self.provider_id,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model=self.model,
+                messages=messages,
+                api_surface=RESPONSES,
+                responses_enabled=self.responses_enabled,
+                timeout=self.timeout,
+                max_tokens=max_tokens,
+                temperature=0.1,
+                thinking_mode=self.thinking_mode,
+                max_requests=self.logical_request_limit,
+            )
+        )
+        return result.text
+
+
 def build_chat_json_client(
     provider: str,
     *,
@@ -391,12 +644,33 @@ def build_chat_json_client(
     timeout: float = 60.0,
     session: Any | None = None,
     thinking_mode: str | None = None,
+    api_surface: str = CHAT_COMPLETIONS,
+    provider_id: str = "",
+    responses_enabled: bool = False,
 ) -> ChatJsonClient:
     name = (provider or "").strip().lower()
     if name in {"openai-compatible", "openai"}:
         resolved_base_url = base_url or os.getenv("SCANSCI_CHAT_BASE_URL", "")
         resolved_api_key = api_key or os.getenv("SCANSCI_CHAT_API_KEY", "")
         resolved_model = model or os.getenv("SCANSCI_CHAT_MODEL", "")
+        selected_surface = select_api_surface(
+            api_surface,
+            provider_kind=name,
+            provider_id=provider_id,
+            model=resolved_model,
+            responses_enabled=responses_enabled,
+        )
+        if selected_surface == RESPONSES:
+            return OpenAIResponsesJsonClient(
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                model=resolved_model,
+                provider_id=provider_id,
+                responses_enabled=responses_enabled,
+                timeout=timeout,
+                session=session,
+                thinking_mode=thinking_mode,
+            )
         return OpenAICompatibleChatJsonClient(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
@@ -435,6 +709,11 @@ def complete_chat_text(
     max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
     max_requests: int = _MAX_LOGICAL_REQUESTS,
     use_litellm: bool = True,
+    api_surface: str = CHAT_COMPLETIONS,
+    provider_id: str = "",
+    responses_enabled: bool = False,
+    previous_response_id: str | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> str | tuple[str, dict[str, int]]:
     """Return a plain conversational response without requiring a research library."""
 
@@ -446,6 +725,35 @@ def complete_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    selected_surface = select_api_surface(
+        api_surface,
+        provider_kind=provider,
+        provider_id=provider_id,
+        model=model,
+        responses_enabled=responses_enabled,
+    )
+    if selected_surface != CHAT_COMPLETIONS:
+        result = complete_model(
+            ModelRequest(
+                provider_kind=provider,
+                provider_id=provider_id,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                api_surface=selected_surface,
+                responses_enabled=responses_enabled,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking_mode=thinking_mode,
+                previous_response_id=previous_response_id,
+                response_format=response_format,
+                max_requests=max_requests,
+                session=session,
+            )
+        )
+        return (result.text, result.usage) if include_usage else result.text
     _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
     request_limit = max(1, min(_MAX_LOGICAL_REQUESTS, int(max_requests)))
 
@@ -555,6 +863,11 @@ def stream_chat_text(
     temperature: float = 0.4,
     max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
     max_requests: int = _STREAM_LOGICAL_REQUESTS,
+    api_surface: str = CHAT_COMPLETIONS,
+    provider_id: str = "",
+    responses_enabled: bool = False,
+    previous_response_id: str | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield OpenAI-compatible text deltas and a final usage event.
 
@@ -571,6 +884,55 @@ def stream_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    selected_surface = select_api_surface(
+        api_surface,
+        provider_kind=provider,
+        provider_id=provider_id,
+        model=model,
+        responses_enabled=responses_enabled,
+    )
+    if selected_surface != CHAT_COMPLETIONS:
+        usage: dict[str, int] = {}
+        for event in stream_model_events(
+            ModelRequest(
+                provider_kind=provider,
+                provider_id=provider_id,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                messages=messages,
+                api_surface=selected_surface,
+                responses_enabled=responses_enabled,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                thinking_mode=thinking_mode,
+                previous_response_id=previous_response_id,
+                response_format=response_format,
+                max_requests=max_requests,
+                session=session,
+            )
+        ):
+            event_type = str(event.get("type", ""))
+            if event_type == "text_delta":
+                yield {"type": "delta", "content": str(event.get("content", ""))}
+            elif event_type == "reasoning_delta":
+                yield {"type": "reasoning", "content": str(event.get("content", ""))}
+            elif event_type == "retry":
+                yield {"type": "retry", **dict(event)}
+            elif event_type == "usage":
+                usage = dict(event.get("usage", {}) or {})
+            elif event_type == "completed":
+                yield {
+                    "type": "done",
+                    "usage": usage,
+                    "finish_reason": str(event.get("finish_reason", "stop")),
+                    "truncated": False,
+                    "response_id": str(event.get("response_id", "")),
+                }
+            elif event_type == "error":
+                raise RuntimeError(str(event.get("error", "Model stream failed")))
+        return
     _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
     request_limit = max(1, min(_STREAM_LOGICAL_REQUESTS, int(max_requests)))
 

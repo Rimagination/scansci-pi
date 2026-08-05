@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as readline from "node:readline";
+import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -29,11 +30,15 @@ interface RunStart extends JsonRecord {
   provider_kind: string;
   base_url: string;
   model_id: string;
+  api_surface?: string;
+  responses_enabled?: boolean;
   thinking_level?: string;
   system_prompt: string;
   prompt: string;
   task_mode?: string;
   task_contract?: JsonRecord;
+  prefix_shape?: JsonRecord;
+  context_policy?: JsonRecord;
   mcp_servers?: JsonRecord[];
   disabled_tools?: string[];
   background?: boolean;
@@ -44,6 +49,9 @@ type ToolRisk = "read_only" | "reversible" | "high";
 interface NormalizedTaskContract {
   contractId: string;
   goal: string;
+  outputFormat: string;
+  pausePolicy: string;
+  requiredEvidence: string[];
   autonomy: string;
   riskLevel: string;
   requiresPlan: boolean;
@@ -68,6 +76,7 @@ interface SessionState {
   currentRequestId?: string;
   mcpClients: McpClient[];
   activeToolNames: string[];
+  prefixShape: JsonRecord;
 }
 
 interface ActiveRun {
@@ -250,9 +259,13 @@ function errorText(error: unknown): string {
   return String(classifyError(error).message || error);
 }
 
-function providerApi(kind: string): "anthropic-messages" | "openai-completions" {
-  return kind === "anthropic" || kind === "anthropic-compatible"
-    ? "anthropic-messages"
+function providerApi(
+  kind: string,
+  apiSurface = "chat_completions",
+): "anthropic-messages" | "openai-completions" | "openai-responses" {
+  if (kind === "anthropic" || kind === "anthropic-compatible") return "anthropic-messages";
+  return String(apiSurface || "chat_completions").toLowerCase() === "responses"
+    ? "openai-responses"
     : "openai-completions";
 }
 
@@ -403,6 +416,82 @@ function freshUsageTokens(usage: unknown): number {
   return Math.max(0, total - cacheRead - cacheWrite);
 }
 
+function stableHash(value: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(value, (_key, nested) => {
+      if (!nested || typeof nested !== "object" || Array.isArray(nested)) return nested;
+      return Object.fromEntries(Object.entries(nested as JsonRecord).sort(([left], [right]) => left.localeCompare(right)));
+    }))
+    .digest("hex");
+}
+
+function buildPrefixShape(request: RunStart, activeToolNames: string[]): JsonRecord {
+  const selectedSkillIds = [...String(request.system_prompt || "").matchAll(/<selected_skill\s+id="([^"]+)"/gi)]
+    .map((match) => String(match[1] || ""))
+    .filter(Boolean)
+    .sort();
+  const components = {
+    provider: String(request.provider_kind || ""),
+    model: String(request.model_id || ""),
+    api_surface: String(request.api_surface || "chat_completions"),
+    system_prompt_hash: stableHash(String(request.system_prompt || "")),
+    tool_names_hash: stableHash([...activeToolNames].sort()),
+    selected_skill_ids: selectedSkillIds,
+    mcp_server_ids: (Array.isArray(request.mcp_servers) ? request.mcp_servers : [])
+      .map((server) => String(server.id || server.name || ""))
+      .filter(Boolean)
+      .sort(),
+    contract_shape: taskContractSessionSignature(request),
+  };
+  return {
+    schema_version: "scansci.prefix-shape.v1",
+    hash: stableHash(components),
+    components,
+  };
+}
+
+function pruneStaleToolResults(state: SessionState, keepRecentTurns = 2): JsonRecord {
+  const messages = Array.isArray(state.session.messages) ? state.session.messages as JsonRecord[] : [];
+  let currentTurn = 0;
+  const locations: Array<{ message: JsonRecord; turn: number }> = [];
+  for (const message of messages) {
+    const role = String(message.role || "").toLowerCase();
+    if (role === "user") currentTurn += 1;
+    if (["tool", "toolresult", "tool_result"].includes(role)) locations.push({ message, turn: currentTurn });
+  }
+  let pruned = 0;
+  let originalChars = 0;
+  let retainedChars = 0;
+  for (const location of locations) {
+    const message = location.message;
+    const content = message.content;
+    const encoded = JSON.stringify(content ?? "");
+    const size = encoded.length;
+    originalChars += size;
+    if (currentTurn - location.turn >= Math.max(1, keepRecentTurns)) {
+      const notice = {
+        _scansci_pruned: true,
+        tool: String(message.toolName || message.tool_name || message.name || "tool").slice(0, 80),
+        original_chars: size,
+        notice: "Stale tool output was pruned before context compaction; rerun a focused tool if needed.",
+      };
+      message.content = [{ type: "text", text: JSON.stringify(notice) }];
+      message._scansci_context_pruned = true;
+      pruned += 1;
+    }
+    retainedChars += JSON.stringify(message.content ?? "").length;
+  }
+  return {
+    policy: "stale_tool_result_pruning",
+    examined_tool_results: locations.length,
+    pruned_tool_results: pruned,
+    preserved_tool_results: Math.max(0, locations.length - pruned),
+    original_chars: originalChars,
+    retained_chars: retainedChars,
+    saved_chars: Math.max(0, originalChars - retainedChars),
+  };
+}
+
 function sessionStats(state: SessionState): JsonRecord {
   const base = state.session.getSessionStats() as JsonRecord;
   const messages = Array.isArray(state.session.messages) ? state.session.messages as JsonRecord[] : [];
@@ -443,6 +532,8 @@ function sessionStats(state: SessionState): JsonRecord {
   const rawTokens = base.tokens && typeof base.tokens === "object" ? base.tokens as JsonRecord : {};
   const inputTokens = Math.max(0, Number(rawTokens.input ?? rawTokens.inputTokens ?? rawTokens.prompt_tokens ?? 0) || 0);
   const outputTokens = Math.max(0, Number(rawTokens.output ?? rawTokens.outputTokens ?? rawTokens.completion_tokens ?? 0) || 0);
+  const cacheRead = Math.max(0, Number(rawTokens.cacheRead ?? rawTokens.cache_read_tokens ?? 0) || 0);
+  const cacheWrite = Math.max(0, Number(rawTokens.cacheWrite ?? rawTokens.cache_write_tokens ?? 0) || 0);
   const normalizedTokens = {
     ...rawTokens,
     input: inputTokens,
@@ -475,6 +566,14 @@ function sessionStats(state: SessionState): JsonRecord {
       selected: selectedSkillBlocks.length,
       ids: selectedSkillBlocks.map((block) => block.match(/<selected_skill\s+id="([^"]+)"/i)?.[1] || "").filter(Boolean),
     },
+    prefixShape: state.prefixShape,
+    cacheDiagnostics: {
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
+      cacheMissTokens: cacheWrite,
+      cacheHitRate: cacheRead + cacheWrite > 0 ? Number((cacheRead / (cacheRead + cacheWrite)).toFixed(6)) : null,
+    },
+    contextPolicy: state.request.context_policy || {},
   };
 }
 
@@ -487,7 +586,7 @@ function thinkingLevel(value: unknown): ThinkingLevel {
 }
 
 function modelCompat(request: RunStart): JsonRecord | undefined {
-  if (providerApi(request.provider_kind) !== "openai-completions") return undefined;
+  if (providerApi(request.provider_kind, request.api_surface) !== "openai-completions") return undefined;
   const model = request.model_id.toLowerCase();
   const baseUrl = request.base_url.toLowerCase();
   if (baseUrl.includes("models.github.ai") || model.startsWith("openai/")) {
@@ -558,6 +657,11 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
   return {
     contractId: String(raw.contract_id || `legacy-${request.request_id}`),
     goal: String(raw.goal || finalUserRequestText(request.prompt || "")).slice(0, 1200),
+    outputFormat: String(raw.output_format || "text").slice(0, 120),
+    pausePolicy: String(raw.pause_policy || "pause only when a missing user choice changes the result").slice(0, 300),
+    requiredEvidence: Array.isArray(raw.required_evidence)
+      ? raw.required_evidence.map(String).filter(Boolean).slice(0, 12)
+      : [],
     autonomy: String(raw.autonomy || fallbackRisk),
     riskLevel: String(raw.risk_level || fallbackRisk),
     requiresPlan: raw.requires_plan === true,
@@ -1521,7 +1625,7 @@ function tools(
       : undefined
   );
   const modeBuiltins = enabled ? enabledAvailable.filter((tool) => enabled.has(tool.name)) : enabledAvailable;
-  const builtins = taskContract
+  const builtins = taskContract && taskContract.allowedTools.size > 0
     ? modeBuiltins.filter((tool) => taskContract.allowedTools.has(tool.name))
     : modeBuiltins;
   const allowExternal = [...modeParts].some((part) => ["general", "knowledge", "research", "benchmark"].includes(part));
@@ -1618,6 +1722,8 @@ function systemPrompt(request: RunStart): string {
   ].filter(Boolean).join("\n");
   const contractRule = [
     `Task contract ${contract.contractId}: goal=${contract.goal || "answer the final request"}.`,
+    `Output format=${contract.outputFormat}; pause policy=${contract.pausePolicy}.`,
+    contract.requiredEvidence.length ? `Required evidence: ${contract.requiredEvidence.join("; ")}.` : "",
     `Autonomy=${contract.autonomy}; risk ceiling=${contract.riskLevel}.`,
     contract.requiresPlan
       ? "A user-approved plan is REQUIRED before any reversible or high-risk action."
@@ -1725,6 +1831,8 @@ function sessionSignature(request: RunStart): string {
     request.cwd,
     request.agent_dir,
     request.provider_kind,
+    request.api_surface || "chat_completions",
+    request.responses_enabled === true,
     request.base_url,
     request.model_id,
     request.thinking_level || "medium",
@@ -1765,7 +1873,7 @@ async function createSession(
     name: "ScanSci Pi provider",
     baseUrl: request.base_url,
     apiKey: "$SCANSCIPI_PROVIDER_KEY",
-    api: providerApi(request.provider_kind),
+    api: providerApi(request.provider_kind, request.api_surface),
     models: [{
       id: request.model_id,
       name: request.model_id,
@@ -1790,7 +1898,7 @@ async function createSession(
       name: "scansci-provider-request-guard",
       factory: (pi) => {
         pi.on("before_provider_request", (event) => {
-          const payload = providerApi(request.provider_kind) === "openai-completions"
+          const payload = providerApi(request.provider_kind, request.api_surface) === "openai-completions"
             ? normalizeTextOnlyOpenAIRequest(event.payload)
             : event.payload;
           return guardProviderRequest(payload, String(request.task_mode || "general"));
@@ -1807,6 +1915,7 @@ async function createSession(
     request.disabled_tools || [],
     request.task_contract ? taskContract : undefined,
   );
+  const prefixShape = buildPrefixShape(request, customTools.map((tool) => String(tool.name)));
   const sessionDir = `${request.agent_dir}/sessions`;
   fs.mkdirSync(sessionDir, { recursive: true });
   const resumeFile = String(request.session_file || "");
@@ -1845,6 +1954,7 @@ async function createSession(
     unsubscribe: () => undefined,
     mcpClients: external.clients,
     activeToolNames: customTools.map((tool) => String(tool.name)),
+    prefixShape,
   };
   state.unsubscribe = state.session.subscribe((event) => {
     const requestId = state.currentRequestId || "";
@@ -1995,8 +2105,14 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         max_tool_budget: runState.taskContract.maxToolBudget,
         model_token_budget: runState.taskContract.modelTokenBudget,
       },
+      prefix_shape: state.prefixShape,
+      context_policy: request.context_policy || {},
     });
     try {
+      const cleanup = pruneStaleToolResults(state);
+      if (Number(cleanup.pruned_tool_results || 0) > 0) {
+        emit({ type: "status.update", request_id: request.request_id, status: "context_pruned", name: "stale_tool_results", details: cleanup });
+      }
       try {
         await state.session.prompt(request.prompt);
       } catch (error) {
@@ -2063,6 +2179,10 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
             : requiredToolMissing ? "required_tool" : "incomplete_answer",
           attempt: continuation + 1,
         });
+        const cleanup = pruneStaleToolResults(state);
+        if (Number(cleanup.pruned_tool_results || 0) > 0) {
+          emit({ type: "status.update", request_id: request.request_id, status: "context_pruned", name: "stale_tool_results", details: cleanup });
+        }
         const strategyInstruction = stalledRecoveries > 0
           ? "The previous route made no progress. Do NOT repeat a tool with equivalent arguments. Switch source, narrow the query, change parameters, or use another permitted tool while preserving completed results. "
           : "";
@@ -2257,8 +2377,9 @@ async function compactSession(message: JsonRecord): Promise<void> {
     return;
   }
   try {
+    const cleanup = pruneStaleToolResults(state);
     const result = await state.session.compact(String(message.instructions || "") || undefined);
-    emit({ type: "session.compact_completed", command_id: commandId, session_id: sessionId, result, stats: sessionStats(state) });
+    emit({ type: "session.compact_completed", command_id: commandId, session_id: sessionId, result, stats: { ...sessionStats(state), contextCleanup: cleanup } });
   } catch (error) {
     emit({ type: "session.compact_failed", command_id: commandId, session_id: sessionId, error: errorText(error) });
   }
@@ -2283,6 +2404,8 @@ async function loadSession(message: JsonRecord): Promise<void> {
       provider_kind: String(message.provider_kind || "openai-compatible"),
       base_url: String(message.base_url || ""),
       model_id: String(message.model_id || ""),
+      api_surface: String(message.api_surface || "chat_completions"),
+      responses_enabled: message.responses_enabled === true,
       thinking_level: String(message.thinking_level || "medium"),
       system_prompt: "",
       prompt: "",

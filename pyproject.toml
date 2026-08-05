@@ -67,6 +67,11 @@ evaluation = [
   "langchain-anthropic>=1.4,<2",
   "langchain-openai>=1.3,<2",
 ]
+harness = [
+  "pydantic-ai>=1,<2",
+  "openai-agents>=0.1,<1",
+  "langgraph>=1,<2",
+]
 
 [project.scripts]
 scansci = "scansci_html.cli:main"

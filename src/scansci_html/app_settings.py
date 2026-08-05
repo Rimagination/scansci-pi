@@ -57,6 +57,11 @@ def _provider_preset(
         "logo": identifier,
         "kind": kind,
         "base_url": base_url,
+        # Keep the current production behavior explicit.  Operators may opt
+        # a provider into Responses through the settings payload only after
+        # confirming that the endpoint supports it.
+        "api_surface": "chat_completions",
+        "responses_enabled": False,
         "category": category,
         "summary": summary,
         "auth_mode": auth_mode,
@@ -748,6 +753,13 @@ def _normalize_providers(value: object) -> list[dict[str, Any]]:
                 "name": name,
                 "kind": kind,
                 "base_url": _text(item.get("base_url"), limit=500),
+                "api_surface": (
+                    _text(item.get("api_surface"), fallback="chat_completions", limit=32).lower()
+                    if _text(item.get("api_surface"), fallback="chat_completions", limit=32).lower()
+                    in {"auto", "chat_completions", "responses"}
+                    else "chat_completions"
+                ),
+                "responses_enabled": bool(item.get("responses_enabled", False)),
                 "enabled": bool(item.get("enabled", True)),
                 "logo": _text(item.get("logo"), fallback=identifier, limit=80),
                 "category": _text(item.get("category"), fallback="自定义提供商", limit=48),
