@@ -13,6 +13,7 @@
         "-m",
         "pytest",
         "tests/test_desktop.py",
+        "tests/test_mcp_bridge.py",
         "tests/test_webapp.py",
         "tests/test_llm.py",
         "tests/test_app_settings.py",

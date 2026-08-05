@@ -36,6 +36,57 @@ from scansci_html.research_runs import StageSpec
 from scansci_html.workspace import attach_annotation_layers_to_notebook, sync_sources_from_evidence_store
 
 
+def test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Keep this route-level test independent from the real stdio bridge. The
+    # latter is covered by tests/test_mcp_bridge.py in the release gate.
+    app, workspace, _evidence = _build_app(tmp_path)
+    observed_servers: list[dict[str, object]] = []
+
+    def fake_probe(*, workspace: str | Path, server: dict[str, object]) -> dict[str, object]:
+        del workspace
+        observed_servers.append(dict(server))
+        if len(observed_servers) == 1:
+            return {"type": "mcp.probe.completed", "server_count": 0, "tool_count": 0, "tools": []}
+        return {
+            "type": "mcp.probe.completed",
+            "server_count": 1,
+            "tool_count": 1,
+            "tools": [{"name": "mcp__fixture-mcp__search_library"}],
+        }
+
+    monkeypatch.setattr(PiAgentClient, "probe_mcp_server", fake_probe)
+    save_settings(
+        workspace,
+        {
+            "mcp_servers": [
+                {
+                    "id": "fixture-mcp",
+                    "name": "Fixture MCP",
+                    "enabled": True,
+                    "transport": "stdio",
+                    "command": "node",
+                    "args": "fixture.mjs",
+                    "connector_kind": "zotero",
+                    "allow_write": False,
+                }
+            ]
+        },
+    )
+
+    tested = _payload(
+        app.dispatch(
+            "POST",
+            "/api/mcp/test",
+            json.dumps({"server_id": "fixture-mcp"}).encode("utf-8"),
+        )
+    )
+    assert tested["server_count"] == 1
+    assert tested["tool_count"] == 1
+    assert tested["tools"][0]["name"] == "mcp__fixture-mcp__search_library"
+    assert len(observed_servers) == 2
+    assert observed_servers[0]["id"] == "fixture-mcp"
+
+
 def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: Path):
     app, workspace, _evidence = _build_app(tmp_path)
     _configure_local_evidence(workspace)
@@ -2802,40 +2853,6 @@ def test_notebook_webapp_exposes_per_workspace_connector_capabilities(tmp_path: 
     assert "attachment_fulltext" in zotero["native_capabilities"]
     assert "formatted_citations" in zotero["native_capabilities"]
     assert "backlinks" in obsidian["native_capabilities"]
-
-
-def test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools(tmp_path: Path):
-    app, workspace, _evidence = _build_app(tmp_path)
-    node, _sidecar = PiAgentClient.runtime_paths()
-    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
-    save_settings(
-        workspace,
-        {
-            "mcp_servers": [
-                {
-                    "id": "fixture-mcp",
-                    "name": "Fixture MCP",
-                    "enabled": True,
-                    "transport": "stdio",
-                    "command": str(node),
-                    "args": str(fixture),
-                    "connector_kind": "zotero",
-                    "allow_write": False,
-                }
-            ]
-        },
-    )
-
-    tested = _payload(
-        app.dispatch(
-            "POST",
-            "/api/mcp/test",
-            json.dumps({"server_id": "fixture-mcp"}).encode("utf-8"),
-        )
-    )
-    assert tested["server_count"] == 1
-    assert tested["tool_count"] == 1
-    assert tested["tools"][0]["name"] == "mcp__fixture-mcp__search_library"
 
 
 def test_notebook_webapp_exposes_presets_capabilities_and_ppt_outline(tmp_path: Path):
