@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any
+from typing import Any, Iterable
+
+from .skill_runtime import normalize_skill_ids
 
 
 _SPACE = re.compile(r"\s+")
@@ -65,6 +67,11 @@ _EVIDENCE_REVIEW = re.compile(
     r"(?:逐句|逐条)引用.{0,24}(?:综述|回顾)|notebooklm(?:式|风格)?(?:综述|回顾)?)",
     re.IGNORECASE,
 )
+_SKILL_HELP = re.compile(
+    r"(?:怎么用|如何使用|使用方法|能做什么|是什么|介绍一下|说明一下|help|how\s+to\s+use|what\s+does)",
+    re.IGNORECASE,
+)
+_SKILL_MENTION = re.compile(r"(?<!\S)\$[a-zA-Z0-9._-]+")
 
 
 @dataclass(frozen=True)
@@ -94,7 +101,12 @@ class FreeformTaskRoute:
         }
 
 
-def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
+def route_freeform_task(
+    text: str,
+    *,
+    has_knowledge: bool,
+    skill_ids: Iterable[str] = (),
+) -> FreeformTaskRoute:
     """Return a minimal, deterministic route for explicit product requests.
 
     ``has_knowledge`` represents an actively selected, usable local library.
@@ -103,6 +115,7 @@ def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
     """
 
     request = _SPACE.sub(" ", str(text or "").strip())
+    selected_skills = normalize_skill_ids(skill_ids)
     if not request:
         return FreeformTaskRoute(route="direct_chat", reason="empty_request")
 
@@ -111,6 +124,13 @@ def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
     # describes application state; it is not an instruction to find a paper.
     if _LOCAL_PRODUCT_STATUS.search(request):
         return FreeformTaskRoute(route="direct_chat", reason="local_product_status")
+
+    # Asking what a Skill does is still a normal conversation.  Skill names
+    # often contain words such as "search" or "review" and must not by
+    # themselves launch a paid or long-running workflow.
+    request_without_mentions = _SKILL_MENTION.sub(" ", request).strip()
+    if selected_skills and _SKILL_HELP.search(request_without_mentions):
+        return FreeformTaskRoute(route="direct_chat", reason="selected_skill_help")
 
     identifiers = _paper_identifiers(request)
     if _DOWNLOAD.search(request):
@@ -180,6 +200,14 @@ def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
             input_payload={"question": request, "limit": 36, "max_search_rounds": 2, "max_fulltext": 4},
         )
 
+    selected_route = _route_selected_skill(
+        request,
+        has_knowledge=has_knowledge,
+        skill_ids=selected_skills,
+    )
+    if selected_route is not None:
+        return selected_route
+
     if _ACADEMIC_SEARCH.search(request):
         return FreeformTaskRoute(
             route="durable_run",
@@ -204,6 +232,76 @@ def route_freeform_task(text: str, *, has_knowledge: bool) -> FreeformTaskRoute:
         )
 
     return FreeformTaskRoute(route="direct_chat", reason="open_conversation")
+
+
+def _route_selected_skill(
+    request: str,
+    *,
+    has_knowledge: bool,
+    skill_ids: list[str],
+) -> FreeformTaskRoute | None:
+    """Map explicit executable Skills to the smallest native workflow.
+
+    Most research Skills are low-latency model contracts and intentionally stay
+    in direct chat.  Only Skills whose promised result needs retrieval, a
+    knowledge scope, or an artifact are promoted to durable product workflows.
+    User order decides which executable Skill wins in an explicit composite.
+    """
+
+    for identifier in skill_ids:
+        if identifier == "nature-academic-search":
+            return FreeformTaskRoute(
+                route="durable_run",
+                workflow_type="academic_search",
+                presentation_mode="academic",
+                reason="selected_nature_academic_search",
+                scope="public_academic",
+                input_payload={"query": request, "raw_query": request, "limit": 24, "per_source": 10},
+            )
+        if identifier == "literature-review":
+            if has_knowledge:
+                return FreeformTaskRoute(
+                    route="durable_run",
+                    workflow_type="literature_review",
+                    presentation_mode="knowledge",
+                    reason="selected_literature_review",
+                    scope="selected_knowledge",
+                    input_payload={
+                        "question": request,
+                        "writing_brief": {
+                            "audience": "researcher",
+                            "tone": "academic",
+                            "length": "long",
+                        },
+                    },
+                )
+            return FreeformTaskRoute(
+                route="durable_run",
+                workflow_type="deep_research",
+                presentation_mode="deep-research",
+                reason="selected_literature_review_public",
+                scope="public_academic",
+                input_payload={"question": request, "limit": 36, "max_search_rounds": 2, "max_fulltext": 4},
+            )
+        if identifier == "scientific-brainstorming" and has_knowledge:
+            return FreeformTaskRoute(
+                route="durable_run",
+                workflow_type="research_idea",
+                presentation_mode="idea",
+                reason="selected_scientific_brainstorming",
+                scope="selected_knowledge",
+                input_payload={"direction": request},
+            )
+        if identifier == "nature-paper2ppt" and has_knowledge:
+            return FreeformTaskRoute(
+                route="durable_run",
+                workflow_type="ppt_project",
+                presentation_mode="slides",
+                reason="selected_nature_paper2ppt",
+                scope="selected_knowledge",
+                input_payload={"topic": request},
+            )
+    return None
 
 
 def _paper_identifiers(text: str) -> list[str]:

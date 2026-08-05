@@ -28,6 +28,8 @@ from .academic_search import search_academic_papers
 from .academic_planning import plan_academic_search
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
+from .checkpoints import CheckpointError, CheckpointStore
+from .context_policy import prune_stale_tool_results
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
 from .library_manager import import_library_files
 from .qa.agent import answer_question
@@ -53,6 +55,9 @@ from .zotero_integration import (
     zotero_status,
 )
 from .obsidian_integration import obsidian_backlinks, obsidian_status, read_obsidian_note, search_obsidian_vault
+from .prefix_diagnostics import build_prefix_shape
+from .run_manifest import RunManifest
+from .task_contract import TaskContract
 
 
 class PiRuntimeUnavailable(RuntimeError):
@@ -1075,6 +1080,8 @@ class PiAgentClient:
         base_url: str,
         api_key: str,
         model_id: str,
+        api_surface: str = "chat_completions",
+        responses_enabled: bool = False,
         messages: list[dict[str, Any]],
         thinking_level: str = "medium",
         task_mode: str = "general",
@@ -1084,13 +1091,17 @@ class PiAgentClient:
     ) -> Iterator[dict[str, Any]]:
         """Yield normalized Pi events, optionally continuing a durable session."""
 
+        messages, context_report = prune_stale_tool_results(messages)
         system_parts: list[str] = []
         conversation: list[str] = []
         for item in messages:
             role = str(item.get("role", "user")).strip().lower()
             content = item.get("content", "")
             if not isinstance(content, str):
-                raise ValueError("Pi text bridge does not accept image message blocks")
+                if role in {"tool", "toolresult", "tool_result"}:
+                    content = json.dumps(content, ensure_ascii=False, default=str)
+                else:
+                    raise ValueError("Pi text bridge does not accept image message blocks")
             if role == "system":
                 system_parts.append(content)
             else:
@@ -1119,7 +1130,40 @@ class PiAgentClient:
                 "Continue the following ScanSci conversation. Reply to the final USER message.\n\n"
                 + "\n\n".join(conversation)
             )
+        final_request = next(
+            (
+                str(item.get("content", ""))
+                for item in reversed(messages)
+                if str(item.get("role", "user")).strip().lower() == "user"
+            ),
+            prompt,
+        )
+        effective_contract = TaskContract.from_payload(
+            task_contract,
+            request=final_request,
+            task_mode=task_mode,
+        ).to_dict()
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
+        tool_set = {
+            "mcp_servers": [str(item.get("id", "")) for item in self._enabled_mcp_servers() if isinstance(item, dict)],
+            "disabled_tools": self._disabled_artifact_tools(),
+        }
+        contract_shape = {
+            key: effective_contract.get(key)
+            for key in (
+                "schema_version", "output_format", "constraints", "required_evidence",
+                "allowed_tools", "pause_policy", "success_criteria",
+            )
+        }
+        prefix_shape = build_prefix_shape(
+            provider=provider_kind,
+            model=model_id,
+            api_surface=str(api_surface or "chat_completions"),
+            system_prompt="\n\n".join(system_parts),
+            tool_set=tool_set,
+            selected_skills=re.findall(r'<selected_skill\s+id="([^"]+)"', "\n\n".join(system_parts), flags=re.IGNORECASE),
+            task_contract=contract_shape,
+        )
         start_message = {
             "type": "run.start",
             "request_id": request_id,
@@ -1130,17 +1174,79 @@ class PiAgentClient:
             "provider_kind": provider_kind,
             "base_url": effective_base_url,
             "model_id": model_id,
+            "api_surface": str(api_surface or "chat_completions"),
+            "responses_enabled": bool(responses_enabled),
             "thinking_level": thinking_level,
             "system_prompt": "\n\n".join(system_parts),
             "prompt": prompt,
             "task_mode": task_mode,
             "mcp_servers": self._enabled_mcp_servers(),
             "disabled_tools": self._disabled_artifact_tools(),
+            "task_contract": effective_contract,
+            "prefix_shape": prefix_shape,
+            "context_policy": context_report.to_dict(),
         }
-        if task_contract:
-            start_message["task_contract"] = _json_safe(dict(task_contract))
+        manifest: RunManifest | None = None
         try:
-            yield from self._run_request(start_message, api_key=api_key, timeout_seconds=timeout_seconds)
+            manifest = RunManifest.start(
+                self.workspace,
+                harness="pi",
+                provider=provider_kind,
+                model=model_id,
+                api_surface=str(api_surface or "chat_completions"),
+                session_id=logical_session_id,
+                prompt=prompt,
+                tool_set=tool_set,
+                timeout_seconds=timeout_seconds,
+                prefix_shape=prefix_shape,
+                task_contract=effective_contract,
+                context_policy=context_report.to_dict(),
+            )
+        except OSError:
+            # Diagnostics are valuable but must never prevent a research run.
+            manifest = None
+        started_at = time.monotonic()
+        first_visible_at: float | None = None
+        retry_count = 0
+        tool_calls = 0
+        tool_failures = 0
+        try:
+            for event in self._run_request(start_message, api_key=api_key, timeout_seconds=timeout_seconds):
+                event_type = str(event.get("type", ""))
+                if event_type == "delta" and str(event.get("content", "")) and first_visible_at is None:
+                    first_visible_at = time.monotonic()
+                elif event_type == "retry":
+                    retry_count += 1
+                elif event_type == "tool.completed":
+                    tool_calls += 1
+                elif event_type == "tool.failed":
+                    tool_calls += 1
+                    tool_failures += 1
+                if manifest is not None:
+                    manifest.record(
+                        f"agent.{event_type or 'event'}",
+                        name=event.get("name", ""),
+                        status=event.get("status", ""),
+                    )
+                    if event_type in {"done", "session_stats"}:
+                        stats = event.get("stats") or event.get("value")
+                        if isinstance(stats, dict):
+                            manifest.record_context_stats(stats, prefix_shape=prefix_shape)
+                yield event
+            if manifest is not None:
+                manifest.finish(
+                    status="completed",
+                    duration_ms=round((time.monotonic() - started_at) * 1000, 2),
+                    ttft_ms=round((first_visible_at - started_at) * 1000, 2) if first_visible_at else None,
+                    retry_count=retry_count,
+                    tool_calls=tool_calls,
+                    tool_failures=tool_failures,
+                )
+        except BaseException as error:
+            if manifest is not None:
+                manifest.metric("duration_ms", round((time.monotonic() - started_at) * 1000, 2))
+                manifest.fail(error, retryable=isinstance(error, (TimeoutError, ConnectionError)))
+            raise
         finally:
             if transient_session:
                 self.close()
@@ -2833,6 +2939,7 @@ class PiAgentClient:
                 int(arguments.get("slide_index", 0)),
                 str(arguments.get("old_string", "")),
                 str(arguments.get("new_string", "")),
+                workspace=self.workspace,
             )
         if name == "self_assess":
             return _build_self_assessment(self._tool_history)
@@ -3051,11 +3158,27 @@ def _edit_section(file_path: str, old_string: str, new_string: str, *, workspace
     if old_string not in original:
         return {"ok": False, "error": "old_string not found in file", "matched": False}
     updated = original.replace(old_string, new_string, 1)
+    checkpoint_id = ""
+    try:
+        checkpoint = CheckpointStore(workspace.parent).begin(turn_id="edit_section", label=path.name)
+        CheckpointStore(workspace.parent).capture(checkpoint.checkpoint_id, path)
+        checkpoint_id = checkpoint.checkpoint_id
+    except CheckpointError:
+        # Preserve the legacy edit behaviour for artifacts outside the local
+        # workspace; in-workspace edits are checkpointed automatically.
+        checkpoint_id = ""
     path.write_text(updated, encoding="utf-8")
-    return {"ok": True, "matched": True, "file_path": str(path)}
+    return {"ok": True, "matched": True, "file_path": str(path), **({"checkpoint_id": checkpoint_id} if checkpoint_id else {})}
 
 
-def _edit_slide_text(pptx_path: str, slide_index: int, old_string: str, new_string: str) -> dict[str, Any]:
+def _edit_slide_text(
+    pptx_path: str,
+    slide_index: int,
+    old_string: str,
+    new_string: str,
+    *,
+    workspace: Path | None = None,
+) -> dict[str, Any]:
     """Replace text in a specific slide of an existing PPTX file.
 
     Opens the file, finds the slide (1-based index), walks all text runs in all
@@ -3094,11 +3217,25 @@ def _edit_slide_text(pptx_path: str, slide_index: int, old_string: str, new_stri
             break
     if not matched:
         return {"ok": False, "error": f"old_string not found on slide {slide_index}", "matched": False}
+    checkpoint_id = ""
+    if workspace is not None:
+        try:
+            checkpoint = CheckpointStore(workspace.parent).begin(turn_id="edit_slide", label=path.name)
+            CheckpointStore(workspace.parent).capture(checkpoint.checkpoint_id, path)
+            checkpoint_id = checkpoint.checkpoint_id
+        except CheckpointError:
+            checkpoint_id = ""
     try:
         presentation.save(str(path))
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"无法保存 PPTX：{exc}", "matched": True}
-    return {"ok": True, "matched": True, "slide_index": slide_index, "pptx_path": str(path)}
+    return {
+        "ok": True,
+        "matched": True,
+        "slide_index": slide_index,
+        "pptx_path": str(path),
+        **({"checkpoint_id": checkpoint_id} if checkpoint_id else {}),
+    }
 
 
 # -- L1: search auto-retry ---------------------------------------------------

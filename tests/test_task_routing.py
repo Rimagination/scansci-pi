@@ -72,6 +72,61 @@ def test_failed_component_download_question_stays_in_local_status_chat() -> None
     assert decision.reason == "local_product_status"
 
 
+def test_explicit_academic_search_skill_routes_a_bare_topic() -> None:
+    decision = route_freeform_task(
+        "$nature-academic-search RAG factual consistency",
+        has_knowledge=False,
+        skill_ids=["nature-academic-search"],
+    )
+
+    assert decision.workflow_type == "academic_search"
+    assert decision.reason == "selected_nature_academic_search"
+
+
+def test_literature_review_skill_uses_local_evidence_or_public_deep_research() -> None:
+    request = "$literature-review 城市树冠降温效应"
+
+    public = route_freeform_task(request, has_knowledge=False, skill_ids=["literature-review"])
+    local = route_freeform_task(request, has_knowledge=True, skill_ids=["literature-review"])
+
+    assert public.workflow_type == "deep_research"
+    assert public.scope == "public_academic"
+    assert local.workflow_type == "literature_review"
+    assert local.scope == "selected_knowledge"
+
+
+def test_brainstorming_skill_only_promotes_when_evidence_scope_is_available() -> None:
+    request = "$scientific-brainstorming 城市树冠与热暴露"
+
+    direct = route_freeform_task(request, has_knowledge=False, skill_ids=["scientific-brainstorming"])
+    durable = route_freeform_task(request, has_knowledge=True, skill_ids=["scientific-brainstorming"])
+
+    assert direct.route == "direct_chat"
+    assert durable.workflow_type == "research_idea"
+    assert durable.input_payload["direction"] == request
+
+
+def test_direct_model_contract_skills_do_not_create_background_runs() -> None:
+    decision = route_freeform_task(
+        "$nature-polishing 请润色这段英文摘要",
+        has_knowledge=True,
+        skill_ids=["nature-polishing"],
+    )
+
+    assert decision.route == "direct_chat"
+
+
+def test_skill_help_question_never_launches_a_workflow() -> None:
+    decision = route_freeform_task(
+        "$nature-academic-search 怎么用？",
+        has_knowledge=False,
+        skill_ids=["nature-academic-search"],
+    )
+
+    assert decision.route == "direct_chat"
+    assert decision.reason == "selected_skill_help"
+
+
 @pytest.mark.parametrize(
     "query",
     [

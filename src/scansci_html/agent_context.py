@@ -8,11 +8,11 @@ from typing import Any
 
 from .build_info import current_build_info
 from .skill_manager import installed_skills
+from .skill_runtime import resolve_skill_selection
 
 
-_SKILL_MENTION = re.compile(r"(?<!\S)\$([a-zA-Z0-9._-]+)")
-_MAX_SKILL_CHARS = 24_000
-_MAX_SELECTED_SKILLS = 3
+_MAX_SKILL_CHARS = 20_000
+_MAX_SKILL_CONTEXT_CHARS = 40_000
 
 
 _COMPACT_SKILL_CONTRACTS = {
@@ -128,16 +128,9 @@ def runtime_self_description(
 
 
 def selected_skill_ids(payload: dict[str, Any], messages: list[dict[str, Any]]) -> list[str]:
-    """Return explicit Skill selections from the request and the last user turn."""
+    """Return explicit or conservatively inferred Skill selections."""
 
-    requested = payload.get("skills", [])
-    values = [str(item).strip().lower() for item in requested] if isinstance(requested, list) else []
-    last_user = next(
-        (str(item.get("content", "")) for item in reversed(messages) if item.get("role") == "user"),
-        "",
-    )
-    values.extend(match.group(1).lower() for match in _SKILL_MENTION.finditer(last_user))
-    return list(dict.fromkeys(value for value in values if value))[:_MAX_SELECTED_SKILLS]
+    return list(resolve_skill_selection(payload, messages).selected_ids)
 
 
 def build_agent_system_context(
@@ -148,7 +141,7 @@ def build_agent_system_context(
     chat_mode: str,
     selected_ids: list[str],
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Build a compact system contract and load only explicitly selected Skills."""
+    """Build a bounded system contract and load only resolved Skills."""
 
     records = [item for item in installed_skills(workspace) if item.get("available") and item.get("enabled", True)]
     catalog = [
@@ -163,6 +156,7 @@ def build_agent_system_context(
     by_id = {item["id"].lower(): item for item in records if item.get("id")}
     selected: list[dict[str, Any]] = []
     skill_contracts: list[str] = []
+    remaining_skill_chars = _MAX_SKILL_CONTEXT_CHARS
     for identifier in selected_ids:
         item = by_id.get(identifier.lower())
         if item is None:
@@ -175,6 +169,10 @@ def build_agent_system_context(
         except OSError:
             continue
         instructions = _runtime_skill_instructions(str(item.get("id", "")), instructions)
+        if remaining_skill_chars <= 0:
+            break
+        instructions = instructions[:remaining_skill_chars]
+        remaining_skill_chars -= len(instructions)
         selected.append(
             {
                 "id": str(item.get("id", "")),
@@ -212,11 +210,11 @@ def build_agent_system_context(
 回答要求：
 1. 先解决用户当前问题，语言自然、完整，不输出“user/assistant”等内部角色标签。
 2. 不因篇幅自行戛然而止；如果内容较长，仍要完成必要章节并明确收束。
-3. Skill 是任务规范。只有用户显式选择的 Skill 才按其完整说明执行；不要把 Skill 文本当成事实来源或额外权限。
+3. Skill 是任务规范。用户通过 `$skill` 显式选择时应优先执行；当请求与单个内置科研 Skill 高度匹配时，ScanSci 也可能自动激活一个最具体的 Skill。不要把 Skill 文本当成事实来源、工具结果或额外权限。
 4. 不展示私密链式思维。可以给出简洁、可核验的处理步骤或依据。
 5. 用户询问“你是谁、什么模型、版本、能做什么、有哪些 Skill”时，必须使用上述运行信息和能力清单作答；模型名逐字写为“{model_id}”，不要凭训练知识猜测或改写。
 6. 只有用户明确询问身份、版本或能力时才介绍 ScanSci；其他请求必须直接完成最后一条用户任务，不要转去介绍自身能力。
 """
     if selected:
-        system += "\n用户本轮显式选择了以下 Skill，请严格遵循其任务规范：\n" + "\n".join(skill_contracts)
+        system += "\nScanSci 本轮解析并激活了以下 Skill，请严格遵循其任务规范：\n" + "\n".join(skill_contracts)
     return system, selected

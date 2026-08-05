@@ -16,8 +16,11 @@ const state = {
   activeSettings: "general",
   activeExtensions: "skills",
   extensionDetail: null,
+  skillInstallReview: null,
+  skillInstallBusy: false,
   composerImages: { home: [], chat: [] },
   composerSources: { home: [], chat: [] },
+  composerSkills: { home: [], chat: [] },
   selectedProviderId: "",
   providerQuery: "",
   modelQuery: "",
@@ -577,11 +580,95 @@ function renderAssistantContent(value = "") {
 }
 
 function extractSkillMentions(text = "") {
-  return [...String(text).matchAll(/(?:^|\s)\$([a-zA-Z0-9._-]+)/g)].map((match) => match[1]);
+  return [...new Set([...String(text).matchAll(/(?:^|\s)\$([a-zA-Z0-9._-]+)/g)].map((match) => match[1].toLowerCase()))];
 }
 
 function enabledSkillCatalog() {
   return (state.extensions.skills || []).filter((item) => item.available !== false && item.enabled !== false && !item.uninstalled);
+}
+
+function skillRecord(skillId) {
+  const normalized = String(skillId || "").trim().toLowerCase();
+  return enabledSkillCatalog().find((item) => String(item.id || "").toLowerCase() === normalized) || null;
+}
+
+function localSkillHref(path = "") {
+  const normalized = String(path || "").trim().replace(/\\/g, "/");
+  if (!normalized) return "";
+  const encoded = normalized.split("/").map((part, index) => {
+    if (index === 0 && /^[a-z]:$/i.test(part)) return part;
+    return encodeURIComponent(part);
+  }).join("/");
+  return /^[a-z]:\//i.test(normalized) ? `file:///${encoded}` : `file://${encoded.startsWith("/") ? "" : "/"}${encoded}`;
+}
+
+function skillTokenMarkup(skill, { key = "", removable = false } = {}) {
+  if (!skill?.id) return "";
+  const id = String(skill.id);
+  const name = String(skill.name || id);
+  const path = String(skill.skill_file || "").trim();
+  const label = path
+    ? `<a class="composer-skill-token-link" href="${escapeHtml(localSkillHref(path))}" data-action="open-local-path" data-local-path="${escapeHtml(path)}" data-skill-id="${escapeHtml(id)}" aria-label="${escapeHtml(name)}，打开本地 SKILL.md" title="${escapeHtml(path)}">${escapeHtml(name)}</a>`
+    : `<span class="composer-skill-token-link" data-skill-id="${escapeHtml(id)}">${escapeHtml(name)}</span>`;
+  const remove = removable
+    ? `<button type="button" class="composer-skill-token-remove" data-action="remove-composer-skill" data-composer-key="${escapeHtml(key)}" data-skill-id="${escapeHtml(id)}" aria-label="移除 Skill ${escapeHtml(name)}" title="移除">×</button>`
+    : "";
+  return `<span class="composer-skill-token" data-skill-token="${escapeHtml(id)}">${label}${remove}</span>`;
+}
+
+function composerSkillRecords(key) {
+  return Array.isArray(state.composerSkills[key]) ? state.composerSkills[key] : [];
+}
+
+function composerSkillIds(key, text = "") {
+  return [...new Set([
+    ...composerSkillRecords(key).map((item) => String(item.id || "").toLowerCase()),
+    ...extractSkillMentions(text),
+  ].filter(Boolean))].slice(0, 4);
+}
+
+function skillRecordsForIds(ids = []) {
+  return [...new Set(ids.map((item) => String(typeof item === "string" ? item : item?.id || "").toLowerCase()).filter(Boolean))]
+    .map((id) => skillRecord(id) || { id, name: id, skill_file: "" });
+}
+
+function messageSkillTokensMarkup(skills = []) {
+  const records = Array.isArray(skills) ? skills.map((item) => typeof item === "string" ? (skillRecord(item) || { id: item, name: item }) : item) : [];
+  if (!records.length) return "";
+  return `<div class="message-skill-tokens" aria-label="本轮使用的 Skill">${records.map((item) => skillTokenMarkup(item)).join("")}</div>`;
+}
+
+function renderComposerSkills(key) {
+  const target = byId(`${key}SkillTokens`);
+  if (!target) return;
+  const skills = composerSkillRecords(key);
+  target.hidden = !skills.length;
+  target.innerHTML = skills.map((item) => skillTokenMarkup(item, { key, removable: true })).join("");
+  target.closest("form")?.classList.toggle("has-skill-token", Boolean(skills.length));
+}
+
+function addComposerSkill(key, skillId) {
+  const item = skillRecord(skillId);
+  if (!item) return false;
+  const existing = composerSkillRecords(key);
+  if (existing.some((skill) => String(skill.id).toLowerCase() === String(item.id).toLowerCase())) return true;
+  if (existing.length >= 4) {
+    toast("一次最多选择 4 个 Skill", true);
+    return false;
+  }
+  state.composerSkills[key] = [...existing, item];
+  renderComposerSkills(key);
+  return true;
+}
+
+function removeComposerSkill(key, skillId) {
+  state.composerSkills[key] = composerSkillRecords(key).filter((item) => String(item.id).toLowerCase() !== String(skillId || "").toLowerCase());
+  renderComposerSkills(key);
+}
+
+function clearComposerSkills(key) {
+  state.composerSkills[key] = [];
+  renderComposerSkills(key);
 }
 
 function currentSkillMention(input) {
@@ -621,24 +708,33 @@ function renderSkillSuggestions(input) {
   closeSkillSuggestions();
   const mention = currentSkillMention(input);
   if (!mention) return;
+  const selected = new Set(composerSkillRecords(composerKey(input.id)).map((item) => String(item.id).toLowerCase()));
   const candidates = enabledSkillCatalog().filter((item) => {
     const searchable = `${item.id || ""} ${item.name || ""} ${item.description || ""}`.toLowerCase();
-    return !mention.query || searchable.includes(mention.query);
+    return !selected.has(String(item.id || "").toLowerCase()) && (!mention.query || searchable.includes(mention.query));
   }).slice(0, 8);
   if (!candidates.length) return;
   const popover = document.createElement("div");
   popover.className = "skill-suggestions";
   popover.setAttribute("role", "listbox");
-  popover.innerHTML = `<div class="skill-suggestions-label">选择 Skill</div>${candidates.map((item, index) => `<button type="button" class="skill-suggestion ${index === 0 ? "is-active" : ""}" data-action="select-skill-suggestion" data-skill-id="${escapeHtml(item.id)}" data-input-id="${escapeHtml(input.id)}" role="option" aria-selected="${index === 0 ? "true" : "false"}"><span><strong>$${escapeHtml(item.id)}</strong><small>${escapeHtml(item.description || item.name || "已安装 Skill")}</small></span>${item.builtin ? '<em>内置</em>' : ""}</button>`).join("")}`;
+  popover.innerHTML = `<div class="skill-suggestions-head"><span>Skills</span><small><kbd>↑↓</kbd> 移动 · <kbd>Enter</kbd> 选择</small></div>${candidates.map((item, index) => `<button type="button" class="skill-suggestion ${index === 0 ? "is-active" : ""}" data-action="select-skill-suggestion" data-skill-id="${escapeHtml(item.id)}" data-input-id="${escapeHtml(input.id)}" role="option" aria-selected="${index === 0 ? "true" : "false"}"><span><strong>${escapeHtml(item.name || item.id)}</strong><small><code>$${escapeHtml(item.id)}</code><span>${escapeHtml(item.description || "已安装 Skill")}</span></small></span>${item.builtin ? '<em>内置</em>' : ""}</button>`).join("")}`;
   input.closest("form")?.appendChild(popover);
 }
 
 function selectSkillSuggestion(input, skillId) {
   const mention = currentSkillMention(input);
   if (!mention || !skillId) return;
-  input.setRangeText(`$${skillId} `, mention.start, mention.end, "end");
+  const key = composerKey(input.id);
+  if (!addComposerSkill(key, skillId)) return;
+  const left = input.value.slice(0, mention.start).replace(/[ \t]+$/, "");
+  const right = input.value.slice(mention.end).replace(/^[ \t]+/, "");
+  const spacer = left && right && !/\s$/.test(left) ? " " : "";
+  input.value = `${left}${spacer}${right}`;
+  const cursor = left.length + spacer.length;
+  input.setSelectionRange(cursor, cursor);
   closeSkillSuggestions();
   input.focus();
+  input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function moveSkillSuggestion(direction) {
@@ -2754,6 +2850,8 @@ function startTask() {
   window.localStorage.removeItem("scansci.active.task");
   window.localStorage.removeItem("scansci.active.session");
   state.directMessages = [];
+  clearComposerSkills("home");
+  clearComposerSkills("chat");
   setComposerMode("general");
   applyContextPanelPreset("none");
   setView("home");
@@ -3253,6 +3351,8 @@ async function askQuestion(event, inputId) {
     return;
   }
   const key = composerKey(inputId);
+  const selectedSkillIds = composerSkillIds(key, input.value);
+  const selectedSkills = skillRecordsForIds(selectedSkillIds);
   const selectedMode = composerMode(inputId);
   const images = imagePayloadForComposer(key);
   const sourceFiles = sourcePayloadForComposer(key);
@@ -3288,7 +3388,7 @@ async function askQuestion(event, inputId) {
   // this decision when creating the run, so this preview is never authority.
   if (selectedMode === "general" && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length) {
     try {
-      const decision = await previewFreeformTask(question);
+      const decision = await previewFreeformTask(question, selectedSkillIds);
       if (decision?.route === "durable_run" && decision?.workflow_type) {
         routedTask = decision;
         mode = String(decision.presentation_mode || mode);
@@ -3327,7 +3427,7 @@ async function askQuestion(event, inputId) {
   }
   if (mode === "academic" && !isTaskFollowUp && !routedTask) {
     try {
-      await openAcademicSearchPlan(question, { inputId, key, sourceFiles, images });
+      await openAcademicSearchPlan(question, { inputId, key, sourceFiles, images, skills: selectedSkillIds });
     } catch (error) {
       toast(`无法生成检索计划：${error.message}`, true);
     }
@@ -3340,10 +3440,10 @@ async function askQuestion(event, inputId) {
   applyContextPanelPreset(directChatMode === "knowledge" ? "knowledge" : mode === "deep-research" ? "review" : "none");
   setView("conversation");
   if (isTaskFollowUp) {
-    renderPendingTaskFollowUp(activeRun, question);
+    renderPendingTaskFollowUp(activeRun, question, selectedSkills);
   } else {
     state.conversationAutoFollow = true;
-    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}<p>${escapeHtml(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
+    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}<p>${escapeHtml(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
     followLatestConversationMessage();
   }
   if (mode === "deep-research" || (mode === "knowledge" && state.evidenceOutputMode === "review")) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
@@ -3355,7 +3455,7 @@ async function askQuestion(event, inputId) {
       // like the message was never sent (and invites duplicate submissions).
       input.value = "";
       input.dispatchEvent(new Event("input", { bubbles: true }));
-      const result = await continueTaskConversation(activeRun.run_id, question);
+      const result = await continueTaskConversation(activeRun.run_id, question, selectedSkillIds);
       const run = result.run;
       state.activeTaskId = run.run_id;
       window.localStorage.setItem("scansci.active.task", run.run_id);
@@ -3365,6 +3465,7 @@ async function askQuestion(event, inputId) {
       state.sessionId = `research-run-${run.run_id}`;
       window.localStorage.setItem("scansci.active.session", state.sessionId);
       void restoreSessionStats(estimateRunSessionStats(run));
+      clearComposerSkills(key);
       if (["queued", "planning", "running", "verifying"].includes(String(run.status || ""))) {
         watchRun(run.run_id, (next) => {
           if (state.activeView === "conversation" && state.activeTaskId === next.run_id) renderRun(next);
@@ -3377,7 +3478,7 @@ async function askQuestion(event, inputId) {
         notebook_id: String(notebook.notebook_id),
         title: knowledgeScopeTitle(notebook),
       }));
-      const userMessage = { role: "user", content: question, sources: sourceFiles, images, created_at: new Date().toISOString() };
+      const userMessage = { role: "user", content: question, skills: selectedSkills, sources: sourceFiles, images, created_at: new Date().toISOString() };
       const messages = [...state.directMessages, userMessage].filter((message) => !message.streaming).slice(-16);
       const startedAt = performance.now();
       streamingMessage = { role: "assistant", content: "", streaming: true, mode: directChatMode, trace: [], knowledgeScopes, created_at: new Date().toISOString() };
@@ -3399,7 +3500,7 @@ async function askQuestion(event, inputId) {
           ...(selectedKnowledge.length ? { notebook_ids: selectedKnowledge.map((notebook) => notebook.notebook_id) } : {}),
           ...(activeKnowledgeScopePayload() ? { knowledge_scope: activeKnowledgeScopePayload() } : {}),
           ...(selectedKnowledge.length ? { knowledge_scopes: activeKnowledgeScopePayloads() } : {}),
-          skills: extractSkillMentions(question),
+          skills: selectedSkillIds,
         },
         (eventType, payload) => {
           if (eventType === "RUN_STARTED") {
@@ -3461,6 +3562,7 @@ async function askQuestion(event, inputId) {
       );
       if (!completed) throw new Error("模型流在最终回复到达前结束。");
       input.value = "";
+      clearComposerSkills(key);
       clearComposerImages(key);
       clearComposerSources(key);
       return;
@@ -3469,9 +3571,10 @@ async function askQuestion(event, inputId) {
     const { workflowType, workflowInput } = routedTask
       ? {
           workflowType: "auto",
-          workflowInput: { question, task_origin: "freeform" },
+          workflowInput: { question, task_origin: "freeform", skills: selectedSkillIds },
         }
       : composerRun(mode, question, images, sourceFiles);
+    if (selectedSkillIds.length) workflowInput.skills = selectedSkillIds;
     if (isReviewWorkflow) Object.assign(workflowInput, reviewWorkflowPreferences());
     const run = await createResearchRun(workflowType, workflowInput);
     state.activeTaskId = run.run_id;
@@ -3485,6 +3588,7 @@ async function askQuestion(event, inputId) {
       if (state.activeView === "conversation" && state.activeTaskId === next.run_id) renderRun(next);
     });
     input.value = "";
+    clearComposerSkills(key);
     clearComposerImages(key);
     clearComposerSources(key);
   } catch (error) {
@@ -3497,7 +3601,7 @@ async function askQuestion(event, inputId) {
       return;
     }
     if (isTaskFollowUp && activeRun) {
-      renderFailedTaskFollowUp(activeRun, question, error);
+      renderFailedTaskFollowUp(activeRun, question, error, selectedSkills);
       toast(error.message, true);
     } else if (isDirectConversation && streamingMessage) {
       streamingMessage.streaming = false;
@@ -3732,7 +3836,7 @@ function interactionMarkup(interaction) {
   return `<section class="agent-interaction-card ${kind === "plan" ? "is-plan" : "is-question"}"><header><span>${kind === "plan" ? "执行计划" : "需要你的决定"}</span><b>任务已安全暂停</b></header><h3>${escapeHtml(question)}</h3>${payload.reason ? `<p>${escapeHtml(payload.reason)}</p>` : ""}${planSteps}<div class="agent-interaction-actions">${optionButtons}</div>${freeform}</section>`;
 }
 
-function renderPendingTaskFollowUp(run, question) {
+function renderPendingTaskFollowUp(run, question, skills = []) {
   state.conversationAutoFollow = true;
   state.lastRunRenderKey = "";
   renderRun(run);
@@ -3747,6 +3851,7 @@ function renderPendingTaskFollowUp(run, question) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: question,
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${escapeHtml(question)}</p></div>`,
     createdAt: new Date().toISOString(),
     classes: "is-pending-follow-up",
   });
@@ -3764,7 +3869,7 @@ function renderPendingTaskFollowUp(run, question) {
   followLatestConversationMessage();
 }
 
-function renderFailedTaskFollowUp(run, question, error) {
+function renderFailedTaskFollowUp(run, question, error, skills = []) {
   const scrollSnapshot = conversationScrollSnapshot();
   state.lastRunRenderKey = "";
   renderRun(run);
@@ -3779,6 +3884,7 @@ function renderFailedTaskFollowUp(run, question, error) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: question,
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${escapeHtml(question)}</p></div>`,
     createdAt: new Date().toISOString(),
   });
   const failedAnswer = conversationMessageMarkup({
@@ -3857,7 +3963,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       return conversationMessageMarkup({
         role: "user",
         content: message.content,
-        contentMarkup: `<div class="user-turn-bubble">${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}<p>${escapeHtml(message.content)}</p></div>`,
+        contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(message.skills || [])}${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}<p>${escapeHtml(message.content)}</p></div>`,
         createdAt: message.created_at,
       });
     }
@@ -4001,7 +4107,7 @@ function renderAcademicSearchPlanDialog() {
   sourceContainer.innerHTML = Object.entries(academicProviderLabels).map(([id, label]) => `<label class="academic-search-plan-source"><input type="checkbox" name="academic-search-provider" value="${escapeHtml(id)}" ${selected.has(id) ? "checked" : ""} /><span>${escapeHtml(label)}</span></label>`).join("");
 }
 
-async function openAcademicSearchPlan(question, { inputId, key, sourceFiles = [], images = [] } = {}) {
+async function openAcademicSearchPlan(question, { inputId, key, sourceFiles = [], images = [], skills = [] } = {}) {
   const requestPayload = parseAcademicSearchPrompt(question);
   const plan = await request("/api/academic-search/plan", {
     method: "POST",
@@ -4014,6 +4120,7 @@ async function openAcademicSearchPlan(question, { inputId, key, sourceFiles = []
     key,
     sourceFiles,
     images,
+    skills,
     limit: 24,
     // Preserve a temporal constraint inferred by the host planner.  The
     // dialog remains editable, but a request such as "2022 年以来" must not
@@ -4050,6 +4157,7 @@ function reviewedAcademicSearchInput() {
     providers,
     limit,
     per_source: limit > 24 ? 18 : 10,
+    ...(draft.skills?.length ? { skills: draft.skills } : {}),
     ...(year !== null ? { year_from: year } : {}),
     search_plan: {
       query_variants: queryVariants,
@@ -4084,6 +4192,7 @@ async function startReviewedAcademicSearch() {
     });
     const sourceInput = byId(draft.inputId);
     if (sourceInput) sourceInput.value = "";
+    clearComposerSkills(draft.key);
     clearComposerImages(draft.key);
     clearComposerSources(draft.key);
   } finally {
@@ -5074,24 +5183,27 @@ async function createResearchRun(workflowType, input = {}) {
   });
 }
 
-async function previewFreeformTask(question) {
+async function previewFreeformTask(question, skills = []) {
+  const selectedSkills = [...new Set([...(skills || []), ...extractSkillMentions(question)].map((item) => String(item || "").toLowerCase()).filter(Boolean))].slice(0, 4);
   return request("/api/task-routing/preview", {
     method: "POST",
     body: JSON.stringify({
       question,
+      skills: selectedSkills,
       ...(state.notebook ? { notebook_id: state.notebook.notebook_id } : {}),
     }),
   });
 }
 
-async function continueTaskConversation(runId, content) {
+async function continueTaskConversation(runId, content, skills = []) {
+  const selectedSkills = [...new Set([...(skills || []), ...extractSkillMentions(content)].map((item) => String(item || "").toLowerCase()).filter(Boolean))].slice(0, 4);
   return request(`/api/runs/${encodeURIComponent(runId)}/messages`, {
     method: "POST",
     body: JSON.stringify({
       content,
       thinking_level: currentThinkingLevel(),
       chat_mode: composerMode("chatQuestionInput"),
-      skills: extractSkillMentions(content),
+      skills: selectedSkills,
     }),
   });
 }
@@ -5513,7 +5625,7 @@ function renderRun(run) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: userPromptText,
-    contentMarkup: `<div class="user-turn-bubble">${composerSourcePreviewMarkup(run.input?.source_files || [])}${composerImagePreviewMarkup(run.input?.images || [])}<p>${userPrompt}</p></div>`,
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skillRecordsForIds(run.input?.skills || []))}${composerSourcePreviewMarkup(run.input?.source_files || [])}${composerImagePreviewMarkup(run.input?.images || [])}<p>${userPrompt}</p></div>`,
     createdAt: run.created_at,
   });
   const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "EasySlides", pdf_to_ppt: "PPTX" })[run.workflow_type] || "科研任务";
@@ -5917,6 +6029,7 @@ function reviewTaskMarkup(run, model, { percent, stages, actions }) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: runUserPromptText(run),
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skillRecordsForIds(run.input?.skills || []))}<p>${runUserPromptMarkup(run)}</p></div>`,
     createdAt: run.created_at,
     classes: "review-conversation-message",
   });
@@ -7043,8 +7156,11 @@ function renderExtensionDetail() {
   const source = detail.kind === "skills" ? (item.path || item.source || "内置") : (item.source || "未指定来源");
   const title = detail.kind === "skills" ? "Skill" : "插件";
   const operations = Array.isArray(item.skills) && item.skills.length ? `<section class="extension-detail-operations"><span>包含能力</span>${item.skills.map((skill) => `<p>${escapeHtml(skill)}</p>`).join("")}</section>` : "";
+  const security = detail.kind === "skills" ? item.security_scan : null;
+  const securityCounts = security?.counts || {};
+  const securityMarkup = security?.verdict ? `<section class="extension-detail-security is-${escapeHtml(String(security.verdict).toLowerCase())}"><span>${uiIcon("shield-check")}</span><div><small>安装安全检查</small><strong>${escapeHtml(security.verdict)}</strong><p>${escapeHtml(security.scanned_at || "")} · ${escapeHtml(String(Number(securityCounts.critical || 0) + Number(securityCounts.high || 0)))} 高风险 · ${escapeHtml(String(Number(securityCounts.medium || 0)))} 需审查</p></div></section>` : "";
   const remove = item.builtin ? "" : `<button type="button" class="extension-remove" data-action="uninstall-extension" data-extension-kind="${detail.kind}" data-extension-id="${escapeHtml(item.id)}">卸载</button>`;
-  return `<div class="extension-detail-backdrop" data-action="close-extension-detail"><section class="extension-detail-card" data-action="extension-detail-content" role="dialog" aria-modal="true" aria-label="${escapeHtml(item.name)} 详情"><header>${extensionRecordMark(detail.kind, item)}<div><span>${title}</span><h2>${escapeHtml(item.name)}</h2></div><button type="button" data-action="close-extension-detail" aria-label="关闭">${uiIcon("x")}</button></header><p>${escapeHtml(item.description || "尚未添加说明")}</p>${operations}<dl><div><dt>标识</dt><dd><code>${escapeHtml(item.id)}</code></dd></div><div><dt>来源</dt><dd><code>${escapeHtml(source)}</code></dd></div><div><dt>状态</dt><dd>${item.enabled ? "已启用" : "已停用"}</dd></div></dl><footer>${remove}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="${detail.kind}" data-record-id="${escapeHtml(item.id)}" ${item.enabled ? "checked" : ""} /><span>${item.enabled ? "启用" : "已停用"}</span></label></footer></section></div>`;
+  return `<div class="extension-detail-backdrop" data-action="close-extension-detail"><section class="extension-detail-card" data-action="extension-detail-content" role="dialog" aria-modal="true" aria-label="${escapeHtml(item.name)} 详情"><header>${extensionRecordMark(detail.kind, item)}<div><span>${title}</span><h2>${escapeHtml(item.name)}</h2></div><button type="button" data-action="close-extension-detail" aria-label="关闭">${uiIcon("x")}</button></header><p>${escapeHtml(item.description || "尚未添加说明")}</p>${operations}${securityMarkup}<dl><div><dt>标识</dt><dd><code>${escapeHtml(item.id)}</code></dd></div><div><dt>来源</dt><dd><code>${escapeHtml(source)}</code></dd></div><div><dt>状态</dt><dd>${item.enabled ? "已启用" : "已停用"}</dd></div></dl><footer>${remove}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="${detail.kind}" data-record-id="${escapeHtml(item.id)}" ${item.enabled ? "checked" : ""} /><span>${item.enabled ? "启用" : "已停用"}</span></label></footer></section></div>`;
 }
 
 const BUILTIN_PLUGIN_LOGOS = Object.freeze({
@@ -7080,7 +7196,8 @@ function renderExtensionPlugins(plugins) {
 
 function renderExtensionSkills(skills) {
   const rows = skills.length ? skills.map((skill) => {
-    const sourceLabel = skill.builtin ? "内置能力" : ({ local: "本地导入", git: "Git 仓库", archive: "压缩包", marketplace: "skills.sh 市场" }[skill.source_type] || "手动登记");
+    const securityLabel = skill.security_scan?.verdict ? ` · ${skill.security_scan.verdict === "SAFE" ? "已检查" : "风险已确认"}` : "";
+    const sourceLabel = skill.builtin ? "内置能力" : `${({ local: "本地导入", git: "Git 仓库", archive: "压缩包", marketplace: "skills.sh 市场" }[skill.source_type] || "手动登记")}${securityLabel}`;
     const status = skill.available ? "可用" : "缺少文件";
     return `<article class="extension-record skill-record"><button type="button" class="extension-record-main" data-action="open-extension-detail" data-extension-kind="skills" data-extension-id="${escapeHtml(skill.id)}">${extensionRecordMark("skills", skill)}<div class="extension-record-copy"><div class="extension-record-title"><h3>${escapeHtml(skill.name || skill.id)}</h3><span>${escapeHtml(sourceLabel)}</span></div><p>${escapeHtml(skill.description || "尚未添加说明")}</p></div></button><div class="extension-record-actions"><span class="extension-status ${skill.available ? "is-ready" : "is-missing"}">${status}</span><label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="skills" data-record-id="${escapeHtml(skill.id)}" ${skill.enabled ? "checked" : ""} /><span>${skill.enabled ? "启用" : "已停用"}</span></label></div></article>`;
   }).join("") : `<div class="extension-empty"><span>${uiIcon("wand")}</span><strong>还没有可用技能</strong><p>从本地文件夹、Git 仓库、压缩包或市场中安装一个 Skill。</p></div>`;
@@ -7129,14 +7246,110 @@ async function refreshExtensions({ marketOnly = false, quiet = false, includeMar
   if (!quiet && market) toast(market.offline ? "市场暂不可用，正在显示可安装示例" : "市场已刷新");
 }
 
+const skillSecurityVerdictMeta = Object.freeze({
+  SAFE: { label: "可以安装", summary: "未发现阻断项", icon: "shield-check" },
+  REVIEW: { label: "需要审查", summary: "发现需要人工判断的风险", icon: "triangle-alert" },
+  BLOCKED: { label: "已阻止", summary: "发现高风险或严重问题", icon: "lock-keyhole" },
+});
+
+function skillSecurityFindingMarkup(finding) {
+  const location = finding.path ? `${finding.path}${finding.line ? `:${finding.line}` : ""}` : "Skill 包";
+  const evidence = finding.evidence ? `<code>${escapeHtml(finding.evidence)}</code>` : "";
+  return `<li class="skill-security-finding is-${escapeHtml(String(finding.severity || "info").toLowerCase())}"><span>${escapeHtml(finding.severity || "INFO")}</span><div><strong>${escapeHtml(finding.title || "安全发现")}</strong><p>${escapeHtml(finding.detail || "")}</p><small>${escapeHtml(location)}</small>${evidence}</div></li>`;
+}
+
+function renderSkillSecurityReview() {
+  const pending = state.skillInstallReview;
+  const target = byId("skillSecurityContent");
+  const installButton = byId("skillSecurityInstall");
+  if (!pending || !target || !installButton) return;
+  const scan = pending.scan || {};
+  const verdict = String(scan.verdict || "BLOCKED").toUpperCase();
+  const meta = skillSecurityVerdictMeta[verdict] || skillSecurityVerdictMeta.BLOCKED;
+  const scanners = (scan.scanners || []).map((scanner) => {
+    const status = String(scanner.status || "FAIL").toUpperCase();
+    const icon = status === "PASS" ? "check" : status === "WARN" ? "triangle-alert" : "x";
+    return `<li class="is-${status.toLowerCase()}"><span>${uiIcon(icon)}</span><div><strong>${escapeHtml(scanner.name || scanner.id || "Scanner")}</strong><small>${scanner.finding_count ? `${escapeHtml(String(scanner.finding_count))} 项发现` : "通过"}</small></div><b>${escapeHtml(status)}</b></li>`;
+  }).join("");
+  const findings = (scan.findings || []).map(skillSecurityFindingMarkup).join("");
+  const packageNames = (scan.packages || []).map((item) => escapeHtml(item.name || "Skill")).join("、");
+  const counts = scan.counts || {};
+  const findingSummary = `${Number(counts.critical || 0) + Number(counts.high || 0)} 高风险 · ${Number(counts.medium || 0)} 需审查 · ${Number(counts.low || 0)} 低风险`;
+  const acknowledgement = verdict === "REVIEW"
+    ? `<label class="skill-security-ack"><input type="checkbox" id="skillSecurityAcknowledge" /><span><strong>我已阅读全部风险</strong><small>我理解这个 Skill 可能执行动态代码或包含难以自动审查的内容。</small></span></label>`
+    : "";
+  target.innerHTML = `<section class="skill-security-verdict is-${verdict.toLowerCase()}"><span>${uiIcon(meta.icon)}</span><div><small>${escapeHtml(verdict)}</small><h3>${escapeHtml(meta.label)}</h3><p>${escapeHtml(scan.recommendation || meta.summary)}</p></div><b>${escapeHtml(findingSummary)}</b></section>
+    <dl class="skill-security-provenance"><div><dt>来源</dt><dd title="${escapeHtml(scan.source_label || "")}">${escapeHtml(scan.source_label || "未知来源")}</dd></div><div><dt>隔离快照</dt><dd><code>${escapeHtml(String(scan.fingerprint || "").slice(0, 26))}…</code></dd></div><div><dt>内容</dt><dd>${escapeHtml(String(scan.package_count || 0))} 个 Skill · ${escapeHtml(String(scan.file_count || 0))} 个文件 · ${escapeHtml(formatFileSize(scan.byte_count || 0))}${packageNames ? ` · ${packageNames}` : ""}</dd></div></dl>
+    <section class="skill-security-scanners"><header><strong>内置扫描器</strong><span>不会运行 Skill 中的任何代码</span></header><ul>${scanners}</ul></section>
+    ${findings ? `<details class="skill-security-findings" ${verdict !== "SAFE" ? "open" : ""}><summary><span>安全发现</span><b>${escapeHtml(String((scan.findings || []).length))}</b></summary><ol>${findings}</ol></details>` : '<div class="skill-security-clean"><span>✓</span><p><strong>静态检查通过</strong><small>仍请确认来源可信，并只授予任务需要的权限。</small></p></div>'}
+    ${acknowledgement}`;
+  installButton.hidden = verdict === "BLOCKED";
+  installButton.disabled = verdict === "BLOCKED" || verdict === "REVIEW";
+  installButton.textContent = verdict === "REVIEW" ? "理解风险并安装" : "确认安装";
+  const expiry = new Date(pending.expires_at || "");
+  byId("skillSecurityExpiry").textContent = Number.isNaN(expiry.getTime()) ? "隔离快照会自动清理" : `隔离快照 ${expiry.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} 失效`;
+}
+
 async function installSkill(sourceType, source) {
-  const result = await request("/api/skills/install", { method: "POST", body: JSON.stringify({ source_type: sourceType, source }) });
-  state.settings = result.settings || state.settings;
-  state.extensions.skills = result.skills || [];
-  renderModelSelectors();
-  renderExtensions();
-  const count = (result.installed || []).length;
-  toast(count ? `已安装 ${count} 个 Skill` : "Skill 已安装");
+  if (state.skillInstallBusy) {
+    toast("正在检查另一个 Skill，请稍候");
+    return;
+  }
+  state.skillInstallBusy = true;
+  toast("正在隔离并检查 Skill…");
+  try {
+    const result = await request("/api/skills/scan", { method: "POST", body: JSON.stringify({ source_type: sourceType, source }) });
+    state.skillInstallReview = { ...result, sourceType, source };
+    renderSkillSecurityReview();
+    const dialog = byId("skillSecurityDialog");
+    if (dialog && !dialog.open) dialog.showModal();
+    const verdict = String(result.scan?.verdict || "BLOCKED").toUpperCase();
+    toast(verdict === "BLOCKED" ? "安全检查已阻止安装" : verdict === "REVIEW" ? "检查完成，请人工审查风险" : "安全检查通过，请确认安装", verdict === "BLOCKED");
+  } finally {
+    state.skillInstallBusy = false;
+  }
+}
+
+function closeSkillSecurityReview({ discard = true } = {}) {
+  const pending = state.skillInstallReview;
+  state.skillInstallReview = null;
+  const dialog = byId("skillSecurityDialog");
+  if (dialog?.open) dialog.close();
+  if (discard && pending?.scan_id) {
+    request("/api/skills/scan/cancel", { method: "POST", body: JSON.stringify({ scan_id: pending.scan_id }) }).catch(() => {});
+  }
+}
+
+async function confirmSkillInstall() {
+  const pending = state.skillInstallReview;
+  const button = byId("skillSecurityInstall");
+  if (!pending || !button) return;
+  const verdict = String(pending.scan?.verdict || "BLOCKED").toUpperCase();
+  const acknowledgeRisk = Boolean(byId("skillSecurityAcknowledge")?.checked);
+  if (verdict === "BLOCKED") return;
+  if (verdict === "REVIEW" && !acknowledgeRisk) {
+    toast("请先阅读风险并勾选确认", true);
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "正在安装…";
+  try {
+    const result = await request("/api/skills/install", {
+      method: "POST",
+      body: JSON.stringify({ scan_id: pending.scan_id, decision: "install", acknowledge_risk: acknowledgeRisk }),
+    });
+    state.settings = result.settings || state.settings;
+    state.extensions.skills = result.skills || [];
+    closeSkillSecurityReview({ discard: false });
+    byId("skillInstallForm")?.reset();
+    renderModelSelectors();
+    renderExtensions();
+    const count = (result.installed || []).length;
+    toast(count ? `已安全安装 ${count} 个 Skill` : "Skill 已安全安装");
+  } catch (error) {
+    renderSkillSecurityReview();
+    throw error;
+  }
 }
 
 async function installMarketSkill(skillId) {
@@ -8155,7 +8368,7 @@ document.addEventListener("click", (event) => {
     state.historyMenuRunId = "";
     renderTasks();
   }
-  if (!event.target.closest(".skill-suggestions, #homeQuestionInput, #chatQuestionInput")) closeSkillSuggestions();
+  if (!event.target.closest(".skill-suggestions, .composer-skill-strip, #homeQuestionInput, #chatQuestionInput")) closeSkillSuggestions();
   const extensionTab = event.target.closest("[data-extension-tab]");
   if (extensionTab) {
     state.activeExtensions = extensionTab.dataset.extensionTab || "skills";
@@ -8471,6 +8684,12 @@ document.addEventListener("click", (event) => {
     event.preventDefault();
     selectSkillSuggestion(byId(element.dataset.inputId || ""), element.dataset.skillId || "");
   }
+  else if (action === "remove-composer-skill") {
+    event.preventDefault();
+    const key = element.dataset.composerKey === "chat" ? "chat" : "home";
+    removeComposerSkill(key, element.dataset.skillId || "");
+    byId(`${key}QuestionInput`)?.focus();
+  }
   else if (action === "review-document-tab") switchReviewDocumentTab(element.dataset.reviewTab || "preview");
   else if (action === "scroll-review-section") {
     switchReviewDocumentTab("preview");
@@ -8536,6 +8755,8 @@ document.addEventListener("click", (event) => {
   else if (action === "test-mcp-server") testMcpServer(element.dataset.recordId || "").catch((error) => toast(error.message, true));
   else if (action === "refresh-marketplace") refreshExtensions({ marketOnly: true }).catch((error) => toast(error.message, true));
   else if (action === "install-market-skill") installMarketSkill(element.dataset.marketSkillId || "").catch((error) => toast(error.message, true));
+  else if (action === "close-skill-security") closeSkillSecurityReview();
+  else if (action === "confirm-skill-install") confirmSkillInstall().catch((error) => toast(error.message, true));
   else if (action === "open-extension-detail") {
     state.extensionDetail = { kind: element.dataset.extensionKind, id: element.dataset.extensionId };
     renderExtensions();
@@ -8619,6 +8840,7 @@ document.addEventListener("click", (event) => {
     if (url.startsWith("/") || /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener");
   }
   else if (action === "open-local-path") {
+    event.preventDefault();
     openLocalArtifact(element.dataset.localPath || "").catch((error) => toast(error.message, true));
   }
   else if (action === "reveal-local-path") {
@@ -8830,6 +9052,15 @@ document.addEventListener("keydown", (event) => {
       }
     }
   }
+  if (composer && ["homeQuestionInput", "chatQuestionInput"].includes(composer.id) && event.key === "Backspace" && !event.isComposing && !document.querySelector(".skill-suggestions") && composer.value === "" && composer.selectionStart === 0 && composer.selectionEnd === 0) {
+    const key = composerKey(composer.id);
+    const lastSkill = composerSkillRecords(key).at(-1);
+    if (lastSkill) {
+      event.preventDefault();
+      removeComposerSkill(key, lastSkill.id);
+      return;
+    }
+  }
   if (composer && event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     composer.form?.requestSubmit();
@@ -8928,11 +9159,21 @@ document.addEventListener("paste", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.id === "skillSecurityAcknowledge") {
+    const button = byId("skillSecurityInstall");
+    if (button) button.disabled = !event.target.checked;
+    return;
+  }
   const toggle = event.target.closest("[data-update-auto-check]");
   if (!toggle) return;
   state.autoCheckUpdates = Boolean(toggle.checked);
   window.localStorage.setItem("scansci.update.auto-check", String(state.autoCheckUpdates));
   toast(state.autoCheckUpdates ? "已开启自动检查更新" : "已关闭自动检查更新");
+});
+
+byId("skillSecurityDialog")?.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeSkillSecurityReview();
 });
 
 document.addEventListener("change", (event) => {

@@ -44,6 +44,8 @@ from .browser_config import BrowserFetcherConfig, BrowserIdentityConfig
 from .broker import BrokerService, enqueue_request, wait_for_response
 from .browser import BrowserFetcher
 from .citations import extract_reference_candidates
+from .capability_doctor import doctor_capabilities
+from .checkpoints import CheckpointError, CheckpointStore
 from .cnki_reader import cnki_reader_counts, download_cnki_reader_images, render_cnki_reader_json
 from .credentials import credential_names, credential_status, delete_credential, set_credential
 from .data_availability import DataAvailabilityRecord, extract_data_availability_records
@@ -469,6 +471,26 @@ def build_parser(*, prog: str = "scansci-html") -> argparse.ArgumentParser:
         default=100,
         help="Maximum number of link issues to include in JSON output.",
     )
+    doctor = subparsers.add_parser("doctor", help="Run read-only Agent capability diagnostics.")
+    doctor_subparsers = doctor.add_subparsers(dest="doctor_command", required=True)
+    capabilities_doctor = doctor_subparsers.add_parser("capabilities", help="Inspect installed harnesses and local capabilities.")
+    capabilities_doctor.add_argument("--root", default=".", help="Workspace root to inspect.")
+    capabilities_doctor.add_argument("--evidence-db", default="", help="Optional evidence database path.")
+    capabilities_doctor.add_argument("--live", action="store_true", help="Record an explicit live request; external processes remain opt-in.")
+    capabilities_doctor.add_argument("--json", action="store_true", help="Emit JSON (the default output format).")
+    checkpoint = subparsers.add_parser("checkpoint", help="Create, list, or restore local file checkpoints.")
+    checkpoint_subparsers = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_create = checkpoint_subparsers.add_parser("create", help="Snapshot files before an edit.")
+    checkpoint_create.add_argument("--root", default=".", help="Workspace root.")
+    checkpoint_create.add_argument("--file", action="append", default=[], help="Workspace-relative file to snapshot. Repeatable.")
+    checkpoint_create.add_argument("--turn-id", default="", help="Logical turn identifier.")
+    checkpoint_create.add_argument("--label", default="", help="Human-readable checkpoint label.")
+    checkpoint_list = checkpoint_subparsers.add_parser("list", help="List local checkpoints.")
+    checkpoint_list.add_argument("--root", default=".", help="Workspace root.")
+    checkpoint_restore = checkpoint_subparsers.add_parser("restore", help="Restore a checkpoint explicitly.")
+    checkpoint_restore.add_argument("--root", default=".", help="Workspace root.")
+    checkpoint_restore.add_argument("--id", required=True, help="Checkpoint id.")
+    checkpoint_restore.add_argument("--mode", choices=["code", "conversation", "both"], default="code")
     search = subparsers.add_parser("search", help="Search a JSONL evidence index.")
     search.add_argument("--index", "-i", required=True, help="Path to an evidence JSONL index.")
     search.add_argument("--query", "-q", required=True, help="Question or search query.")
@@ -2214,6 +2236,17 @@ def _add_chat_options(parser: argparse.ArgumentParser) -> None:
         default="",
         help="OpenAI-compatible chat model; may also use SCANSCI_CHAT_MODEL.",
     )
+    parser.add_argument(
+        "--chat-api-surface",
+        default="chat_completions",
+        choices=["chat_completions", "responses", "auto"],
+        help="Explicit model API surface; Responses requires provider support or --chat-responses-enabled.",
+    )
+    parser.add_argument(
+        "--chat-responses-enabled",
+        action="store_true",
+        help="Declare that the configured OpenAI-compatible endpoint supports /responses.",
+    )
 
 
 def _add_workspace_options(parser: argparse.ArgumentParser) -> None:
@@ -2280,6 +2313,8 @@ def main(argv: list[str] | None = None) -> int:
         "index-v2",
         "index-md",
         "evidence-doctor",
+        "doctor",
+        "checkpoint",
         "search",
         "search-v2",
         "ask",
@@ -2345,6 +2380,38 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "opencli-bridge-doctor":
         return _run_opencli_bridge_doctor(args)
+
+    if args.command == "doctor":
+        if args.doctor_command == "capabilities":
+            payload = doctor_capabilities(
+                Path(args.root),
+                evidence_db=Path(args.evidence_db) if args.evidence_db else None,
+                live=bool(args.live),
+            )
+            _emit_json(payload)
+            return 0 if payload.get("status") != "failed" else 1
+        parser.print_help()
+        return 2
+
+    if args.command == "checkpoint":
+        store = CheckpointStore(Path(args.root))
+        try:
+            if args.checkpoint_command == "create":
+                checkpoint = store.begin(turn_id=args.turn_id, label=args.label)
+                checkpoint = store.capture_many(checkpoint.checkpoint_id, [Path(path) for path in args.file]) if args.file else checkpoint
+                _emit_json(checkpoint.to_dict())
+                return 0
+            if args.checkpoint_command == "list":
+                _emit_json({"checkpoints": [item.to_dict() for item in store.list()]})
+                return 0
+            if args.checkpoint_command == "restore":
+                _emit_json(store.restore(args.id, mode=args.mode))
+                return 0
+        except (CheckpointError, OSError, ValueError) as error:
+            _emit_json({"status": "error", "error": str(error)})
+            return 1
+        parser.print_help()
+        return 2
 
     if args.command == "credentials":
         return _run_credentials(args)
@@ -3435,6 +3502,8 @@ def _run_literature_workflow(args: argparse.Namespace) -> dict[str, object]:
         chat_base_url=args.chat_base_url,
         chat_api_key=args.chat_api_key,
         chat_model=args.chat_model,
+        chat_api_surface=args.chat_api_surface,
+        chat_responses_enabled=args.chat_responses_enabled,
         cascade_first_stage_limit=args.cascade_first_stage_limit,
         generate_gold_template=args.generate_gold_template,
         questions_per_type=args.questions_per_type,
@@ -3572,6 +3641,8 @@ def _chat_client_from_args(args: argparse.Namespace) -> object:
         base_url=args.chat_base_url,
         api_key=args.chat_api_key,
         model=args.chat_model,
+        api_surface=args.chat_api_surface,
+        responses_enabled=args.chat_responses_enabled,
     )
 
 

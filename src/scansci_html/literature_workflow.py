@@ -49,6 +49,8 @@ class LiteratureWorkflowConfig:
     chat_base_url: str = ""
     chat_api_key: str = ""
     chat_model: str = ""
+    chat_api_surface: str = "chat_completions"
+    chat_responses_enabled: bool = False
     cascade_first_stage_limit: int = 50
     generate_gold_template: bool = False
     questions_per_type: int = 5
@@ -501,6 +503,8 @@ def _chat_client_from_config_if_needed(config: LiteratureWorkflowConfig) -> obje
         base_url=config.chat_base_url,
         api_key=config.chat_api_key,
         model=config.chat_model,
+        api_surface=config.chat_api_surface,
+        responses_enabled=config.chat_responses_enabled,
     )
 
 
