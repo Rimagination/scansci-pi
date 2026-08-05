@@ -1208,8 +1208,8 @@ function renderAppUpdate() {
     installing: "正在更新",
     restarting: "正在重启",
     available: "有可用更新",
-    current: `v${update.current_version || "0.2.2"}`,
-    idle: `v${update.current_version || "0.2.2"}`,
+    current: `v${update.current_version || "0.2.3"}`,
+    idle: `v${update.current_version || "0.2.3"}`,
     error: "版本信息",
   };
   byId("appUpdateLabel").textContent = labels[status] || "版本信息";
@@ -7406,7 +7406,7 @@ function renderAboutSettings() {
   const update = state.update || {};
   const isBusy = ["checking", "installing", "restarting"].includes(update.state);
   const hasUpdate = Boolean(update.available);
-  const version = update.current_version || "0.2.2";
+  const version = update.current_version || "0.2.3";
   const latestVersion = update.latest_version || version;
   const checkAction = hasUpdate && update.can_install ? "install-app-update" : "check-app-update";
   const checkLabel = isBusy ? (update.state === "installing" ? "正在更新" : "检查中") : (hasUpdate && update.can_install ? "立即更新" : "检查更新");

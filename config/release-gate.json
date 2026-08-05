@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "ScanSci",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "scope_file": "config/release-scope.json",
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [

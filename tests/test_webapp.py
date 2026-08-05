@@ -129,9 +129,9 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     assert health["status"] == "ok"
     assert health["workspace_exists"] is True
     assert health["evidence_store_exists"] is True
-    assert health["version"] == "0.2.2"
+    assert health["version"] == "0.2.3"
     assert health["build_id"] == "source"
-    assert update["current_version"] == "0.2.2"
+    assert update["current_version"] == "0.2.3"
     assert update["state"] in {"idle", "current"}
     assert workspace["counts"]["sources"] == 1
     assert answer["question"] == "What did Galunisertib reduce?"
