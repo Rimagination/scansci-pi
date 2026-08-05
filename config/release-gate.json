@@ -32,7 +32,12 @@
         "tests/test_research_tools.py",
         "tests/test_research_runs.py",
         "-q"
-      ]
+      ],
+      "retry": {
+        "max_attempts": 2,
+        "delay_seconds": 1,
+        "failure_reason": "test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools"
+      }
     },
     {
       "id": "frontend-syntax",

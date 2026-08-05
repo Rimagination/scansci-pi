@@ -496,13 +496,21 @@ class ReleaseGate:
                     failure_reason = ""
                     if timed_out:
                         failure_reason = "command_timeout"
-                    elif required_result is not None and required_result.is_file():
+                    elif retry_failure_reason:
                         try:
-                            result_text = required_result.read_text(encoding="utf-8-sig")
-                            if retry_failure_reason and retry_failure_reason in result_text:
+                            log.flush()
+                            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                            if retry_failure_reason in log_text:
                                 failure_reason = retry_failure_reason
                         except OSError:
                             pass
+                        if not failure_reason and required_result is not None and required_result.is_file():
+                            try:
+                                result_text = required_result.read_text(encoding="utf-8-sig")
+                                if retry_failure_reason in result_text:
+                                    failure_reason = retry_failure_reason
+                            except OSError:
+                                pass
                     attempts.append(
                         {
                             "attempt": attempt_number,

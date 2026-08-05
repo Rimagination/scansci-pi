@@ -195,6 +195,45 @@ def test_real_verification_retries_only_an_explicit_rate_limit_result(tmp_path: 
     assert step["attempts"][0]["failure_reason"] == "provider_rate_limited"
 
 
+def test_command_retry_can_match_failure_text_in_the_command_log(tmp_path: Path) -> None:
+    contract_path = _write_json(tmp_path / "contract.json", _contract())
+    scope_path = _write_json(tmp_path / "scope.json", _scope())
+    gate = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="source",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="log-retry-test",
+    )
+    marker = tmp_path / "attempts.txt"
+    code = (
+        "from pathlib import Path; "
+        f"marker=Path({str(marker)!r}); "
+        "count=len(marker.read_text() if marker.exists() else '')+1; "
+        "marker.write_text('x'*count); "
+        "print('test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools' if count == 1 else 'ok'); "
+        "raise SystemExit(1 if count == 1 else 0)"
+    )
+
+    step = gate.command_step(
+        step_id="log-retry",
+        title="log retry",
+        command=[sys.executable, "-c", code],
+        echo_output=False,
+        retry={
+            "max_attempts": 2,
+            "delay_seconds": 0,
+            "failure_reason": "test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools",
+        },
+    )
+
+    assert step["status"] == "passed"
+    assert marker.read_text(encoding="utf-8") == "xx"
+    assert [attempt["exit_code"] for attempt in step["attempts"]] == [1, 0]
+    assert step["attempts"][0]["failure_reason"] == "test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools"
+
+
 def test_release_gate_stops_a_hung_verification_at_the_declared_timeout(tmp_path: Path) -> None:
     contract_path = _write_json(tmp_path / "contract.json", _contract())
     scope_path = _write_json(tmp_path / "scope.json", _scope())
