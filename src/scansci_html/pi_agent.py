@@ -951,12 +951,24 @@ class PiAgentClient:
             raise PiRuntimeUnavailable("The ScanSci Pi sidecar bundle is unavailable")
         return node_path, script_path
 
+    @staticmethod
+    def _node_environment() -> dict[str, str]:
+        """Return a clean environment for the Node sidecar and its children."""
+
+        environment = dict(os.environ)
+        # Python-only import paths can make Windows reject a nested stdio
+        # child spawn when the release gate injects PYTHONPATH. The Node
+        # runtime does not need this variable, so do not pass it downstream.
+        environment.pop("PYTHONPATH", None)
+        return environment
+
     @classmethod
     def runtime_status(cls, *, timeout_seconds: float = 8.0) -> dict[str, Any]:
         node_path, script_path = cls.runtime_paths()
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
             [str(node_path), str(script_path)],
+            env=cls._node_environment(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1012,6 +1024,7 @@ class PiAgentClient:
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
             [str(node_path), str(script_path)],
+            env=cls._node_environment(),
             cwd=Path(workspace).resolve().parent,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1258,7 +1271,7 @@ class PiAgentClient:
                 return self._process
             self.close()
         node_path, script_path = self.runtime_paths()
-        environment = dict(os.environ)
+        environment = self._node_environment()
         environment["SCANSCIPI_PROVIDER_KEY"] = api_key
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._output = Queue()

@@ -427,7 +427,11 @@ class ReleaseGate:
         }
         self._record(step)
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(PROJECT_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        # Keep the inherited environment intact. Injecting PYTHONPATH here
+        # leaks a Python-only import path into Node and its nested MCP stdio
+        # children; Windows can reject those child spawns with EPERM. The
+        # release environment installs the project package before running the
+        # gate, so source imports do not require this mutation.
         retry = dict(retry or {})
         max_attempts = max(1, int(retry.get("max_attempts", 1) or 1))
         retry_delay_seconds = max(0.0, float(retry.get("delay_seconds", 0) or 0))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -10,9 +11,12 @@ from scansci_html.pi_agent import PiAgentClient
 def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict[str, object]:
     node, sidecar = PiAgentClient.runtime_paths()
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
     process = subprocess.Popen(
         [str(node), str(sidecar)],
         cwd=Path(__file__).parents[1],
+        env=environment,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
