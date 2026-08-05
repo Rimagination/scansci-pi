@@ -210,6 +210,51 @@ def test_public_fulltext_candidates_prioritize_unpaywall_and_europe_pmc(monkeypa
     ]
 
 
+def test_public_archive_race_keeps_one_pdf_and_records_source_health(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "downloads"
+    candidates = [
+        {"url": "https://broken.test/paper.pdf", "source": "Broken repository"},
+        {"url": "https://working.test/paper.pdf", "source": "Working repository"},
+    ]
+
+    monkeypatch.setattr(
+        research_tools,
+        "_public_fulltext_candidates",
+        lambda _identifier, timeout: candidates,
+    )
+
+    def fake_download(candidate, *, output_dir, identifier, timeout):
+        if candidate["source"] == "Broken repository":
+            raise RuntimeError("HTTP 404 Not Found")
+        destination = Path(output_dir) / "staged.pdf"
+        destination.write_bytes(b"%PDF-1.4" + b"x" * 128)
+        return destination
+
+    monkeypatch.setattr(research_tools, "_download_public_pdf", fake_download)
+
+    result = research_tools._download_from_public_archives(
+        "10.1000/example",
+        workspace=tmp_path / "workspace.sqlite",
+        strategy="oa_first",
+        timeout=10,
+        output_dir=output_dir,
+    )
+
+    assert result["source_race"] is True
+    assert len(result["files"]) == 1
+    assert Path(result["files"][0]).is_file()
+    assert sum(item.get("selected", False) for item in result["attempts"]) == 1
+    assert {item["source"] for item in result["attempts"]} == {
+        "Broken repository",
+        "Working repository",
+    }
+    scores = json.loads((output_dir / ".source_scores.json").read_text(encoding="utf-8"))
+    assert scores["Broken repository"]["last_error"] == "not_found"
+    assert scores["Working repository"]["attempts"] == 1
+    assert list(output_dir.glob("*.pdf")) == [Path(result["files"][0])]
+    assert not list(output_dir.glob(".source-race-*"))
+
+
 def test_arxiv_doi_resolves_without_waiting_for_metadata_apis(monkeypatch):
     monkeypatch.setattr(
         research_tools,
@@ -247,3 +292,45 @@ def test_cli_success_without_a_pdf_falls_back_to_public_archive(tmp_path: Path, 
 
     assert result["source"] == "Open archive"
     assert result["files"] == [str(destination)]
+
+
+def test_download_paper_uses_structured_institutional_fetch_after_get(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace.sqlite"
+    output_dir = research_tools._download_directory(workspace)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged = output_dir / "institutional.pdf"
+    staged.write_bytes(b"%PDF-1.4" + b"x" * 128)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(research_tools.shutil, "which", lambda _name: "scansci-pdf")
+    monkeypatch.setattr(research_tools, "_crossref_filename_metadata", lambda *_args, **_kwargs: {})
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if command[1] == "get":
+            return research_tools.subprocess.CompletedProcess(command, 0, stdout="login required", stderr="")
+        return research_tools.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "status": "success",
+                    "quality": "full_text",
+                    "paper": {"pdf_path": str(staged), "source": "publisher_pdf"},
+                    "attempts": [{"stage": "publisher_pdf", "status": "success"}],
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(research_tools.subprocess, "run", fake_run)
+
+    result = research_tools.download_paper(
+        "10.1000/example",
+        workspace=workspace,
+        strategy="legal_only",
+    )
+
+    assert [command[1] for command in commands] == ["get", "fetch"]
+    assert result["provider"] == "scansci-pdf-institutional"
+    assert result["files"] and Path(result["files"][0]).is_file()

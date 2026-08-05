@@ -47,6 +47,10 @@ _CLI_ENCODING_FAILURE_HINTS = (
     "'cp936' codec can't encode",
 )
 _DOWNLOAD_COMMIT_LOCK = threading.Lock()
+_PUBLIC_SCORE_ALPHA = 0.1
+_PUBLIC_DEFAULT_SCORE = 0.5
+_PUBLIC_DEFAULT_LATENCY_MS = 5000.0
+_PUBLIC_RACE_WORKERS = max(2, min(6, int(os.getenv("SCANSCI_PUBLIC_RACE_WORKERS", "4") or "4")))
 
 
 def _scansci_pdf_environment(
@@ -148,6 +152,94 @@ def _parse_scansci_pdf_json(output: str) -> dict[str, Any]:
         if isinstance(payload, dict) and isinstance(payload.get("results"), list):
             return payload
     raise ValueError("scansci-pdf did not emit a JSON object")
+
+
+def _parse_scansci_pdf_payload(output: str) -> dict[str, Any]:
+    """Parse one JSON object from a CLI stream that may contain log lines."""
+
+    text = str(output or "").lstrip("\ufeff")
+    decoder = json.JSONDecoder()
+    starts = [0, *[index for index, character in enumerate(text) if character == "{"]]
+    for start in starts:
+        try:
+            payload, _ = decoder.raw_decode(text[start:].lstrip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("scansci-pdf did not emit a JSON payload")
+
+
+def _run_scansci_pdf_fetch(
+    executable: str,
+    identifier: str,
+    *,
+    output_dir: Path,
+    timeout: float,
+    env_overrides: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Use the latest structured institutional cascade as a safe fallback."""
+
+    command = [
+        executable,
+        "fetch",
+        identifier,
+        "--output",
+        str(output_dir),
+        "--format",
+        "json",
+    ]
+    completed = _run_scansci_pdf(
+        command,
+        timeout=timeout,
+        retry_encoding_failure=True,
+        env_overrides=env_overrides,
+    )
+    stdout = str(getattr(completed, "stdout", "") or "")
+    stderr = str(getattr(completed, "stderr", "") or "")
+    try:
+        payload = _parse_scansci_pdf_payload(stdout)
+    except ValueError:
+        return {
+            "ok": False,
+            "provider": "scansci-pdf-institutional",
+            "status": "unavailable",
+            "message": (stderr or stdout or "structured fetch returned no JSON")[-800:],
+        }
+
+    paper = payload.get("paper") if isinstance(payload.get("paper"), dict) else {}
+    raw_file = paper.get("pdf_path") or payload.get("file") or payload.get("pdf_path") or ""
+    if raw_file:
+        file_path = Path(str(raw_file)).expanduser()
+        if not file_path.is_absolute():
+            file_path = output_dir / file_path
+        file_path = file_path.resolve()
+        if _pdf_file(file_path):
+            return {
+                "ok": True,
+                "identifier": identifier,
+                "output_dir": str(output_dir),
+                "files": [str(file_path)],
+                "source": str(paper.get("source") or "institutional_cascade"),
+                "provider": "scansci-pdf-institutional",
+                "status": str(payload.get("status") or "success"),
+                "quality": str(payload.get("quality") or ""),
+                "reason": str(payload.get("reason") or ""),
+                "next_action": payload.get("next_action"),
+                "attempts": payload.get("attempts") or [],
+            }
+
+    return {
+        "ok": False,
+        "identifier": identifier,
+        "output_dir": str(output_dir),
+        "provider": "scansci-pdf-institutional",
+        "status": str(payload.get("status") or "unavailable"),
+        "quality": str(payload.get("quality") or "none"),
+        "reason": str(payload.get("reason") or "no_pdf"),
+        "next_action": payload.get("next_action"),
+        "attempts": payload.get("attempts") or [],
+    }
 
 
 SCANSCI_APPS: tuple[dict[str, str], ...] = (
@@ -456,6 +548,7 @@ def download_paper(
     timeout: float = 180.0,
     env_overrides: dict[str, str] | None = None,
     _output_dir: str | Path | None = None,
+    _source_health_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     clean = _normalize_download_identifier(identifier)
     if not (_DOI_PATTERN.fullmatch(clean) or _ARXIV_PATTERN.fullmatch(clean)):
@@ -494,6 +587,7 @@ def download_paper(
                 strategy=normalized_strategy,
                 timeout=timeout,
                 output_dir=output_dir,
+                source_health_dir=_source_health_dir,
             )
         except RuntimeError:
             preferred = None
@@ -516,6 +610,7 @@ def download_paper(
             strategy=normalized_strategy,
             timeout=timeout,
             output_dir=output_dir,
+            source_health_dir=_source_health_dir,
         )
         return _finalize_download_result(
             result,
@@ -547,6 +642,26 @@ def download_paper(
             changed_pdfs.append(resolved)
     created = sorted(str(path) for path in changed_pdfs)
     if completed.returncode != 0 or not created:
+        # The current scansci-pdf release exposes a structured institutional
+        # cascade (OA, Elsevier, CARSI, publisher, browser, gateway). Try it
+        # after the racing ``get`` command and accept it only when its JSON
+        # points to a real PDF on disk.
+        institutional = _run_scansci_pdf_fetch(
+            executable,
+            clean,
+            output_dir=output_dir,
+            timeout=timeout,
+            env_overrides=env_overrides,
+        )
+        if institutional and institutional.get("files"):
+            return _finalize_download_result(
+                institutional,
+                clean,
+                workspace=workspace,
+                timeout=timeout,
+                output_dir=output_dir,
+            )
+
         # A few optional downloader versions report success while printing a
         # failure/login hint and creating no file.  Fall back to lawful public
         # archives and only report success after an actual PDF is present.
@@ -557,6 +672,7 @@ def download_paper(
                 strategy=normalized_strategy,
                 timeout=timeout,
                 output_dir=output_dir,
+                source_health_dir=_source_health_dir,
             )
             return _finalize_download_result(
                 result,
@@ -940,6 +1056,337 @@ def _pdf_file(path: Path) -> bool:
         return False
 
 
+def _public_source_scores_path(download_dir: Path) -> Path:
+    """Return the local, non-secret source-health file for public downloads."""
+
+    return download_dir / ".source_scores.json"
+
+
+def _load_public_source_scores(download_dir: Path) -> dict[str, dict[str, Any]]:
+    path = _public_source_scores_path(download_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(source): dict(entry)
+        for source, entry in payload.items()
+        if isinstance(entry, dict)
+    }
+
+
+def _write_public_source_scores(download_dir: Path, scores: dict[str, dict[str, Any]]) -> None:
+    path = _public_source_scores_path(download_dir)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(scores, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _record_public_source_result(
+    download_dir: Path,
+    source: str,
+    *,
+    success: bool,
+    latency_ms: float,
+    error_type: str = "",
+) -> None:
+    """Persist a small EMA for public sources, mirroring scansci-pdf scoring."""
+
+    source = str(source or "unknown").strip() or "unknown"
+    with _DOWNLOAD_COMMIT_LOCK:
+        scores = _load_public_source_scores(download_dir)
+        entry = scores.get(
+            source,
+            {
+                "success_ema": _PUBLIC_DEFAULT_SCORE,
+                "latency_ema": _PUBLIC_DEFAULT_LATENCY_MS,
+                "attempts": 0,
+                "last_error": "",
+                "last_update": 0,
+            },
+        )
+        value = 1.0 if success else 0.0
+        entry["success_ema"] = (
+            _PUBLIC_SCORE_ALPHA * value
+            + (1.0 - _PUBLIC_SCORE_ALPHA) * float(entry.get("success_ema", _PUBLIC_DEFAULT_SCORE))
+        )
+        if success and latency_ms > 0:
+            entry["latency_ema"] = (
+                _PUBLIC_SCORE_ALPHA * latency_ms
+                + (1.0 - _PUBLIC_SCORE_ALPHA) * float(entry.get("latency_ema", _PUBLIC_DEFAULT_LATENCY_MS))
+            )
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["last_error"] = str(error_type or "") if not success else ""
+        entry["last_update"] = int(time.time())
+        scores[source] = entry
+        try:
+            _write_public_source_scores(download_dir, scores)
+        except OSError:
+            # Source health is an optimization, never a reason to fail a PDF.
+            return
+
+
+def _rank_public_candidates(candidates: list[dict[str, str]], download_dir: Path) -> list[dict[str, str]]:
+    """Order candidates by recent success, then by observed latency."""
+
+    scores = _load_public_source_scores(download_dir)
+    indexed = list(enumerate(candidates))
+
+    def sort_key(item: tuple[int, dict[str, str]]) -> tuple[float, float, int]:
+        index, candidate = item
+        entry = scores.get(str(candidate.get("source", "")), {})
+        success = float(entry.get("success_ema", _PUBLIC_DEFAULT_SCORE))
+        latency = float(entry.get("latency_ema", _PUBLIC_DEFAULT_LATENCY_MS))
+        return (-success, latency, index)
+
+    return [candidate for _, candidate in sorted(indexed, key=sort_key)]
+
+
+def _public_download_error_type(error_value: Exception | str) -> str:
+    """Classify common public-source failures for UI diagnostics and scoring."""
+
+    detail = str(error_value).casefold()
+    if "404" in detail or "not found" in detail:
+        return "not_found"
+    if "403" in detail or "forbidden" in detail or "access denied" in detail:
+        return "forbidden"
+    if "429" in detail or "rate" in detail or "too many" in detail:
+        return "rate_limited"
+    if "timeout" in detail or "timed out" in detail:
+        return "timeout"
+    if "ssl" in detail or "certificate" in detail:
+        return "ssl_error"
+    if "captcha" in detail or "challenge" in detail or "cloudflare" in detail:
+        return "captcha"
+    return "unknown"
+
+
+def _is_suspicious_public_pdf(path: Path) -> bool:
+    """Reject tiny one-page preview PDFs when pypdf can inspect the file.
+
+    Some repositories return a cover/preview page with a valid ``%PDF`` header.
+    Parsing is deliberately best-effort: a malformed test fixture or a PDF that
+    pypdf cannot parse is left to the existing header validation path.
+    """
+
+    try:
+        from pypdf import PdfReader
+
+        if path.stat().st_size >= 100_000:
+            return False
+        reader = PdfReader(str(path), strict=False)
+        if len(reader.pages) > 1:
+            return False
+        if not reader.pages:
+            return True
+        text = (reader.pages[0].extract_text() or "").strip()
+        return path.stat().st_size < 16_384 and len(text) < 80
+    except Exception:
+        return False
+
+
+def _download_public_candidate_race(
+    candidate: dict[str, str],
+    *,
+    output_dir: Path,
+    identifier: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Download one public candidate into an isolated staging directory."""
+
+    started = time.perf_counter()
+    staging = TemporaryDirectory(prefix=".source-race-", dir=str(output_dir))
+    try:
+        destination = _download_public_pdf(
+            candidate,
+            output_dir=Path(staging.name),
+            identifier=identifier,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        staging.cleanup()
+        return {
+            "candidate": candidate,
+            "error": str(exc),
+            "latency_ms": (time.perf_counter() - started) * 1000,
+            "staging": None,
+        }
+    return {
+        "candidate": candidate,
+        "path": Path(destination),
+        "latency_ms": (time.perf_counter() - started) * 1000,
+        "staging": staging,
+    }
+
+
+def _cleanup_public_race_outcome(outcome: dict[str, Any]) -> None:
+    staging = outcome.get("staging")
+    if staging is not None:
+        try:
+            staging.cleanup()
+        except OSError:
+            pass
+
+
+def _race_public_archives(
+    candidates: list[dict[str, str]],
+    *,
+    identifier: str,
+    strategy: str,
+    output_dir: Path,
+    score_dir: Path | None = None,
+    timeout: float,
+) -> dict[str, Any]:
+    """Race public locations and converge the result to one canonical PDF."""
+
+    pool = ThreadPoolExecutor(max_workers=min(_PUBLIC_RACE_WORKERS, len(candidates)))
+    futures = {
+        pool.submit(
+            _download_public_candidate_race,
+            candidate,
+            output_dir=output_dir,
+            identifier=identifier,
+            timeout=timeout,
+        ): candidate
+        for candidate in candidates
+    }
+    outcomes: dict[Any, dict[str, Any]] = {}
+    winner: Path | None = None
+    errors: list[str] = []
+    health_dir = score_dir or output_dir
+
+    def evaluate(outcome: dict[str, Any], *, select: bool) -> None:
+        nonlocal winner
+        path = outcome.get("path")
+        if path is None or not _pdf_file(Path(path)):
+            outcome["success"] = False
+            outcome.setdefault("error", "source did not produce a valid PDF")
+            return
+        if _is_suspicious_public_pdf(Path(path)):
+            outcome["success"] = False
+            outcome["error"] = "public source returned a suspicious preview PDF"
+            outcome["error_type"] = "suspicious_pdf"
+            return
+        outcome["success"] = True
+        if select and winner is None:
+            destination = output_dir / f"{_safe_project_name(identifier.replace('/', '_'))}.pdf"
+            try:
+                with _DOWNLOAD_COMMIT_LOCK:
+                    if destination.exists() and destination.resolve() != Path(path).resolve():
+                        destination.unlink(missing_ok=True)
+                    if destination.resolve() != Path(path).resolve():
+                        Path(path).replace(destination)
+                winner = destination.resolve()
+                outcome["selected"] = True
+            except OSError as exc:
+                outcome["success"] = False
+                outcome["error"] = f"could not commit selected PDF: {exc}"
+                outcome["error_type"] = "commit_error"
+
+    try:
+        try:
+            for future in as_completed(futures, timeout=max(1.0, float(timeout))):
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = {
+                        "candidate": futures[future],
+                        "error": str(exc),
+                        "latency_ms": 0.0,
+                        "staging": None,
+                    }
+                outcomes[future] = outcome
+                evaluate(outcome, select=True)
+                if winner is not None:
+                    break
+        except TimeoutError:
+            errors.append("public source race timed out")
+    finally:
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+        # Collect late results so source health is updated and all staging
+        # directories are cleaned, including sources that lost the race.
+        for future, candidate in futures.items():
+            if future in outcomes:
+                continue
+            if future.cancelled():
+                outcomes[future] = {
+                    "candidate": candidate,
+                    "error": "cancelled after another source succeeded",
+                    "latency_ms": 0.0,
+                    "staging": None,
+                }
+                continue
+            try:
+                outcome = future.result()
+            except Exception as exc:
+                outcome = {
+                    "candidate": candidate,
+                    "error": str(exc),
+                    "latency_ms": 0.0,
+                    "staging": None,
+                }
+            outcomes[future] = outcome
+            evaluate(outcome, select=winner is None)
+
+        attempts: list[dict[str, Any]] = []
+        for outcome in outcomes.values():
+            candidate = dict(outcome.get("candidate") or {})
+            source = str(candidate.get("source") or "unknown")
+            success = bool(outcome.get("success"))
+            error_value = str(outcome.get("error") or "")
+            error_type = str(
+                outcome.get("error_type")
+                or (_public_download_error_type(error_value) if not success else "")
+            )
+            latency_ms = float(outcome.get("latency_ms") or 0.0)
+            _record_public_source_result(
+                health_dir,
+                source,
+                success=success,
+                latency_ms=latency_ms,
+                error_type=error_type,
+            )
+            attempts.append(
+                {
+                    "source": source,
+                    "status": "success" if success else "failed",
+                    "selected": bool(outcome.get("selected")),
+                    "latency_ms": round(latency_ms),
+                    **({"error_type": error_type} if error_type else {}),
+                    **({"error": error_value[:300]} if error_value else {}),
+                }
+            )
+            if not success and error_value:
+                errors.append(f"{source}: {error_value}")
+            _cleanup_public_race_outcome(outcome)
+
+    if winner is not None and _pdf_file(winner):
+        selected_source = next(
+            (str(item["source"]) for item in attempts if item.get("selected")),
+            "public archive",
+        )
+        return {
+            "ok": True,
+            "identifier": identifier,
+            "strategy": strategy,
+            "output_dir": str(output_dir),
+            "files": [str(winner)],
+            "source": selected_source,
+            "source_race": True,
+            "attempts": attempts,
+            "message": f"downloaded from {selected_source}",
+        }
+    raise RuntimeError("public source download failed: " + " | ".join(errors[-3:]))
+
+
 def _doi_index_path(download_dir: Path) -> Path:
     return download_dir / ".doi_index.json"
 
@@ -1218,6 +1665,8 @@ def download_papers(
                 "status": "completed" if existing else "pending",
                 "files": existing,
                 "error": "",
+                "source": "local_cache" if existing else "",
+                "attempts": [],
             }
         )
 
@@ -1245,8 +1694,9 @@ def download_papers(
     if not pending:
         return _build_result(items, download_dir, normalized_strategy, rotation_state)
 
-    # Worker: call download_paper with retries, return (identifier, files, error).
-    def _download_one(item: dict[str, Any]) -> tuple[str, list[str], str]:
+    # Worker: call download_paper with retries, return the file plus source
+    # diagnostics so batch progress can explain which version won the race.
+    def _download_one(item: dict[str, Any]) -> tuple[str, list[str], str, dict[str, Any]]:
         identifier = str(item["identifier"])
         attempt = 0
         while True:
@@ -1260,6 +1710,7 @@ def download_papers(
                         timeout=timeout,
                         env_overrides=env_overrides,
                         _output_dir=staging_dir,
+                        _source_health_dir=download_dir,
                     )
                     files = [str(path) for path in (result.get("files") or [])]
                     staged_files = [
@@ -1279,7 +1730,11 @@ def download_papers(
                                 download_dir=download_dir,
                                 timeout=timeout,
                             )
-                return identifier, files, ""
+                return identifier, files, "", {
+                    "source": str(result.get("source") or ""),
+                    "provider": str(result.get("provider") or ""),
+                    "attempts": list(result.get("attempts") or []),
+                }
             except _BatchCancelled:
                 raise
             except Exception as error:
@@ -1290,7 +1745,7 @@ def download_papers(
                         raise _BatchCancelled("批量下载已取消") from None
                     attempt += 1
                     continue
-                return identifier, [], f"{type(error).__name__}: {error}"[:500]
+                return identifier, [], f"{type(error).__name__}: {error}"[:500], {}
 
     # Main loop: throttle submissions and collect results.
     workers = max(1, min(_BATCH_WORKERS, len(pending)))
@@ -1350,12 +1805,15 @@ def download_papers(
                     raise _BatchCancelled("批量下载已取消")
                 item = futures[future]
                 try:
-                    identifier, files, error = future.result()
+                    identifier, files, error, details = future.result()
                 except _BatchCancelled:
                     item["status"] = "cancelled"
                     emit()
                     raise
                 item["files"] = files
+                item["source"] = str(details.get("source") or "")
+                item["provider"] = str(details.get("provider") or "")
+                item["attempts"] = list(details.get("attempts") or [])
                 if error:
                     item["status"] = "failed"
                     item["error"] = error
@@ -1381,6 +1839,7 @@ def _download_from_public_archives(
     strategy: str,
     timeout: float,
     output_dir: str | Path | None = None,
+    source_health_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Download from public archives when the optional CLI is not packaged.
 
@@ -1394,8 +1853,21 @@ def _download_from_public_archives(
         raise RuntimeError("未找到可直接获取的开放全文或灰色文献存档版本。")
     resolved_output_dir = Path(output_dir).resolve() if output_dir else _download_directory(workspace)
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_health_dir = Path(source_health_dir).resolve() if source_health_dir else resolved_output_dir
+    resolved_health_dir.mkdir(parents=True, exist_ok=True)
+    candidates = _rank_public_candidates(candidates, resolved_health_dir)
+    if len(candidates) > 1:
+        return _race_public_archives(
+            candidates,
+            identifier=identifier,
+            strategy=strategy,
+            output_dir=resolved_output_dir,
+            score_dir=resolved_health_dir,
+            timeout=timeout,
+        )
     errors: list[str] = []
     for candidate in candidates:
+        started = time.perf_counter()
         try:
             destination = _download_public_pdf(
                 candidate,
@@ -1405,7 +1877,21 @@ def _download_from_public_archives(
             )
         except RuntimeError as exc:
             errors.append(str(exc))
+            _record_public_source_result(
+                resolved_health_dir,
+                candidate["source"],
+                success=False,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error_type=_public_download_error_type(exc),
+            )
             continue
+        latency_ms = (time.perf_counter() - started) * 1000
+        _record_public_source_result(
+            resolved_health_dir,
+            candidate["source"],
+            success=True,
+            latency_ms=latency_ms,
+        )
         return {
             "ok": True,
             "identifier": identifier,
@@ -1413,6 +1899,15 @@ def _download_from_public_archives(
             "output_dir": str(resolved_output_dir),
             "files": [str(destination)],
             "source": candidate["source"],
+            "source_race": False,
+            "attempts": [
+                {
+                    "source": candidate["source"],
+                    "status": "success",
+                    "selected": True,
+                    "latency_ms": round(latency_ms),
+                }
+            ],
             "message": f"已从 {candidate['source']} 保存全文。",
         }
     raise RuntimeError("已找到全文入口，但下载失败：" + "；".join(errors[-3:]))

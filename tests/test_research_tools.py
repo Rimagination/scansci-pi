@@ -460,6 +460,23 @@ def test_download_papers_retries_on_rate_limit_then_succeeds(tmp_path, monkeypat
     assert result["items"][0]["status"] == "completed"
 
 
+def test_batch_downloads_keep_source_health_in_stable_download_dir(tmp_path, monkeypatch):
+    captured: list[Path] = []
+    monkeypatch.setattr(research_tools, "_BATCH_DELAY_MAX", 0.0)
+
+    def fake_download(identifier, **kwargs):
+        captured.append(Path(kwargs["_source_health_dir"]).resolve())
+        return {"files": [str(tmp_path / "paper.pdf")], "source": "Working repository"}
+
+    monkeypatch.setattr(research_tools, "download_paper", fake_download)
+
+    workspace = _isolated_workspace(tmp_path)
+    result = research_tools.download_papers([_VALID_DOI], workspace=workspace)
+
+    assert result["completed"] == 1
+    assert captured == [research_tools._download_directory(workspace).resolve()]
+
+
 def test_download_papers_does_not_retry_permanent_failure(tmp_path, monkeypatch):
     """A genuine 'not found' is not retried — only rate-limit hints are."""
     monkeypatch.setattr(research_tools, "_cancelable_sleep", lambda _s, _c: None)

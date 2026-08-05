@@ -9421,7 +9421,11 @@ function renderModeArtifact(run) {
   else if (run.workflow_type === "paper_atlas") renderAtlasResults(payload);
   else if (run.workflow_type === "paper_download") {
     const files = (payload.files || []).map((file) => `<code>${escapeHtml(file)}</code>`).join("");
-    byId("modeResults").innerHTML = `<div class="download-result"><span>✓</span><div><strong>文献已保存</strong><p>${escapeHtml(payload.identifier || run.title)}</p>${files || `<code>${escapeHtml(payload.output_dir || artifact.file_path)}</code>`}</div></div>`;
+    const source = payload.source ? `<small>来源：${escapeHtml(payload.source)}</small>` : "";
+    const attempts = Array.isArray(payload.attempts) && payload.attempts.length > 1
+      ? `<small>已尝试 ${payload.attempts.length} 个来源，仅保留一个可用版本</small>`
+      : "";
+    byId("modeResults").innerHTML = `<div class="download-result"><span>✓</span><div><strong>文献已保存</strong><p>${escapeHtml(payload.identifier || run.title)}</p>${source}${attempts}${files || `<code>${escapeHtml(payload.output_dir || artifact.file_path)}</code>`}</div></div>`;
   } else if (run.workflow_type === "paper_download_batch") {
     const items = Array.isArray(payload.items) ? payload.items : [];
     const completed = Number(payload.completed || 0);
