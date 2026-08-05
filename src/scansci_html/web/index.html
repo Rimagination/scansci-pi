@@ -131,6 +131,7 @@
               <div class="composer-source-strip" id="homeSourceAttachments" aria-live="polite" hidden></div>
               <div class="paper-list-attachment" id="homePaperBatchAttachment" aria-live="polite" hidden></div>
               <div class="composer-image-strip" id="homeImageAttachments" aria-live="polite" hidden></div>
+              <div class="composer-skill-strip" id="homeSkillTokens" aria-label="已选择的 Skill" aria-live="polite" hidden></div>
               <textarea id="homeQuestionInput" rows="3" placeholder="向 ScanSci 提问，@ 资料，/ 工具，$ 技能"></textarea>
               <div class="prompt-tools">
                 <div class="composer-left">
@@ -192,6 +193,7 @@
                 <div class="composer-knowledge-strip" id="chatKnowledgeScope" aria-live="polite" hidden></div>
                 <div class="composer-source-strip" id="chatSourceAttachments" aria-live="polite" hidden></div>
                 <div class="composer-image-strip" id="chatImageAttachments" aria-live="polite" hidden></div>
+                <div class="composer-skill-strip" id="chatSkillTokens" aria-label="已选择的 Skill" aria-live="polite" hidden></div>
                 <textarea id="chatQuestionInput" rows="2" placeholder="继续追问或提出新的研究问题"></textarea>
                 <div class="chat-composer-tools">
                   <div class="composer-left">
@@ -330,6 +332,20 @@
         <section class="academic-search-plan-sources" aria-labelledby="academicSearchPlanSourcesTitle"><div><strong id="academicSearchPlanSourcesTitle">公开来源</strong><span>可按研究领域调整；至少保留一个来源</span></div><div id="academicSearchPlanSources"></div></section>
         <footer><button type="button" class="secondary-button" data-action="close-academic-search-plan">返回修改</button><button type="submit" class="primary-button" id="academicSearchPlanSubmit">开始联网检索</button></footer>
       </form>
+    </dialog>
+    <dialog class="skill-security-dialog" id="skillSecurityDialog" aria-labelledby="skillSecurityTitle">
+      <section class="skill-security-shell">
+        <header class="skill-security-header">
+          <span class="skill-security-mark"><span data-ui-icon="shield-check"></span></span>
+          <div><span>SKILL SECURITY GATE</span><h2 id="skillSecurityTitle">安装前安全检查</h2><p>扫描的是隔离快照；确认后只会安装这份已经检查的内容。</p></div>
+          <button type="button" data-action="close-skill-security" aria-label="关闭安全检查"><span data-ui-icon="x"></span></button>
+        </header>
+        <div class="skill-security-content" id="skillSecurityContent" aria-live="polite"></div>
+        <footer class="skill-security-footer">
+          <span id="skillSecurityExpiry">隔离快照会在 30 分钟后失效</span>
+          <div><button type="button" class="secondary-button" data-action="close-skill-security">取消</button><button type="button" class="primary-button" id="skillSecurityInstall" data-action="confirm-skill-install" disabled>确认安装</button></div>
+        </footer>
+      </section>
     </dialog>
     <dialog class="knowledge-scope-dialog" id="knowledgeScopeDialog" aria-labelledby="knowledgeScopeTitle">
       <section class="knowledge-scope-shell">

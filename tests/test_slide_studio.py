@@ -238,7 +238,13 @@ def test_presentation_ui_uses_stable_rendering_and_native_save_bridge():
     # Public academic/deep research no longer requires a selected local
     # notebook.  Only the two evidence-bound shortcuts retain that guard.
     assert '["novelty", "idea"].includes(mode) && !state.notebook && !isTaskFollowUp' in app_js
-    assert 'skills: extractSkillMentions(content)' in app_js
+    assert "composerSkills: { home: [], chat: [] }" in app_js
+    assert "function skillTokenMarkup" in app_js
+    assert "function renderComposerSkills" in app_js
+    assert 'data-action="open-local-path"' in app_js
+    assert 'data-action="remove-composer-skill"' in app_js
+    assert "skills: selectedSkills" in app_js
+    assert "clearComposerSkills(key)" in app_js
     assert 'document.addEventListener("keyup", (event) =>' in app_js
     assert 'renderSkillSuggestions(event.target);' in app_js
     assert '!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key)' in app_js

@@ -8,7 +8,7 @@ supporting files); it never executes a package during installation.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -22,9 +22,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 import zipfile
+from uuid import uuid4
 
 from .app_settings import load_settings, save_settings
 from .builtin_skills import builtin_skill_asset_path
+from .skill_security import scan_skill_packages
 
 
 _LIBRARY_NAME = ".scansci-skills"
@@ -34,8 +36,12 @@ _MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 _MAX_MARKETPLACE_BYTES = 12 * 1024 * 1024
 _SKILL_ID = re.compile(r"[^a-z0-9._-]+")
 _MARKETPLACE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*){1,2}$", re.IGNORECASE)
+_SCAN_ID = re.compile(r"^[0-9a-f]{32}$")
+_QUARANTINE_NAME = ".scansci-skill-quarantine"
+_SCAN_TTL = timedelta(minutes=30)
+_IGNORED_PACKAGE_NAMES = (".git", ".venv", "venv", "node_modules", "__pycache__", ".DS_Store")
 _GITHUB_TREE_URL = re.compile(
-    r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?:tree|blob)/(?P<branch>[^/]+)(?:/(?P<path>.*))?/?$",
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?:tree|blob)/(?P<branch>[^/]+)(?:/(?P<path>.*))?/?$",
     re.IGNORECASE,
 )
 
@@ -93,7 +99,12 @@ def installed_skills(workspace: str | Path) -> list[dict[str, Any]]:
                 item["skill_file"] = str(asset_path / _SKILL_FILE)
             item["available"] = (asset_path / _SKILL_FILE).is_file()
         else:
-            item["available"] = (Path(path) / _SKILL_FILE).is_file()
+            package_path = Path(path)
+            skill_file = package_path / _SKILL_FILE
+            if skill_file.is_file():
+                item["package_path"] = str(package_path)
+                item["skill_file"] = str(skill_file)
+            item["available"] = skill_file.is_file()
         rows.append(item)
     return rows
 
@@ -125,8 +136,8 @@ def marketplace_skills(*, query: str = "", view: str = "trending", limit: int = 
         return {"items": items, "offline": True, "provider": "skills.sh"}
 
 
-def install_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
-    """Install one source into the local library and register all discovered Skills."""
+def scan_skill_source(workspace: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Copy a source into quarantine and statically scan the exact snapshot."""
 
     source_type = str(payload.get("source_type", "") or "").strip().lower()
     source = str(payload.get("source", "") or "").strip()
@@ -137,6 +148,10 @@ def install_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, A
 
     temporary: Path | None = None
     recorded_source = source
+    scan_id = uuid4().hex
+    quarantine = _skill_quarantine_path(workspace)
+    _cleanup_skill_quarantine(quarantine)
+    scan_root = quarantine / scan_id
     try:
         if source_type == "local":
             root = _local_source_root(source)
@@ -152,12 +167,168 @@ def install_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, A
         else:
             temporary, root = _clone_git_source(_marketplace_git_fallback(source))
             roots = [_marketplace_skill_root(root, source)]
-        installed = _copy_into_library(workspace, roots=roots, source_type=source_type, source=recorded_source)
-        settings = load_settings(workspace)
-        return {"installed": installed, "skills": installed_skills(workspace), "settings": settings}
+        _validate_skill_source_size(roots)
+        packages_root = scan_root / "packages"
+        packages_root.mkdir(parents=True, exist_ok=False)
+        snapshots: list[Path] = []
+        for index, skill_root in enumerate(roots, start=1):
+            package_name = f"{index:02d}-{_slug(skill_root.name)}"
+            destination = packages_root / package_name
+            shutil.copytree(skill_root, destination, ignore=shutil.ignore_patterns(*_IGNORED_PACKAGE_NAMES))
+            snapshots.append(destination)
+        report = scan_skill_packages(snapshots, source_type=source_type, source=recorded_source)
+        created_at = datetime.now(timezone.utc)
+        expires_at = created_at + _SCAN_TTL
+        manifest = {
+            "scan_id": scan_id,
+            "source_type": source_type,
+            "source": recorded_source,
+            "created_at": created_at.isoformat(timespec="seconds"),
+            "expires_at": expires_at.isoformat(timespec="seconds"),
+            "packages": [item.name for item in snapshots],
+            "report": report,
+        }
+        (scan_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "scan_id": scan_id,
+            "scan": report,
+            "requires_confirmation": report["verdict"] != "BLOCKED",
+            "expires_at": manifest["expires_at"],
+        }
+    except Exception:
+        shutil.rmtree(scan_root, ignore_errors=True)
+        raise
     finally:
         if temporary is not None:
             shutil.rmtree(temporary, ignore_errors=True)
+
+
+def install_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Install a previously scanned quarantine snapshot after user confirmation."""
+
+    scan_id = str(payload.get("scan_id", "") or "").strip().lower()
+    if not _SCAN_ID.fullmatch(scan_id):
+        raise SkillInstallError("安装前必须先完成 Skill 安全检查")
+    if str(payload.get("decision", "") or "").strip().lower() != "install":
+        raise SkillInstallError("需要明确确认后才能安装 Skill")
+
+    scan_root, manifest = _load_scan_manifest(workspace, scan_id)
+    report = dict(manifest.get("report", {}) or {})
+    verdict = str(report.get("verdict", "BLOCKED") or "BLOCKED").upper()
+    if verdict == "BLOCKED":
+        raise SkillInstallError("安全检查已阻止安装该 Skill")
+    if verdict == "REVIEW" and payload.get("acknowledge_risk") is not True:
+        raise SkillInstallError("请先阅读风险并明确勾选确认")
+
+    packages_root = (scan_root / "packages").resolve()
+    roots: list[Path] = []
+    for name in manifest.get("packages", []):
+        candidate = (packages_root / str(name)).resolve()
+        try:
+            candidate.relative_to(packages_root)
+        except ValueError as error:
+            raise SkillInstallError("Skill 隔离快照路径无效") from error
+        if not candidate.is_dir():
+            raise SkillInstallError("Skill 隔离快照已失效，请重新检查")
+        roots.append(candidate)
+    if not roots:
+        raise SkillInstallError("Skill 隔离快照中没有可安装内容")
+
+    current_report = scan_skill_packages(
+        roots,
+        source_type=str(manifest.get("source_type", "")),
+        source=str(manifest.get("source", "")),
+    )
+    if current_report.get("fingerprint") != report.get("fingerprint") or current_report.get("verdict") != verdict:
+        raise SkillInstallError("Skill 隔离快照在确认前发生变化，请重新检查")
+
+    installed = _copy_into_library(
+        workspace,
+        roots=roots,
+        source_type=str(manifest.get("source_type", "")),
+        source=str(manifest.get("source", "")),
+        security_scan=_security_scan_summary(current_report),
+    )
+    shutil.rmtree(scan_root, ignore_errors=True)
+    settings = load_settings(workspace)
+    return {
+        "installed": installed,
+        "skills": installed_skills(workspace),
+        "settings": settings,
+        "scan": current_report,
+    }
+
+
+def cancel_skill_scan(workspace: str | Path, scan_id: str) -> dict[str, Any]:
+    """Discard one pending quarantine snapshot without touching installed Skills."""
+
+    normalized = str(scan_id or "").strip().lower()
+    if not _SCAN_ID.fullmatch(normalized):
+        return {"ok": False}
+    target = _skill_quarantine_path(workspace) / normalized
+    existed = target.is_dir()
+    shutil.rmtree(target, ignore_errors=True)
+    return {"ok": existed}
+
+
+def _skill_quarantine_path(workspace: str | Path) -> Path:
+    return Path(workspace).resolve().parent / _QUARANTINE_NAME
+
+
+def _cleanup_skill_quarantine(quarantine: Path) -> None:
+    quarantine.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now(timezone.utc) - _SCAN_TTL
+    for candidate in quarantine.iterdir():
+        if not candidate.is_dir():
+            continue
+        manifest_path = candidate / "manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            created_at = datetime.fromisoformat(str(payload.get("created_at", "")))
+            stale = created_at < cutoff
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            try:
+                modified_at = datetime.fromtimestamp(candidate.stat().st_mtime, tz=timezone.utc)
+                stale = modified_at < cutoff
+            except OSError:
+                stale = True
+        if stale:
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
+def _load_scan_manifest(workspace: str | Path, scan_id: str) -> tuple[Path, dict[str, Any]]:
+    scan_root = _skill_quarantine_path(workspace) / scan_id
+    manifest_path = scan_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SkillInstallError("Skill 安全检查已失效，请重新检查") from error
+    try:
+        expires_at = datetime.fromisoformat(str(manifest.get("expires_at", "")))
+    except ValueError as error:
+        raise SkillInstallError("Skill 安全检查记录无效") from error
+    if expires_at.tzinfo is None:
+        raise SkillInstallError("Skill 安全检查记录无效")
+    if expires_at <= datetime.now(timezone.utc):
+        shutil.rmtree(scan_root, ignore_errors=True)
+        raise SkillInstallError("Skill 安全检查已过期，请重新检查")
+    return scan_root, manifest
+
+
+def _security_scan_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": report.get("version"),
+        "verdict": report.get("verdict"),
+        "scanned_at": report.get("scanned_at"),
+        "fingerprint": report.get("fingerprint"),
+        "package_count": report.get("package_count"),
+        "file_count": report.get("file_count"),
+        "byte_count": report.get("byte_count"),
+        "counts": dict(report.get("counts", {}) or {}),
+        "scanners": list(report.get("scanners", []) or []),
+        "findings": list(report.get("findings", []) or []),
+        "recommendation": report.get("recommendation"),
+    }
 
 
 def _local_source_root(source: str) -> Path:
@@ -173,6 +344,21 @@ def _local_source_root(source: str) -> Path:
     if not resolved.is_dir():
         raise SkillInstallError("本地来源必须是 Skill 文件夹或 SKILL.md")
     return resolved
+
+
+def _validate_skill_source_size(roots: list[Path]) -> None:
+    file_count = 0
+    byte_count = 0
+    for root in roots:
+        for item in root.rglob("*"):
+            if item.is_symlink():
+                raise SkillInstallError(f"Skill 不能包含符号链接：{item.name}")
+            if not item.is_file() or any(part in set(_IGNORED_PACKAGE_NAMES) for part in item.parts):
+                continue
+            file_count += 1
+            byte_count += item.stat().st_size
+            if file_count > _MAX_ARCHIVE_FILES or byte_count > _MAX_ARCHIVE_BYTES:
+                raise SkillInstallError("Skill 来源超过 ScanSci 的安全安装上限")
 
 
 def _extract_archive(source: str) -> Path:
@@ -219,7 +405,7 @@ def _clone_git_source(source: str) -> tuple[Path, Path]:
         raise SkillInstallError("未检测到 Git，无法从仓库安装 Skill")
     target = Path(tempfile.mkdtemp(prefix="scansci-skill-git-"))
     checkout = target / "checkout"
-    command = ["git", "clone", "--depth", "1", "--filter=blob:none", "--no-tags"]
+    command = ["git", "-c", f"core.hooksPath={target / 'disabled-hooks'}", "clone", "--depth", "1", "--filter=blob:none", "--no-tags"]
     if branch:
         command.extend(["--branch", branch])
     command.extend([clone_url, str(checkout)])
@@ -230,7 +416,7 @@ def _clone_git_source(source: str) -> tuple[Path, Path]:
             capture_output=True,
             text=True,
             timeout=90,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         shutil.rmtree(target, ignore_errors=True)
@@ -263,11 +449,11 @@ def _parse_git_source(source: str) -> tuple[str, str | None, str]:
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         return f"https://github.com/{value}.git", None, ""
     parsed = urlparse(value)
-    if parsed.scheme in {"https", "http", "ssh", "git"} and parsed.netloc:
+    if parsed.scheme == "https" and parsed.netloc:
         return value, None, ""
-    if value.startswith("git@") and ":" in value:
-        return value, None, ""
-    raise SkillInstallError("Git 来源须为仓库 URL、GitHub owner/repo 或 GitHub tree 地址")
+    if parsed.scheme in {"http", "ssh", "git"} or value.startswith("git@"):
+        raise SkillInstallError("远程 Skill 只允许通过 HTTPS 下载；私有仓库请先下载到本地再检查")
+    raise SkillInstallError("Git 来源须为 HTTPS 仓库 URL、GitHub owner/repo 或 GitHub tree 地址")
 
 
 def _marketplace_git_fallback(skill_id: str) -> str:
@@ -373,7 +559,7 @@ def _find_skill_roots(root: Path) -> list[Path]:
         return [root]
     candidates: list[Path] = []
     for path in root.rglob(_SKILL_FILE):
-        if any(part in {".git", "node_modules", ".venv", "__pycache__"} for part in path.parts):
+        if any(part in set(_IGNORED_PACKAGE_NAMES) for part in path.parts):
             continue
         if path.is_file():
             candidates.append(path.parent)
@@ -399,6 +585,7 @@ def _copy_into_library(
     roots: list[Path],
     source_type: str,
     source: str,
+    security_scan: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     library = skill_library_path(workspace)
     library.mkdir(parents=True, exist_ok=True)
@@ -413,7 +600,7 @@ def _copy_into_library(
             folder = _unique_folder_name(_slug(metadata["id"]), reserved)
             reserved.add(folder.lower())
             destination = staged / folder
-            shutil.copytree(root, destination, ignore=shutil.ignore_patterns(".git", "__pycache__", ".DS_Store"))
+            shutil.copytree(root, destination, ignore=shutil.ignore_patterns(*_IGNORED_PACKAGE_NAMES))
             copied.append((destination, {**metadata, "folder": folder}))
         installed: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -434,6 +621,7 @@ def _copy_into_library(
                 "source_type": source_type,
                 "source": source,
                 "installed_at": now,
+                **({"security_scan": dict(security_scan)} if security_scan else {}),
             }
             existing.append(record)
             installed.append(record)

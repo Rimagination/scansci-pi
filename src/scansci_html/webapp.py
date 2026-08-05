@@ -75,7 +75,14 @@ from .research_tools import (
     test_provider_connection,
     verify_doi_metadata,
 )
-from .skill_manager import install_skill, installed_skills, marketplace_skills, skill_library_path
+from .skill_manager import (
+    cancel_skill_scan,
+    install_skill,
+    installed_skills,
+    marketplace_skills,
+    scan_skill_source,
+    skill_library_path,
+)
 from .slides_templates import list_slide_templates, slide_template_asset
 from .slide_studio import save_browser_rendered_deck
 from .telemetry import diagnostic_span, diagnostics_summary, export_diagnostics_bundle
@@ -667,8 +674,12 @@ class NotebookWebApp:
             return self._save_settings(payload)
         if path == "/api/app/update/check":
             return self._json(HTTPStatus.OK, self.update_service.check())
+        if path == "/api/skills/scan":
+            return self._json(HTTPStatus.OK, scan_skill_source(self.workspace, payload))
         if path == "/api/skills/install":
             return self._json(HTTPStatus.CREATED, install_skill(self.workspace, payload))
+        if path == "/api/skills/scan/cancel":
+            return self._json(HTTPStatus.OK, cancel_skill_scan(self.workspace, str(payload.get("scan_id", ""))))
         if path == "/api/mcp/marketplace/sync":
             return self._json(HTTPStatus.OK, sync_official_registry(self.workspace))
         if path == "/api/mcp/marketplace/install":

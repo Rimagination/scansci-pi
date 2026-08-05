@@ -100,6 +100,7 @@ from .research_tools import (
 )
 from .slide_studio import create_source_slide_deck, persist_slide_sources
 from .task_routing import route_freeform_task
+from .skill_runtime import resolve_skill_selection
 from .workspace import load_workspace_summary
 from .zotero_integration import zotero_status
 
@@ -318,6 +319,8 @@ def _direct_output_budget(user_text: str, selected_skills: list[dict[str, Any]] 
         re.IGNORECASE,
     ):
         return 4_096
+    if skill_ids & {"literature-review", "nature-writing", "nature-reviewer", "nature-response"}:
+        return 4_096
     if re.search(
         r"(?:详细|全面|系统|完整|深入|长文|综述|教程|报告)"
         r"|(?:detailed|comprehensive|in[- ]depth|tutorial|report|review)",
@@ -325,6 +328,16 @@ def _direct_output_budget(user_text: str, selected_skills: list[dict[str, Any]] 
         re.IGNORECASE,
     ):
         return 3_072
+    if skill_ids & {"academic-research-suite", "nature-polishing", "nature-paper2ppt"}:
+        return 3_072
+    if skill_ids & {
+        "scientific-brainstorming",
+        "nature-statistics",
+        "scientific-visualization",
+        "nature-figure",
+        "nature-data",
+    }:
+        return 2_048
     return 1_024
 
 
@@ -993,6 +1006,15 @@ def _tor_failure_hint(error_name: str) -> str:
 
 def _has_selected_skill(selected_skills: list[dict[str, Any]], identifier: str) -> bool:
     return any(str(item.get("id", "")).strip().lower() == identifier for item in selected_skills)
+
+
+def _selected_skill_requires_web(selected_skills: list[dict[str, Any]]) -> bool:
+    """Return whether an active Skill promises fresh public-source discovery."""
+
+    return any(
+        _has_selected_skill(selected_skills, identifier)
+        for identifier in {"web-access", "nature-academic-search"}
+    )
 
 
 def _normalize_direct_chat_output(text: str, selected_skills: list[dict[str, Any]]) -> str:
@@ -1708,9 +1730,18 @@ class ResearchAgentRuntime:
                 has_knowledge = bool(list(notebook.get("sources", []) or []))
             except (FileNotFoundError, sqlite3.Error):
                 has_knowledge = False
-        decision = route_freeform_task(request, has_knowledge=has_knowledge).to_dict()
+        selection = resolve_skill_selection(
+            payload,
+            [{"role": "user", "content": request}],
+        )
+        decision = route_freeform_task(
+            request,
+            has_knowledge=has_knowledge,
+            skill_ids=selection.explicit_ids,
+        ).to_dict()
         decision["host_owned"] = True
         decision["has_selected_knowledge"] = has_knowledge
+        decision["skill_selection"] = selection.to_dict()
         return decision
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3637,7 +3668,7 @@ class ResearchAgentRuntime:
             if local_facts
             else self._direct_pi_task_mode(
                 chat_request.chat_mode,
-                "on" if _has_selected_skill(chat_request.selected_skills, "web-access") else web_search_mode,
+                "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
                 messages=chat_request.messages,
             )
         )
@@ -4350,7 +4381,7 @@ class ResearchAgentRuntime:
                 if local_facts
                 else self._direct_pi_task_mode(
                     chat_request.chat_mode,
-                    "on" if _has_selected_skill(chat_request.selected_skills, "web-access") else web_search_mode,
+                    "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
                     messages=chat_request.messages,
                 )
             )
