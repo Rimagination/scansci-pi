@@ -14,6 +14,10 @@
   #error AppVersion must be supplied by the release build script.
 #endif
 
+#ifndef UpdateManifestUrl
+  #define UpdateManifestUrl ""
+#endif
+
 [Setup]
 AppId={{F1A9C2B3-83AA-4B8B-89D4-68046D71D441}
 AppName=ScanSci
@@ -42,8 +46,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\ScanSci"; Filename: "{app}\ScanSci.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\ScanSci"; Filename: "{app}\ScanSci.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\ScanSci"; Filename: "{app}\ScanSci.exe"; Parameters: "--update-manifest-url ""{#UpdateManifestUrl}"""; WorkingDir: "{app}"
+Name: "{autodesktop}\ScanSci"; Filename: "{app}\ScanSci.exe"; Parameters: "--update-manifest-url ""{#UpdateManifestUrl}"""; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ScanSci.exe"; Description: "Launch ScanSci"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\ScanSci.exe"; Parameters: "--update-manifest-url ""{#UpdateManifestUrl}"""; Description: "Launch ScanSci"; Flags: nowait postinstall skipifsilent

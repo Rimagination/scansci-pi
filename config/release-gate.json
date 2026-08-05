@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "ScanSci",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "scope_file": "config/release-scope.json",
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [
@@ -156,6 +156,7 @@
     "name": "ScanSci",
     "profile": "core",
     "signature_required": false,
+    "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
     "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
     "max_package_bytes": 1500000000,
     "forbidden_top_level_resources": [

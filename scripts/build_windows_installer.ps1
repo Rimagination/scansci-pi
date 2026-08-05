@@ -8,6 +8,7 @@ param(
     [string]$BuildId,
     [Parameter(Mandatory)]
     [string]$OutputDir,
+    [string]$UpdateManifestUrl = "",
     [switch]$RequireSignature
 )
 
@@ -112,6 +113,16 @@ if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$') {
 if ($BuildId -notmatch '^[0-9A-Za-z._+-]+$') {
     throw "BuildId may only contain letters, numbers, dots, underscores, plus signs, and hyphens."
 }
+if ($UpdateManifestUrl) {
+    try {
+        $updateUri = [uri]$UpdateManifestUrl
+    } catch {
+        throw "UpdateManifestUrl must be an absolute HTTPS URL."
+    }
+    if (-not $updateUri.IsAbsoluteUri -or $updateUri.Scheme -ne "https") {
+        throw "UpdateManifestUrl must be an absolute HTTPS URL."
+    }
+}
 
 $signing = Get-SigningConfiguration
 $sourceSignature = Get-AuthenticodeSignature -LiteralPath $exe
@@ -138,6 +149,7 @@ $arguments = @(
     "/DOutputDir=$output",
     "/DAppVersion=$Version",
     "/DBuildId=$BuildId",
+    "/DUpdateManifestUrl=$UpdateManifestUrl",
     $scriptPath
 )
 & $iscc @arguments

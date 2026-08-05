@@ -17,7 +17,7 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
 _DEFAULT_RELEASE_NOTES = [

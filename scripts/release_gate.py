@@ -176,6 +176,9 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
     runtime_manifest_url = str(package.get("runtime_manifest_url", "")).strip()
     if runtime_manifest_url and urlparse(runtime_manifest_url).scheme.lower() != "https":
         raise GateFailure("package runtime_manifest_url must use HTTPS")
+    update_manifest_url = str(package.get("update_manifest_url", "")).strip()
+    if update_manifest_url and urlparse(update_manifest_url).scheme.lower() != "https":
+        raise GateFailure("package update_manifest_url must use HTTPS")
 
 
 def _template_command(parts: list[str], variables: dict[str, str]) -> list[str]:
@@ -760,6 +763,9 @@ class ReleaseGate:
             "-OutputDir",
             str(self.installer_dir),
         ]
+        update_manifest_url = str(self.contract["package"].get("update_manifest_url", "")).strip()
+        if update_manifest_url:
+            command.extend(["-UpdateManifestUrl", update_manifest_url])
         if self.signature_required:
             command.append("-RequireSignature")
         self.command_step(
