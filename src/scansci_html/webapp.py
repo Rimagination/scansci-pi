@@ -697,9 +697,18 @@ class NotebookWebApp:
             )
             if server is None:
                 raise FileNotFoundError(f"MCP server does not exist: {server_id}")
+            tested = PiAgentClient.probe_mcp_server(workspace=self.workspace, server=dict(server))
+            # A fresh Node sidecar can occasionally finish its handshake with
+            # an empty client list while the stdio child is still starting.
+            # Retry once so the explicit connection test is useful instead of
+            # reporting a transient "0 servers" result to the user.
+            if not int(tested.get("server_count", 0) or 0):
+                retry = PiAgentClient.probe_mcp_server(workspace=self.workspace, server=dict(server))
+                if int(retry.get("server_count", 0) or 0) or int(retry.get("tool_count", 0) or 0):
+                    tested = retry
             return self._json(
                 HTTPStatus.OK,
-                PiAgentClient.probe_mcp_server(workspace=self.workspace, server=dict(server)),
+                tested,
             )
         if path == "/api/library":
             title = str(payload.get("title", "")).strip()
