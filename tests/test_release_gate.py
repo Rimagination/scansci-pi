@@ -234,6 +234,30 @@ def test_command_retry_can_match_failure_text_in_the_command_log(tmp_path: Path)
     assert step["attempts"][0]["failure_reason"] == "test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools"
 
 
+def test_command_step_can_write_nested_process_output_directly_to_its_log(tmp_path: Path) -> None:
+    contract_path = _write_json(tmp_path / "contract.json", _contract())
+    scope_path = _write_json(tmp_path / "scope.json", _scope())
+    gate = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="source",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="file-output-test",
+    )
+
+    step = gate.command_step(
+        step_id="file-output",
+        title="file output",
+        command=[sys.executable, "-c", "print('nested output')"],
+        echo_output=False,
+        output_to_file=True,
+    )
+
+    assert step["status"] == "passed"
+    assert "nested output" in (gate.diagnostics_dir / "file-output.log").read_text(encoding="utf-8")
+
+
 def test_release_gate_stops_a_hung_verification_at_the_declared_timeout(tmp_path: Path) -> None:
     contract_path = _write_json(tmp_path / "contract.json", _contract())
     scope_path = _write_json(tmp_path / "scope.json", _scope())

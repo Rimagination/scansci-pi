@@ -11,6 +11,19 @@ from scansci_html.pi_agent import PiAgentClient
 def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict[str, object]:
     node, sidecar = PiAgentClient.runtime_paths()
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    if not deferred:
+        return PiAgentClient.probe_mcp_server(
+            workspace=tmp_path,
+            server={
+                "id": "fixture",
+                "name": "Fixture MCP",
+                "enabled": True,
+                "transport": "stdio",
+                "command": str(node),
+                "args_list": [str(fixture)],
+                "allow_write": allow_write,
+            },
+        )
     environment = dict(os.environ)
     for variable in ("PYTHONPATH", "PYTHONUTF8"):
         environment.pop(variable, None)
@@ -23,6 +36,8 @@ def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
     )
     try:
         assert process.stdin is not None

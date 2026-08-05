@@ -408,6 +408,7 @@ class ReleaseGate:
         echo_output: bool = True,
         retry: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
+        output_to_file: bool = False,
     ) -> dict[str, Any]:
         previous = self._previous(step_id)
         if previous and previous.get("status") == "passed" and (required_result is None or required_result.is_file()):
@@ -445,50 +446,74 @@ class ReleaseGate:
                     attempt_started = time.monotonic()
                     if attempt_number > 1:
                         log.write(f"\n[retry] attempt {attempt_number}/{max_attempts}\n")
-                    process = subprocess.Popen(
-                        command,
-                        cwd=PROJECT_ROOT,
-                        env=env,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                    assert process.stdout is not None
-                    output_queue: Queue[str] = Queue()
-
-                    def drain_output() -> None:
-                        for line in process.stdout:
-                            output_queue.put(line)
-
-                    output_thread = Thread(target=drain_output, daemon=True)
-                    output_thread.start()
                     timed_out = False
-                    deadline = (
-                        time.monotonic() + command_timeout
-                        if command_timeout is not None
-                        else None
-                    )
-                    while process.poll() is None:
+                    if output_to_file:
+                        # A verification that launches nested Windows
+                        # subprocesses must not inherit the gate runner's
+                        # captured stdout pipe. Direct the child output to its
+                        # artifact log instead; this preserves evidence while
+                        # avoiding handle-inheritance failures such as
+                        # ``spawn EPERM`` in stdio MCP probes.
+                        process = subprocess.Popen(
+                            command,
+                            cwd=PROJECT_ROOT,
+                            env=env,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
                         try:
-                            line = output_queue.get(timeout=0.1)
-                        except Empty:
-                            if deadline is not None and time.monotonic() >= deadline:
-                                timed_out = True
-                                process.kill()
-                                break
-                            continue
-                        if echo_output:
-                            _emit_console(line, end="")
-                        log.write(line)
-                    exit_code = process.wait()
-                    output_thread.join(timeout=1.0)
-                    while not output_queue.empty():
-                        line = output_queue.get_nowait()
-                        if echo_output:
-                            _emit_console(line, end="")
-                        log.write(line)
+                            exit_code = process.wait(timeout=command_timeout)
+                        except subprocess.TimeoutExpired:
+                            timed_out = True
+                            process.kill()
+                            exit_code = process.wait()
+                    else:
+                        process = subprocess.Popen(
+                            command,
+                            cwd=PROJECT_ROOT,
+                            env=env,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                        )
+                        assert process.stdout is not None
+                        output_queue: Queue[str] = Queue()
+
+                        def drain_output() -> None:
+                            for line in process.stdout:
+                                output_queue.put(line)
+
+                        output_thread = Thread(target=drain_output, daemon=True)
+                        output_thread.start()
+                        deadline = (
+                            time.monotonic() + command_timeout
+                            if command_timeout is not None
+                            else None
+                        )
+                        while process.poll() is None:
+                            try:
+                                line = output_queue.get(timeout=0.1)
+                            except Empty:
+                                if deadline is not None and time.monotonic() >= deadline:
+                                    timed_out = True
+                                    process.kill()
+                                    break
+                                continue
+                            if echo_output:
+                                _emit_console(line, end="")
+                            log.write(line)
+                        exit_code = process.wait()
+                        output_thread.join(timeout=1.0)
+                        while not output_queue.empty():
+                            line = output_queue.get_nowait()
+                            if echo_output:
+                                _emit_console(line, end="")
+                            log.write(line)
                     if timed_out:
                         exit_code = 124
                         timeout_message = (
@@ -599,6 +624,7 @@ class ReleaseGate:
                 echo_output=str(item.get("console", "stream")) != "log",
                 retry=dict(item.get("retry", {}) or {}),
                 timeout_seconds=(float(item["timeout_seconds"]) if item.get("timeout_seconds") is not None else None),
+                output_to_file=str(item.get("output", "pipe")) == "file",
             )
 
     @property

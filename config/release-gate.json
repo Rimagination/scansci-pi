@@ -38,7 +38,8 @@
         "max_attempts": 2,
         "delay_seconds": 1,
         "failure_reason": "test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools"
-      }
+      },
+      "output": "file"
     },
     {
       "id": "frontend-syntax",
@@ -109,7 +110,8 @@
     {
       "id": "full-python",
       "title": "完整 Python 测试套件",
-      "command": ["{python}", "-m", "pytest", "-q"]
+      "command": ["{python}", "-m", "pytest", "-q"],
+      "output": "file"
     }
   ],
   "real_verifications": [
