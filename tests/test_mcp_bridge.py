@@ -12,7 +12,8 @@ def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict
     node, sidecar = PiAgentClient.runtime_paths()
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
     environment = dict(os.environ)
-    environment.pop("PYTHONPATH", None)
+    for variable in ("PYTHONPATH", "PYTHONUTF8"):
+        environment.pop(variable, None)
     process = subprocess.Popen(
         [str(node), str(sidecar)],
         cwd=Path(__file__).parents[1],

@@ -17,7 +17,6 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
-$env:PYTHONUTF8 = "1"
 
 $gateScript = Join-Path $PSScriptRoot "release_gate.py"
 $arguments = @(

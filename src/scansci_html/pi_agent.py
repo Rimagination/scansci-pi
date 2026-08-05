@@ -959,7 +959,8 @@ class PiAgentClient:
         # Python-only import paths can make Windows reject a nested stdio
         # child spawn when the release gate injects PYTHONPATH. The Node
         # runtime does not need this variable, so do not pass it downstream.
-        environment.pop("PYTHONPATH", None)
+        for variable in ("PYTHONPATH", "PYTHONUTF8"):
+            environment.pop(variable, None)
         return environment
 
     @classmethod
