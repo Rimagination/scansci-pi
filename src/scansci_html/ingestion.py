@@ -83,7 +83,7 @@ def ingest_sources(
     records: list[dict[str, Any]] = []
     try:
         for source in list(job["sources"]):
-            records.append(_extract_source(source, parser=normalized_parser))
+            records.append(_extract_source(source, parser=normalized_parser, workspace=workspace))
     except Exception as error:
         job["status"] = "failed"
         job["error"] = str(error)
@@ -304,12 +304,29 @@ def _extract_source(
     *,
     parser: str,
     output_dir: str | Path | None = None,
+    workspace: str | Path | None = None,
 ) -> dict[str, Any]:
     path = Path(str(source["path"])).resolve()
     suffix = path.suffix.lower()
     warnings: list[str] = []
     text = ""
     selected_parser = ""
+
+    # MinerU is a configurable cloud PDF parser.  When the user has enabled it
+    # and supplied an API key, it takes priority over the local parsers.
+    if suffix == ".pdf" and workspace is not None:
+        try:
+            from .app_settings import get_document_service_api_key, load_settings
+
+            mineru_config = load_settings(workspace).get("document_processing", {}).get("mineru", {})
+            mineru_enabled = bool(mineru_config.get("enabled"))
+            mineru_base_url = str(mineru_config.get("base_url", "https://mineru.net"))
+            mineru_api_key = get_document_service_api_key(workspace, "mineru")
+            if mineru_enabled and mineru_api_key:
+                text = _mineru_text(path, base_url=mineru_base_url, api_key=mineru_api_key)
+                selected_parser = "mineru"
+        except Exception as error:
+            warnings.append(f"MinerU 解析失败，已回退到本地解析：{error}")
 
     if parser == "enhanced":
         text = _docling_text(path)
@@ -329,7 +346,7 @@ def _extract_source(
 
     page_sections: list[dict[str, Any]] = []
     page_count = 1
-    if suffix == ".pdf":
+    if suffix == ".pdf" and not text:
         page_sections = _pdf_pages(path)
         page_count = len(page_sections)
         paged_text = "\n\n".join(
@@ -365,6 +382,14 @@ def _extract_source(
         "preview": _clean_text(text)[:360],
         "warnings": warnings,
     }
+
+
+def _mineru_text(path: Path, *, base_url: str, api_key: str) -> str:
+    """Convert a PDF through the MinerU cloud service."""
+
+    from .mineru import mineru_convert
+
+    return mineru_convert(path, api_key=api_key, base_url=base_url)
 
 
 def _markitdown_text(path: Path) -> str:
