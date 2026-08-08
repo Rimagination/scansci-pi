@@ -364,7 +364,7 @@ def cached_embedding_candidates(
     provider: Any,
     query_vector: list[float],
     limit: int,
-    cache_batch_size: int = 512,
+    cache_batch_size: int = 2048,
     build_missing: bool = True,
     prune_stale: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -1207,7 +1207,7 @@ def prewarm_embedding_cache(
     rows: dict[str, dict[str, Any]],
     *,
     provider: Any,
-    cache_batch_size: int = 128,
+    cache_batch_size: int = 2048,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -1487,6 +1487,17 @@ def vector_cache_status(
                 and str(current.get("state")) == "active"
                 and completed >= total_evidence
             )
+            reusable_vectors = min(
+                total_evidence,
+                max(
+                    0,
+                    int(completed),
+                    int(active_matching),
+                    int(legacy_matching),
+                    int(current.get("reused", 0)) if current else 0,
+                ),
+            )
+            pending_vectors = max(0, total_evidence - reusable_vectors)
             error = str(target.get("error", "")) if target else ""
             if total_evidence == 0:
                 state = "empty"
@@ -1555,6 +1566,10 @@ def vector_cache_status(
                 "total": total_evidence,
                 "progress": progress,
                 "ready": ready,
+                "reusable_vectors": reusable_vectors,
+                "pending_vectors": pending_vectors,
+                "reuse_available": reusable_vectors > 0,
+                "automatic_build_deferred": bool(reusable_vectors > 0 and not ready),
                 "migration_required": bool(provider) and not ready and total_evidence > 0,
                 "serving_stale": bool(active and active_matching and not ready),
                 "serving_vectors": active_matching,

@@ -1539,6 +1539,55 @@ class ResearchAgentRuntime:
         self._local_evidence_models: dict[str, LocalEvidenceStack] = {}
         self._academic_discovery_models: dict[str, LocalEvidenceStack] = {}
         self._zotero_tag_sync_cache: set[str] = set()
+        self._background_warm_lock = threading.Lock()
+        self._background_warming: set[str] = set()
+
+    def _maybe_warm_cache_in_background(
+        self,
+        evidence_db: Path,
+        stack: LocalEvidenceStack,
+    ) -> None:
+        """Start a background thread to build the neural vector cache.
+
+        Only one thread per evidence database runs at a time.  The first
+        user query to a library with a cold cache will use the fast
+        (hashing) path while this thread warms the neural index; subsequent
+        queries switch to the dense route automatically.
+        """
+
+        key = str(evidence_db.resolve())
+        with self._background_warm_lock:
+            if key in self._background_warming:
+                return
+            self._background_warming.add(key)
+        provider = stack.embedding_provider
+        if isinstance(provider, HashingEmbeddingProvider):
+            with self._background_warm_lock:
+                self._background_warming.discard(key)
+            return
+
+        def _warm() -> None:
+            try:
+                from .vector_index import prewarm_embedding_cache
+                from .retrieval import _load_evidence_spans
+
+                rows = _load_evidence_spans(evidence_db)
+                if not rows:
+                    return
+                prewarm_embedding_cache(
+                    evidence_db,
+                    rows,
+                    provider=provider,
+                    # The batch size is already raised to 2048; GPU encoding
+                    # is auto-detected by the embedding provider.
+                )
+            except Exception:
+                pass
+            finally:
+                with self._background_warm_lock:
+                    self._background_warming.discard(key)
+
+        threading.Thread(target=_warm, daemon=True, name=f"scansci-warm-{evidence_db.name}").start()
 
     def _wrap_model_client(self, client: Any) -> Any:
         context = getattr(self._model_event_context, "value", None)
@@ -1882,8 +1931,21 @@ class ResearchAgentRuntime:
         self._submit(str(run["run_id"]))
         return self.store.get_run(str(run["run_id"]))
 
-    def start_evidence_index(self, notebook_id: str) -> dict[str, Any] | None:
-        """Start an observable neural-cache build for any non-empty library."""
+    def start_evidence_index(
+        self,
+        notebook_id: str,
+        *,
+        automatic: bool = False,
+    ) -> dict[str, Any] | None:
+        """Start a neural-cache build, reusing compatible vectors first.
+
+        Automatic callers must not turn a partially reusable library into a
+        surprise GPU workload.  When ``automatic`` is true, an existing
+        serving generation or any matching cache rows are enough to keep the
+        current lexical/stale retrieval path available; the missing vectors
+        are left for an explicit user-triggered retry.  Explicit callers keep
+        the previous behaviour and may complete the incremental build.
+        """
 
         notebook = self._notebook(str(notebook_id))
         evidence_db = self._evidence_db_for_notebook(notebook)
@@ -1919,8 +1981,26 @@ class ResearchAgentRuntime:
         )
         if existing is not None:
             if str(existing.get("status", "")) == "paused":
+                # A paused legacy build may have been interrupted by an app
+                # restart. Automatic startup must not silently resume it;
+                # the user can retry explicitly when the machine is cool
+                # and the timing is acceptable.
+                if automatic:
+                    return existing
                 return self.resume(str(existing["run_id"]))
             return existing
+        reusable_vectors = max(
+            0,
+            int(cache_status.get("reusable_vectors", 0) or 0),
+            int(cache_status.get("serving_vectors", 0) or 0),
+            int(cache_status.get("completed", 0) or 0),
+            migrated_vectors,
+        )
+        if automatic and reusable_vectors > 0:
+            # Keep the previous generation/cache as the low-temperature path.
+            # An explicit POST/retry can still call this method with the
+            # default ``automatic=False`` to finish only the missing rows.
+            return None
         return self.start(
             {
                 "workflow_type": "evidence_index",
@@ -2432,7 +2512,7 @@ class ResearchAgentRuntime:
                         "model": vision_model_id,
                     }
                 except Exception as error:
-                    ocr = ocr_image_blocks(blocks)
+                    ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
                     image_analysis = {
                         "text": str(ocr.get("text", "")).strip()
                         or "视觉模型本轮未能读取图片，且 OCR 未提取到可用文字。请不要根据图片猜测事实。",
@@ -2441,7 +2521,7 @@ class ResearchAgentRuntime:
                         "fallback_reason": f"{type(error).__name__}: {error}"[:240],
                     }
             else:
-                ocr = ocr_image_blocks(blocks)
+                ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
                 image_analysis = {
                     "text": str(ocr.get("text", "")).strip()
                     or "当前没有可用的视觉模型，且 OCR 未提取到可用文字。请不要根据图片猜测事实。",
@@ -6767,7 +6847,7 @@ class ResearchAgentRuntime:
             blocks = vision_image_blocks(self.workspace, attachments)
             text = str(messages[-1].get("content", ""))
             if vision_route.get("mode") == "ocr-fallback":
-                ocr = ocr_image_blocks(blocks)
+                ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
                 ocr_text = str(ocr.get("text", "")).strip()
                 vision_route.update(
                     {
@@ -7103,7 +7183,7 @@ class ResearchAgentRuntime:
                     evidence_db,
                     rows,
                     provider=local_evidence.embedding_provider,
-                    cache_batch_size=128,
+                    cache_batch_size=2048,
                     progress_callback=report_progress,
                     cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
                 )
@@ -7708,7 +7788,10 @@ class ResearchAgentRuntime:
         result["imported"] = imported
         result["evidence_status"] = "indexed_fulltext"
         try:
-            index_run = self.start_evidence_index(str(notebook_id))
+            # Full-text import is already useful without dense vectors.  Do
+            # not turn a follow-up download into an unexpected GPU rebuild
+            # when the notebook has compatible cached vectors to reuse.
+            index_run = self.start_evidence_index(str(notebook_id), automatic=True)
         except Exception as error:  # neural prewarm is optional after full-text indexing
             result["evidence_index_error"] = f"{type(error).__name__}: {error}"[:500]
         else:
@@ -8952,6 +9035,12 @@ class ResearchAgentRuntime:
                             else existing_reranker
                         ),
                     )
+        # If the stack is neural but the cache is still cold, start a
+        # background thread to build it.  The first query will already
+        # benefit from the fast (hashing) path; subsequent queries switch
+        # to the dense route automatically once the warm is done.
+        if stack_base != "fast" and not neural_cache_ready and target.is_file():
+            self._maybe_warm_cache_in_background(target, self._local_evidence_models[stack_kind])
         return self._local_evidence_models[stack_kind]
 
     def _academic_discovery_stack(self) -> LocalEvidenceStack:
