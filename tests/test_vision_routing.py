@@ -102,3 +102,97 @@ def test_ocr_fallback_reports_unavailable_without_raising(monkeypatch):
     assert result["available"] is False
     assert result["backend"] == "unavailable"
     assert "Tesseract" in result["message"]
+
+
+def test_system_ocr_prefers_native_backend_before_tesseract(monkeypatch):
+    monkeypatch.setattr(
+        vision_routing,
+        "_system_ocr_image_blocks",
+        lambda *_args, **_kwargs: {
+            "text": "Windows OCR text",
+            "backend": "windows-ocr",
+            "available": True,
+            "message": "已使用 Windows 系统 OCR",
+        },
+    )
+    monkeypatch.setattr(vision_routing, "_tesseract_path", lambda: "")
+
+    result = vision_routing.ocr_image_blocks(
+        [{"mime_type": "image/png", "data": "aGVsbG8="}],
+        settings={"document_processing": {"ocr": {"provider": "system", "enabled": True}}},
+    )
+
+    assert result["backend"] == "windows-ocr"
+    assert result["available"] is True
+    assert result["text"] == "Windows OCR text"
+
+
+def test_system_ocr_status_reports_installed_languages(monkeypatch):
+    class FakeLanguage:
+        def __init__(self, tag):
+            self.language_tag = tag
+
+    class FakeEngine:
+        @staticmethod
+        def get_available_recognizer_languages():
+            return [FakeLanguage("zh-Hans-CN"), FakeLanguage("en-US")]
+
+        @staticmethod
+        def try_create_from_user_profile_languages():
+            return object()
+
+    monkeypatch.setattr(
+        vision_routing,
+        "_load_windows_ocr_runtime",
+        lambda **_kwargs: {"available": True, "OcrEngine": FakeEngine},
+    )
+
+    result = vision_routing.system_ocr_status(["zh", "en"])
+
+    assert result["available"] is True
+    assert result["backend"] == "windows-ocr"
+    assert result["selected_language"] == "zh-Hans-CN"
+    assert result["requested_supported"] is True
+
+
+def test_deepseek_ocr_uses_configured_siliconflow_endpoint(tmp_path: Path, monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "# 扫描页\n\n这是 OCR 结果。"}}]}
+
+    class FakeSession:
+        def post(self, url, *, headers, json, timeout):
+            calls.append((url, headers, json, timeout))
+            return FakeResponse()
+
+    monkeypatch.setattr(vision_routing, "get_document_service_api_key", lambda *_args: "siliconflow-secret")
+    result = vision_routing.ocr_image_blocks(
+        [{"mime_type": "image/png", "data": "aGVsbG8="}],
+        workspace=tmp_path,
+        settings={
+            "document_processing": {
+                "ocr": {
+                    "provider": "deepseek",
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "enabled": True,
+                }
+            }
+        },
+        session=FakeSession(),
+    )
+
+    assert result["backend"] == "deepseek-ocr"
+    assert result["available"] is True
+    assert result["text"].startswith("# 扫描页")
+    assert calls[0][0] == "https://api.siliconflow.cn/v1/chat/completions"
+    assert calls[0][1]["Authorization"] == "Bearer siliconflow-secret"
+    body = calls[0][2]
+    assert body["model"] == "deepseek-ai/DeepSeek-OCR"
+    assert body["messages"][0]["content"][0]["type"] == "text"
+    assert "<|grounding|>Convert the document to markdown." in body["messages"][0]["content"][0]["text"]
+    assert body["messages"][0]["content"][1]["image_url"]["url"] == "data:image/png;base64,aGVsbG8="

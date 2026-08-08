@@ -57,6 +57,9 @@ local-gpu = [
 desktop = [
   "pywebview>=6.0,<7.0",
   "pyinstaller>=6.0,<7.0",
+  # Windows.Media.Ocr projection used by the native System OCR provider.
+  "winsdk>=1.0.0b10,<2; sys_platform == 'win32'",
+  "Pillow>=10.0,<12",
 ]
 enhanced-document = [
   "docling>=2.70,<3",

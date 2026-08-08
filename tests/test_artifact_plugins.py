@@ -74,6 +74,23 @@ def test_latex_plugin_compiles_with_detected_runtime(tmp_path: Path) -> None:
     assert Path(artifact["file_path"]).is_file()
 
 
+def test_find_tectonic_does_not_probe_codex_plugin_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scansci_html.artifact_plugins as artifact_plugins
+
+    class _NoManagedTectonic:
+        def executable(self) -> None:
+            return None
+
+    monkeypatch.setattr(artifact_plugins, "default_tectonic_component", lambda: _NoManagedTectonic())
+    monkeypatch.setattr(artifact_plugins.shutil, "which", lambda _name: None)
+
+    def _unexpected_home() -> Path:
+        raise AssertionError("find_tectonic must not inspect the Codex plugin cache")
+
+    monkeypatch.setattr(Path, "home", staticmethod(_unexpected_home))
+    assert artifact_plugins.find_tectonic() is None
+
+
 def test_plugin_runtime_statuses_cover_every_builtin() -> None:
     statuses = plugin_runtime_statuses()
     assert set(statuses) == {"zotero", "documents", "pdf", "spreadsheets", "presentations", "latex"}

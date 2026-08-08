@@ -23,7 +23,7 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
     assert settings["providers"][0]["api_key_configured"] is True
     assert {
         model["id"] for model in settings["providers"][0]["models"]
-    } == {"glm-4.7-flash", "Qwen/Qwen2.5-7B-Instruct"}
+    } == {"glm-4.7-flash"}
     assert settings["local_models"][0]["runtime"] == "builtin"
     assert settings["local_models"][0]["name"] == "离线基础检索（非模型）"
     assert settings["local_models"][0]["model_id"] == "local-hash-v1 / local-lexical-v1"
@@ -31,7 +31,7 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
     assert offline_provider["name"] == "离线基础检索（非模型）"
     assert offline_provider["models"][0]["name"] == "关键词检索与词法重排（非模型）"
     assert settings["model_roles"]["retrieval"] == "local:builtin-evidence"
-    assert settings["document_processing"]["ocr"]["provider"] == "system"
+    assert settings["document_processing"]["ocr"]["provider"] == "tesseract"
     assert settings["document_processing"]["mineru"]["base_url"] == "https://mineru.net"
     assert settings["document_processing"]["mineru"]["api_key_configured"] is False
     assert settings["onboarding"] == {
@@ -39,18 +39,14 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
         "resource_setup_completed": False,
         "data_setup_completed": False,
     }
-    assert settings["appearance"] == {"locale": "zh-CN", "theme": "system", "accent": "jade"}
+    assert settings["appearance"] == {"locale": "zh-CN", "theme": "system", "accent": "jade", "font_scale": "medium"}
     assert not settings_path(tmp_path / "workspace.sqlite").exists()
 
 
 def test_managed_model_catalog_separates_routes_from_approved_fallbacks():
-    assert managed_model_ids() == (
-        "glm-4.7-flash",
-        "Qwen/Qwen2.5-7B-Instruct",
-    )
+    assert managed_model_ids() == ("glm-4.7-flash",)
     assert managed_probe_model_ids() == ("glm-4.7-flash",)
     assert managed_fallback_model_ids("glm-4.7-flash") == ()
-    assert managed_fallback_model_ids("Qwen/Qwen2.5-7B-Instruct") == ()
 
 
 @pytest.mark.skip(reason="Qwen removed; WIP")
@@ -188,12 +184,12 @@ def test_appearance_preferences_are_persisted_and_normalized(tmp_path: Path):
         {"appearance": {"locale": "en", "theme": "dark", "accent": "ocean"}},
     )
 
-    assert settings["appearance"] == {"locale": "en", "theme": "dark", "accent": "ocean"}
+    assert settings["appearance"] == {"locale": "en", "theme": "dark", "accent": "ocean", "font_scale": "medium"}
     persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
-    assert persisted["appearance"] == {"locale": "en", "theme": "dark", "accent": "ocean"}
+    assert persisted["appearance"] == {"locale": "en", "theme": "dark", "accent": "ocean", "font_scale": "medium"}
 
     normalized = save_settings(workspace, {"appearance": {"locale": "fr", "theme": "neon", "accent": "red"}})
-    assert normalized["appearance"] == {"locale": "zh-CN", "theme": "system", "accent": "jade"}
+    assert normalized["appearance"] == {"locale": "zh-CN", "theme": "system", "accent": "jade", "font_scale": "medium"}
 
 
 def test_provider_and_local_runtime_presets_are_credential_free():
@@ -202,7 +198,7 @@ def test_provider_and_local_runtime_presets_are_credential_free():
 
     assert {item["id"] for item in providers} >= {"openai", "anthropic", "gemini", "deepseek", "dashscope", "openrouter", "zai", "moonshot", "minimax", "siliconflow"}
     assert all("api_key" not in item for item in providers)
-    assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp"}
+    assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp", "local-huggingface"}
 
 
 def test_provider_catalog_includes_cherry_documented_and_desktop_services():
@@ -304,7 +300,7 @@ def test_selected_non_default_model_survives_a_fresh_settings_load(tmp_path: Pat
         {
             "active_model": {
                 "provider_id": "deepseek",
-                "model_id": "deepseek-chat",
+                "model_id": "deepseek-v4-pro",
             },
             "providers": [{
                 "id": "deepseek",
@@ -313,8 +309,8 @@ def test_selected_non_default_model_survives_a_fresh_settings_load(tmp_path: Pat
                 "base_url": "https://api.deepseek.com",
                 "enabled": True,
                 "models": [{
-                    "id": "deepseek-chat",
-                    "name": "DeepSeek Chat",
+                    "id": "deepseek-v4-pro",
+                    "name": "DeepSeek V4 Pro",
                     "capabilities": ["reasoning", "tool"],
                 }],
             }],
@@ -325,7 +321,7 @@ def test_selected_non_default_model_survives_a_fresh_settings_load(tmp_path: Pat
 
     assert reloaded["active_model"] == {
         "provider_id": "deepseek",
-        "model_id": "deepseek-chat",
+        "model_id": "deepseek-v4-pro",
     }
     managed = next(item for item in reloaded["providers"] if item["id"] == "scansci-managed")
     assert managed["name"] == "ScanSci"
@@ -495,3 +491,23 @@ def test_document_processing_preserves_paddle_ocr_provider(tmp_path: Path):
 
     assert settings["document_processing"]["ocr"]["provider"] == "paddle"
     assert settings["document_processing"]["ocr"]["base_url"] == ""
+
+
+def test_document_processing_preserves_deepseek_ocr_provider(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = save_settings(
+        workspace,
+        {
+            "document_processing": {
+                "ocr": {
+                    "provider": "deepseek",
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "languages": ["zh", "en"],
+                    "enabled": True,
+                },
+            },
+        },
+    )
+
+    assert settings["document_processing"]["ocr"]["provider"] == "deepseek"
+    assert settings["document_processing"]["ocr"]["base_url"] == "https://api.siliconflow.cn/v1"

@@ -1,3 +1,5 @@
+const sidebarCollapsedPreference = window.localStorage.getItem("scansci.sidebar.collapsed");
+
 const state = {
   workspace: null,
   notebook: null,
@@ -14,6 +16,7 @@ const state = {
   onboardingOpen: false,
   onboardingStep: "welcome",
   onboardingMode: "",
+  resourceGuideStep: 0,
   onboardingPersisting: false,
   pendingLocalModelResource: "",
   capabilities: null,
@@ -129,7 +132,8 @@ const state = {
   inlineSlidePreviewPage: "",
   slideTemplateQuery: "",
   lastRunRenderKey: "",
-  sidebarCollapsed: window.localStorage.getItem("scansci.sidebar.collapsed") === "true",
+  sidebarCollapsed: sidebarCollapsedPreference === "true"
+    || (sidebarCollapsedPreference === null && window.innerWidth <= 900),
   sidebarWidth: Math.max(260, Math.min(520, Number(window.localStorage.getItem("scansci.sidebar.width")) || 352)),
   thinkingLevel: ["auto", "low", "medium", "high"].includes(window.localStorage.getItem("scansci.thinking.level"))
     ? window.localStorage.getItem("scansci.thinking.level")
@@ -1377,11 +1381,17 @@ function bindCitationInteractions(result, scope = byId("answerArea")) {
 
 function toast(message, isError = false) {
   const target = byId("toast");
+  if (!target) return;
   target.textContent = message;
   target.classList.toggle("is-error", isError);
+  target.setAttribute("role", isError ? "alert" : "status");
+  target.setAttribute("aria-live", isError ? "assertive" : "polite");
   target.classList.add("is-visible");
   window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => target.classList.remove("is-visible"), 2800);
+  toast.timer = window.setTimeout(
+    () => target.classList.remove("is-visible"),
+    isError ? 10000 : 2800,
+  );
 }
 
 function closeNotionWizard(result = null) {
@@ -1959,6 +1969,24 @@ function bootstrapPresetsFallback() {
   return { providers: [], local_models: [] };
 }
 
+function mergeProviderCatalogIntoSettings(settings, presets) {
+  const base = settings && typeof settings === "object" ? settings : bootstrapSettingsFallback();
+  const currentProviders = Array.isArray(base.providers) ? base.providers : [];
+  const presetProviders = Array.isArray(presets?.providers) ? presets.providers : [];
+  const knownIds = new Set(currentProviders.map((provider) => String(provider?.id || "")).filter(Boolean));
+  const missingProviders = presetProviders
+    .filter((preset) => preset && preset.id && !knownIds.has(String(preset.id)))
+    .map((preset) => ({
+      ...preset,
+      enabled: String(preset.id) === "scansci-managed",
+      api_key_configured: String(preset.id) === "scansci-managed",
+      models: Array.isArray(preset.models) ? preset.models.map((model) => ({ ...model })) : [],
+    }));
+  return missingProviders.length
+    ? { ...base, providers: [...currentProviders, ...missingProviders] }
+    : base;
+}
+
 async function initialize() {
   const bootstrapWarnings = [];
   const safeBootstrapRequest = async (path, fallback, label) => {
@@ -1999,8 +2027,12 @@ async function initialize() {
     state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === rememberedNotebookId)
       || (state.workspace.notebooks || [])[0]
       || null;
-    state.settings = settings || bootstrapSettingsFallback();
     state.presets = presets || bootstrapPresetsFallback();
+    // Keep the full provider catalog visible even when the settings request
+    // temporarily falls back to the minimal built-in ScanSci snapshot. The
+    // catalog contains no credentials; user-specific values still come from
+    // the successful /api/settings response and remain authoritative.
+    state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);
     state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
     state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed);
@@ -3749,7 +3781,16 @@ function installSidebarResizer() {
     } else return;
     applySidebarWidth({ persist: true });
   });
-  window.addEventListener("resize", () => applySidebarWidth());
+  let wasNarrowWindow = window.innerWidth <= 900;
+  window.addEventListener("resize", () => {
+    const isNarrowWindow = window.innerWidth <= 900;
+    if (isNarrowWindow && !wasNarrowWindow && window.localStorage.getItem("scansci.sidebar.collapsed") === null) {
+      state.sidebarCollapsed = true;
+      applySidebarState();
+    }
+    wasNarrowWindow = isNarrowWindow;
+    applySidebarWidth();
+  });
 }
 
 function maxContextPanelWidth() {
@@ -6186,6 +6227,7 @@ async function pollGuidedLibraryImport() {
   const jobId = state.libraryImportJob?.job_id;
   if (!jobId) return;
   try {
+    const previousJobState = state.libraryImportJob?.state;
     const job = await request(`/api/library/import-jobs/${encodeURIComponent(jobId)}`);
     state.libraryImportJob = job;
     if (job.state === "completed" && job.result && state.libraryImportAppliedJobId !== jobId) {
@@ -6206,6 +6248,12 @@ async function pollGuidedLibraryImport() {
         progress: Number(job.progress || 0),
         error: String(job.error || "资料索引未完成"),
       };
+      if (previousJobState !== "failed") {
+        const failureDetail = String(
+          job.detail || job.error || "无法遍历所选路径，请确认文件夹存在且有读取权限。",
+        );
+        toast(`资料接入失败：${failureDetail}`, true);
+      }
       if (String(job.library_kind || "") === "zotero") {
         const notebook = (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === notebookId) || state.notebook;
         state.zoteroConnectionIssue = {
@@ -6231,6 +6279,7 @@ async function pollGuidedLibraryImport() {
       detail: "原文件没有被修改；请在设置中重新开始接入。",
       error: error.message || "资料接入状态请求失败",
     };
+    toast(`资料接入失败：${error.message || "无法读取导入任务状态，请稍后重试。"}`, true);
     renderResourceOnboarding();
   }
 }
@@ -8436,6 +8485,12 @@ const ONBOARDING_AUDIO_MODEL = "Qwen/Qwen3-ASR-0.6B-hf";
 // prerequisite for the guided download flow.
 const ONBOARDING_VISION_MODEL = "openbmb/MiniCPM-V-4.6-BNB";
 const ONBOARDING_RESOURCE_ORDER = ["embedding", "reranking", "chat", "vision", "audio"];
+const RESOURCE_GUIDE_STEPS = [
+  { id: "retrieval", label: "研究检索组件", eyebrow: "第 1 页 · 研究检索组件", title: "先把研究检索准备好", description: "嵌入模型负责召回，重排模型负责筛选；这是最推荐优先配置的一组本地能力。", resourceIds: ["embedding", "reranking"] },
+  { id: "knowledge", label: "知识库链接", eyebrow: "第 2 页 · 知识库链接", title: "把你的资料链接进来", description: "模型准备好后，再选择知识库和资料源。原文件留在原处，ScanSci 只建立本地索引与证据定位。", resourceIds: [] },
+  { id: "multimodal", label: "视觉与语音", eyebrow: "第 3 页 · 视觉与语音", title: "按需添加视觉和语音", description: "图片理解与语音转写彼此独立；没有对应需求时可以直接跳过。", resourceIds: ["vision", "audio"] },
+  { id: "chat", label: "小型本地对话模型", eyebrow: "第 4 页 · 可选能力", title: "最后再考虑本地对话", description: "小型本地对话模型不是必需项。只有在你希望离线对话或网络不稳定时，才建议安装。", resourceIds: ["chat"] },
+];
 
 const ONBOARDING_RESOURCE_DEFINITIONS = {
   embedding: {
@@ -8667,25 +8722,74 @@ function onboardingSourceCard({ kind, action, title, description, actionLabel })
   return `<article class="data-source-card ${count ? "is-connected" : ""} ${importing ? "is-importing" : ""}"><span class="data-source-card-icon ${escapeHtml(kind)}">${onboardingSourceIcon(kind)}</span><div><header><strong>${escapeHtml(title)}</strong><i>${escapeHtml(status)}</i></header><p>${escapeHtml(description)}</p><button type="button" data-action="${escapeHtml(action)}" ${importing ? "disabled" : ""}>${uiIcon(count ? "plus" : "arrow-up-right")}${escapeHtml(actionLabel)}</button></div></article>`;
 }
 
+function installResourceOnboardingDragHandle(host) {
+  const backdrop = host?.querySelector?.(".resource-onboarding-backdrop");
+  if (!backdrop || backdrop.querySelector(".resource-onboarding-window-drag")) return;
+  const handle = document.createElement("div");
+  handle.className = "resource-onboarding-window-drag pywebview-drag-region";
+  handle.dataset.titlebarDrag = "";
+  handle.setAttribute("aria-hidden", "true");
+  backdrop.prepend(handle);
+}
+
 function renderDataOnboarding() {
   const sources = connectedDataSourceCount();
   return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("library")}</div><h1 id="resourceOnboardingTitle">把资料留在原处，<br />让证据变得可用。</h1><p>选择你愿意连接的资料源。ScanSci 只读取内容、建立本地索引与引用定位，不会移动或上传原文件。</p><div class="resource-onboarding-note"><span>${uiIcon("map-pin")}</span><p>每条回答都可回到文档、章节和原文证据片段。扫描件无法读取时会明确提示你启用 OCR。</p></div></aside><main class="resource-onboarding-main data-onboarding-main"><header><div><span>资料接入</span><h2>从一个资料源开始就够了</h2><p>连接后会自动完成：文档 → 章节 → 原文证据片段。其他资料源可随后在知识库中添加。</p></div><span class="resource-onboarding-step">02 / 02</span></header><div class="data-source-grid">${onboardingSourceCard({ kind: "folder", action: "onboarding-connect-folder", title: "本地文件夹", description: "递归读取论文、报告、Markdown 和常见办公文档。", actionLabel: "选择文件夹" })}${onboardingSourceCard({ kind: "zotero", action: "onboarding-connect-zotero", title: "Zotero", description: "连接本机文献库与其已管理的论文附件。", actionLabel: "连接 Zotero" })}${onboardingSourceCard({ kind: "obsidian", action: "onboarding-connect-obsidian", title: "Obsidian", description: "保留 Vault 的笔记层级，并为每个段落建立定位。", actionLabel: "选择 Vault" })}${onboardingSourceCard({ kind: "notion", action: "onboarding-connect-notion", title: "Notion", description: "使用你的 Integration 同步已授权的页面和数据库。", actionLabel: "连接 Notion" })}</div>${guidedImportJobMarkup()}<footer><p>${sources ? `<strong>已连接 ${sources} 个资料源。</strong> 你可完成配置；资料仍会在后台建立语义索引。` : "不接入资料也可先体验 ScanSci；随时可在 设置 · 默认能力 或 知识库 中继续。"}</p><div><button type="button" class="resource-skip-button" data-action="back-resource-onboarding">上一步</button><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button>${sources ? `<button type="button" class="resource-finish-button" data-action="finish-data-onboarding">完成并开始 ${uiIcon("arrow-up-right")}</button>` : ""}</div></footer></main></section></div>`;
 }
 
+function resourceGuideStepIndex() {
+  const index = Number(state.resourceGuideStep);
+  return Number.isInteger(index) ? Math.max(0, Math.min(RESOURCE_GUIDE_STEPS.length - 1, index)) : 0;
+}
+
+function resourceGuideStepRail(currentIndex) {
+  return RESOURCE_GUIDE_STEPS.map((step, index) => `<li class="resource-guide-step ${index === currentIndex ? "is-current" : index < currentIndex ? "is-complete" : ""}"><span>${index < currentIndex ? uiIcon("check") : index + 1}</span><small>${escapeHtml(step.label)}</small></li>`).join("");
+}
+
+function resourceGuideKnowledgePage() {
+  const sourceCount = connectedDataSourceCount();
+  return `<div class="resource-guide-page is-knowledge">
+    <section class="guide-destination resource-guide-destination is-library"><span class="guide-destination-icon">${uiIcon("library")}</span><div><span>工作区 · 知识库</span><h3>${sourceCount ? `已连接 ${sourceCount} 个资料源` : "选择知识库，再链接资料"}</h3><p>知识库负责管理文件夹、Zotero 和其他资料源，并建立文档、章节与证据片段的定位。</p><div class="guide-destination-tags"><b>原文件不移动</b><b>可随时添加</b><b>支持 Zotero</b></div></div><button type="button" class="guide-destination-action" data-action="open-data-onboarding">${sourceCount ? "管理知识库" : "打开知识库"} ${uiIcon("arrow-up-right")}</button></section>
+    <div class="resource-guide-note-grid"><article><span>${uiIcon("folder-open")}</span><div><strong>资料仍在原处</strong><p>连接只是建立本地索引，不会复制、移动或上传你的原文件。</p></div></article><article><span>${uiIcon("map-pin")}</span><div><strong>回答可回到证据</strong><p>后续回答会尽量返回文档、章节和原文片段位置。</p></div></article></div>
+  </div>`;
+}
+
+function resourceGuidePageMarkup(step) {
+  if (step.id === "knowledge") return resourceGuideKnowledgePage();
+  const resources = step.resourceIds.map((resourceId) => resourceSetupCard(resourceInstallSnapshot(resourceId))).join("");
+  if (step.id === "retrieval") {
+    return `<div class="resource-guide-page is-retrieval"><div class="resource-guide-model-grid">${resources}</div><aside class="resource-guide-cuda-card"><span class="resource-guide-cuda-icon">${uiIcon("gpu")}</span><div><strong>CUDA 加速（可选）</strong><p>检测到 NVIDIA GPU 时会自动优先使用；没有 CUDA 也可以继续使用 CPU，不影响基础检索。</p><span class="resource-guide-cuda-status" data-cuda-status>正在检测本机 CUDA…</span></div></aside></div>`;
+  }
+  if (step.id === "chat") {
+    return `<div class="resource-guide-page is-chat"><div class="resource-guide-optional-banner">${uiIcon("info")}<span>这是可选的第四页，不安装也不影响 ScanSci 的基础对话、联网模型和关键词检索。</span></div><div class="resource-guide-model-grid is-single">${resources}</div></div>`;
+  }
+  return `<div class="resource-guide-page is-multimodal"><div class="resource-guide-model-grid">${resources}</div><div class="guide-tip resource-guide-tip">${uiIcon("sparkles")}<span>视觉模型用于图片和图表理解；语音模型用于把录音转成文字。两者可以分别下载。</span></div></div>`;
+}
+
 function renderResourceGuideOverlay() {
   const snapshots = ONBOARDING_RESOURCE_ORDER.map((resourceId) => resourceInstallSnapshot(resourceId));
   const readyCount = snapshots.filter((resource) => resource.state === "ready").length;
-  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL</span><div class="resource-onboarding-glyph">${uiIcon("download")}</div><h1 id="resourceGuideTitle">需要什么，<br />再下载什么。</h1><p>本地模型都是可选能力。下载完成后会显示“已就绪”，ScanSci 会在需要时自动使用。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>默认能力 · 按需添加</span><h2>选择你现在需要的本地能力</h2><p>只点击需要的卡片；首次使用会自动准备 ScanSci 本地运行能力，然后继续下载。</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span><span class="resource-guide-cuda" data-cuda-status></span></header><div class="resource-setup-cards resource-guide-resource-list">${snapshots.map(resourceSetupCard).join("")}</div><footer><p>关闭后可以从“默认能力”页右上角再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button><button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成 ${uiIcon("check")}</button></div></footer></main></section></div>`;
+  const currentIndex = resourceGuideStepIndex();
+  const step = RESOURCE_GUIDE_STEPS[currentIndex];
+  const lastStep = currentIndex === RESOURCE_GUIDE_STEPS.length - 1;
+  const backButton = currentIndex > 0 ? `<button type="button" class="resource-skip-button" data-action="resource-guide-back">上一步</button>` : "";
+  const nextButton = lastStep
+    ? `<button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成向导 ${uiIcon("check")}</button>`
+    : `<button type="button" class="resource-finish-button" data-action="resource-guide-next">下一页 ${uiIcon("arrow-right")}</button>`;
+  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card resource-guide-wizard" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(step.id === "knowledge" ? "library" : step.id === "multimodal" ? "eye" : step.id === "chat" ? "brain" : "download")}</div><h1 id="resourceGuideTitle">把本地能力<br />一步步配好。</h1><p>按照研究检索、知识库、视觉语音和本地对话的顺序配置；每一页都可以跳过。</p><ol class="resource-guide-step-rail">${resourceGuideStepRail(currentIndex)}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>${escapeHtml(step.eyebrow)}</span><h2>${escapeHtml(step.title)}</h2><p>${escapeHtml(step.description)}</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span></header><div class="resource-guide-wizard-body">${resourceGuidePageMarkup(step)}</div><footer><p>第 ${currentIndex + 1} / ${RESOURCE_GUIDE_STEPS.length} 页 · 关闭后可从“默认能力”页再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button>${backButton}${nextButton}</div></footer></main></section></div>`;
 }
 
 function openResourceGuideOverlay() {
   state.onboardingMode = "resources";
+  state.resourceGuideStep = 0;
   state.onboardingOpen = true;
   renderResourceOnboarding();
+  refreshCudaStatus();
 }
 
 async function closeResourceGuideOverlay(result = "skip") {
   state.onboardingMode = "";
+  state.resourceGuideStep = 0;
   if (result === "complete") {
     await persistOnboardingPreferences(
       { resource_setup_completed: true },
@@ -8710,11 +8814,13 @@ function renderLegacyResourceOnboarding() {
   if (state.onboardingStep === "sources") {
     host.hidden = false;
     host.innerHTML = renderDataOnboarding();
+    installResourceOnboardingDragHandle(host);
     hydrateIcons(host);
     return;
   }
   host.hidden = false;
   host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>资源配置</span><h2>按能力分别添加</h2><p>嵌入和重排负责知识库检索；视觉、语音和本地对话按需开启。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>每项模型都可单独下载。跳过不会影响基础使用，之后可在设置里继续。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
+  installResourceOnboardingDragHandle(host);
   hydrateIcons(host);
 }
 
@@ -8742,11 +8848,13 @@ function renderResourceOnboarding() {
   if (state.onboardingMode === "resources") {
     host.hidden = false;
     host.innerHTML = renderResourceGuideOverlay();
+    installResourceOnboardingDragHandle(host);
     hydrateIcons(host);
     return;
   }
   host.hidden = false;
   host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card guide-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside guide-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(current === "knowledge" ? "library" : current === "models" ? "settings" : "sparkles")}</div><h1 id="resourceOnboardingTitle">把研究桌面<br />用顺手。</h1><p>三步认识 ScanSci，配置按需进行，想跳过也完全可以。</p><ol class="guide-step-rail">${stepRail}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>设置和资料只保存在这台电脑上；你可以随时回到对应页面继续。</p></div></aside><main class="resource-onboarding-main guide-onboarding-main">${panels[current]}</main></section></div>`;
+  installResourceOnboardingDragHandle(host);
   hydrateIcons(host);
 }
 
@@ -9808,7 +9916,8 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
     : tesseractSelected
       ? "解决：安装 Tesseract 后点击重新检测；中文识别还需要 chi_sim.traineddata。"
       : "解决：打开 Windows 设置 → 时间和语言 → 语言和区域，安装对应语言包；也可以切换为 Tesseract。");
-  const systemOcrGuide = `<aside class="system-ocr-status is-${systemTone} is-${tesseractSelected ? "tesseract" : "windows"}"><span class="system-ocr-status-icon">${systemStatus.loading ? "…" : systemStatus.available && systemStatus.requested_supported !== false ? uiIcon("check") : uiIcon("info")}</span><div class="system-ocr-status-copy"><strong>${systemTitle}</strong><p>${escapeHtml(systemStatus.message || `${ocrStatusName} 可用于本地识别图片文字。`)}</p><small>${escapeHtml(ocrSolution || installedLanguages)}</small></div><button type="button" class="system-ocr-refresh" data-action="refresh-system-ocr-status" ${systemStatus.loading ? "disabled" : ""}>重新检测</button></aside>`;
+  const systemOcrReady = !systemStatus.loading && systemStatus.available && systemStatus.requested_supported !== false;
+  const systemOcrGuide = systemOcrReady ? "" : `<aside class="system-ocr-status is-${systemTone} is-${tesseractSelected ? "tesseract" : "windows"}"><span class="system-ocr-status-icon">${systemStatus.loading ? "…" : systemStatus.available && systemStatus.requested_supported !== false ? uiIcon("check") : uiIcon("info")}</span><div class="system-ocr-status-copy"><strong>${systemTitle}</strong><p>${escapeHtml(systemStatus.message || `${ocrStatusName} 可用于本地识别图片文字。`)}</p><small>${escapeHtml(ocrSolution || installedLanguages)}</small></div><button type="button" class="system-ocr-refresh" data-action="refresh-system-ocr-status" ${systemStatus.loading ? "disabled" : ""}>重新检测</button></aside>`;
   const ocrConnection = deepseekSelected ? `<div class="document-service-fields"><label class="setting-field"><span>硅基流动 API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "https://api.siliconflow.cn/v1")}" placeholder="https://api.siliconflow.cn/v1" maxlength="500" /></label><label class="setting-field"><span>硅基流动 API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "粘贴硅基流动 API 密钥"}" /></label></div><p class="document-service-note">使用模型 <code>deepseek-ai/DeepSeek-OCR</code> 将图片发送到硅基流动；未配置密钥或调用失败时自动回退到本地 OCR。<a href="https://cloud.siliconflow.cn/models?target=deepseek-ai/DeepSeek-OCR" target="_blank" rel="noreferrer">查看模型与额度 ${uiIcon("arrow-up-right")}</a></p>` : ocr.provider === "custom" ? `<div class="document-service-fields"><label class="setting-field"><span>API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "")}" placeholder="https://ocr.example.com/v1" maxlength="500" /></label><label class="setting-field"><span>API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "可选，保存后仅存于系统凭据管理器"}" /></label></div>` : tesseractSelected || ocr.provider === "system" ? systemOcrGuide : "";
   const paddleGuide = paddleSelected ? `<aside class="paddle-ocr-guide is-configuring"><span class="paddle-ocr-guide-icon">P</span><div class="paddle-ocr-guide-main"><header><strong>PaddleOCR</strong><em>飞桨 AI Studio</em></header><p>需要 PaddleOCR 时填写 Access Token；令牌只保存在这台电脑。</p><label class="setting-field paddle-ocr-token-field"><span>Access Token</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存；输入新值以替换" : "粘贴 AI Studio Access Token"}" ${ocr.api_key_configured ? "" : "required"} /></label></div><div class="paddle-ocr-guide-actions"><a href="https://aistudio.baidu.com/account/accessToken" target="_blank" rel="noreferrer">获取 Token ${uiIcon("arrow-up-right")}</a></div></aside>` : "";
   const mineruName = mineru.provider === "mineru" ? "MinerU" : "自定义文档解析服务";
@@ -10399,6 +10508,18 @@ async function handleSettingsAction(action, element) {
   }
   if (action === "close-resource-guide") {
     await closeResourceGuideOverlay(element.dataset.resourceGuideResult || "skip");
+    return;
+  }
+  if (action === "resource-guide-next") {
+    state.resourceGuideStep = Math.min(RESOURCE_GUIDE_STEPS.length - 1, resourceGuideStepIndex() + 1);
+    renderResourceOnboarding();
+    refreshCudaStatus();
+    return;
+  }
+  if (action === "resource-guide-back") {
+    state.resourceGuideStep = Math.max(0, resourceGuideStepIndex() - 1);
+    renderResourceOnboarding();
+    refreshCudaStatus();
     return;
   }
   if (action === "start-onboarding-resource") {
@@ -12263,6 +12384,13 @@ async function compactSession() {
 byId("sourceFilter").addEventListener("input", (event) => {
   state.sourceQuery = event.target.value;
   renderSources();
+});
+
+byId("toast")?.addEventListener("click", () => {
+  const target = byId("toast");
+  if (!target?.classList.contains("is-error")) return;
+  target.classList.remove("is-visible");
+  window.clearTimeout(toast.timer);
 });
 
 byId("slideTemplateSearch").addEventListener("input", (event) => {

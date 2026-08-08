@@ -39,7 +39,7 @@ def test_desktop_launches_native_shell_against_ephemeral_loopback_server(tmp_pat
     assert fake.window is not None
     assert fake.window["title"] == "ScanSci Test"
     assert str(fake.window["url"]).startswith("http://127.0.0.1:")
-    assert fake.window["options"]["min_size"] == (1080, 700)
+    assert fake.window["options"]["min_size"] == (800, 560)
     assert fake.window["options"]["resizable"] is True
     assert fake.window["options"]["frameless"] is True
     assert fake.window["options"]["easy_drag"] is False

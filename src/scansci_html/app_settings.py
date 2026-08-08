@@ -291,7 +291,7 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "document_processing": {
         "ocr": {
-            "provider": "system",
+            "provider": "tesseract",
             "base_url": "",
             "languages": ["zh", "en"],
             "enabled": True,
@@ -922,8 +922,8 @@ def _normalize_document_processing(value: object) -> dict[str, Any]:
     mineru_source = source.get("mineru") if isinstance(source.get("mineru"), dict) else {}
 
     ocr_provider = _text(ocr_source.get("provider"), fallback=defaults["ocr"]["provider"], limit=32).lower()
-    if ocr_provider not in {"system", "paddle", "custom"}:
-        ocr_provider = "system"
+    if ocr_provider not in {"tesseract", "system", "paddle", "deepseek", "custom"}:
+        ocr_provider = "tesseract"
     language_source = ocr_source.get("languages") if isinstance(ocr_source.get("languages"), list) else []
     languages = [
         code

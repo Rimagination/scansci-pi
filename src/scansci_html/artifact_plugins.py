@@ -398,9 +398,12 @@ def find_tectonic() -> Path | None:
     path_command = shutil.which("tectonic")
     if path_command:
         candidates.append(Path(path_command))
-    codex_plugins = Path.home() / ".codex" / "plugins" / "cache" / "openai-bundled" / "latex"
-    if codex_plugins.is_dir():
-        candidates.extend(sorted(codex_plugins.glob("*/bin/tectonic.exe"), reverse=True))
+    # Do not scan external agent/plugin caches here.  On Windows, the Codex
+    # plugin cache may be exposed through a restricted mount point; merely
+    # checking or globbing that directory can raise WinError 448 while the
+    # settings page is loading.  Release packages carry their own Tectonic
+    # binary, and source installs should use an explicit managed component or
+    # a normal PATH installation instead.
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()

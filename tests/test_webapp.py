@@ -272,6 +272,8 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "settings-select-menu" in script
     assert "resourceInstallGuideGroup" in script
     assert "resource-install-grid" in script
+    assert "function mergeProviderCatalogIntoSettings" in script
+    assert "state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);" in script
     assert "local-installed-panel" in script
     assert "default-tools-disclosure" in script
     assert ".local-recommendation-grid" in styles
@@ -280,6 +282,9 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert ".settings-content select" in styles
     assert ".settings-select-menu" in styles
     assert ".guide-onboarding-card" in styles
+    assert "installResourceOnboardingDragHandle" in script
+    assert ".resource-onboarding-window-drag" in styles
+    assert "isError ? 10000 : 2800" in script
 
 
 def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path):
@@ -540,6 +545,9 @@ def test_review_entry_uses_grounded_workflow_with_source_scope_and_notes(tmp_pat
     assert "save-review-note" in script
     assert "选择保存位置" in script
     assert "choose-review-save-folder" in script
+    assert "function reviewPickedFolderPath(value)" in script
+    assert "reviewSaveFolderInput" in script
+    assert "browserFolderMode === \"input\"" in script
     assert "reviewSaveNewFolderInput" in script
     assert "new_folder_name" in script
 
@@ -727,6 +735,9 @@ def test_sidebar_resizer_keeps_the_saved_width_at_desktop_breakpoints(tmp_path: 
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
 
     assert "function installSidebarResizer" in script
+    assert 'const sidebarCollapsedPreference = window.localStorage.getItem("scansci.sidebar.collapsed");' in script
+    assert 'sidebarCollapsedPreference === null && window.innerWidth <= 900' in script
+    assert 'const isNarrowWindow = window.innerWidth <= 900;' in script
     assert 'workbench.style.setProperty("--sidebar-width"' in script
     assert 'window.localStorage.setItem("scansci.sidebar.width"' in script
     assert styles.count("grid-template-columns: var(--sidebar-width) minmax(0, 1fr)") >= 3
@@ -1255,6 +1266,44 @@ def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):
     assert saved["active_model"] == {"provider_id": "local", "model_id": "retrieval"}
     assert saved["providers"][0]["api_key_configured"] is False
     assert (workspace.parent / ".scansci-notebook.json").exists()
+
+
+def test_notebook_webapp_reports_system_ocr_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        "scansci_html.webapp.system_ocr_status",
+        lambda languages=None: {
+            "available": True,
+            "backend": "windows-ocr",
+            "languages": ["zh-Hans-CN"],
+            "requested_languages": languages or [],
+        },
+    )
+
+    status = _payload(app.dispatch("GET", "/api/settings/document-processing/ocr/status?languages=zh,en"))
+
+    assert status["backend"] == "windows-ocr"
+    assert status["requested_languages"] == ["zh", "en"]
+
+
+def test_notebook_webapp_reports_tesseract_status_separately(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        "scansci_html.webapp.tesseract_status",
+        lambda languages=None: {
+            "available": True,
+            "backend": "tesseract",
+            "languages": ["chi_sim", "eng"],
+            "requested_languages": languages or [],
+            "requested_supported": True,
+        },
+    )
+
+    status = _payload(app.dispatch("GET", "/api/settings/document-processing/ocr/status?provider=tesseract&languages=zh,en"))
+
+    assert status["provider"] == "tesseract"
+    assert status["backend"] == "tesseract"
+    assert status["requested_languages"] == ["zh", "en"]
 
 
 def test_provider_secret_reveal_is_explicit_and_kept_out_of_public_settings(

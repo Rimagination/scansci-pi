@@ -1605,6 +1605,32 @@ def test_evidence_index_reports_vectors_migrated_from_a_previous_store(tmp_path:
     assert run["input"]["migration_sources"] == [str(tmp_path / "legacy-evidence.sqlite")]
 
 
+def test_automatic_evidence_index_defers_when_vectors_can_be_reused(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"0" * 1_000_001)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    monkeypatch.setattr(
+        runtime,
+        "_notebook",
+        lambda notebook_id: {"notebook_id": notebook_id, "title": "Reusable library", "sources": []},
+    )
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "total": 100,
+            "completed": 80,
+            "serving_vectors": 80,
+            "ready": False,
+        },
+    )
+    monkeypatch.setattr(runtime, "start", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("automatic indexing should defer")))
+
+    assert runtime.start_evidence_index("review", automatic=True) is None
+
+
 def test_research_run_recovers_interrupted_process_as_paused(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     store = ResearchRunStore(workspace)

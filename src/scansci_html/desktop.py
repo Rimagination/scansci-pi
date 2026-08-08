@@ -653,7 +653,10 @@ def launch_desktop(
             f"http://127.0.0.1:{server.server_port}",
             width=1440,
             height=960,
-            min_size=(1080, 700),
+            # Keep the desktop usable on 14-inch displays and at higher OS
+            # scaling factors; the web layout collapses the sidebar when the
+            # initial viewport is narrow.
+            min_size=(800, 560),
             resizable=True,
             frameless=True,
             easy_drag=False,
