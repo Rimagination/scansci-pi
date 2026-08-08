@@ -60,6 +60,48 @@ def resolve_retrieval_device(device_preference: str | None = None) -> str:
     return "cuda:0" if cuda_available else "cpu"
 
 
+def cuda_status() -> dict[str, Any]:
+    """Return a safe GPU/CUDA snapshot for the settings UI.
+
+    This never imports large inference libraries; it only checks the
+    simple facts PyTorch already knows after its first import.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        return {"available": False, "message": "PyTorch 未安装。如需 GPU 加速，请安装 PyTorch。"}
+
+    available = bool(torch.cuda.is_available())
+    if not available:
+        return {
+            "available": False,
+            "torch_version": str(getattr(torch, "__version__", "unknown")),
+            "message": (
+                "当前 PyTorch 未检测到 CUDA。若你有 NVIDIA 显卡，请安装 CUDA 版 PyTorch："
+                "pip install torch --index-url https://download.pytorch.org/whl/cu124"
+            ),
+        }
+
+    device_count = int(torch.cuda.device_count())
+    devices: list[dict[str, str]] = []
+    for index in range(device_count):
+        try:
+            name = str(torch.cuda.get_device_name(index))
+            mem = int(torch.cuda.get_device_properties(index).total_memory)
+            devices.append({"index": index, "name": name, "memory_bytes": mem})
+        except Exception:
+            devices.append({"index": index, "name": "unknown"})
+    return {
+        "available": True,
+        "torch_version": str(getattr(torch, "__version__", "unknown")),
+        "device_count": device_count,
+        "devices": devices,
+        "resolved_device": resolve_retrieval_device(),
+        "message": "",
+    }
+
+
 def model_device(model: Any) -> str:
     """Return a model's effective device without assuming a specific library."""
 

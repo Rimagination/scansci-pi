@@ -110,6 +110,7 @@ from .slides_templates import list_slide_templates, slide_template_asset
 from .slide_studio import save_browser_rendered_deck
 from .telemetry import diagnostic_span, diagnostics_summary, export_diagnostics_bundle
 from .vector_index import vector_cache_status
+from .vision_routing import system_ocr_status, tesseract_status
 from .workspace import (
     add_note_to_notebook,
     delete_notebook,
@@ -665,6 +666,17 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, load_workspace_summary(self.workspace))
         if path == "/api/connectors":
             return self._json(HTTPStatus.OK, connector_catalog(self.workspace))
+        if path == "/api/settings/document-processing/ocr/status":
+            requested = [
+                part.strip()
+                for value in parse_qs(query).get("languages", [])
+                for part in str(value).split(",")
+                if part.strip()
+            ]
+            provider = str(parse_qs(query).get("provider", ["system"])[0] or "system").strip().lower()
+            status = tesseract_status(requested) if provider == "tesseract" else system_ocr_status(requested)
+            status["provider"] = provider
+            return self._json(HTTPStatus.OK, status)
         if path == "/api/settings":
             return self._json(HTTPStatus.OK, load_settings(self.workspace))
         if path == "/api/model-health":
@@ -700,6 +712,10 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, self.local_runtime.check_manifest_channels())
         if path == "/api/local-runtime/install-status":
             return self._json(HTTPStatus.OK, self.local_runtime.install_status())
+        if path == "/api/cuda-status":
+            from .local_retrieval_runtime import cuda_status
+
+            return self._json(HTTPStatus.OK, cuda_status())
         if path == "/api/skills":
             return self._json(
                 HTTPStatus.OK,
@@ -902,8 +918,13 @@ class NotebookWebApp:
         if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "evidence-index":
             notebook_id = parts[2]
             install = self._ensure_retrieval_models(notebook_id)
+            # Treat an omitted flag as the safe automatic path too.  Older
+            # desktop clients posted an empty JSON body here; an empty body
+            # must not unexpectedly turn a reusable cache into a GPU build.
+            requested_mode = payload.get("auto", payload.get("automatic", True))
+            automatic = bool(requested_mode) and not bool(payload.get("force", False))
             run = (
-                self.research_agent.start_evidence_index(notebook_id)
+                self.research_agent.start_evidence_index(notebook_id, automatic=automatic)
                 if install.get("state") == "ready"
                 else None
             )
@@ -1717,13 +1738,13 @@ class NotebookWebApp:
         }
 
     def _with_evidence_index_run(self, result: dict[str, Any], *, notebook_id: str) -> dict[str, Any]:
-        """Start semantic indexing only after explicitly prepared local components are ready."""
+        """Start semantic indexing without rebuilding reusable caches automatically."""
 
         payload = dict(result)
         install = self._ensure_retrieval_models(notebook_id)
         payload["model_install"] = install
         run = (
-            self.research_agent.start_evidence_index(notebook_id)
+            self.research_agent.start_evidence_index(notebook_id, automatic=True)
             if install.get("state") == "ready"
             else None
         )
@@ -1842,7 +1863,7 @@ class NotebookWebApp:
                     continue
                 with self._retrieval_setup_lock:
                     self._retrieval_setup_errors.pop(target_id, None)
-                self.research_agent.start_evidence_index(target_id)
+                self.research_agent.start_evidence_index(target_id, automatic=True)
             except Exception as error:  # one library must not block the others
                 with self._retrieval_setup_lock:
                     self._retrieval_setup_errors[target_id] = f"{type(error).__name__}: {error}"[:1200]

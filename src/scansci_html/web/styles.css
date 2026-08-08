@@ -1666,6 +1666,20 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .language-chips input { accent-color: #27804a; }
 .document-service-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; margin-top: 14px; }
 .document-service-note { margin: 12px 0 0; color: #929399; font-size: 11px; line-height: 18px; }
+.system-ocr-status { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 11px; margin-top: 13px; padding: 12px 13px; border: 1px solid #dce9df; border-radius: 11px; color: #41604d; background: #f5faf6; }
+.system-ocr-status.is-warning { border-color: #eadfc8; color: #77613b; background: #fffaf0; }
+.system-ocr-status.is-checking { border-color: #dfe3e6; color: #62666b; background: #fafafa; }
+.system-ocr-status-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; color: #2d8651; background: #e3f3e8; font-size: 14px; font-weight: 750; }
+.system-ocr-status.is-warning .system-ocr-status-icon { color: #a77a2e; background: #f8edcf; }
+.system-ocr-status.is-checking .system-ocr-status-icon { color: #747981; background: #eceef0; }
+.system-ocr-status-icon .ui-icon { --icon-size: 16px; }
+.system-ocr-status-copy { display: grid; min-width: 0; gap: 2px; }
+.system-ocr-status-copy strong { font-size: 11px; font-weight: 700; }
+.system-ocr-status-copy p, .system-ocr-status-copy small { overflow: hidden; margin: 0; color: #7e8981; font-size: 10px; line-height: 15px; text-overflow: ellipsis; }
+.system-ocr-status-copy small { color: #9aa29c; }
+.system-ocr-refresh { min-height: 28px; padding: 0 9px; border: 1px solid #cfe0d4; border-radius: 7px; color: #397357; background: #fff; font-size: 10px; font-weight: 650; white-space: nowrap; }
+.system-ocr-refresh:hover:not(:disabled) { border-color: #9fc9ae; color: #175c37; background: #eef8f1; }
+.system-ocr-refresh:disabled { cursor: wait; opacity: .58; }
 .paddle-ocr-guide { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-top: 13px; padding: 13px 14px; border: 1px solid #e2e8e4; border-radius: 12px; background: #f8fbf9; }
 .paddle-ocr-guide.is-configuring { align-items: flex-start; border-color: #bcd8c7; background: #f3faf5; }
 .paddle-ocr-guide-icon { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; color: #2b7b52; background: #e3f2e8; font-family: var(--mono); font-size: 14px; font-weight: 800; }
@@ -2888,9 +2902,11 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .review-save-location-copy { display: grid; min-width: 0; flex: 1; gap: 3px; padding: 9px 11px; border: 1px solid #dfe6e1; border-radius: 10px; background: #f7faf8; }
 .review-save-location-copy span { color: #818b84; font-size: 10px; line-height: 15px; }
 .review-save-location-copy strong { overflow: hidden; color: #3d5144; font-size: 12px; font-weight: 590; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.review-save-folder-input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
 .review-save-folder-button { display: inline-flex; min-width: 112px; align-items: center; justify-content: center; gap: 6px; padding: 8px 11px; border: 1px solid #cfe0d4; border-radius: 10px; color: #2d7653; background: #f2faf5; font-size: 11px; font-weight: 650; }
 .review-save-folder-button:hover { border-color: #9cc5aa; background: #e8f5ec; }
 .review-save-folder-button .ui-icon { --icon-size: 15px; }
+.review-save-error { margin: 9px 0 0; color: #a24d4d; font-size: 11px; line-height: 16px; }
 .review-save-new-folder { display: grid; gap: 5px; margin-top: 12px; color: #63666c; font-size: 11px; line-height: 16px; }
 .review-save-new-folder input { width: 100%; min-height: 36px; box-sizing: border-box; padding: 7px 10px; border: 1px solid #dedfe2; border-radius: 9px; color: #303238; background: #fafafa; font-size: 12px; outline: 0; }
 .review-save-new-folder input:focus { border-color: #8bbca5; background: #fff; box-shadow: 0 0 0 3px rgba(85, 153, 116, .12); }
@@ -2904,6 +2920,7 @@ html[data-theme="dark"] .review-save-new-folder,
 html[data-theme="dark"] .review-save-hint { color: #a7b1aa; }
 html[data-theme="dark"] .review-save-folder-button { border-color: #486c55; color: #b5e1c2; background: #26392d; }
 html[data-theme="dark"] .review-save-folder-button:hover { background: #2c4735; }
+html[data-theme="dark"] .review-save-error { color: #e59a9a; }
 html[data-theme="dark"] .review-save-new-folder input { border-color: var(--rule-strong); color: var(--ink); background: #25292b; }
 @keyframes confirm-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes confirm-card-in { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
@@ -3284,6 +3301,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .document-select-row, .document-language-row { align-items: flex-start; flex-direction: column; gap: 8px; }
   .document-select-row select { width: 100%; }
   .language-chips { justify-content: flex-start; }
+  .system-ocr-status { grid-template-columns: 30px minmax(0, 1fr); }
+  .system-ocr-refresh { grid-column: 2; justify-self: start; }
   .paddle-ocr-guide { grid-template-columns: 32px minmax(0, 1fr); }
   .paddle-ocr-guide-actions { grid-column: 2; justify-content: flex-start; flex-wrap: wrap; }
 }
@@ -5631,6 +5650,20 @@ html[data-theme="dark"] .default-tools-section { border-color: #343b38; }
   .resource-guide-aside { min-height: 0; }
   .resource-guide-main { padding: 27px 23px 21px; }
   .resource-guide-main > header { align-items: flex-start; }
+
+/* --- GPU requirement badges on resource cards --- */
+.resource-gpu-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: 6px; padding: 1px 7px; border-radius: 6px; font-size: 10px; font-style: normal; font-weight: 600; line-height: 17px; vertical-align: middle; }
+.resource-gpu-badge .ui-icon { --icon-size: 11px; }
+.resource-gpu-badge.is-required { color: #b55020; background: #fef0e8; border: 1px solid #f0c8ab; }
+.resource-gpu-badge.is-recommended { color: #6b8830; background: #f7fae9; border: 1px solid #d5e5b0; }
+.resource-gpu-badge.is-cpu { color: #577262; background: #f2f8f3; border: 1px solid #cfe6d8; }
+
+/* --- CUDA status line in resource guide header --- */
+.resource-guide-cuda { display: block; margin-top: 8px; }
+.cuda-status { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 7px; font-size: 11px; font-weight: 600; line-height: 17px; }
+.cuda-status .ui-icon { --icon-size: 12px; }
+.cuda-status.is-ready { color: #1b6a40; background: #e3f5e9; border: 1px solid #b5ddc5; }
+.cuda-status.is-missing { color: #8a6d3b; background: #fdf5e3; border: 1px solid #e9d9a8; }
   .font-scale-choice-grid { grid-template-columns: 1fr; }
 }
 
@@ -6372,6 +6405,248 @@ html[data-theme="dark"] .local-model-card {
 
   .cherry-provider-panel {
     padding: 28px 22px 52px;
+  }
+}
+
+/* Default capabilities: individual controls stay card-led while the page
+   shell becomes an open canvas. Explanations are available on demand. */
+.setting-help {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.setting-help-button {
+  display: inline-grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #aeb8b1;
+  border-radius: 50%;
+  color: #7b8780;
+  background: transparent;
+  font-family: var(--ui);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.setting-help-button:hover,
+.setting-help.is-open .setting-help-button {
+  border-color: #378362;
+  color: #26704f;
+  background: #edf7f0;
+}
+
+.setting-help-popover {
+  position: absolute;
+  z-index: 180;
+  top: calc(100% + 8px);
+  left: 0;
+  display: block;
+  width: max-content;
+  max-width: min(270px, calc(100vw - 40px));
+  padding: 9px 11px;
+  border-radius: 9px;
+  color: #fff;
+  background: #202221;
+  box-shadow: 0 10px 24px rgba(26, 29, 27, .22);
+  font-size: 11px;
+  font-weight: 450;
+  line-height: 17px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  transition: opacity .14s ease, transform .14s ease;
+  visibility: hidden;
+}
+
+.setting-help-popover::before {
+  position: absolute;
+  top: -5px;
+  left: 6px;
+  width: 10px;
+  height: 10px;
+  background: #202221;
+  content: "";
+  transform: rotate(45deg);
+}
+
+.setting-help.is-open .setting-help-popover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+  visibility: visible;
+}
+
+.default-capability-label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-content:has(.default-capabilities-page) {
+  padding: 28px clamp(24px, 5vw, 72px) 54px;
+  background: #fff;
+}
+
+.settings-content:has(.default-capabilities-page) .settings-surface {
+  width: min(1020px, 100%);
+  min-height: 0;
+  margin: 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capabilities-page {
+  width: 100%;
+}
+
+.settings-surface:has(.default-capabilities-page) .settings-minimal-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel {
+  min-width: 0;
+  margin: 0;
+  overflow: visible;
+  border: 1px solid #e2e7e4;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child {
+  grid-column: 1 / -1;
+  border-top-color: #e2e7e4;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel > header {
+  padding: 16px 17px 13px;
+  border-bottom: 1px solid #edf0ee;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel > header h2 {
+  font-size: 16px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-list {
+  overflow: visible;
+  border: 0;
+  border-radius: 0 0 16px 16px;
+  background: transparent;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row,
+.settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child .default-capability-row {
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  min-height: 62px;
+  padding: 11px 17px;
+  border-bottom-color: #edf0ee;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-copy small {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .settings-minimal-actions > span {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section {
+  margin-top: 12px;
+  border: 0;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  display: block;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid #e2e7e4;
+  border-radius: 16px;
+  background: #fff;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card:first-child {
+  border-top: 1px solid #e2e7e4;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading {
+  min-height: 32px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 16px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading p,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-note {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-rule {
+  margin: 14px 0 10px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .settings-footer-actions {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+html[data-theme="dark"] .settings-content:has(.default-capabilities-page) {
+  background: #171b1a;
+}
+
+html[data-theme="dark"] .settings-content:has(.default-capabilities-page) .settings-surface {
+  background: transparent;
+}
+
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel,
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  border-color: #373e3b;
+  background: #202426;
+}
+
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel > header,
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row {
+  border-color: #343b38;
+}
+
+@media (max-width: 760px) {
+  .settings-surface:has(.default-capabilities-page) .settings-minimal-sections,
+  .settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child {
+    grid-column: auto;
+  }
+
+  .settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row,
+  .settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child .default-capability-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
   }
 }
 
@@ -7252,5 +7527,228 @@ html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .defau
   .settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-fields,
   .settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-note {
     grid-column: 1;
+  }
+}
+
+/* Final default-capabilities pass: this page is intentionally an open canvas.
+   Keep only the five useful feature cards and hide secondary copy until the
+   user asks for it. This block is last so legacy settings rules cannot rebuild
+   the removed outer frame. */
+.settings-content:has(.default-capabilities-page) {
+  padding: 28px clamp(24px, 5vw, 72px) 54px;
+  background: #fff;
+}
+
+.settings-content:has(.default-capabilities-page) .settings-surface {
+  width: min(1020px, 100%);
+  min-height: 0;
+  margin: 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capabilities-page {
+  width: 100%;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capabilities-heading {
+  margin: 0 0 16px;
+  padding: 0 0 14px;
+  border-bottom: 1px solid #edf1ee;
+}
+
+.settings-surface:has(.default-capabilities-page) .settings-minimal-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel {
+  min-width: 0;
+  margin: 0;
+  overflow: visible;
+  border: 1px solid #e2e7e4;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child {
+  grid-column: 1 / -1;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel > header {
+  padding: 16px 17px 13px;
+  border-bottom: 1px solid #edf0ee;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel > header h2 {
+  font-size: 16px;
+  line-height: 21px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-list {
+  overflow: visible;
+  border: 0;
+  border-radius: 0 0 16px 16px;
+  background: transparent;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row {
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  min-height: 62px;
+  padding: 11px 17px;
+  border-bottom: 1px solid #edf0ee;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-copy small,
+.settings-surface:has(.default-capabilities-page) .settings-minimal-actions > span {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section {
+  margin-top: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section > .default-tools-heading {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  display: block;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid #e2e7e4;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading {
+  min-height: 32px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  font-size: 16px;
+  line-height: 21px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-heading p,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-note {
+  display: none;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-rule {
+  margin: 14px 0 10px;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .settings-footer-actions {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+html[data-theme="dark"] .settings-content:has(.default-capabilities-page) {
+  background: var(--surface);
+}
+
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel,
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  border-color: #373e3b;
+  background: #202426;
+}
+
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel > header,
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row {
+  border-color: #343b38;
+}
+
+@media (max-width: 760px) {
+  .settings-surface:has(.default-capabilities-page) .settings-minimal-sections,
+  .settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child {
+    grid-column: auto;
+  }
+
+  .settings-surface:has(.default-capabilities-page) .default-capability-panel .default-capability-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+}
+
+/* Default capabilities stay readable as one vertical sequence. Every
+   feature remains its own rounded card; there is no shared outer frame. */
+.settings-surface:has(.default-capabilities-page) .settings-minimal-sections,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form {
+  grid-template-columns: 1fr;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-capability-panel:first-child {
+  grid-column: auto;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-processing-form,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  box-sizing: border-box;
+  overflow: visible;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  position: relative;
+  isolation: isolate;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-status {
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: start;
+  min-width: 0;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-status-copy p,
+.settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-status-copy small {
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+  word-break: break-word;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-status-copy small {
+  display: block;
+}
+
+@media (max-width: 760px) {
+  .settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-status {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .settings-surface:has(.default-capabilities-page) .default-tools-section .system-ocr-refresh {
+    grid-column: 2;
+    justify-self: start;
+    margin-top: 4px;
   }
 }

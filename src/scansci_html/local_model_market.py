@@ -22,14 +22,14 @@ _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9.
 QWEN3_ASR_NATIVE_MODEL_ID = "Qwen/Qwen3-ASR-0.6B-hf"
 QWEN3_ASR_LEGACY_MODEL_ID = "Qwen/Qwen3-ASR-0.6B"
 _CURATED = (
-    {"id": "Qwen/Qwen2.5-1.5B-Instruct", "name": "Qwen2.5 1.5B Instruct", "kind": "chat", "size_hint": "约 3 GB", "description": "轻量中文对话，适合 CPU 或入门显卡。"},
-    {"id": "Qwen/Qwen2.5-3B-Instruct", "name": "Qwen2.5 3B Instruct", "kind": "chat", "size_hint": "约 6 GB", "description": "本地中文通用对话的平衡选择。"},
-    {"id": "Qwen/Qwen3-4B-Instruct-2507", "name": "Qwen3 4B Instruct", "kind": "chat", "size_hint": "约 8 GB", "description": "更强的本地推理与写作能力。"},
-    {"id": "Qwen/Qwen3-Embedding-0.6B", "name": "Qwen3 Embedding 0.6B", "kind": "embedding", "size_hint": "约 1 GB", "description": "中文与英文语义检索。"},
-    {"id": "Qwen/Qwen3-Reranker-0.6B", "name": "Qwen3 Reranker 0.6B", "kind": "reranking", "size_hint": "约 1 GB", "description": "提升资料库检索排序质量。"},
-    {"id": QWEN3_ASR_NATIVE_MODEL_ID, "name": "Qwen3 ASR 0.6B（Transformers 原生）", "kind": "audio", "size_hint": "约 2 GB", "description": "本地语音转写；使用 Transformers 原生格式，下载后可由 ScanSci 直接运行。"},
-    {"id": "openbmb/MiniCPM-V-4.6-BNB", "name": "MiniCPM-V 4.6（BNB 4-bit）", "kind": "vision", "runtime": "local-huggingface", "size_hint": "约 1.1 GB", "description": "适合 NVIDIA 显卡的 4-bit 视觉模型；ScanSci 可通过本地 Transformers 运行。"},
-    {"id": "openbmb/MiniCPM-V-4.6-GPTQ", "name": "MiniCPM-V 4.6（GPTQ）", "kind": "vision", "runtime": "local-huggingface", "size_hint": "约 1.9 GB", "description": "GPTQ 4-bit 视觉模型；需要兼容 GPTQModel 的本地运行环境。"},
+    {"id": "Qwen/Qwen2.5-1.5B-Instruct", "name": "Qwen2.5 1.5B Instruct", "kind": "chat", "gpu": "recommended", "size_hint": "约 3 GB", "description": "轻量中文对话，适合 CPU 或入门显卡。"},
+    {"id": "Qwen/Qwen2.5-3B-Instruct", "name": "Qwen2.5 3B Instruct", "kind": "chat", "gpu": "recommended", "size_hint": "约 6 GB", "description": "本地中文通用对话的平衡选择。"},
+    {"id": "Qwen/Qwen3-4B-Instruct-2507", "name": "Qwen3 4B Instruct", "kind": "chat", "gpu": "recommended", "size_hint": "约 8 GB", "description": "更强的本地推理与写作能力。"},
+    {"id": "Qwen/Qwen3-Embedding-0.6B", "name": "Qwen3 Embedding 0.6B", "kind": "embedding", "gpu": "cpu", "size_hint": "约 1 GB", "description": "中文与英文语义检索。"},
+    {"id": "Qwen/Qwen3-Reranker-0.6B", "name": "Qwen3 Reranker 0.6B", "kind": "reranking", "gpu": "cpu", "size_hint": "约 1 GB", "description": "提升资料库检索排序质量。"},
+    {"id": QWEN3_ASR_NATIVE_MODEL_ID, "name": "Qwen3 ASR 0.6B（Transformers 原生）", "kind": "audio", "gpu": "recommended", "size_hint": "约 2 GB", "description": "本地语音转写；使用 Transformers 原生格式，下载后可由 ScanSci 直接运行。"},
+    {"id": "openbmb/MiniCPM-V-4.6-BNB", "name": "MiniCPM-V 4.6（BNB 4-bit）", "kind": "vision", "runtime": "local-huggingface", "gpu": "required", "size_hint": "约 1.1 GB", "description": "需要 NVIDIA 显卡的 4-bit 视觉模型；ScanSci 可通过本地 Transformers 运行。"},
+    {"id": "openbmb/MiniCPM-V-4.6-GPTQ", "name": "MiniCPM-V 4.6（GPTQ）", "kind": "vision", "runtime": "local-huggingface", "gpu": "required", "size_hint": "约 1.9 GB", "description": "需要 NVIDIA 显卡的 GPTQ 4-bit 视觉模型；需要兼容 GPTQModel 的本地运行环境。"},
 )
 
 

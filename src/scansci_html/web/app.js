@@ -2,6 +2,7 @@ const state = {
   workspace: null,
   notebook: null,
   settings: null,
+  systemOcrStatus: { loading: false, requestedKey: "", provider: "tesseract", checkedAt: "", available: false, message: "尚未检测 OCR" },
   presets: { providers: [], local_models: [] },
   modelHealth: { checked_at: "", providers: {}, models: {}, loading: false },
   localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false },
@@ -60,6 +61,7 @@ const state = {
     newFolderName: "",
     browserDirectoryHandle: null,
     browserFolderLabel: "",
+    browserFolderMode: "",
     busy: false,
   },
   contextPanel: "sources",
@@ -1509,6 +1511,14 @@ function reviewSaveLocationLabel(dialog = state.reviewSaveDialog) {
   return child ? `${base.replace(/[\\/]$/, "")} / ${child}` : base;
 }
 
+function reviewPickedFolderPath(value) {
+  if (Array.isArray(value)) return reviewPickedFolderPath(value[0]);
+  if (value && typeof value === "object") {
+    return reviewPickedFolderPath(value.path || value.folder_path || value.folder || value.directory);
+  }
+  return String(value || "").trim();
+}
+
 function closeReviewSaveDialog() {
   if (!state.reviewSaveDialog?.open) return;
   state.reviewSaveDialog = {
@@ -1517,6 +1527,7 @@ function closeReviewSaveDialog() {
     newFolderName: "",
     browserDirectoryHandle: null,
     browserFolderLabel: "",
+    browserFolderMode: "",
     busy: false,
   };
   const host = byId("confirmDialogHost");
@@ -1535,7 +1546,7 @@ function renderReviewSaveDialog() {
     if (host.dataset.dialogKind === "review-save") closeReviewSaveDialog();
     return;
   }
-  const hasFolder = Boolean(dialog.folderPath || dialog.browserDirectoryHandle);
+  const hasFolder = Boolean(dialog.folderPath || dialog.browserDirectoryHandle || (dialog.browserFolderMode === "input" && dialog.browserFolderLabel));
   const location = reviewSaveLocationLabel(dialog);
   host.dataset.dialogKind = "review-save";
   host.innerHTML = `
@@ -1550,7 +1561,9 @@ function renderReviewSaveDialog() {
           <div class="review-save-location">
             <div class="review-save-location-copy"><span>目标文件夹</span><strong title="${escapeHtml(location)}">${escapeHtml(location)}</strong></div>
             <button type="button" class="review-save-folder-button" data-action="choose-review-save-folder" ${dialog.busy ? "disabled" : ""}>${uiIcon("folder-open")}选择文件夹</button>
+            <input id="reviewSaveFolderInput" class="review-save-folder-input" type="file" webkitdirectory directory multiple />
           </div>
+          ${dialog.error ? `<p class="review-save-error">${escapeHtml(dialog.error)}</p>` : ""}
           <label class="review-save-new-folder"><span>新建文件夹（可选）</span><input id="reviewSaveNewFolderInput" type="text" maxlength="120" value="${escapeHtml(dialog.newFolderName || "")}" placeholder="例如：2026-08-08 光伏综述" ${dialog.busy ? "disabled" : ""} /></label>
           <p class="review-save-hint">填写后，会在选定位置下新建这个文件夹，并把笔记保存进去。</p>
         </div>
@@ -1584,25 +1597,41 @@ function openReviewSaveDialog() {
     newFolderName: "",
     browserDirectoryHandle: null,
     browserFolderLabel: "",
+    browserFolderMode: "",
     busy: false,
   };
   renderReviewSaveDialog();
 }
 
 async function chooseReviewSaveFolder() {
+  const dialog = state.reviewSaveDialog;
+  if (!dialog?.open || dialog.busy) return;
+  dialog.error = "";
   const nativePicker = window.pywebview?.api?.choose_library_folder;
   if (typeof nativePicker === "function") {
-    const path = String(await nativePicker() || "").trim();
+    const path = reviewPickedFolderPath(await nativePicker());
     if (!path) return;
-    state.reviewSaveDialog.folderPath = path;
-    state.reviewSaveDialog.browserDirectoryHandle = null;
-    state.reviewSaveDialog.browserFolderLabel = "";
+    dialog.folderPath = path;
+    dialog.browserDirectoryHandle = null;
+    dialog.browserFolderLabel = "";
+    dialog.browserFolderMode = "";
     renderReviewSaveDialog();
     return;
+  }
+  if (typeof window.showDirectoryPicker !== "function") {
+    const fallbackInput = byId("reviewSaveFolderInput");
+    if (fallbackInput) {
+      fallbackInput.click();
+      return;
+    }
   }
   if (typeof window.showDirectoryPicker === "function") {
     try {
       const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+      dialog.folderPath = "";
+      dialog.browserDirectoryHandle = handle;
+      dialog.browserFolderLabel = handle.name || "已选择文件夹";
+      dialog.browserFolderMode = "handle";
       state.reviewSaveDialog.folderPath = "";
       state.reviewSaveDialog.browserDirectoryHandle = handle;
       state.reviewSaveDialog.browserFolderLabel = handle.name || "已选择文件夹";
@@ -1636,6 +1665,12 @@ async function commitReviewAsNote() {
   dialog.newFolderName = newFolderName;
   const browserFolder = dialog.browserDirectoryHandle;
   if (!dialog.folderPath && !browserFolder) {
+    if (dialog.browserFolderMode === "input" && dialog.browserFolderLabel) {
+      downloadReviewDocument();
+      closeReviewSaveDialog();
+      toast("当前预览无法直接写入本机文件夹，已下载 Markdown；桌面应用可保存到所选位置。", false);
+      return;
+    }
     toast("请先选择一个保存文件夹。", true);
     return;
   }
@@ -1909,7 +1944,7 @@ function bootstrapSettingsFallback() {
       slides: "provider:scansci-managed:glm-4.7-flash",
     },
     document_processing: {
-      ocr: { provider: "system", base_url: "", languages: ["zh", "en"], enabled: true, api_key_configured: false },
+      ocr: { provider: "tesseract", base_url: "", languages: ["zh", "en"], enabled: true, api_key_configured: false },
       mineru: { provider: "mineru", base_url: "https://mineru.net", enabled: false, api_key_configured: false },
     },
     onboarding: { welcome_dismissed: false, resource_setup_completed: false, data_setup_completed: false },
@@ -2047,13 +2082,13 @@ async function initialize() {
   }
 }
 
-async function ensureActiveKnowledgeIndex(requestedNotebookId = "") {
+async function ensureActiveKnowledgeIndex(requestedNotebookId = "", { force = false } = {}) {
   const notebookId = String(requestedNotebookId || state.notebook?.notebook_id || "").trim();
   if (!notebookId) return;
   try {
     const result = await request(`/api/notebooks/${encodeURIComponent(notebookId)}/evidence-index`, {
       method: "POST",
-      body: "{}",
+      body: JSON.stringify(force ? { force: true } : { auto: true }),
     });
     if (result?.status) {
       state.knowledgeIndexStatuses[notebookId] = result.status;
@@ -8181,6 +8216,10 @@ function knowledgeIndexStatusMarkup(notebook) {
     pending: "等待同步",
     empty: "尚无内容",
   };
+  if (Boolean(status.automatic_build_deferred)) {
+    labels.pending = "可按需优化";
+    labels.degraded = "可按需优化";
+  }
   const retryable = ["failed", "degraded", "pending"].includes(statusState);
   const title = status.error
     ? `检索索引：${labels[statusState] || "等待同步"}。${String(status.error)}`
@@ -8569,7 +8608,11 @@ function resourceSetupCard(resource) {
     : resource.state === "ready"
       ? `<span>${uiIcon("check")}</span>`
       : `<button type="button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}" ${active ? "disabled" : ""}>${uiIcon(retryable ? "refresh" : "download")}${escapeHtml(actionLabel)}</button>`;
-  return `<article class="resource-setup-card is-${escapeHtml(resource.state)}"><div class="resource-setup-mark">${uiIcon(resource.icon)}</div><div class="resource-setup-copy"><span>${escapeHtml(resource.eyebrow)}</span><h3>${escapeHtml(resource.title)}</h3><p>${escapeHtml(resource.description)}</p><small>${escapeHtml(copy.hint)}</small>${progress}</div><div class="resource-setup-action"><b>${escapeHtml(copy.label)}</b>${action}</div></article>`;
+  const gpuBadge = resource.gpu === "required" ? `<em class="resource-gpu-badge is-required" title="需要 NVIDIA 显卡（GPU）">${uiIcon("gpu")} 需要 GPU</em>`
+    : resource.gpu === "recommended" ? `<em class="resource-gpu-badge is-recommended" title="推荐使用 NVIDIA 显卡（GPU）以获得更好性能">${uiIcon("gpu")} 推荐 GPU</em>`
+    : resource.gpu === "cpu" ? `<em class="resource-gpu-badge is-cpu" title="可在纯 CPU 上运行">${uiIcon("cpu")} CPU 可用</em>`
+    : "";
+  return `<article class="resource-setup-card is-${escapeHtml(resource.state)}"><div class="resource-setup-mark">${uiIcon(resource.icon)}</div><div class="resource-setup-copy"><span>${escapeHtml(resource.eyebrow)}</span><h3>${escapeHtml(resource.title)} ${gpuBadge}</h3><p>${escapeHtml(resource.description)}</p><small>${escapeHtml(copy.hint)}</small>${progress}</div><div class="resource-setup-action"><b>${escapeHtml(copy.label)}</b>${action}</div></article>`;
 }
 
 function resourceSetupCardsMarkup() {
@@ -8632,7 +8675,7 @@ function renderDataOnboarding() {
 function renderResourceGuideOverlay() {
   const snapshots = ONBOARDING_RESOURCE_ORDER.map((resourceId) => resourceInstallSnapshot(resourceId));
   const readyCount = snapshots.filter((resource) => resource.state === "ready").length;
-  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL</span><div class="resource-onboarding-glyph">${uiIcon("download")}</div><h1 id="resourceGuideTitle">需要什么，<br />再下载什么。</h1><p>本地模型都是可选能力。下载完成后会显示“已就绪”，ScanSci 会在需要时自动使用。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>默认能力 · 按需添加</span><h2>选择你现在需要的本地能力</h2><p>只点击需要的卡片；首次使用会自动准备 ScanSci 本地运行能力，然后继续下载。</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span></header><div class="resource-setup-cards resource-guide-resource-list">${snapshots.map(resourceSetupCard).join("")}</div><footer><p>关闭后可以从“默认能力”页右上角再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button><button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成 ${uiIcon("check")}</button></div></footer></main></section></div>`;
+  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL</span><div class="resource-onboarding-glyph">${uiIcon("download")}</div><h1 id="resourceGuideTitle">需要什么，<br />再下载什么。</h1><p>本地模型都是可选能力。下载完成后会显示“已就绪”，ScanSci 会在需要时自动使用。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>默认能力 · 按需添加</span><h2>选择你现在需要的本地能力</h2><p>只点击需要的卡片；首次使用会自动准备 ScanSci 本地运行能力，然后继续下载。</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span><span class="resource-guide-cuda" data-cuda-status></span></header><div class="resource-setup-cards resource-guide-resource-list">${snapshots.map(resourceSetupCard).join("")}</div><footer><p>关闭后可以从“默认能力”页右上角再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button><button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成 ${uiIcon("check")}</button></div></footer></main></section></div>`;
 }
 
 function openResourceGuideOverlay() {
@@ -8878,6 +8921,45 @@ function renderKnowledgeSettingsPreview() {
   </section>`;
 }
 
+function systemOcrLanguageKey() {
+  const values = state.settings?.document_processing?.ocr?.languages;
+  return (Array.isArray(values) ? values : ["zh", "en"]).map((value) => String(value || "").trim()).filter(Boolean).sort().join(",");
+}
+
+function selectedOcrProvider() {
+  return String(state.settings?.document_processing?.ocr?.provider || "tesseract").trim().toLowerCase() || "tesseract";
+}
+
+async function refreshSystemOcrStatus({ force = false } = {}) {
+  const requestedKey = systemOcrLanguageKey();
+  const provider = selectedOcrProvider();
+  const current = state.systemOcrStatus || {};
+  if (current.loading || (!force && current.provider === provider && current.requestedKey === requestedKey && current.checkedAt)) return current;
+  const providerTitle = provider === "system" ? "Windows OCR 引擎" : provider === "tesseract" ? "Tesseract OCR" : "OCR 服务";
+  state.systemOcrStatus = { ...current, loading: true, provider, requestedKey, message: `正在检测 ${providerTitle}…` };
+  if (state.activeView === "settings" && ["defaults", "document-processing"].includes(state.activeSettings)) renderSettings();
+  try {
+    const params = new URLSearchParams();
+    if (requestedKey) params.set("languages", requestedKey);
+    params.set("provider", provider);
+    const query = `?${params.toString()}`;
+    const result = await request(`/api/settings/document-processing/ocr/status${query}`);
+    state.systemOcrStatus = { ...result, loading: false, provider, requestedKey, checkedAt: new Date().toISOString() };
+  } catch (error) {
+    state.systemOcrStatus = {
+      ...current,
+      loading: false,
+      provider,
+      requestedKey,
+      checkedAt: new Date().toISOString(),
+      available: false,
+      message: `${providerTitle} 检测失败：${error.message || "未知错误"}`,
+    };
+  }
+  if (state.activeView === "settings" && ["defaults", "document-processing"].includes(state.activeSettings)) renderSettings();
+  return state.systemOcrStatus;
+}
+
 function renderSettings() {
   if (["routing", "document-processing"].includes(state.activeSettings)) state.activeSettings = "defaults";
   applyAppearancePreferences();
@@ -8903,6 +8985,7 @@ function renderSettings() {
   hydrateIcons(target);
   hydrateSettingsSelects(target);
   renderDownloadActivity();
+  if (["defaults", "document-processing"].includes(state.activeSettings)) refreshSystemOcrStatus().catch(() => {});
 }
 
 function renderExtensions() {
@@ -9697,11 +9780,36 @@ function renderLocalModelsSettings() {
 
 function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", embedded = false) {
   const processing = state.settings.document_processing || {};
-  const ocr = processing.ocr || { provider: "system", base_url: "", languages: ["zh", "en"], enabled: true };
+  const ocr = processing.ocr || { provider: "tesseract", base_url: "", languages: ["zh", "en"], enabled: true };
   const mineru = processing.mineru || { provider: "mineru", base_url: "https://mineru.net", enabled: false };
   const ocrLanguages = new Set(ocr.languages || []);
+  const tesseractSelected = ocr.provider === "tesseract";
   const paddleSelected = ocr.provider === "paddle";
-  const ocrConnection = ocr.provider === "custom" ? `<div class="document-service-fields"><label class="setting-field"><span>API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "")}" placeholder="https://ocr.example.com/v1" maxlength="500" /></label><label class="setting-field"><span>API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "可选，保存后仅存于系统凭据管理器"}" /></label></div>` : ocr.provider === "system" ? `<p class="document-service-note">使用系统 OCR 识别扫描页与图片中的中英文文字，无需填写 API 密钥。</p>` : "";
+  const deepseekSelected = ocr.provider === "deepseek";
+  const systemStatus = state.systemOcrStatus || {};
+  const systemTone = systemStatus.loading ? "checking" : systemStatus.available && systemStatus.requested_supported !== false ? "ready" : "warning";
+  const ocrStatusName = tesseractSelected ? "Tesseract OCR" : "Windows OCR";
+  const systemTitle = systemStatus.loading
+    ? `正在检测 ${ocrStatusName}`
+    : tesseractSelected
+      ? systemStatus.available && systemStatus.requested_supported !== false
+        ? "Tesseract 已就绪"
+        : "Tesseract 尚未就绪"
+    : systemStatus.available && systemStatus.requested_supported !== false
+      ? "检测到 Windows OCR 引擎可用"
+      : systemStatus.available
+        ? "检测到引擎，但缺少当前语言包"
+        : "未检测到 Windows OCR 引擎";
+  const installedLanguages = Array.isArray(systemStatus.languages) && systemStatus.languages.length
+    ? `已安装识别语言：${systemStatus.languages.slice(0, 8).join("、")}${systemStatus.languages.length > 8 ? " 等" : ""}`
+    : tesseractSelected ? "未检测到 Tesseract 语言数据" : "需要安装 Windows OCR 语言包后才能使用";
+  const ocrSolution = systemStatus.solution || (systemStatus.available && systemStatus.requested_supported !== false
+    ? installedLanguages
+    : tesseractSelected
+      ? "解决：安装 Tesseract 后点击重新检测；中文识别还需要 chi_sim.traineddata。"
+      : "解决：打开 Windows 设置 → 时间和语言 → 语言和区域，安装对应语言包；也可以切换为 Tesseract。");
+  const systemOcrGuide = `<aside class="system-ocr-status is-${systemTone} is-${tesseractSelected ? "tesseract" : "windows"}"><span class="system-ocr-status-icon">${systemStatus.loading ? "…" : systemStatus.available && systemStatus.requested_supported !== false ? uiIcon("check") : uiIcon("info")}</span><div class="system-ocr-status-copy"><strong>${systemTitle}</strong><p>${escapeHtml(systemStatus.message || `${ocrStatusName} 可用于本地识别图片文字。`)}</p><small>${escapeHtml(ocrSolution || installedLanguages)}</small></div><button type="button" class="system-ocr-refresh" data-action="refresh-system-ocr-status" ${systemStatus.loading ? "disabled" : ""}>重新检测</button></aside>`;
+  const ocrConnection = deepseekSelected ? `<div class="document-service-fields"><label class="setting-field"><span>硅基流动 API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "https://api.siliconflow.cn/v1")}" placeholder="https://api.siliconflow.cn/v1" maxlength="500" /></label><label class="setting-field"><span>硅基流动 API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "粘贴硅基流动 API 密钥"}" /></label></div><p class="document-service-note">使用模型 <code>deepseek-ai/DeepSeek-OCR</code> 将图片发送到硅基流动；未配置密钥或调用失败时自动回退到本地 OCR。<a href="https://cloud.siliconflow.cn/models?target=deepseek-ai/DeepSeek-OCR" target="_blank" rel="noreferrer">查看模型与额度 ${uiIcon("arrow-up-right")}</a></p>` : ocr.provider === "custom" ? `<div class="document-service-fields"><label class="setting-field"><span>API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "")}" placeholder="https://ocr.example.com/v1" maxlength="500" /></label><label class="setting-field"><span>API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "可选，保存后仅存于系统凭据管理器"}" /></label></div>` : tesseractSelected || ocr.provider === "system" ? systemOcrGuide : "";
   const paddleGuide = paddleSelected ? `<aside class="paddle-ocr-guide is-configuring"><span class="paddle-ocr-guide-icon">P</span><div class="paddle-ocr-guide-main"><header><strong>PaddleOCR</strong><em>飞桨 AI Studio</em></header><p>需要 PaddleOCR 时填写 Access Token；令牌只保存在这台电脑。</p><label class="setting-field paddle-ocr-token-field"><span>Access Token</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存；输入新值以替换" : "粘贴 AI Studio Access Token"}" ${ocr.api_key_configured ? "" : "required"} /></label></div><div class="paddle-ocr-guide-actions"><a href="https://aistudio.baidu.com/account/accessToken" target="_blank" rel="noreferrer">获取 Token ${uiIcon("arrow-up-right")}</a></div></aside>` : "";
   const mineruName = mineru.provider === "mineru" ? "MinerU" : "自定义文档解析服务";
   const heading = embedded
@@ -9709,8 +9817,8 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
     : settingsHeading("文档处理", "配置扫描页识别与学术 PDF 解析服务。密钥不会写入工作区文件。");
   return `${heading}
     <form id="${escapeHtml(formId)}" class="document-processing-form${embedded ? " embedded-document-processing-form" : ""}">
-      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR 服务</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="system" ${ocr.provider === "system" ? "selected" : ""}>系统 OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<div class="document-language-row"><span>识别语言</span><div class="language-chips"><label><input name="ocr-language" type="checkbox" value="zh" ${ocrLanguages.has("zh") ? "checked" : ""} />中文</label><label><input name="ocr-language" type="checkbox" value="en" ${ocrLanguages.has("en") ? "checked" : ""} />English</label></div></div>${ocrConnection}</section>
-      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档解析</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">可填写多个 MinerU 密钥时请使用英文逗号分隔；密钥仅保存在当前电脑的系统凭据管理器中。</p></section>
+      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR ${settingHelpMarkup("用于识别图片内文字。", "OCR 说明")}</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="tesseract" ${tesseractSelected ? "selected" : ""}>Tesseract OCR</option><option value="system" ${ocr.provider === "system" ? "selected" : ""}>Windows OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="deepseek" ${deepseekSelected ? "selected" : ""}>DeepSeek-OCR（硅基流动）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<div class="document-language-row"><span>识别语言</span><div class="language-chips"><label><input name="ocr-language" type="checkbox" value="zh" ${ocrLanguages.has("zh") ? "checked" : ""} />中文</label><label><input name="ocr-language" type="checkbox" value="en" ${ocrLanguages.has("en") ? "checked" : ""} />English</label></div></div>${ocrConnection}</section>
+      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档处理 ${settingHelpMarkup("用于按版面解析论文，保留段落、表格、公式和图片结构。", "文档处理说明")}</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">可填写多个 MinerU 密钥时请使用英文逗号分隔；密钥仅保存在当前电脑的系统凭据管理器中。</p></section>
       <div class="settings-footer-actions"><button type="submit" class="save-button">保存文档处理配置</button></div>
     </form>`.replace('<h2>OCR 服务</h2>', '<h2>OCR</h2>').replace('<h2>文档解析</h2>', '<h2>文档处理</h2>');
 }
@@ -9838,16 +9946,22 @@ function defaultConversationModelOptions(selected = "") {
   return options.join("");
 }
 
+function settingHelpMarkup(description, label = "查看说明") {
+  const text = String(description || "").trim();
+  if (!text) return "";
+  return `<span class="setting-help"><button type="button" class="setting-help-button" data-help-toggle aria-label="${escapeHtml(label)}" aria-expanded="false">?</button><span class="setting-help-popover" role="tooltip">${escapeHtml(text)}</span></span>`;
+}
+
 function defaultCapabilityRow({ id, title, description, capability, conversation = false }) {
   const roles = state.settings.model_roles || {};
   const options = conversation
     ? defaultConversationModelOptions(`${state.settings.active_model?.provider_id || ""}::${state.settings.active_model?.model_id || ""}`)
     : modelTargetOptions(roles[id] || "", capability);
-  return `<label class="default-capability-row"><span class="default-capability-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span><select name="${conversation ? "default-conversation-model" : `model-role-${id}`}" ${conversation ? "data-default-conversation-model" : `data-model-role="${escapeHtml(id)}"`}>${options}</select></label>`;
+  return `<div class="default-capability-row"><span class="default-capability-copy"><span class="default-capability-label"><strong>${escapeHtml(title)}</strong>${settingHelpMarkup(description, `${title}说明`)}</span></span><select name="${conversation ? "default-conversation-model" : `model-role-${id}`}" ${conversation ? "data-default-conversation-model" : `data-model-role="${escapeHtml(id)}"`}>${options}</select></div>`;
 }
 
 function defaultCapabilityPanel(eyebrow, title, description, rows) {
-  return `<section class="settings-minimal-section default-capability-panel"><header><h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p></header><div class="default-capability-list">${rows}</div></section>`;
+  return `<section class="settings-minimal-section default-capability-panel"><header><h2>${escapeHtml(title)}</h2></header><div class="default-capability-list">${rows}</div></section>`;
 }
 
 function renderDefaultCapabilitiesSettings() {
@@ -9861,10 +9975,10 @@ function renderDefaultCapabilitiesSettings() {
     { id: "reranking", title: "重排模型", description: "提高证据片段排序。", capability: "reranking" },
     { id: "retrieval", title: "基础检索", description: "语义模型不可用时的关键词回退。", capability: "retrieval" },
   ].map((item) => defaultCapabilityRow(item)).join("");
-  return `<section class="settings-minimal-page default-capabilities-page"><header class="settings-page-heading default-capabilities-heading"><div><h1>默认能力</h1><p>选择 ScanSci 在不同任务中默认使用的能力。</p></div><button type="button" class="quiet-text-button" data-action="open-resource-guide">添加本地能力 ${uiIcon("arrow-right")}</button></header>
+  return `<section class="settings-minimal-page default-capabilities-page"><header class="settings-page-heading default-capabilities-heading"><div><h1>默认能力</h1></div><button type="button" class="quiet-text-button" data-action="open-resource-guide">添加本地能力 ${uiIcon("arrow-right")}</button></header>
     <form id="defaultCapabilitiesForm"><div class="settings-minimal-sections">
       ${defaultCapabilityPanel("助手", "默认助手", "对话、任务、写作和演示使用同一个默认模型。", assistantRows)}
-      ${defaultCapabilityPanel("多模态", "图片与语音", "没有配置时，相关功能会自动使用可用回退。", multimodalRows)}
+      ${defaultCapabilityPanel("多模态", "视觉与语音", "没有配置时，相关功能会自动使用可用回退。", multimodalRows)}
       ${defaultCapabilityPanel("知识库", "语义检索", "嵌入和重排可以独立选择；基础检索始终可用。", retrievalRows)}
     </div><footer class="settings-minimal-actions"><span>配置仅保存在此电脑</span><button type="submit" class="save-button">保存默认能力</button></footer></form>
     <section class="default-tools-section default-tools-disclosure">${renderDocumentProcessingFormMarkup("defaultDocumentProcessingForm", true)}</section>
@@ -10123,9 +10237,30 @@ function collectLocalModelsForm() {
   return state.settings.local_models;
 }
 
+async function refreshCudaStatus() {
+  try {
+    state.cuda = await request("/api/cuda-status");
+  } catch (_error) {
+    state.cuda = { available: false, message: "" };
+  }
+  renderCudaStatus();
+}
+
+function renderCudaStatus() {
+  const targets = document.querySelectorAll("[data-cuda-status]");
+  const status = state.cuda || {};
+  const markup = status.available
+    ? `<span class="cuda-status is-ready" title="${escapeHtml(status.devices?.[0]?.name || "GPU")}">${uiIcon("gpu")} CUDA 已就绪 · ${escapeHtml(status.devices?.[0]?.name || "")}</span>`
+    : status.message
+      ? `<span class="cuda-status is-missing" title="${escapeHtml(status.message)}">${uiIcon("cpu")} CPU 模式 · ${escapeHtml(status.torch_version || "")}</span>`
+      : "";
+  targets.forEach((el) => { el.innerHTML = markup; });
+}
+
 async function refreshLocalModelMarket() {
   const query = String(state.localModelMarket?.query || "").trim();
   state.localModelMarket.loading = true;
+  refreshCudaStatus();
   const [installed, catalog, runtime, ollama] = await Promise.all([
     request("/api/local-models/installed"),
     request(`/api/local-models/market${query ? `?q=${encodeURIComponent(query)}` : ""}`),
@@ -10615,6 +10750,10 @@ async function handleSettingsAction(action, element) {
     refreshLocalModelMarket().catch((error) => toast(error.message, true));
     return;
   }
+  if (action === "refresh-system-ocr-status") {
+    await refreshSystemOcrStatus({ force: true });
+    return;
+  }
   if (action === "check-local-runtime-channels") {
     checkLocalRuntimeChannels().catch((error) => toast(error.message, true));
     return;
@@ -10766,6 +10905,21 @@ document.addEventListener("change", (event) => {
 });
 
 document.addEventListener("click", (event) => {
+  const helpButton = event.target.closest?.("[data-help-toggle]");
+  const openHelp = document.querySelector(".setting-help.is-open");
+  if (openHelp && (!helpButton || !openHelp.contains(helpButton))) {
+    openHelp.classList.remove("is-open");
+    openHelp.querySelector("[data-help-toggle]")?.setAttribute("aria-expanded", "false");
+  }
+  if (helpButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const help = helpButton.closest(".setting-help");
+    const shouldOpen = !help?.classList.contains("is-open");
+    help?.classList.toggle("is-open", shouldOpen);
+    helpButton.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    return;
+  }
   if (!event.target.closest("[data-settings-select]")) closeSettingsSelects();
   if (state.updateCardOpen && !event.target.closest("[data-app-update]")) toggleAppUpdateCard(false);
   if (!event.target.closest("[data-mode-picker]")) closeComposerModePickers();
@@ -10891,7 +11045,7 @@ document.addEventListener("click", (event) => {
       error: "",
     };
     syncKnowledgeIndexBadge(notebookId);
-    ensureActiveKnowledgeIndex(notebookId).catch((error) => toast(error.message, true));
+    ensureActiveKnowledgeIndex(notebookId, { force: true }).catch((error) => toast(error.message, true));
   }
   else if (action === "refresh-evidence-index") refreshKnowledgeIndexStatus(element.dataset.notebookId || "").catch(() => {});
   else if (action === "refresh-knowledge-scope-counts") refreshKnowledgeScopeCounts();
@@ -11367,6 +11521,18 @@ document.addEventListener("change", (event) => {
     renderSettings();
     return;
   }
+  if (event.target.id === "reviewSaveFolderInput") {
+    const files = [...(event.target.files || [])];
+    const folderLabel = String(files[0]?.webkitRelativePath || "").split("/")[0].trim();
+    if (!files.length || !folderLabel || !state.reviewSaveDialog?.open) return;
+    state.reviewSaveDialog.folderPath = "";
+    state.reviewSaveDialog.browserDirectoryHandle = null;
+    state.reviewSaveDialog.browserFolderLabel = folderLabel;
+    state.reviewSaveDialog.browserFolderMode = "input";
+    state.reviewSaveDialog.error = "预览环境只能识别文件夹名称；保存时会下载 Markdown。桌面应用可直接写入所选文件夹。";
+    renderReviewSaveDialog();
+    return;
+  }
   if (event.target.matches("[data-review-source]")) {
     updateReviewSourceCount();
     return;
@@ -11394,9 +11560,15 @@ document.addEventListener("change", (event) => {
     addComposerSources(key, files).catch((error) => toast(error.message, true));
     return;
   }
+  if (event.target.closest("#documentProcessingForm, #defaultDocumentProcessingForm") && event.target.name === "ocr-language") {
+    collectDocumentProcessingForm(event.target.form?.id || "");
+    refreshSystemOcrStatus({ force: true }).catch((error) => toast(error.message, true));
+    return;
+  }
   if (event.target.closest("#documentProcessingForm, #defaultDocumentProcessingForm") && ["ocr-provider", "mineru-provider"].includes(event.target.name)) {
     collectDocumentProcessingForm();
     renderSettings();
+    if (event.target.name === "ocr-provider") refreshSystemOcrStatus({ force: true }).catch((error) => toast(error.message, true));
     return;
   }
   if (event.target.dataset.action === "toggle-record") {
@@ -11497,6 +11669,13 @@ document.addEventListener("drop", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  const openHelp = document.querySelector(".setting-help.is-open");
+  if (openHelp && event.key === "Escape") {
+    event.preventDefault();
+    openHelp.classList.remove("is-open");
+    openHelp.querySelector("[data-help-toggle]")?.setAttribute("aria-expanded", "false");
+    return;
+  }
   if (confirmDialogResolve) {
     if (event.key === "Escape") {
       event.preventDefault();
