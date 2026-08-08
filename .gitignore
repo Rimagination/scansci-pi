@@ -13,6 +13,7 @@ src/*.egg-info/
 .coverage
 htmlcov/
 dist/
+dist-*/
 build/
 coverage/
 *.log
