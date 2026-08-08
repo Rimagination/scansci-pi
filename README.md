@@ -2,6 +2,13 @@
 
 ![ScanSci Pi product banner](assets/scansci-pi-banner.png)
 
+## 内置互联网能力
+
+ScanSci Pi 已内置 Agent Reach 风格的只读互联网渠道路由。直接让它读取
+网页、RSS、公开 GitHub、B 站或 V2EX 内容即可，不需要另行安装
+`agent-reach` CLI。遇到登录态、动态渲染或公开读取被拦截的页面，会升级到
+内置的只读 `browser_access` 浏览器桥接；详见 [Agent Reach 集成说明](docs/agent-reach-integration.zh.md)。
+
 ScanSci Pi 是一个证据优先的科研 AI 工作台：帮助你找论文、读资料、核验证据、写研究结论，并生成可交付的文档、表格和演示文稿。
 
 ## 你可以用它做什么
@@ -10,6 +17,14 @@ ScanSci Pi 是一个证据优先的科研 AI 工作台：帮助你找论文、�
 - 在本地论文库中搜索句子级证据，回答问题或撰写综述。
 - 对结论绑定原文、引用和定位信息，证据不足时明确说明。
 - 把研究结果整理成文档、表格、PDF 或演示文稿。
+
+## 图片与语音
+
+- 在输入框的“添加资料”菜单中，可以上传图片、上传语音，或直接录制语音。
+- 视觉模型：先安装 [Ollama](https://ollama.com/download/windows)，再在“设置 → 本地模型 → 模型市场”下载 MiniCPM-V 4.6。
+- 语音模型：同一页面下载 `Qwen3-ASR-0.6B-hf`；语音会先在本机转写，再交给当前对话模型，不上传原始音频。
+
+如果电脑上已有旧版 `Qwen/Qwen3-ASR-0.6B`，它属于旧的 `qwen-asr` 模型格式，不能直接由当前 ScanSci 运行；请改下载 `Qwen3-ASR-0.6B-hf`。
 
 ## 界面预览
 

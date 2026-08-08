@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -39,9 +40,74 @@ def test_desktop_launches_native_shell_against_ephemeral_loopback_server(tmp_pat
     assert fake.window["title"] == "ScanSci Test"
     assert str(fake.window["url"]).startswith("http://127.0.0.1:")
     assert fake.window["options"]["min_size"] == (1080, 700)
+    assert fake.window["options"]["resizable"] is True
     assert fake.window["options"]["frameless"] is True
     assert fake.window["options"]["easy_drag"] is False
     assert fake.window["options"]["js_api"].__class__.__name__ == "ScanSciDesktopApi"
+
+
+class _FakeUser32:
+    def __init__(self) -> None:
+        self.style = 0
+        self.calls: list[tuple[object, ...]] = []
+
+    def GetWindowLongPtrW(self, hwnd: int, index: int) -> int:
+        self.calls.append(("get", hwnd, index))
+        return self.style
+
+    def SetWindowLongPtrW(self, hwnd: int, index: int, style: int) -> int:
+        self.calls.append(("set", hwnd, index, style))
+        self.style = style
+        return style
+
+    def SetWindowPos(self, *args: object) -> int:
+        self.calls.append(("frame-changed", *args))
+        return 1
+
+
+class _FakeDwmApi:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def DwmSetWindowAttribute(self, hwnd: int, attribute: int, value: object, size: int) -> int:
+        decoded = ctypes.cast(value, ctypes.POINTER(ctypes.c_uint32)).contents.value
+        self.calls.append((hwnd, attribute, decoded, size))
+        return 0
+
+
+def test_borderless_window_gets_native_resize_style() -> None:
+    user32 = _FakeUser32()
+
+    assert desktop._apply_borderless_resize_style(1234, user32) is True
+    assert user32.style & 0x00040000
+    assert user32.calls[0] == ("get", 1234, -16)
+    assert user32.calls[1][0:3] == ("set", 1234, -16)
+    assert user32.calls[2][0] == "frame-changed"
+
+
+def test_maximized_native_frame_can_be_removed_and_bounds_are_exact() -> None:
+    user32 = _FakeUser32()
+    user32.style = 0x00040000
+
+    assert desktop._set_resize_frame_style(1234, enabled=False, user32=user32) is True
+    assert user32.style & 0x00040000 == 0
+    assert desktop._set_native_window_bounds(1234, (0, 0, 1920, 1040), user32=user32) is True
+    assert user32.calls[-1] == ("frame-changed", 1234, 0, 0, 0, 1920, 1040, 52)
+
+
+def test_windows_window_chrome_removes_maximized_rounding_and_border(monkeypatch) -> None:
+    monkeypatch.setattr(desktop.os, "name", "nt")
+    dwmapi = _FakeDwmApi()
+
+    assert desktop._set_windows_window_chrome(1234, maximized=True, dwmapi=dwmapi) is True
+    assert dwmapi.calls == [
+        (1234, 33, 1, ctypes.sizeof(ctypes.c_uint32)),
+        (1234, 34, 0xFFFFFFFE, ctypes.sizeof(ctypes.c_uint32)),
+    ]
+
+    dwmapi.calls.clear()
+    assert desktop._set_windows_window_chrome(1234, maximized=False, dwmapi=dwmapi) is True
+    assert dwmapi.calls[0][0:3] == (1234, 33, 2)
 
 
 def test_packaged_desktop_uses_per_user_data_directory(monkeypatch, tmp_path: Path) -> None:
@@ -112,6 +178,19 @@ def test_desktop_save_presentation_copy_uses_native_save_dialog(tmp_path: Path) 
     assert Path(result["path"]).name == "Research deck.pptx"
     assert Path(result["path"]).read_bytes() == b"pptx-data"
     assert webview.window.dialog_calls[0]["save_filename"] == "Research deck.pptx"
+
+
+def test_desktop_local_runtime_file_picker_allows_manifest_and_parts(tmp_path: Path) -> None:
+    archive = tmp_path / "local-runtime.zip"
+    manifest = tmp_path / "local-transformers.json"
+    archive.write_bytes(b"zip")
+    manifest.write_text("{}", encoding="utf-8")
+    webview = _FakeSaveWindowModule(archive)
+    webview.window.create_file_dialog = lambda _dialog_type, **kwargs: (str(archive), str(manifest))
+
+    selected = ScanSciDesktopApi(webview, workspace=tmp_path / "workspace.sqlite").choose_local_runtime_files()
+
+    assert selected == [str(archive), str(manifest)]
 
 
 def test_desktop_local_artifact_bridge_opens_and_reveals_existing_file(monkeypatch, tmp_path: Path) -> None:

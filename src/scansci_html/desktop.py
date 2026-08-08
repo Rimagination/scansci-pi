@@ -29,6 +29,16 @@ from .vector_index import vector_cache_status
 # or an explicit package path is launched.
 WINDOWS_APP_USER_MODEL_ID = "ScanSci.Pi.Desktop"
 
+# Windows 11 applies rounded corners and a DWM border to borderless windows
+# unless the app opts out.  ScanSci uses a custom title bar, so the native
+# chrome must follow the same state as the HTML shell: rounded in a normal
+# window, square and borderless when the window fills the monitor work area.
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWA_BORDER_COLOR = 34
+_DWMWCP_DONOTROUND = 1
+_DWMWCP_ROUND = 2
+_DWMWA_COLOR_NONE = 0xFFFFFFFE
+
 
 def _desktop_data_directory() -> Path | None:
     """Return the durable per-user location used by packaged Windows builds."""
@@ -72,6 +82,207 @@ def _windows_app_user_model_id() -> str:
         return WINDOWS_APP_USER_MODEL_ID
     safe_stem = "".join(character for character in executable_stem if character.isalnum())
     return f"{WINDOWS_APP_USER_MODEL_ID}.{safe_stem or 'Preview'}"
+
+
+def _set_resize_frame_style(
+    hwnd: int,
+    *,
+    enabled: bool,
+    user32: Any | None = None,
+) -> bool:
+    """Toggle the native resize frame without restoring a visible title bar."""
+
+    if user32 is None:
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+        except (AttributeError, ImportError, OSError):
+            return False
+
+    get_window_long = getattr(user32, "GetWindowLongPtrW", None) or getattr(
+        user32, "GetWindowLongW", None
+    )
+    set_window_long = getattr(user32, "SetWindowLongPtrW", None) or getattr(
+        user32, "SetWindowLongW", None
+    )
+    set_window_pos = getattr(user32, "SetWindowPos", None)
+    if not all((get_window_long, set_window_long, set_window_pos)):
+        return False
+
+    # WS_THICKFRAME makes DefWindowProc report HTLEFT/HTRIGHT/HTTOP and corner
+    # hit-test results even though pywebview removed the visible title bar.
+    gwl_style = -16
+    ws_thickframe = 0x00040000
+    swp_nosize = 0x0001
+    swp_nomove = 0x0002
+    swp_nozorder = 0x0004
+    swp_noactivate = 0x0010
+    swp_framechanged = 0x0020
+    try:
+        style = int(get_window_long(int(hwnd), gwl_style))
+        next_style = style | ws_thickframe if enabled else style & ~ws_thickframe
+        if next_style == style:
+            return True
+        set_window_long(int(hwnd), gwl_style, next_style)
+        set_window_pos(
+            int(hwnd),
+            0,
+            0,
+            0,
+            0,
+            0,
+            swp_nosize | swp_nomove | swp_nozorder | swp_noactivate | swp_framechanged,
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _apply_borderless_resize_style(hwnd: int, user32: Any | None = None) -> bool:
+    """Give a frameless Windows form native edge and corner resize hit areas."""
+
+    return _set_resize_frame_style(hwnd, enabled=True, user32=user32)
+
+
+def _set_native_window_bounds(
+    hwnd: int,
+    bounds: tuple[int, int, int, int],
+    user32: Any | None = None,
+) -> bool:
+    """Place a native window on exact physical monitor-work-area bounds."""
+
+    if user32 is None:
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+        except (AttributeError, ImportError, OSError):
+            return False
+    set_window_pos = getattr(user32, "SetWindowPos", None)
+    if not callable(set_window_pos):
+        return False
+    try:
+        x, y, width, height = (int(value) for value in bounds)
+        # SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        flags = 0x0004 | 0x0010 | 0x0020
+        return bool(set_window_pos(int(hwnd), 0, x, y, width, height, flags))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _set_windows_window_chrome(
+    hwnd: int,
+    *,
+    maximized: bool,
+    dwmapi: Any | None = None,
+) -> bool:
+    """Synchronize native corners with ScanSci's custom window state."""
+
+    if os.name != "nt":
+        return False
+    if dwmapi is None:
+        try:
+            import ctypes
+
+            dwmapi = ctypes.windll.dwmapi
+        except (AttributeError, ImportError, OSError):
+            return False
+
+    set_window_attribute = getattr(dwmapi, "DwmSetWindowAttribute", None)
+    if not callable(set_window_attribute):
+        return False
+
+    try:
+        import ctypes
+
+        corner_preference = ctypes.c_uint32(
+            _DWMWCP_DONOTROUND if maximized else _DWMWCP_ROUND
+        )
+        border_color = ctypes.c_uint32(_DWMWA_COLOR_NONE)
+        corner_result = int(
+            set_window_attribute(
+                int(hwnd),
+                _DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(corner_preference),
+                ctypes.sizeof(corner_preference),
+            )
+        )
+        border_result = int(
+            set_window_attribute(
+                int(hwnd),
+                _DWMWA_BORDER_COLOR,
+                ctypes.byref(border_color),
+                ctypes.sizeof(border_color),
+            )
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return corner_result == 0 and border_result == 0
+
+
+def _native_window_handle(window: Any) -> int | None:
+    """Return a WinForms/pywebview HWND when the backend exposes one."""
+
+    native = getattr(window, "native", None)
+    handle = getattr(native, "Handle", None)
+    if handle is None:
+        return None
+    for method_name in ("ToInt64", "ToInt32"):
+        converter = getattr(handle, method_name, None)
+        if callable(converter):
+            try:
+                hwnd = int(converter())
+            except (OSError, TypeError, ValueError):
+                continue
+            if hwnd:
+                return hwnd
+    try:
+        hwnd = int(handle)
+    except (TypeError, ValueError):
+        return None
+    return hwnd or None
+
+
+def _physical_working_area_for_window(window: Any) -> tuple[int, int, int, int] | None:
+    """Return the native physical work area used to remove outer frame gaps."""
+
+    if os.name != "nt":
+        return None
+    native = getattr(window, "native", None)
+    if native is None:
+        return None
+    try:
+        from System.Windows.Forms import Screen  # type: ignore[import-not-found]
+
+        rectangle = Screen.FromHandle(native.Handle).WorkingArea
+        return tuple(
+            int(getattr(rectangle, field))
+            for field in ("X", "Y", "Width", "Height")
+        )
+    except Exception:
+        return None
+
+
+def _enable_borderless_window_resize(window: Any) -> bool:
+    """Install native resizing after pywebview has created the Windows form."""
+
+    if os.name != "nt" or window is None:
+        return False
+    events = getattr(window, "events", None)
+    shown = getattr(events, "shown", None)
+    if shown is not None and not shown.wait(15):
+        return False
+    hwnd = _native_window_handle(window)
+    if hwnd is None:
+        return False
+    _apply_borderless_resize_style(hwnd)
+    _set_windows_window_chrome(hwnd, maximized=False)
+    return True
 
 
 class ScanSciDesktopApi:
@@ -220,6 +431,14 @@ class ScanSciDesktopApi:
                 window.resize(restore_width, restore_height)
                 window.move(restore_x, restore_y)
             self._maximized = False
+        hwnd = _native_window_handle(window)
+        if hwnd is not None:
+            _set_resize_frame_style(hwnd, enabled=not self._maximized)
+            _set_windows_window_chrome(hwnd, maximized=self._maximized)
+            if self._maximized:
+                native_work_area = _physical_working_area_for_window(window)
+                if native_work_area is not None:
+                    _set_native_window_bounds(hwnd, native_work_area)
         return {"ok": True, "maximized": self._maximized}
 
     def close_window(self) -> dict[str, bool]:
@@ -245,6 +464,22 @@ class ScanSciDesktopApi:
             allow_multiple=True,
             file_types=(
                 "研究资料 (*.pdf;*.docx;*.pptx;*.xlsx;*.xls;*.csv;*.json;*.xml;*.html;*.htm;*.md;*.markdown;*.txt;*.rtf;*.epub;*.zip;*.png;*.jpg;*.jpeg;*.webp;*.tif;*.tiff)",
+                "所有文件 (*.*)",
+            ),
+        )
+        return [str(path) for path in list(result or [])]
+
+    def choose_local_runtime_files(self) -> list[str]:
+        """Pick a runtime ZIP, manifest, or multipart runtime assets."""
+
+        windows = list(getattr(self.webview, "windows", []) or [])
+        if not windows:
+            return []
+        result = windows[0].create_file_dialog(
+            getattr(self.webview, "OPEN_DIALOG", 0),
+            allow_multiple=True,
+            file_types=(
+                "ScanSci 本地运行组件 (*.zip;*.json;*.part*)",
                 "所有文件 (*.*)",
             ),
         )
@@ -413,18 +648,24 @@ def launch_desktop(
             daemon=True,
         ).start()
     try:
-        webview.create_window(
+        native_window = webview.create_window(
             title,
             f"http://127.0.0.1:{server.server_port}",
             width=1440,
             height=960,
             min_size=(1080, 700),
+            resizable=True,
             frameless=True,
             easy_drag=False,
-            background_color="#f2f3f5",
+            # Keep the native surface identical to --canvas so no 1 px
+            # Windows/DWM strip becomes visible at the custom frame edges.
+            background_color="#f4f4f6",
             js_api=ScanSciDesktopApi(webview, workspace=workspace, update_service=updates, relaunch_args=relaunch_args),
         )
-        webview.start()
+        if webview_module is None:
+            webview.start(_enable_borderless_window_resize, args=(native_window,))
+        else:
+            webview.start()
     finally:
         server.shutdown()
         server.server_close()

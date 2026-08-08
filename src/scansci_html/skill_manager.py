@@ -259,6 +259,308 @@ def install_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, A
     }
 
 
+def check_skill_updates(workspace: str | Path) -> dict[str, Any]:
+    """Check tracked external Skills without changing the installed library.
+
+    A Skill is only eligible for automatic update when its provenance is a
+    public HTTPS Git or marketplace source.  Local folders and archives are
+    intentionally reported as manual sources because ScanSci cannot infer a
+    trustworthy remote version for them.  Every remote snapshot is scanned by
+    the same static security gate used during installation.
+    """
+
+    results: list[dict[str, Any]] = []
+    for record in installed_skills(workspace):
+        base = {
+            "id": str(record.get("id", "")),
+            "name": str(record.get("name", "") or record.get("id", "")),
+            "source_type": str(record.get("source_type", "") or ""),
+            "source": str(record.get("source", "") or ""),
+            "available": False,
+        }
+        if record.get("builtin"):
+            results.append({**base, "state": "bundled", "message": "随 ScanSci 应用更新"})
+            continue
+        source_type = str(record.get("source_type", "") or "").strip().lower()
+        if source_type not in {"git", "marketplace"}:
+            results.append({**base, "state": "manual", "message": "本地来源没有可自动检查的远程版本"})
+            continue
+        try:
+            current_root = _installed_skill_root(record)
+            current_report = scan_skill_packages(
+                [current_root],
+                source_type=source_type,
+                source=str(record.get("source", "")),
+            )
+            temporary, repository_root = _acquire_skill_update_source(record)
+            try:
+                remote_roots = _find_skill_roots(repository_root)
+                remote_root = _select_skill_root(remote_roots, record)
+                _validate_skill_source_size([remote_root])
+                remote_report = scan_skill_packages(
+                    [remote_root],
+                    source_type=source_type,
+                    source=str(record.get("source", "")),
+                )
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+            remote_verdict = str(remote_report.get("verdict", "BLOCKED") or "BLOCKED").upper()
+            fingerprint_changed = current_report.get("fingerprint") != remote_report.get("fingerprint")
+            if remote_verdict == "BLOCKED":
+                results.append({
+                    **base,
+                    "state": "blocked",
+                    "message": "远程版本未通过安全检查，已阻止更新",
+                    "current_fingerprint": current_report.get("fingerprint", ""),
+                    "latest_fingerprint": remote_report.get("fingerprint", ""),
+                    "latest_scan": _security_scan_summary(remote_report),
+                })
+                continue
+            results.append({
+                **base,
+                "state": "available" if fingerprint_changed else "current",
+                "available": fingerprint_changed,
+                "message": "发现可更新版本" if fingerprint_changed else "当前已是最新内容",
+                "current_fingerprint": current_report.get("fingerprint", ""),
+                "latest_fingerprint": remote_report.get("fingerprint", ""),
+                "latest_scan": _security_scan_summary(remote_report),
+            })
+        except (OSError, ValueError, SkillInstallError) as error:
+            results.append({**base, "state": "error", "message": "检查更新失败", "error": str(error)[:500]})
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "skills": results,
+        "available_count": sum(1 for item in results if item.get("available")),
+        "error_count": sum(1 for item in results if item.get("state") == "error"),
+    }
+
+
+def scan_skill_update(workspace: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Acquire and scan one remote Skill update into a quarantine snapshot."""
+
+    record = _find_external_skill(workspace, str(payload.get("record_id", "") or "").strip())
+    source_type = str(record.get("source_type", "") or "").strip().lower()
+    if source_type not in {"git", "marketplace"}:
+        raise SkillInstallError("这个 Skill 没有可自动更新的远程来源")
+    current_root = _installed_skill_root(record)
+    current_report = scan_skill_packages([current_root], source_type=source_type, source=str(record.get("source", "")))
+    temporary, repository_root = _acquire_skill_update_source(record)
+    scan_id = uuid4().hex
+    quarantine = _skill_quarantine_path(workspace)
+    _cleanup_skill_quarantine(quarantine)
+    scan_root = quarantine / scan_id
+    try:
+        remote_root = _select_skill_root(_find_skill_roots(repository_root), record)
+        _validate_skill_source_size([remote_root])
+        packages_root = scan_root / "packages"
+        packages_root.mkdir(parents=True, exist_ok=False)
+        destination = packages_root / f"01-{_slug(remote_root.name)}"
+        shutil.copytree(remote_root, destination, ignore=shutil.ignore_patterns(*_IGNORED_PACKAGE_NAMES))
+        report = scan_skill_packages([destination], source_type=source_type, source=str(record.get("source", "")))
+        created_at = datetime.now(timezone.utc)
+        manifest = {
+            "scan_id": scan_id,
+            "operation": "update",
+            "record_id": str(record.get("id", "")),
+            "target_path": str(Path(str(record.get("path", ""))).resolve()),
+            "current_fingerprint": current_report.get("fingerprint", ""),
+            "source_type": source_type,
+            "source": str(record.get("source", "")),
+            "created_at": created_at.isoformat(timespec="seconds"),
+            "expires_at": (created_at + _SCAN_TTL).isoformat(timespec="seconds"),
+            "packages": [destination.name],
+            "report": report,
+        }
+        (scan_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "scan_id": scan_id,
+            "record_id": str(record.get("id", "")),
+            "scan": report,
+            "current_fingerprint": current_report.get("fingerprint", ""),
+            "requires_confirmation": report["verdict"] != "BLOCKED",
+            "expires_at": manifest["expires_at"],
+        }
+    except Exception:
+        shutil.rmtree(scan_root, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def update_skill(workspace: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Replace one external Skill atomically after a fresh security scan.
+
+    The previous package is moved to a workspace-scoped backup before the new
+    snapshot is promoted.  If either the filesystem swap or settings write
+    fails, both are restored before the error is returned to the UI.
+    """
+
+    scan_id = str(payload.get("scan_id", "") or "").strip().lower()
+    if not _SCAN_ID.fullmatch(scan_id):
+        raise SkillInstallError("更新前必须先完成 Skill 安全检查")
+    if str(payload.get("decision", "") or "").strip().lower() != "update":
+        raise SkillInstallError("需要明确确认后才能更新 Skill")
+    scan_root, manifest = _load_scan_manifest(workspace, scan_id)
+    if str(manifest.get("operation", "")) != "update":
+        raise SkillInstallError("这份安全快照不是 Skill 更新快照")
+    record_id = str(manifest.get("record_id", "") or "")
+    record = _find_external_skill(workspace, record_id)
+    report = dict(manifest.get("report", {}) or {})
+    verdict = str(report.get("verdict", "BLOCKED") or "BLOCKED").upper()
+    if verdict == "BLOCKED":
+        raise SkillInstallError("安全检查已阻止更新这个 Skill")
+    if verdict == "REVIEW" and payload.get("acknowledge_risk") is not True:
+        raise SkillInstallError("请先阅读风险并明确勾选确认")
+
+    packages_root = (scan_root / "packages").resolve()
+    roots: list[Path] = []
+    for name in manifest.get("packages", []):
+        candidate = (packages_root / str(name)).resolve()
+        try:
+            candidate.relative_to(packages_root)
+        except ValueError as error:
+            raise SkillInstallError("Skill 更新快照路径无效") from error
+        if not candidate.is_dir():
+            raise SkillInstallError("Skill 更新快照已失效，请重新检查")
+        roots.append(candidate)
+    if len(roots) != 1:
+        raise SkillInstallError("一次只能更新一个 Skill")
+    snapshot_report = scan_skill_packages(
+        roots,
+        source_type=str(manifest.get("source_type", "")),
+        source=str(manifest.get("source", "")),
+    )
+    if snapshot_report.get("fingerprint") != report.get("fingerprint") or snapshot_report.get("verdict") != verdict:
+        raise SkillInstallError("Skill 更新快照在确认前发生变化，请重新检查")
+
+    library = skill_library_path(workspace).resolve()
+    target = Path(str(record.get("path", ""))).resolve()
+    if target.parent != library or target.name.startswith(".") or not target.is_dir():
+        raise SkillInstallError("Skill 安装目录无效，已取消更新")
+    if target != Path(str(manifest.get("target_path", ""))).resolve():
+        raise SkillInstallError("Skill 安装位置已变化，请重新检查")
+    current_report = scan_skill_packages(
+        [target],
+        source_type=str(manifest.get("source_type", "")),
+        source=str(manifest.get("source", "")),
+    )
+    if current_report.get("fingerprint") != manifest.get("current_fingerprint"):
+        raise SkillInstallError("当前 Skill 内容已变化，请重新检查后再更新")
+
+    settings_before = load_settings(workspace)
+    stage_parent = Path(tempfile.mkdtemp(prefix=".scansci-skill-update-", dir=library.parent))
+    backup_parent = library.parent / ".scansci-skill-backups" / _slug(record_id)
+    backup_parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_parent / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    staged = stage_parent / target.name
+    promoted = False
+    try:
+        shutil.copytree(roots[0], staged, ignore=shutil.ignore_patterns(*_IGNORED_PACKAGE_NAMES))
+        _ensure_no_symlinks(staged)
+        target.replace(backup)
+        staged.replace(target)
+        promoted = True
+        metadata = _skill_metadata(target / _SKILL_FILE, fallback=target.name)
+        records = list(settings_before.get("skills", []) or [])
+        updated_record: dict[str, Any] | None = None
+        for index, item in enumerate(records):
+            if str(item.get("id", "")) != record_id:
+                continue
+            replacement = {
+                **item,
+                "name": metadata["name"],
+                "description": metadata["description"],
+                "path": str(target),
+                "source_type": str(manifest.get("source_type", "")),
+                "source": str(manifest.get("source", "")),
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "security_scan": _security_scan_summary(snapshot_report),
+            }
+            records[index] = replacement
+            updated_record = replacement
+            break
+        if updated_record is None:
+            raise SkillInstallError("找不到待更新的 Skill 配置")
+        settings_before["skills"] = records
+        settings = save_settings(workspace, settings_before)
+        installed_record = next((item for item in settings.get("skills", []) if str(item.get("id", "")) == record_id), updated_record)
+        shutil.rmtree(scan_root, ignore_errors=True)
+        return {
+            "updated": installed_record,
+            "backup_path": str(backup),
+            "skills": installed_skills(workspace),
+            "settings": settings,
+            "scan": snapshot_report,
+        }
+    except Exception as error:
+        rollback_error: Exception | None = None
+        try:
+            if promoted and target.exists():
+                shutil.rmtree(target, ignore_errors=False)
+            if backup.exists():
+                backup.replace(target)
+            save_settings(workspace, settings_before)
+        except Exception as restore_error:  # pragma: no cover - catastrophic filesystem failure
+            rollback_error = restore_error
+        if rollback_error is not None:
+            raise SkillInstallError(f"Skill 更新失败，自动回滚也失败：{rollback_error}") from error
+        raise SkillInstallError(f"Skill 更新失败，已自动回滚：{error}") from error
+    finally:
+        shutil.rmtree(stage_parent, ignore_errors=True)
+
+
+def _find_external_skill(workspace: str | Path, record_id: str) -> dict[str, Any]:
+    if not record_id:
+        raise SkillInstallError("缺少 Skill 标识")
+    record = next((item for item in installed_skills(workspace) if str(item.get("id", "")) == record_id), None)
+    if record is None:
+        raise SkillInstallError("找不到要更新的 Skill")
+    if record.get("builtin"):
+        raise SkillInstallError("内置 Skill 会随 ScanSci 应用更新")
+    return record
+
+
+def _installed_skill_root(record: dict[str, Any]) -> Path:
+    path = Path(str(record.get("path", ""))).expanduser()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise SkillInstallError("本地 Skill 文件已不存在") from error
+    if not resolved.is_dir() or not (resolved / _SKILL_FILE).is_file():
+        raise SkillInstallError("本地 Skill 文件不完整")
+    _ensure_no_symlinks(resolved)
+    return resolved
+
+
+def _acquire_skill_update_source(record: dict[str, Any]) -> tuple[Path, Path]:
+    source_type = str(record.get("source_type", "") or "").strip().lower()
+    source = str(record.get("source", "") or "").strip()
+    if source_type == "marketplace":
+        return _clone_git_source(_marketplace_git_fallback(source))
+    if source_type == "git":
+        return _clone_git_source(source)
+    raise SkillInstallError("这个 Skill 来源不支持自动更新")
+
+
+def _select_skill_root(roots: list[Path], record: dict[str, Any]) -> Path:
+    if len(roots) == 1:
+        return roots[0]
+    expected = {
+        _slug(record.get("name", "")),
+        _slug(Path(str(record.get("path", ""))).name),
+        _slug(record.get("id", "")),
+    }
+    matches = []
+    for root in roots:
+        metadata = _skill_metadata(root / _SKILL_FILE, fallback=root.name)
+        candidates = {_slug(root.name), _slug(metadata["id"]), _slug(metadata["name"])}
+        if expected & candidates:
+            matches.append(root)
+    if len(matches) == 1:
+        return matches[0]
+    raise SkillInstallError("远程来源包含多个 Skill，无法安全判断更新目标")
+
+
 def cancel_skill_scan(workspace: str | Path, scan_id: str) -> dict[str, Any]:
     """Discard one pending quarantine snapshot without touching installed Skills."""
 

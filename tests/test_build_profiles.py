@@ -8,6 +8,7 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     script = (ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8-sig")
 
     assert '[string]$PackageProfile = "core"' in script
+    assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json' in script
     assert 'build\\desktop-cache\\$cacheName' in script
     assert '$sourceTreeHash' in script
     assert 'source_tree_sha256 = $sourceTreeHash' in script
@@ -33,6 +34,7 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     assert '"--hidden-import", "transformers.models.auto.modeling_auto"' in script
     assert '"--hidden-import", "transformers.generation.streamers"' in script
     assert '"--hidden-import", "transformers.models.qwen3.modeling_qwen3"' in script
+    assert '"--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr"' in script
     assert '"--hidden-import", "transformers"' not in script
     assert '"--hidden-import", "sentence_transformers"' not in script
     assert '"--hidden-import", "torch.testing._internal.logging_tensor"' in script
@@ -69,6 +71,7 @@ def test_local_runtime_has_an_independent_versioned_build() -> None:
     assert '"--hidden-import", "transformers.models.auto.modeling_auto"' in script
     assert '"--hidden-import", "transformers.generation.streamers"' in script
     assert '"--hidden-import", "transformers.models.qwen3.modeling_qwen3"' in script
+    assert '"--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr"' in script
     assert '"--hidden-import", "transformers"' not in script
     assert '"--hidden-import", "sentence_transformers"' not in script
     assert '"--hidden-import", "torch.testing._internal.logging_tensor"' in script

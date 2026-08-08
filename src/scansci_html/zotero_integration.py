@@ -50,27 +50,50 @@ class ZoteroIntegrationError(RuntimeError):
     """A user-facing Zotero protocol or availability failure."""
 
 
-def zotero_status(*, timeout: float = 1.5) -> dict[str, Any]:
+def zotero_status(
+    *,
+    timeout: float = 1.5,
+    data_dir: str | Path | None = None,
+) -> dict[str, Any]:
     """Return truthful local-database, API, and connector readiness."""
 
     try:
-        discovered = discover_local_zotero()
+        discovered = discover_local_zotero(data_dir)
     except FileNotFoundError:
         discovered = {}
+    database_error = ""
+    database_readable = False
+    if discovered:
+        try:
+            database = Path(discovered["database_path"])
+            connection = sqlite3.connect(
+                f"{database.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+                timeout=max(0.2, min(2.0, float(timeout))),
+            )
+            try:
+                connection.execute("SELECT 1").fetchone()
+            finally:
+                connection.close()
+            database_readable = True
+        except (OSError, sqlite3.Error, ValueError) as error:
+            database_error = f"{type(error).__name__}: {error}"[:300]
     api = _http("/api/", timeout=timeout)
     connector = _http("/connector/ping", timeout=timeout)
-    explicit_data_dir = bool(str(os.environ.get("ZOTERO_DATA_DIR", "")).strip())
+    explicit_data_dir = bool(str(data_dir or "").strip() or str(os.environ.get("ZOTERO_DATA_DIR", "")).strip())
+    api_running = bool(api[0])
     return {
         "installed": bool(discovered),
         "data_dir": discovered.get("data_dir", ""),
         "database_path": discovered.get("database_path", ""),
-        "database_readable": bool(discovered),
-        "api_running": api[0],
+        "database_readable": database_readable,
+        "database_error": database_error,
+        "api_running": api_running,
         "api_status": api[1],
         "connector_running": connector[0],
         "connector_status": connector[1],
-        "read_mode": "local-database" if explicit_data_dir and discovered else (
-            "local-api" if api[0] else ("local-database" if discovered else "unavailable")
+        "read_mode": "local-database" if database_readable and (explicit_data_dir or not api_running) else (
+            "local-api" if api_running else "unavailable"
         ),
     }
 
@@ -208,6 +231,11 @@ def _search_zotero_api(
             )
             if name:
                 creators.append(name)
+        tags: list[str] = []
+        for raw_tag in list(data.get("tags", []) or []):
+            tag = str(raw_tag.get("tag", "") if isinstance(raw_tag, dict) else raw_tag).strip()
+            if tag and tag not in tags:
+                tags.append(tag)
         collection_keys = [str(key) for key in list(data.get("collections", []) or []) if key]
         collection_map = {str(collection["key"]): str(collection["name"]) for collection in collections}
         attachments = _api_pdf_children(item_key, include_fulltext=include_fulltext, query=normalized_query)
@@ -225,6 +253,7 @@ def _search_zotero_api(
             "abstract": str(data.get("abstractNote", ""))[:1_200],
             "url": str(data.get("url", "")),
             "collections": [{"key": key, "name": collection_map.get(key, key)} for key in collection_keys],
+            "tags": tags,
             "attachments": [{key: value for key, value in attachment.items() if key != "fulltext_excerpt"} for attachment in attachments],
             "evidence_kind": "zotero-metadata",
         }
@@ -527,6 +556,7 @@ def _item_details(connection: sqlite3.Connection, *, item_ids: list[int], data_d
     fields: dict[int, dict[str, str]] = {item_id: {} for item_id in item_ids}
     creators: dict[int, list[str]] = {item_id: [] for item_id in item_ids}
     collections: dict[int, list[dict[str, str]]] = {item_id: [] for item_id in item_ids}
+    tags: dict[int, list[str]] = {item_id: [] for item_id in item_ids}
     attachments: dict[int, list[dict[str, Any]]] = {item_id: [] for item_id in item_ids}
     for row in connection.execute(
         f"""
@@ -558,6 +588,22 @@ def _item_details(connection: sqlite3.Connection, *, item_ids: list[int], data_d
         item_ids,
     ):
         collections[int(row[0])].append({"key": str(row[1] or ""), "name": str(row[2] or "")})
+    try:
+        for row in connection.execute(
+            f"""
+            SELECT it.itemID, t.name
+            FROM itemTags it
+            JOIN tags t ON t.tagID = it.tagID
+            WHERE it.itemID IN ({placeholders})
+            ORDER BY it.itemID, lower(t.name), t.tagID
+            """,
+            item_ids,
+        ):
+            tag = str(row[1] or "").strip()
+            if tag and tag not in tags[int(row[0])]:
+                tags[int(row[0])].append(tag)
+    except sqlite3.Error:
+        pass
     for row in connection.execute(
         f"""
         SELECT ia.parentItemID, child.key, ia.path, ia.linkMode
@@ -599,6 +645,7 @@ def _item_details(connection: sqlite3.Connection, *, item_ids: list[int], data_d
             "abstract": str(values.get("abstractNote", ""))[:1_200],
             "url": str(values.get("url", "")),
             "collections": collections[item_id],
+            "tags": tags[item_id],
             "attachments": attachments[item_id],
             "evidence_kind": "zotero-metadata",
         })

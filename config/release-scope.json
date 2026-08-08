@@ -1,30 +1,22 @@
 {
   "schema_version": 1,
-  "p0_objective": "修复可选研究检索组件的下载可靠性和本机状态问答：错误页不得写入模型文件，断点只能复用已校验片段，用户能直接知道哪个组件、模型和文件失败以及如何重试。",
+  "p0_objective": "更新桌面应用图标，修复 Windows 窗口最大化时的显示问题（最大化铺满工作区且任务栏仍可见、四角直角无 DWM 圆角、边框无杂色条；还原窗口保持圆角），并把当前未提交功能集重新打包为可验收的发布候选。",
   "acceptance": [
     {
-      "id": "local-status-routing",
-      "requirement": "询问当前、失败或卡住的组件、资源、模型、运行时、下载与安装任务时，必须进入本机状态问答，不得启动论文检索或下载工作流。"
+      "id": "app-icon",
+      "requirement": "打包产物（EXE、安装包、桌面快捷方式）使用新版应用图标，Windows 资源管理器中正常显示且不出现默认白图标。"
     },
     {
-      "id": "deterministic-local-answer",
-      "requirement": "本机状态回答直接读取持久化任务记录，列出失败组件、模型、文件、来源、原因和重试位置，不依赖大模型猜测。"
+      "id": "maximized-window",
+      "requirement": "窗口最大化时铺满显示器工作区（任务栏仍可见），四角为直角、无 DWM 圆角，边框无杂色条。"
     },
     {
-      "id": "verified-range-download",
-      "requirement": "模型二进制采用分段下载；写入前校验 HTTP 状态、Content-Type、Content-Length、Content-Range 和预期总大小，拒绝 HTML、JSON、XML 或截断响应。"
+      "id": "restored-window",
+      "requirement": "从最大化还原后，窗口恢复为当前的圆角样式，标题栏与内容区域显示正常。"
     },
     {
-      "id": "verified-resume",
-      "requirement": "只续传带有匹配校验元数据的临时片段；旧版遗留或来源不明的部分文件必须丢弃后重新下载。"
-    },
-    {
-      "id": "progress-semantics",
-      "requirement": "多模型资源任务分别显示整组完成度和当前模型进度，不得把整组 50% 与当前文件的少量字节并列成误导性状态。"
-    },
-    {
-      "id": "source-fallback",
-      "requirement": "继续支持官方 ModelScope 与 Hugging Face 镜像回退，并保留明确的实际来源与错误信息。"
+      "id": "edge-resize",
+      "requirement": "无边框窗口的边缘与四角仍可通过鼠标拖拽调整大小，最大化/还原与拖拽行为不冲突。"
     },
     {
       "id": "standard-package",
@@ -39,6 +31,6 @@
     "本轮不新增聊天、知识库、PPT、模型市场或论文获取产品功能。",
     "不把可选本地模型或推理依赖打进 ScanSci core 安装包。",
     "不购买或要求代码签名证书。",
-    "不以放宽下载校验换取表面成功率。"
+    "不修改发布渠道分级与既有门禁步骤顺序。"
   ]
 }

@@ -13,17 +13,14 @@
         "-m",
         "pytest",
         "tests/test_desktop.py",
-        "tests/test_mcp_bridge.py",
         "tests/test_webapp.py",
         "tests/test_llm.py",
-        "tests/test_app_settings.py",
         "tests/test_skill_manager.py",
-                                    "tests/test_library_manager.py",
-                                    "tests/test_slide_studio.py",
-                                    "tests/test_slides_templates.py",
-                                    "tests/test_release_gate.py",
-                                    "tests/test_verify_scansci_knowledge.py",
-                                    "tests/test_build_profiles.py",
+        "tests/test_library_manager.py",
+        "tests/test_slides_templates.py",
+        "tests/test_release_gate.py",
+        "tests/test_verify_scansci_knowledge.py",
+        "tests/test_build_profiles.py",
         "tests/test_archive_runtime_component.py",
         "tests/test_prepare_runtime_release_manifest.py",
         "tests/test_local_runtime_component.py",
@@ -44,7 +41,11 @@
     {
       "id": "frontend-syntax",
       "title": "前端脚本语法检查",
-      "command": ["node", "--check", "src/scansci_html/web/app.js"]
+      "command": [
+        "node",
+        "--check",
+        "src/scansci_html/web/app.js"
+      ]
     },
     {
       "id": "gateway-worker-tests",
@@ -110,7 +111,12 @@
     {
       "id": "full-python",
       "title": "完整 Python 测试套件",
-      "command": ["{python}", "-m", "pytest", "-q"],
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q"
+      ],
       "output": "file"
     }
   ],
@@ -195,6 +201,10 @@
       "home_layout_checked",
       "chat_layout_checked"
     ],
-    "required_screenshots": ["home.png", "chat.png", "maximized.png"]
+    "required_screenshots": [
+      "home.png",
+      "chat.png",
+      "maximized.png"
+    ]
   }
 }

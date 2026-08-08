@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from threading import Lock
 from typing import Any, Iterator, Protocol
 
 from pydantic import ValidationError
@@ -28,9 +29,55 @@ _STRUCTURED_PROVIDER_INPUT_TOKENS = 48_000
 # response cannot quietly multiply paid requests.
 _MAX_LOGICAL_REQUESTS = 2
 # A managed streaming turn can briefly return 429 while a previous gateway
-# worker drains its queue.  Allow one additional, bounded retry here without
-# weakening the structured-output budget above.
-_STREAM_LOGICAL_REQUESTS = 3
+# worker drains its queue.  Keep the retry budget bounded, but give a transient
+# gateway window enough time to recover before surfacing an error to the user.
+_STREAM_LOGICAL_REQUESTS = 4
+
+# The desktop server can receive two submissions at nearly the same time (for
+# example Enter plus a click, or two windows sharing the same gateway).  A
+# process-local gate prevents those requests from stampeding one managed
+# endpoint.  The cooldown is deliberately keyed by endpoint, not model: GLM
+# and the standby managed model share the same upstream capacity.
+_STREAM_GATE_LOCKS: dict[str, Lock] = {}
+_STREAM_GATE_LOCKS_GUARD = Lock()
+_STREAM_COOLDOWN_UNTIL: dict[str, float] = {}
+_STREAM_COOLDOWN_GUARD = Lock()
+
+
+def _stream_rate_key(provider: str, base_url: str) -> str:
+    return f"{str(provider or '').strip().lower()}::{str(base_url or '').rstrip('/').lower()}"
+
+
+def _stream_request_gate(rate_key: str) -> Lock:
+    with _STREAM_GATE_LOCKS_GUARD:
+        gate = _STREAM_GATE_LOCKS.get(rate_key)
+        if gate is None:
+            gate = Lock()
+            _STREAM_GATE_LOCKS[rate_key] = gate
+        return gate
+
+
+def _stream_cooldown_remaining(rate_key: str) -> float:
+    with _STREAM_COOLDOWN_GUARD:
+        remaining = max(0.0, float(_STREAM_COOLDOWN_UNTIL.get(rate_key, 0.0)) - time.monotonic())
+        if remaining <= 0:
+            _STREAM_COOLDOWN_UNTIL.pop(rate_key, None)
+        return remaining
+
+
+def _stream_set_cooldown(rate_key: str, delay: float) -> None:
+    if delay <= 0:
+        return
+    with _STREAM_COOLDOWN_GUARD:
+        _STREAM_COOLDOWN_UNTIL[rate_key] = max(
+            float(_STREAM_COOLDOWN_UNTIL.get(rate_key, 0.0)),
+            time.monotonic() + float(delay),
+        )
+
+
+def _stream_clear_cooldown(rate_key: str) -> None:
+    with _STREAM_COOLDOWN_GUARD:
+        _STREAM_COOLDOWN_UNTIL.pop(rate_key, None)
 
 
 class StructuredOutputError(ValueError):
@@ -165,11 +212,49 @@ def _structured_retry_instruction(
     )
 
 
+def _compact_provider_input_for_estimate(value: object) -> object:
+    """Replace inline image bytes before estimating text-token budget.
+
+    OpenAI-compatible vision requests carry images as base64 data URLs.  The
+    bytes are real input to the vision model, but they are not text tokens.
+    Counting every base64 character here can reject an otherwise valid image
+    request before it ever reaches the selected local or remote vision model.
+    """
+
+    if isinstance(value, list):
+        return [_compact_provider_input_for_estimate(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    compacted = {
+        key: _compact_provider_input_for_estimate(item)
+        for key, item in value.items()
+    }
+    part_type = str(value.get("type", "")).strip().lower()
+    if part_type == "image_url" and isinstance(value.get("image_url"), dict):
+        image_url = dict(value["image_url"])
+        url = str(image_url.get("url", ""))
+        if url.startswith("data:image/"):
+            image_url["url"] = "[inline image bytes omitted from text estimate]"
+        compacted["image_url"] = image_url
+    source = value.get("source")
+    if part_type == "image" and isinstance(source, dict) and str(source.get("type", "")).lower() == "base64":
+        compacted_source = dict(compacted.get("source", {}) or {})
+        compacted_source["data"] = "[inline image bytes omitted from text estimate]"
+        compacted["source"] = compacted_source
+    return compacted
+
+
 def _estimate_provider_input_tokens(messages: object) -> int:
     """Conservatively estimate serialized provider input before any paid call."""
 
     try:
-        text = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
+        text = json.dumps(
+            _compact_provider_input_for_estimate(messages),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
     except (TypeError, ValueError):
         text = str(messages)
     ascii_chars = sum(1 for char in text if ord(char) <= 0x7F)
@@ -976,6 +1061,8 @@ def stream_chat_text(
         raise ValueError(f"Unsupported chat provider: {provider}")
 
     client = session or requests.Session()
+    rate_key = _stream_rate_key(provider, base_url)
+    request_gate = _stream_request_gate(rate_key)
     continuation_messages = [dict(item) for item in messages]
     complete_text = ""
     total_usage: dict[str, int] = {}
@@ -1004,15 +1091,37 @@ def stream_chat_text(
         finish_reason = ""
         try:
             for retry_index in range(request_limit):
+                queued_delay = _stream_cooldown_remaining(rate_key)
+                if queued_delay > 0:
+                    yield {
+                        "type": "retry",
+                        "reason": "rate_limit",
+                        "status": 429,
+                        "delay_seconds": round(queued_delay, 1),
+                        "attempt": retry_index + 1,
+                        "queued": True,
+                    }
+                    time.sleep(queued_delay)
+                    # The sleep above is this request's acknowledgement of the
+                    # shared cooldown.  Clear the marker before acquiring the
+                    # gate again; a final 429 still leaves the marker in place
+                    # for the next logical request.
+                    _stream_clear_cooldown(rate_key)
                 try:
-                    response = client.post(
-                        f"{base_url.rstrip('/')}/chat/completions",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json=request_body,
-                        timeout=timeout,
-                        stream=True,
-                    )
-                    response.raise_for_status()
+                    with request_gate:
+                        gate_delay = _stream_cooldown_remaining(rate_key)
+                        if gate_delay > 0:
+                            time.sleep(gate_delay)
+                            _stream_clear_cooldown(rate_key)
+                        response = client.post(
+                            f"{base_url.rstrip('/')}/chat/completions",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json=request_body,
+                            timeout=timeout,
+                            stream=True,
+                        )
+                        response.raise_for_status()
+                    _stream_clear_cooldown(rate_key)
                     break
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
@@ -1021,14 +1130,22 @@ def stream_chat_text(
                     # do not make users manually recover from a stale desktop
                     # keep-alive connection.
                     retryable = status is None or status in {429, 502, 503, 504}
-                    if not retryable or retry_index >= request_limit - 1:
-                        raise
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
                         requested_delay = float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)
                     except (TypeError, ValueError):
                         requested_delay = 0
-                    delay = min(30.0, max(requested_delay, float(2 ** (retry_index + 1))))
+                    base_delay = 2 ** (retry_index + 2) if status == 429 else 2 ** (retry_index + 1)
+                    delay = min(45.0, max(requested_delay, float(base_delay)))
+                    if status == 429:
+                        _stream_set_cooldown(rate_key, delay)
+                    if not retryable or retry_index >= request_limit - 1:
+                        # Release the failed streaming connection before
+                        # raising so the socket is not leaked to the caller.
+                        if response is not None:
+                            response.close()
+                            response = None
+                        raise RuntimeError(_public_model_error(error, prefix="模型流式响应暂时不可用")) from error
                     if response is not None:
                         response.close()
                         response = None
@@ -1041,6 +1158,7 @@ def stream_chat_text(
                         "attempt": retry_index + 1,
                     }
                     time.sleep(delay)
+                    _stream_clear_cooldown(rate_key)
             content_type = str(dict(getattr(response, "headers", {}) or {}).get("Content-Type", "")).lower()
             if "text/event-stream" not in content_type:
                 # A managed worker may briefly return a non-SSE gateway page
@@ -1575,7 +1693,7 @@ def analyze_vision_images(
     )
     kind = str(provider or "").strip().lower()
     active_session = session or requests.Session()
-    if kind in {"openai", "openai-compatible"}:
+    if kind in {"local", "openai", "openai-compatible"}:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         content.extend(
             {

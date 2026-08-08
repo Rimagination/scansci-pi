@@ -712,6 +712,41 @@ def test_search_evidence_store_uses_document_cards_before_bounded_raw_evidence_f
     assert trace[-1]["catalog_selected_documents"] >= 1
 
 
+def test_zotero_tags_add_soft_document_card_recall(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "target.html").write_text(
+        "<article class='paper' data-doi='10.1234/tag-target'><h1>Field observations</h1>"
+        "<h2>Results</h2><p>Seasonal measurements were consistent across the sampled plots.</p></article>",
+        encoding="utf-8",
+    )
+    (library / "other.html").write_text(
+        "<article class='paper' data-doi='10.1234/tag-other'><h1>Laboratory study</h1>"
+        "<h2>Results</h2><p>Laboratory measurements varied across the sampled plots.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    build_library_overview(db_path)
+    with sqlite3.connect(db_path) as connection:
+        target_doc_id = connection.execute(
+            "select doc_id from source_documents where doi = ?",
+            ("10.1234/tag-target",),
+        ).fetchone()[0]
+        connection.execute(
+            "insert into document_tags(doc_id, tag, normalized_tag, source) values (?, ?, ?, ?)",
+            (target_doc_id, "priority", "priority", "zotero"),
+        )
+        connection.commit()
+
+    hits = search_evidence_store(db_path, "priority", limit=1)
+
+    assert hits[0]["doc_id"] == target_doc_id
+    assert "priority" in hits[0]["tags"]
+    assert hits[0]["tag_score"] > 0
+    assert "tag" in hits[0]["routes"]
+
+
 def test_document_card_semantic_cache_routes_to_source_anchors(tmp_path: Path):
     library = tmp_path / "library"
     library.mkdir()

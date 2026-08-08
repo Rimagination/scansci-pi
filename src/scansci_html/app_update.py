@@ -19,6 +19,7 @@ from zipfile import BadZipFile, ZipFile
 
 APP_VERSION = "0.2.3"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
+DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
 _DEFAULT_RELEASE_NOTES = [
     {
@@ -49,7 +50,13 @@ class AppUpdateService:
         updates_root: str | Path | None = None,
     ) -> None:
         self.current_version = current_version
-        self.manifest_url = str(manifest_url if manifest_url is not None else os.getenv(UPDATE_MANIFEST_ENV, "")).strip()
+        configured_manifest = manifest_url if manifest_url is not None else os.getenv(UPDATE_MANIFEST_ENV, "")
+        # A packaged desktop must always have an update channel. Older builds
+        # did not persist this URL in build-info.json, so keep a compiled
+        # fallback for those installs as well as for newly built packages.
+        if manifest_url is None and not str(configured_manifest or "").strip() and getattr(sys, "frozen", False):
+            configured_manifest = DEFAULT_UPDATE_MANIFEST_URL
+        self.manifest_url = str(configured_manifest or "").strip()
         local_root = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         self.updates_root = Path(updates_root or Path(local_root) / "ScanSciPi" / "updates").resolve()
         self._manifest: dict[str, Any] | None = None

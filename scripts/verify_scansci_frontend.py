@@ -9,6 +9,7 @@ event handler reading Event.currentTarget after an await.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 import sys
@@ -106,6 +107,12 @@ def verify() -> dict[str, Any]:
             server.server_close()
         if thread is not None:
             thread.join(timeout=3)
+        # Some sqlite connections are opened with ``with sqlite3.connect(...)``
+        # (transaction-only, not closing).  A reference cycle can keep the
+        # handle alive until the cyclic collector runs; force it before the
+        # TemporaryDirectory cleanup so Windows can delete the workspace file
+        # and the gate never fails on a stale file lock.
+        gc.collect()
         ResearchAgentRuntime.chat_stream = original_stream
 
 

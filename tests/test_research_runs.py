@@ -779,6 +779,75 @@ def test_academic_discovery_uses_precision_models_independent_of_local_library_s
     assert observed == [{"quality_profile": "precision"}]
 
 
+def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 2_000_000)
+    remote = SimpleNamespace(
+        cache_key="siliconflow:https://api.siliconflow.cn/v1:BAAI/bge-reranker-v2-m3",
+        device="remote",
+    )
+    build_calls = []
+
+    monkeypatch.setattr(
+        research_agent,
+        "load_settings",
+        lambda _workspace: {
+            "model_roles": {
+                "embedding": "local:builtin-embedding",
+                "reranking": "provider:siliconflow:BAAI/bge-reranker-v2-m3",
+            },
+            "local_models": [
+                {
+                    "id": "builtin-embedding",
+                    "runtime": "builtin",
+                    "enabled": True,
+                    "model_id": "",
+                }
+            ],
+            "providers": [
+                {
+                    "id": "siliconflow",
+                    "kind": "openai-compatible",
+                    "enabled": True,
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "models": [
+                        {
+                            "id": "BAAI/bge-reranker-v2-m3",
+                            "capabilities": ["reranking"],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda _workspace, _provider: "secret")
+    monkeypatch.setattr(
+        research_agent,
+        "build_reranker",
+        lambda provider, **kwargs: build_calls.append((provider, kwargs)) or remote,
+    )
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    stack = runtime._local_evidence_stack()
+
+    assert build_calls == [
+        (
+            "siliconflow",
+            {
+                "base_url": "https://api.siliconflow.cn/v1",
+                "api_key": "secret",
+                "model_name": "BAAI/bge-reranker-v2-m3",
+            },
+        )
+    ]
+    assert stack.metadata["reranker"] == remote.cache_key
+    assert stack.metadata["remote_reranker_active"] is True
+    assert stack.reranker.stages[1][0] is remote
+
+
 def test_paper_download_batch_workflow_runs_per_item_and_reports_progress(tmp_path: Path, monkeypatch):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)

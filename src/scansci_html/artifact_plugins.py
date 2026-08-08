@@ -16,6 +16,7 @@ import shutil
 import subprocess
 from typing import Any
 from zipfile import ZipFile
+from .runtime_components import default_tectonic_component
 
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+")
@@ -29,6 +30,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from OpenAI Zotero plugin · MIT",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "zotero",
         "skills": ["Search library", "Read attachments", "Export BibTeX", "Format citations"],
         "tool_names": [
@@ -47,6 +50,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from Codex Documents workflow",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "document",
         "skills": ["创建 DOCX", "读取 DOCX", "结构校验"],
         "tool_names": ["create_document"],
@@ -58,6 +63,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from Codex PDF workflow",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "pdf",
         "skills": ["创建 PDF", "读取 PDF", "版面前置校验"],
         "tool_names": ["create_pdf"],
@@ -69,6 +76,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from Codex Spreadsheets workflow",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "spreadsheet",
         "skills": ["创建 XLSX", "公式写入", "工作簿校验"],
         "tool_names": ["create_spreadsheet"],
@@ -80,6 +89,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from Codex Presentations workflow",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "presentation",
         "skills": ["创建 PPTX", "讲述结构", "文件校验"],
         "tool_names": ["create_presentation", "build_presentation_outline"],
@@ -91,6 +102,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "source": "ScanSci built-in · adapted from Codex LaTeX workflow",
         "enabled": True,
         "builtin": True,
+        "update_mode": "app",
+        "version": "bundled",
         "icon": "latex",
         "skills": ["LaTeX Doctor", "LaTeX Compile", "TeX Live 检测"],
         "tool_names": ["compile_latex"],
@@ -375,6 +388,11 @@ def find_tectonic() -> Path | None:
     env_path = os.environ.get("SCANSCI_TECTONIC_PATH", "").strip()
     if env_path:
         candidates.append(Path(env_path))
+    # A user-installed Tectonic component comes before the bundled copy so
+    # slim builds without an embedded engine reuse one confirmed install.
+    managed_tectonic = default_tectonic_component().executable()
+    if managed_tectonic is not None:
+        candidates.append(managed_tectonic)
     package_root = Path(__file__).resolve().parent
     candidates.extend((package_root / "runtime" / "latex" / name for name in ("tectonic.exe", "tectonic")))
     path_command = shutil.which("tectonic")

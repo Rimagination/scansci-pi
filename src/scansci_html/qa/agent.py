@@ -18,7 +18,7 @@ from .quote_extractor import (
 from .synthesizer import synthesize_answer, synthesize_answer_with_llm
 from .verifier import apply_verification_policy, verify_answer_claims, verify_answer_claims_with_llm
 from ..query_fusion import fuse_ranked_hits
-from ..retrieval import search_evidence_store
+from ..retrieval import STOPWORDS, search_evidence_store
 from ..text_tokenization import lexical_tokens
 
 
@@ -197,6 +197,11 @@ def answer_question(
                 break
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
     evidence_table = build_evidence_table(quotes, evidence_by_id)
+    # Generic relevance gate: a question whose non-stopword domain terms
+    # never appear in any retrieved quote has no topical connection to this
+    # library.  The specialised causal grounding check above only covers
+    # English "X caused Y" patterns; this fallback handles any question.
+    adequacy = _apply_topical_relevance_gate(question, evidence_table, adequacy)
     answer_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
     verification_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
     if not bool(adequacy.get("is_sufficient", False)):
@@ -451,6 +456,67 @@ def assess_evidence_adequacy(
         "min_quotes": min_quotes,
         "min_documents": min_documents,
         "followup_reason": "",
+    }
+
+
+def _apply_topical_relevance_gate(
+    question: str,
+    evidence_table: list[dict[str, Any]],
+    adequacy: dict[str, object],
+) -> dict[str, object]:
+    """Fail evidence adequacy when no quote shares a domain term with the question.
+
+    The causal grounding check above only covers English cause/effect patterns.
+    A generic Chinese question can match unrelated papers through boilerplate
+    terms (\"因素\", \"影响\").  Those terms are filtered by STOPWORDS, but the
+    remaining domain terms (\"光伏\", \"组件\", \"衰减\") must overlap retrieved
+    quotes; otherwise the evidence is unrelated.
+    """
+
+    if not bool(adequacy.get("is_sufficient", False)):
+        return adequacy
+    domain_terms = [term for term in lexical_tokens(question) if term not in STOPWORDS and len(term) >= 3]
+    # Chinese bi-grams from lexical_tokens are meaningless noise; a CJK
+    # domain term needs at least three characters; Latin terms need four.
+    domain_terms = [t for t in domain_terms if all('\u4e00' <= c <= '\u9fff' for c in t) or len(t) >= 4]
+    # Stopwords cover individual glyphs, but char-level bigrams/trigrams
+    # like "因素影" (from "因素"+"影") slip through when they share
+    # characters with a stopword.  Filter any domain term that contains
+    # a multi-character stopword as a substring.
+    domain_terms = [
+        t for t in domain_terms
+        if not any(len(sw) >= 2 and sw in t for sw in STOPWORDS)
+    ]
+    if not domain_terms:
+        return adequacy
+    combined_text = " ".join(
+        str(row.get("exact_quote", "") or "")
+        for row in evidence_table
+        if isinstance(row, dict)
+    ).casefold()
+    matched = [term for term in domain_terms if term in combined_text]
+    if not matched:
+        return {
+            **adequacy,
+            "is_sufficient": False,
+            "followup_reason": "retrieved evidence does not share topical terms with the question; the library may not contain relevant material",
+            "topical_relevance": {"domain_terms": domain_terms[:12], "checked_quotes": len(evidence_table)},
+        }
+    # A one-word match among many domain terms can pass the gate while
+    # every substantive term is absent.  Require a meaningful fraction.
+    if len(matched) >= 3 or len(matched) / len(domain_terms) >= 0.2:
+        return adequacy
+    long_match = any(len(term) >= 5 and term in combined_text for term in domain_terms)
+    if long_match:
+        return adequacy
+    return {
+        **adequacy,
+        "is_sufficient": False,
+        "followup_reason": "too few domain terms overlap retrieved evidence; the library may not contain relevant material",
+        "topical_relevance": {
+            "domain_terms": domain_terms[:12], "matched_terms": matched[:8],
+            "checked_quotes": len(evidence_table),
+        },
     }
 
 

@@ -3,13 +3,18 @@ const state = {
   notebook: null,
   settings: null,
   presets: { providers: [], local_models: [] },
+  modelHealth: { checked_at: "", providers: {}, models: {}, loading: false },
   localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false },
   localModelInstall: { jobs: [], active: null },
-  localRuntime: { installed: false, install_available: false, mode: "missing" },
+  localRuntime: { installed: false, install_available: false, manual_install_available: true, mode: "missing", channels: null },
+  ollama: { reachable: false, model_ready: false, model_id: "minicpm-v4.6", error: "" },
+  localRuntimeManualOpen: false,
   downloadStatusError: "",
   onboardingOpen: false,
-  onboardingStep: "resources",
+  onboardingStep: "welcome",
+  onboardingMode: "",
   onboardingPersisting: false,
+  pendingLocalModelResource: "",
   capabilities: null,
   activeView: "home",
   activeMode: "tools",
@@ -19,6 +24,8 @@ const state = {
   skillInstallReview: null,
   skillInstallBusy: false,
   composerImages: { home: [], chat: [] },
+  composerAudio: { home: [], chat: [] },
+  composerRecordings: { home: null, chat: null },
   composerSources: { home: [], chat: [] },
   composerSkills: { home: [], chat: [] },
   selectedProviderId: "",
@@ -33,6 +40,8 @@ const state = {
   historyMenuRunId: "",
   historySearchOpen: false,
   directMessages: [],
+  directConversations: [],
+  directConversationId: window.localStorage.getItem("scansci.active.direct") || "",
   runs: [],
   activeTaskId: "",
   sessionId: window.localStorage.getItem("scansci.active.session") || null,
@@ -45,6 +54,14 @@ const state = {
   activeStreamRunId: "",
   toolProgress: null,
   reviewDocument: null,
+  reviewSaveDialog: {
+    open: false,
+    folderPath: "",
+    newFolderName: "",
+    browserDirectoryHandle: null,
+    browserFolderLabel: "",
+    busy: false,
+  },
   contextPanel: "sources",
   contextPanelPreset: "research",
   contextPanelCollapsed: window.localStorage.getItem("scansci.context-panel.collapsed") !== "false",
@@ -55,8 +72,9 @@ const state = {
   expandedEvidencePanelWidth: Math.max(420, Number(window.localStorage.getItem("scansci.evidence-panel.width")) || 560),
   citationPreviewTimer: 0,
   extensions: { skills: null, libraryPath: "", marketplace: [], marketplaceOffline: false, marketplaceLoaded: false },
+  extensionUpdates: { checked_at: "", loading: false, skills: [], mcp: [], plugins: [], app: null, error: "" },
   marketplaceQuery: "",
-  mcpMarketplace: { items: [], disciplines: [], source: null, synced_at: "", cached_count: 0, loaded: false, loading: false },
+  mcpMarketplace: { items: [], disciplines: [], source: null, synced_at: "", cached_count: 0, updates: [], loaded: false, loading: false },
   mcpMarketplaceQuery: "",
   mcpMarketplaceDiscipline: "all",
   mcpMarketplaceSort: "hot",
@@ -67,8 +85,13 @@ const state = {
   libraryImportGuided: false,
   libraryImportJob: null,
   libraryImportAppliedJobId: "",
+  libraryImportNotebookId: "",
+  zoteroConnectionIssue: null,
   knowledgeSubscope: null,
   knowledgeScopeIds: [],
+  // The picker keeps a local draft while it is open.  Selecting a library
+  // must not redraw the whole workspace or change the active chat context.
+  knowledgeScopeDraftIds: null,
   knowledgePreviewSourceId: "",
   knowledgeQuery: "",
   knowledgeSearchOpen: false,
@@ -76,6 +99,13 @@ const state = {
   knowledgeIndexStatuses: {},
   knowledgeScopeRefreshing: false,
   knowledgePreviewCollapsed: window.localStorage.getItem("scansci.knowledge.preview.collapsed") === "true",
+  knowledgeSettingsPreview: {
+    embedding: "auto",
+    reranking: "auto",
+    advancedOpen: false,
+    chunking: "semantic",
+    topK: "8",
+  },
   knowledgeTreeExpanded: window.localStorage.getItem("scansci.knowledge.tree.expanded") !== "false",
   downloadStrategy: ["oa_first", "gray_oa", "legal_only"].includes(window.localStorage.getItem("scansci.download.strategy"))
     ? window.localStorage.getItem("scansci.download.strategy")
@@ -132,6 +162,7 @@ const byId = (id) => document.getElementById(id);
 const sourceList = byId("sourceList");
 let directConversationRenderFrame = 0;
 let activeDirectChatController = null;
+let composerSubmissionInFlight = false;
 let confirmDialogResolve = null;
 let confirmDialogPreviousFocus = null;
 let localModelInstallPollTimer = 0;
@@ -149,6 +180,7 @@ const applicationCopy = Object.freeze({
     localWorkspace: "本地工作区",
     backToWorkspace: "返回工作区",
     general: "常规",
+    defaultCapabilities: "默认能力",
     resources: "资源配置",
     modelServices: "模型服务",
     localModels: "本地模型",
@@ -166,6 +198,14 @@ const applicationCopy = Object.freeze({
     appearanceThemeHint: "可跟随系统，也可固定为浅色或深色。",
     accentColor: "强调色",
     accentColorHint: "用于选中状态、进度和主要操作。",
+    fontScale: "界面字号",
+    fontScaleHint: "调整设置页和工作区的基础文字大小。",
+    fontSmall: "小",
+    fontMedium: "标准",
+    fontLarge: "大",
+    fontSmallDetail: "更紧凑",
+    fontMediumDetail: "推荐",
+    fontLargeDetail: "更易阅读",
     system: "跟随系统",
     light: "浅色",
     dark: "深色",
@@ -198,6 +238,7 @@ const applicationCopy = Object.freeze({
     localWorkspace: "Local workspace",
     backToWorkspace: "Back to workspace",
     general: "General",
+    defaultCapabilities: "Default capabilities",
     resources: "Resources",
     modelServices: "Model services",
     localModels: "Local models",
@@ -215,6 +256,14 @@ const applicationCopy = Object.freeze({
     appearanceThemeHint: "Follow your system or keep ScanSci light or dark.",
     accentColor: "Accent colour",
     accentColorHint: "Used for selected states, progress, and primary actions.",
+    fontScale: "Interface size",
+    fontScaleHint: "Adjust the base text size across settings and the workspace.",
+    fontSmall: "Small",
+    fontMedium: "Standard",
+    fontLarge: "Large",
+    fontSmallDetail: "More compact",
+    fontMediumDetail: "Recommended",
+    fontLargeDetail: "Easier to read",
     system: "System",
     light: "Light",
     dark: "Dark",
@@ -245,6 +294,7 @@ function appearancePreferences() {
     locale: source.locale === "en" ? "en" : "zh-CN",
     theme: ["system", "light", "dark"].includes(source.theme) ? source.theme : "system",
     accent: ["jade", "ocean", "plum", "amber"].includes(source.accent) ? source.accent : "jade",
+    font_scale: ["small", "medium", "large"].includes(source.font_scale) ? source.font_scale : "medium",
   };
 }
 
@@ -266,6 +316,7 @@ function applyAppearancePreferences() {
   root.dataset.theme = theme;
   root.dataset.themePreference = preferences.theme;
   root.dataset.accent = preferences.accent;
+  root.dataset.fontScale = preferences.font_scale;
   root.style.colorScheme = theme;
   document.title = copy("brand");
   document.querySelector('meta[name="application-name"]')?.setAttribute("content", copy("brand"));
@@ -283,6 +334,7 @@ function collectAppearanceForm() {
     locale: form.elements["appearance-locale"]?.value === "en" ? "en" : "zh-CN",
     theme: ["system", "light", "dark"].includes(form.elements["appearance-theme"]?.value) ? form.elements["appearance-theme"].value : "system",
     accent: ["jade", "ocean", "plum", "amber"].includes(form.elements["appearance-accent"]?.value) ? form.elements["appearance-accent"].value : "jade",
+    font_scale: ["small", "medium", "large"].includes(form.elements["appearance-font-scale"]?.value) ? form.elements["appearance-font-scale"].value : "medium",
   };
   applyAppearancePreferences();
   return state.settings.appearance;
@@ -298,7 +350,11 @@ async function request(path, options = {}) {
     ...options,
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error?.message || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const failure = new Error(payload?.error?.message || `Request failed (${response.status})`);
+    failure.payload = payload;
+    throw failure;
+  }
   return payload;
 }
 
@@ -311,7 +367,10 @@ async function streamChat(payload, onEvent, { signal } = {}) {
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error?.error?.message || `Request failed (${response.status})`);
+    const failure = new Error(error?.error?.message || `Request failed (${response.status})`);
+    failure.code = error?.error?.code || "chat_failed";
+    failure.failure = error?.error?.failure || error?.failure || null;
+    throw failure;
   }
   if (!response.body) throw new Error("This browser does not support streaming responses.");
 
@@ -352,6 +411,48 @@ async function streamChat(payload, onEvent, { signal } = {}) {
   } finally {
     reader.releaseLock();
   }
+}
+
+function waitForStreamRetry(delaySeconds, signal) {
+  const delay = Math.max(0, Number(delaySeconds || 0)) * 1000;
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("The streaming request was aborted.", "AbortError"));
+      return;
+    }
+    let timer = window.setTimeout(done, delay);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new DOMException("The streaming request was aborted.", "AbortError"));
+    };
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function streamChatWithRecovery(payload, onEvent, { signal, onRetry, maxAttempts = 2 } = {}) {
+  const attempts = Math.max(1, Number(maxAttempts) || 1);
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await streamChat(payload, onEvent, { signal });
+    } catch (error) {
+      const failure = error?.failure && typeof error.failure === "object" ? error.failure : null;
+      const retryable = error?.name !== "AbortError"
+        && failure?.retryable !== false
+        && (failure || error?.code === "chat_failed" || !error?.code);
+      if (!retryable || attempt >= attempts) throw error;
+      const requested = Number(failure?.retry_after_seconds || failure?.retry_after || 0);
+      const delay = Math.min(30, Math.max(requested, 6 * attempt));
+      onRetry?.({ error, attempt, delay });
+      onEvent?.("status", { subtype: "retry", attempt, delay_ms: Math.round(delay * 1000) });
+      await waitForStreamRetry(delay, signal);
+    }
+  }
+  throw new Error("The streaming response could not be completed.");
 }
 
 function scheduleDirectConversationRender() {
@@ -459,13 +560,49 @@ function localResourceIcon(kind = "file") {
   return icons[kind] || "file";
 }
 
+const siteUrlTrailingPunctuation = /[),.;:!?，。！？；：、》）】』」]+$/u;
+
+function normalizeExternalUrl(value = "") {
+  const candidate = String(value || "").trim().replace(siteUrlTrailingPunctuation, "");
+  if (!candidate) return "";
+  try {
+    const parsed = new URL(candidate);
+    if (!/^https?:$/.test(parsed.protocol)) return "";
+    return parsed.href;
+  } catch (_error) {
+    return "";
+  }
+}
+
+function siteLinkMarkup(rawUrl, label = rawUrl) {
+  const url = normalizeExternalUrl(rawUrl);
+  if (!url) return escapeHtml(label);
+  const iconUrl = `/api/site-icon?url=${encodeURIComponent(url)}`;
+  return `<a class="site-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" data-site-link="true" data-site-url="${escapeHtml(url)}" title="${escapeHtml(url)}"><span class="site-link-icon" aria-hidden="true"><img data-site-icon="true" src="${escapeHtml(iconUrl)}" alt="" loading="lazy" decoding="async"><span class="site-link-fallback">${uiIcon("globe")}</span></span><span class="site-link-label">${escapeHtml(label)}</span></a>`;
+}
+
+function linkifyExternalUrls(source, rememberHtml) {
+  return String(source).replace(/(^|[^A-Za-z0-9_])((?:https?:\/\/)[^\s<>"'`]+)/gu, (_match, prefix, rawUrl) => {
+    const cleanUrl = rawUrl.replace(siteUrlTrailingPunctuation, "");
+    if (!normalizeExternalUrl(cleanUrl)) return `${prefix}${rawUrl}`;
+    const trailing = rawUrl.slice(cleanUrl.length);
+    return `${prefix}${rememberHtml(siteLinkMarkup(cleanUrl, cleanUrl))}${trailing}`;
+  });
+}
+
 function renderAssistantInline(value = "") {
   const localResources = [];
+  const inlineHtml = [];
   const rememberLocalResource = (path, label = "") => {
     const cleanPath = String(path || "").trim().replace(/^[<"'“‘]+|[>"'”’]+$/g, "");
     if (!/^(?:[a-zA-Z]:[\\/]|\\\\)/.test(cleanPath)) return path;
     const token = `SCANSCI_LOCAL_RESOURCE_${localResources.length}_TOKEN`;
     localResources.push({ token, path: cleanPath, label: String(label || "").trim() });
+    return token;
+  };
+  const rememberHtml = (html) => {
+    const token = `SCANSCI_INLINE_HTML_${inlineHtml.length}_TOKEN`;
+    inlineHtml.push({ token, html });
     return token;
   };
   let source = String(value);
@@ -476,11 +613,19 @@ function renderAssistantInline(value = "") {
     const cleanPath = path.replace(/[),.;:]+$/g, "");
     return `${prefix}${rememberLocalResource(cleanPath)}${path.slice(cleanPath.length)}`;
   });
+  source = source.replace(/`([^`\r\n]+)`/g, (_match, code) => rememberHtml(`<code>${escapeHtml(code)}</code>`));
+  source = source.replace(/\[([^\]\r\n]+)\]\(((?:https?:\/\/)[^\s)]+)\)/g, (_match, label, url) => {
+    const normalized = normalizeExternalUrl(url);
+    return normalized ? rememberHtml(siteLinkMarkup(normalized, label)) : _match;
+  });
+  source = linkifyExternalUrls(source, rememberHtml);
   let markup = escapeHtml(source)
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  inlineHtml.forEach(({ token, html }) => {
+    markup = markup.replace(token, html);
+  });
   localResources.forEach(({ token, path, label }) => {
     const folder = localResourceKind(path) === "folder";
     markup = markup.replace(token, localFileLinkMarkup(path, label || localPathLeaf(path), { folder, inline: true }));
@@ -770,6 +915,7 @@ const uiIconPaths = {
   plus: '<path d="M12 5v14M5 12h14"></path>',
   minus: '<path d="M5 12h14"></path>',
   check: '<path d="m5.5 12 4.1 4 8.9-8.5"></path>',
+  play: '<path d="m8 5 11 7-11 7V5Z"></path>',
   x: '<path d="m7 7 10 10M17 7 7 17"></path>',
   refresh: '<path d="M19 8.5A7.5 7.5 0 1 0 19.5 14"></path><path d="M19.5 4.5v4.8h-4.8"></path>',
   "triangle-alert": '<path d="m21.7 18.2-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-2.8Z"></path><path d="M12 9v4M12 17h.01"></path>',
@@ -876,6 +1022,151 @@ function hydrateIcons(root = document) {
   });
 }
 
+let settingsSelectSequence = 0;
+
+function closeSettingsSelects(except = null) {
+  let closed = false;
+  document.querySelectorAll("[data-settings-select].is-open").forEach((wrapper) => {
+    if (wrapper === except) return;
+    wrapper.classList.remove("is-open");
+    wrapper.querySelector(".settings-select-trigger")?.setAttribute("aria-expanded", "false");
+    const menu = wrapper.querySelector(".settings-select-menu");
+    if (menu) menu.hidden = true;
+    closed = true;
+  });
+  return closed;
+}
+
+function renderSettingsSelectLabel(target, option) {
+  if (!target) return;
+  target.replaceChildren();
+  const accentColor = String(option?.dataset?.accentColor || "").trim();
+  if (accentColor) {
+    const label = document.createElement("span");
+    label.className = "settings-select-accent-label";
+    const swatch = document.createElement("span");
+    swatch.className = "settings-select-accent-swatch";
+    swatch.style.backgroundColor = accentColor;
+    swatch.setAttribute("aria-hidden", "true");
+    const value = document.createElement("strong");
+    value.className = "settings-select-accent-value";
+    value.textContent = accentColor;
+    label.append(swatch, value);
+    target.append(label);
+    return;
+  }
+  const modelName = String(option?.dataset?.modelName || "").trim();
+  const modelMeta = String(option?.dataset?.modelMeta || "").trim();
+  if (!modelName) {
+    target.textContent = option?.textContent?.trim() || option?.value || "请选择";
+    return;
+  }
+  const label = document.createElement("span");
+  label.className = "settings-select-model-label";
+  const name = document.createElement("strong");
+  name.className = "settings-select-model-name";
+  name.textContent = modelName;
+  label.append(name);
+  if (modelMeta) {
+    const meta = document.createElement("small");
+    meta.className = "settings-select-model-meta";
+    meta.textContent = modelMeta;
+    label.append(meta);
+  }
+  target.append(label);
+}
+
+function hydrateSettingsSelects(root = document) {
+  const selects = root.querySelectorAll?.(".settings-content select:not([multiple])") || [];
+  selects.forEach((select) => {
+    if (select.closest("[data-settings-select]")) return;
+    const wrapper = document.createElement("div");
+    wrapper.className = "settings-select";
+    wrapper.dataset.settingsSelect = "true";
+    select.parentNode.insertBefore(wrapper, select);
+    wrapper.append(select);
+
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "settings-select-trigger";
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+    const accessibleLabel = select.getAttribute("aria-label")
+      || select.closest("label")?.querySelector(".settings-row > span > strong, .default-capability-copy > strong, .setting-field > span, .document-select-row > span, .cherry-field > span")?.textContent?.trim()
+      || select.name
+      || "选择选项";
+    trigger.setAttribute("aria-label", accessibleLabel);
+
+    const menu = document.createElement("div");
+    menu.className = "settings-select-menu";
+    menu.hidden = true;
+    menu.id = `settings-select-menu-${++settingsSelectSequence}`;
+    menu.setAttribute("role", "listbox");
+    trigger.setAttribute("aria-controls", menu.id);
+
+    const updateSelection = () => {
+      const selected = select.options[select.selectedIndex];
+      renderSettingsSelectLabel(trigger, selected);
+      menu.querySelectorAll("[role=option]").forEach((option) => {
+        const isSelected = option.dataset.value === select.value;
+        option.classList.toggle("is-selected", isSelected);
+        option.setAttribute("aria-selected", isSelected ? "true" : "false");
+      });
+    };
+    const setOpen = (open) => {
+      if (open) closeSettingsSelects(wrapper);
+      wrapper.classList.toggle("is-open", open);
+      trigger.setAttribute("aria-expanded", open ? "true" : "false");
+      menu.hidden = !open;
+    };
+
+    [...select.options].forEach((option) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "settings-select-option";
+      item.dataset.value = option.value;
+      renderSettingsSelectLabel(item, option);
+      item.disabled = option.disabled;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", "false");
+      item.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (item.disabled) return;
+        select.value = option.value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        updateSelection();
+        setOpen(false);
+        trigger.focus();
+      });
+      menu.append(item);
+    });
+
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(!wrapper.classList.contains("is-open"));
+    });
+    trigger.addEventListener("keydown", (event) => {
+      if (["Enter", " ", "ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        setOpen(true);
+        menu.querySelector(".settings-select-option:not(:disabled)")?.focus();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+      }
+    });
+    select.addEventListener("change", updateSelection);
+    select.classList.add("settings-native-select");
+    select.tabIndex = -1;
+    select.hidden = true;
+    select.setAttribute("aria-hidden", "true");
+    wrapper.append(trigger, menu);
+    updateSelection();
+  });
+}
+
 function observeIcons() {
   hydrateIcons();
   const observer = new MutationObserver((records) => {
@@ -915,6 +1206,39 @@ function refreshEvidenceReaderTheme() {
 function citationMarkerMarkup(citationId) {
   const marker = escapeHtml(citationId);
   return `<button class="citation-marker" type="button" data-citation-id="${marker}" aria-label="查看引用 ${marker}" aria-haspopup="dialog">[${marker}]</button>`;
+}
+
+function citationTextMarkup(value, citations = []) {
+  const records = Array.isArray(citations) ? citations : [];
+  const knownCitationIds = new Set(
+    records
+      .map((citation) => String(citation?.citation_id || "").trim())
+      .filter(Boolean),
+  );
+  const source = String(value || "");
+  if (!source || !knownCitationIds.size) return renderAssistantContent(source);
+  const tokenized = source.replace(/\[(\d+)\]/g, (marker, citationId) => (
+    knownCitationIds.has(citationId) ? `@@SCANSCI_CITATION_${citationId}@@` : marker
+  ));
+  return renderAssistantContent(tokenized).replace(/@@SCANSCI_CITATION_(\d+)@@/g, (_token, citationId) => (
+    citationMarkerMarkup(citationId)
+  ));
+}
+
+function citationRecordsForRun(run = {}) {
+  const records = [
+    ...(run.output_artifact?.payload?.reader_answer?.citations || []),
+    ...(run.output_artifact?.evidence_links || []),
+    ...(Array.isArray(run.messages)
+      ? run.messages.flatMap((message) => message.reader_answer?.citations || message.metadata?.reader_answer?.citations || [])
+      : []),
+  ];
+  const byId = new Map();
+  records.forEach((citation) => {
+    const id = String(citation?.citation_id || "").trim();
+    if (id) byId.set(id, citation);
+  });
+  return [...byId.values()];
 }
 
 function safeReaderUrl(record = {}) {
@@ -1158,6 +1482,215 @@ function requestConfirmation({
   });
 }
 
+function safeReviewFileName(title = "") {
+  const value = String(title || "")
+    .trim()
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/[ .]+$/g, "")
+    .slice(0, 120)
+    .replace(/[ .]+$/g, "");
+  return value || "ScanSci-笔记";
+}
+
+function reviewSaveFolderName(value = "") {
+  const name = String(value || "").trim();
+  if (!name) return "";
+  if (name === "." || name === ".." || /[\\/:*?"<>|]/.test(name)) {
+    throw new Error("新建文件夹名称只能是单个文件夹名");
+  }
+  return name.slice(0, 120).replace(/[ .]+$/g, "");
+}
+
+function reviewSaveLocationLabel(dialog = state.reviewSaveDialog) {
+  const base = String(dialog?.folderPath || dialog?.browserFolderLabel || "").trim();
+  const child = String(dialog?.newFolderName || "").trim();
+  if (!base) return "尚未选择文件夹";
+  return child ? `${base.replace(/[\\/]$/, "")} / ${child}` : base;
+}
+
+function closeReviewSaveDialog() {
+  if (!state.reviewSaveDialog?.open) return;
+  state.reviewSaveDialog = {
+    open: false,
+    folderPath: "",
+    newFolderName: "",
+    browserDirectoryHandle: null,
+    browserFolderLabel: "",
+    busy: false,
+  };
+  const host = byId("confirmDialogHost");
+  if (host?.dataset.dialogKind === "review-save") {
+    host.replaceChildren();
+    delete host.dataset.dialogKind;
+    document.body.classList.remove("has-confirm-dialog");
+  }
+}
+
+function renderReviewSaveDialog() {
+  const dialog = state.reviewSaveDialog;
+  const host = byId("confirmDialogHost");
+  if (!host) return;
+  if (!dialog?.open) {
+    if (host.dataset.dialogKind === "review-save") closeReviewSaveDialog();
+    return;
+  }
+  const hasFolder = Boolean(dialog.folderPath || dialog.browserDirectoryHandle);
+  const location = reviewSaveLocationLabel(dialog);
+  host.dataset.dialogKind = "review-save";
+  host.innerHTML = `
+    <div class="confirm-dialog-backdrop" data-action="close-review-save-dialog">
+      <section class="confirm-dialog-card review-save-dialog" data-action="review-save-dialog-content" role="dialog" aria-modal="true" aria-labelledby="reviewSaveDialogTitle">
+        <div class="confirm-dialog-icon review-save-dialog-icon" aria-hidden="true">${uiIcon("folder-open")}</div>
+        <div class="confirm-dialog-copy">
+          <p class="confirm-dialog-eyebrow">保存研究笔记</p>
+          <h2 id="reviewSaveDialogTitle">选择保存位置</h2>
+          <p class="confirm-dialog-subject">${escapeHtml(state.reviewDocument?.title || "证据综述")}</p>
+          <p class="confirm-dialog-message">会保存一份 Markdown 文件，同时登记到当前知识库，方便后续检索和查看。</p>
+          <div class="review-save-location">
+            <div class="review-save-location-copy"><span>目标文件夹</span><strong title="${escapeHtml(location)}">${escapeHtml(location)}</strong></div>
+            <button type="button" class="review-save-folder-button" data-action="choose-review-save-folder" ${dialog.busy ? "disabled" : ""}>${uiIcon("folder-open")}选择文件夹</button>
+          </div>
+          <label class="review-save-new-folder"><span>新建文件夹（可选）</span><input id="reviewSaveNewFolderInput" type="text" maxlength="120" value="${escapeHtml(dialog.newFolderName || "")}" placeholder="例如：2026-08-08 光伏综述" ${dialog.busy ? "disabled" : ""} /></label>
+          <p class="review-save-hint">填写后，会在选定位置下新建这个文件夹，并把笔记保存进去。</p>
+        </div>
+        <footer class="confirm-dialog-actions">
+          <button type="button" class="confirm-dialog-button is-cancel" data-action="close-review-save-dialog" ${dialog.busy ? "disabled" : ""}>取消</button>
+          <button type="button" class="confirm-dialog-button is-primary" data-action="confirm-review-save-note" ${dialog.busy || !hasFolder ? "disabled" : ""}>${dialog.busy ? "保存中…" : "保存笔记"}</button>
+        </footer>
+      </section>
+    </div>`;
+  document.body.classList.add("has-confirm-dialog");
+  window.requestAnimationFrame(() => {
+    const input = byId("reviewSaveNewFolderInput");
+    if (input && dialog.newFolderName) input.setSelectionRange(input.value.length, input.value.length);
+    if (!dialog.newFolderName) host.querySelector('[data-action="choose-review-save-folder"]')?.focus();
+  });
+}
+
+function openReviewSaveDialog() {
+  if (!state.reviewDocument?.markdown) {
+    toast("当前没有可保存的证据综述稿件。", true);
+    return;
+  }
+  if (!state.notebook?.notebook_id) {
+    toast("请先选择一个知识库。", true);
+    return;
+  }
+  const remembered = window.localStorage.getItem("scansci.review.save-folder") || "";
+  state.reviewSaveDialog = {
+    open: true,
+    folderPath: remembered,
+    newFolderName: "",
+    browserDirectoryHandle: null,
+    browserFolderLabel: "",
+    busy: false,
+  };
+  renderReviewSaveDialog();
+}
+
+async function chooseReviewSaveFolder() {
+  const nativePicker = window.pywebview?.api?.choose_library_folder;
+  if (typeof nativePicker === "function") {
+    const path = String(await nativePicker() || "").trim();
+    if (!path) return;
+    state.reviewSaveDialog.folderPath = path;
+    state.reviewSaveDialog.browserDirectoryHandle = null;
+    state.reviewSaveDialog.browserFolderLabel = "";
+    renderReviewSaveDialog();
+    return;
+  }
+  if (typeof window.showDirectoryPicker === "function") {
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+      state.reviewSaveDialog.folderPath = "";
+      state.reviewSaveDialog.browserDirectoryHandle = handle;
+      state.reviewSaveDialog.browserFolderLabel = handle.name || "已选择文件夹";
+      renderReviewSaveDialog();
+    } catch (error) {
+      if (error?.name !== "AbortError") throw error;
+    }
+    return;
+  }
+  throw new Error("当前预览不能访问本机文件夹，请在 ScanSci 桌面应用中完成保存。 ");
+}
+
+async function writeReviewInBrowserFolder(dialog, newFolderName) {
+  let target = dialog.browserDirectoryHandle;
+  let folderLabel = dialog.browserFolderLabel || target?.name || "已选择文件夹";
+  if (newFolderName) {
+    target = await target.getDirectoryHandle(newFolderName, { create: true });
+    folderLabel = `${folderLabel} / ${newFolderName}`;
+  }
+  const fileHandle = await target.getFileHandle(`${safeReviewFileName(state.reviewDocument.title)}.md`, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(`${state.reviewDocument.markdown.trim()}\n`);
+  await writable.close();
+  return folderLabel;
+}
+
+async function commitReviewAsNote() {
+  const dialog = state.reviewSaveDialog;
+  if (!dialog?.open || dialog.busy) return;
+  const newFolderName = reviewSaveFolderName(byId("reviewSaveNewFolderInput")?.value || dialog.newFolderName);
+  dialog.newFolderName = newFolderName;
+  const browserFolder = dialog.browserDirectoryHandle;
+  if (!dialog.folderPath && !browserFolder) {
+    toast("请先选择一个保存文件夹。", true);
+    return;
+  }
+  dialog.busy = true;
+  renderReviewSaveDialog();
+  const notebookId = state.notebook.notebook_id;
+  try {
+    const payload = {
+      title: state.reviewDocument.title || "证据综述",
+      body: state.reviewDocument.markdown,
+      note_type: "literature_review",
+    };
+    let browserFolderLabel = "";
+    if (browserFolder) {
+      browserFolderLabel = await writeReviewInBrowserFolder(dialog, newFolderName);
+      payload.metadata = { storage: "browser-filesystem", folder_label: browserFolderLabel };
+    } else {
+      payload.folder_path = dialog.folderPath;
+      if (newFolderName) payload.new_folder_name = newFolderName;
+    }
+    const result = await request(`/api/notebooks/${encodeURIComponent(notebookId)}/notes`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (result.notebook) state.notebook = result.notebook;
+    state.workspace = await request("/api/workspace");
+    state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === notebookId) || state.notebook;
+    if (result.destination?.folder_path) window.localStorage.setItem("scansci.review.save-folder", result.destination.folder_path);
+    closeReviewSaveDialog();
+    const destination = result.destination?.file_path || browserFolderLabel;
+    toast(destination ? `笔记已保存到：${destination}` : "笔记已保存到当前知识库");
+  } catch (error) {
+    dialog.busy = false;
+    renderReviewSaveDialog();
+    throw error;
+  }
+}
+
+function trapReviewSaveFocus(event) {
+  const dialog = byId("confirmDialogHost")?.querySelector(".review-save-dialog");
+  if (!dialog || event.key !== "Tab") return false;
+  const controls = [...dialog.querySelectorAll("button:not(:disabled), input:not(:disabled)")];
+  if (!controls.length) return false;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+  return true;
+}
+
 function trapConfirmationFocus(event) {
   const dialog = byId("confirmDialogHost")?.querySelector(".confirm-dialog-card");
   if (!dialog || event.key !== "Tab") return false;
@@ -1193,21 +1726,30 @@ function renderAppUpdate() {
   const update = state.update || {};
   state.updateNative = state.updateNative || Boolean(window.pywebview?.api?.install_update);
   const root = byId("appUpdate");
+  const card = byId("appUpdateCard");
+  const trigger = root?.querySelector("[data-action]");
   const status = ["checking", "installing", "restarting"].includes(update.state) ? update.state : (update.available ? "available" : update.state || "current");
   const shouldShowNotice = Boolean(update.available || ["installing", "restarting"].includes(status));
   root.hidden = !shouldShowNotice;
   document.querySelector(".workbench")?.classList.toggle("has-app-update", shouldShowNotice);
-  if (!shouldShowNotice && state.updateCardOpen) {
+  if (!shouldShowNotice) {
     state.updateCardOpen = false;
-    byId("appUpdateCard").hidden = true;
-    document.querySelector("[data-action='toggle-app-update']")?.setAttribute("aria-expanded", "false");
+    card.hidden = true;
+    root.classList.remove("is-card-open", "is-card-closed");
+    trigger?.setAttribute("aria-expanded", "false");
+  } else {
+    // Keep the card mounted so CSS can reveal it on hover or keyboard focus.
+    // Do not remove is-card-closed here: an explicit close must survive an
+    // unrelated update/status render while the pointer is still over the card.
+    card.hidden = false;
+    if (state.updateCardOpen) root.classList.add("is-card-open");
   }
   root.dataset.state = status;
   const labels = {
     checking: "检查更新",
     installing: "正在更新",
     restarting: "正在重启",
-    available: "有可用更新",
+    available: "更新",
     current: `v${update.current_version || "0.2.3"}`,
     idle: `v${update.current_version || "0.2.3"}`,
     error: "版本信息",
@@ -1224,8 +1766,20 @@ function renderAppUpdate() {
   byId("appUpdateCheckedAt").textContent = formatUpdateTime(update.checked_at);
   byId("appUpdateProgress").hidden = !["installing", "restarting"].includes(status);
 
+  const busy = ["checking", "installing", "restarting"].includes(status);
+  trigger.disabled = busy;
+  if (update.available && update.can_install) {
+    trigger.dataset.action = "install-app-update";
+    trigger.setAttribute("aria-label", `更新到 v${update.latest_version || "新版本"}`);
+    trigger.setAttribute("title", "下载并安装更新");
+  } else {
+    trigger.dataset.action = "toggle-app-update";
+    trigger.setAttribute("aria-label", "查看更新说明");
+    trigger.setAttribute("title", "查看更新说明");
+  }
+
   const primary = byId("appUpdatePrimary");
-  primary.disabled = ["checking", "installing", "restarting"].includes(status);
+  primary.disabled = busy;
   if (update.available && update.can_install) {
     primary.dataset.action = "install-app-update";
     primary.textContent = state.updateNative ? "立即更新" : "在桌面端更新";
@@ -1241,16 +1795,20 @@ function renderAppUpdate() {
 
 function toggleAppUpdateCard(force) {
   if (byId("appUpdate")?.hidden) return;
+  const root = byId("appUpdate");
   const card = byId("appUpdateCard");
   const trigger = document.querySelector("[data-action='toggle-app-update']");
   state.updateCardOpen = typeof force === "boolean" ? force : !state.updateCardOpen;
-  card.hidden = !state.updateCardOpen;
+  card.hidden = false;
+  root.classList.toggle("is-card-open", state.updateCardOpen);
+  root.classList.toggle("is-card-closed", !state.updateCardOpen);
   trigger?.setAttribute("aria-expanded", String(state.updateCardOpen));
 }
 
 function renderUpdateSurfaces() {
   renderAppUpdate();
   if (state.activeView === "settings" && state.activeSettings === "about" && state.settings) renderSettings();
+  if (state.activeView === "extensions") renderExtensions();
 }
 
 async function refreshAppUpdate({ quiet = false } = {}) {
@@ -1298,22 +1856,95 @@ async function restoreSessionStats(fallbackStats = null) {
   }
 }
 
+function bootstrapWorkspaceFallback() {
+  return {
+    workspace_path: "",
+    notebooks: [],
+    counts: { notebooks: 0, sources: 0, notes: 0, layers: 0 },
+  };
+}
+
+function bootstrapSettingsFallback() {
+  // The desktop must still expose the built-in model when an unrelated local
+  // database request fails during first launch. The backend remains the source
+  // of truth and will replace this snapshot as soon as /api/settings responds.
+  return {
+    schema_version: 2,
+    active_model: { provider_id: "scansci-managed", model_id: "glm-4.7-flash" },
+    providers: [{
+      id: "scansci-managed",
+      name: "ScanSci",
+      kind: "openai-compatible",
+      base_url: "https://scansci-glm-gateway.932196440.workers.dev/v1",
+      api_surface: "chat_completions",
+      responses_enabled: false,
+      enabled: true,
+      auth_mode: "managed",
+      model_listing: false,
+      api_key_configured: true,
+      models: [{
+        id: "glm-4.7-flash",
+        name: "GLM-4.7 Flash",
+        group: "GLM",
+        context_window: "200K",
+        capabilities: ["reasoning", "tool", "coding"],
+      }],
+    }],
+    local_models: [{
+      id: "builtin-evidence",
+      name: "离线基础检索",
+      runtime: "builtin",
+      model_id: "local-hash-v1 / local-lexical-v1",
+      enabled: true,
+      capabilities: ["embedding", "reranking"],
+    }],
+    model_roles: {
+      reasoning: "provider:scansci-managed:glm-4.7-flash",
+      writing: "provider:scansci-managed:glm-4.7-flash",
+      retrieval: "local:builtin-evidence",
+      embedding: "auto",
+      reranking: "auto",
+      vision: "",
+      audio: "",
+      slides: "provider:scansci-managed:glm-4.7-flash",
+    },
+    document_processing: {
+      ocr: { provider: "system", base_url: "", languages: ["zh", "en"], enabled: true, api_key_configured: false },
+      mineru: { provider: "mineru", base_url: "https://mineru.net", enabled: false, api_key_configured: false },
+    },
+    onboarding: { welcome_dismissed: false, resource_setup_completed: false, data_setup_completed: false },
+    appearance: { locale: "zh-CN", theme: "system", accent: "jade", font_scale: "medium" },
+    skills: [],
+    mcp_servers: [],
+    plugins: [],
+  };
+}
+
+function bootstrapPresetsFallback() {
+  return { providers: [], local_models: [] };
+}
+
 async function initialize() {
+  const bootstrapWarnings = [];
+  const safeBootstrapRequest = async (path, fallback, label) => {
+    try {
+      return await request(path);
+    } catch (error) {
+      bootstrapWarnings.push(`${label}: ${error.message}`);
+      return typeof fallback === "function" ? fallback() : fallback;
+    }
+  };
+
   try {
-    const [workspace, settings, presets, capabilities, runsPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, skillsPayload] = await Promise.all([
-      request("/api/workspace"),
-      request("/api/settings"),
-      request("/api/settings/presets"),
-      request("/api/capabilities"),
-      request("/api/runs?view=all&limit=200"),
-      request("/api/slides/templates").catch(() => ({ available: false, templates: [] })),
-      request("/api/local-models/installed").catch(() => ({ models: [] })),
-      request("/api/local-models/market").catch(() => ({ items: [] })),
-      request("/api/local-models/install-status").catch(() => ({ jobs: [], active: null })),
-      request("/api/local-runtime").catch(() => ({ installed: false, install_available: false, mode: "missing" })),
-      request("/api/skills").catch(() => ({ skills: [], library_path: "" })),
+    // Only the three records needed to render a usable shell are allowed to
+    // gate the first paint. A failed history, market, or diagnostics endpoint
+    // must never hide settings and the built-in conversation model.
+    const [workspace, settings, presets] = await Promise.all([
+      safeBootstrapRequest("/api/workspace", bootstrapWorkspaceFallback, "工作区"),
+      safeBootstrapRequest("/api/settings", bootstrapSettingsFallback, "设置"),
+      safeBootstrapRequest("/api/settings/presets", bootstrapPresetsFallback, "设置预设"),
     ]);
-    state.workspace = workspace;
+    state.workspace = workspace || bootstrapWorkspaceFallback();
     const rememberedNotebookId = window.localStorage.getItem("scansci.knowledge.scope") || "";
     const rememberedKnowledgeIds = (() => {
       try {
@@ -1323,27 +1954,47 @@ async function initialize() {
         return [];
       }
     })();
-    const searchableNotebookIds = new Set((workspace.notebooks || [])
+    const searchableNotebookIds = new Set((state.workspace.notebooks || [])
       .filter(notebookHasSearchableContent)
       .map((item) => String(item.notebook_id)));
     state.knowledgeScopeIds = rememberedKnowledgeIds.filter((id) => searchableNotebookIds.has(id));
     if (!state.knowledgeScopeIds.length && rememberedNotebookId && searchableNotebookIds.has(rememberedNotebookId)) {
       state.knowledgeScopeIds = [rememberedNotebookId];
     }
-    state.notebook = (workspace.notebooks || []).find((item) => item.notebook_id === rememberedNotebookId)
-      || (workspace.notebooks || [])[0]
+    state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === rememberedNotebookId)
+      || (state.workspace.notebooks || [])[0]
       || null;
-    state.settings = settings;
+    state.settings = settings || bootstrapSettingsFallback();
+    state.presets = presets || bootstrapPresetsFallback();
+    state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
-    state.onboardingOpen = !Boolean(settings?.onboarding?.welcome_dismissed);
-    state.presets = presets;
+    state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed);
+    renderWorkspace();
+    renderResourceOnboarding();
+
+    const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
+      request("/api/capabilities").catch(() => ({})),
+      request("/api/runs?view=all&limit=200").catch(() => ({ runs: [] })),
+      request("/api/chat/history?limit=200").catch(() => ({ conversations: [] })),
+      request("/api/slides/templates").catch(() => ({ available: false, templates: [] })),
+      request("/api/local-models/installed").catch(() => ({ models: [] })),
+      request("/api/local-models/market").catch(() => ({ items: [] })),
+      request("/api/local-models/install-status").catch(() => ({ jobs: [], active: null })),
+      request("/api/local-runtime").catch(() => ({ installed: false, install_available: false, mode: "missing" })),
+      request("/api/ollama/status").catch(() => ({ reachable: false, model_ready: false, model_id: "minicpm-v4.6", error: "" })),
+      request("/api/model-health").catch(() => ({ checked_at: "", providers: {}, models: {} })),
+      request("/api/skills").catch(() => ({ skills: [], library_path: "" })),
+    ]);
     state.capabilities = capabilities;
     state.runs = runsPayload.runs || [];
+    state.directConversations = directHistoryPayload.conversations || [];
     state.slideTemplates = slideTemplatesPayload.templates || [];
     state.slideTemplatesPlugin = slideTemplatesPayload.plugin || {};
     state.localModelMarket = { installed: localInstalled.models || [], catalog: localCatalog.items || [], source: localCatalog.source || "", loading: false };
     state.localModelInstall = localInstall || { jobs: [], active: null };
-    state.localRuntime = localRuntime || { installed: false, install_available: false, mode: "missing" };
+    state.localRuntime = { ...(localRuntime || { installed: false, install_available: false, mode: "missing" }), channels: null };
+    state.ollama = ollamaStatus || state.ollama;
+    state.modelHealth = modelHealthPayload || state.modelHealth;
     state.extensions.skills = skillsPayload.skills || [];
     state.extensions.libraryPath = skillsPayload.library_path || "";
     state.slideTemplatesAvailable = Boolean(slideTemplatesPayload.available && state.slideTemplates.length);
@@ -1361,7 +2012,6 @@ async function initialize() {
       if (state.selectedSlideTemplateId) window.localStorage.setItem("scansci.slides.template", state.selectedSlideTemplateId);
     }
     state.previewSlideTemplateId = state.selectedSlideTemplateId;
-    state.selectedProviderId = settings.active_model?.provider_id || settings.providers?.[0]?.id || "";
     renderWorkspace();
     renderResourceOnboarding();
     void restoreSessionStats();
@@ -1377,6 +2027,18 @@ async function initialize() {
     const rememberedTaskId = window.localStorage.getItem("scansci.active.task") || "";
     if (rememberedTaskId && state.runs.some((item) => item.run_id === rememberedTaskId)) {
       await openTask(rememberedTaskId, { record: false });
+    } else {
+      const rememberedDirectId = window.localStorage.getItem("scansci.active.direct") || "";
+      if (rememberedDirectId && state.directConversations.some((item) => item.conversation_id === rememberedDirectId)) {
+        await openDirectConversation(rememberedDirectId, { record: false });
+      }
+    }
+    if (new URLSearchParams(window.location.search).get("preview") === "knowledge-settings") {
+      state.activeSettings = "knowledge-preview";
+      setView("settings", { record: false });
+    }
+    if (bootstrapWarnings.length) {
+      toast("部分本地状态暂未读取，默认模型仍可用；稍后可重试。", true);
     }
   } catch (error) {
     const homeSubline = byId("homeSubline");
@@ -1457,7 +2119,14 @@ function downloadJobTitle(job, kind = "model") {
   if (kind === "runtime") return "本地运行组件";
   if (job?.job_id === "retrieval-core") return "研究检索组件";
   const models = Array.isArray(job?.models) ? job.models : [];
-  return models.length === 1 ? models[0] : models.length ? `${models.length} 个本地模型` : "本地模型";
+  const names = {
+    [ONBOARDING_EMBEDDING_MODEL]: "嵌入模型",
+    [ONBOARDING_RERANKER_MODEL]: "重排模型",
+    [ONBOARDING_CHAT_MODEL]: "小型本地对话模型",
+    [ONBOARDING_AUDIO_MODEL]: "语音模型",
+    [ONBOARDING_VISION_MODEL]: "视觉模型",
+  };
+  return models.length === 1 ? names[models[0]] || models[0] : models.length ? `${models.length} 个本地模型` : "本地模型";
 }
 
 function downloadJobStatus(job) {
@@ -1627,9 +2296,16 @@ function scheduleLocalRuntimeInstallPoll(delay = 700) {
       if (["queued", "installing", "pausing", "cancelling"].includes(job.state)) {
         scheduleLocalRuntimeInstallPoll(700);
       } else if (job.state === "ready") {
-        state.localRuntime = await request("/api/local-runtime");
+        state.localRuntime = { ...(state.localRuntime || {}), ...(await request("/api/local-runtime")) };
         await refreshLocalModelMarket();
-        toast("ScanSci 本地运行能力已就绪；现在可以按需下载模型。");
+        const pendingResource = state.pendingLocalModelResource;
+        state.pendingLocalModelResource = "";
+        if (pendingResource) {
+          toast("本地运行能力已就绪，正在继续下载模型。");
+          await startOnboardingResource(pendingResource);
+        } else {
+          toast("ScanSci 本地运行能力已就绪；现在可以按需下载模型。");
+        }
       } else if (job.state === "failed") {
         toast(job.error || "本地运行能力安装未完成", true);
       }
@@ -1716,9 +2392,72 @@ function unavailableKnowledgeLabel(notebook) {
   }
 }
 
+function knowledgeLocalBindings(notebook) {
+  const metadata = notebook?.metadata || {};
+  let bindings = Array.isArray(metadata.local_bindings)
+    ? metadata.local_bindings
+    : metadata.local_binding && typeof metadata.local_binding === "object"
+      ? [metadata.local_binding]
+      : [];
+  if (!bindings.length && String(metadata.imported_from_folder || "").trim()) {
+    bindings = [{
+      source_path: String(metadata.imported_from_folder).trim(),
+      kind: "folder",
+      state: "bound",
+      index_state: "ready",
+    }];
+  }
+  return bindings.filter((binding) => binding && typeof binding === "object" && String(binding.source_path || "").trim());
+}
+
+function knowledgeLocalBindingKind(binding) {
+  const explicit = String(binding?.kind || "").trim().toLowerCase();
+  if (explicit === "file") return "file";
+  if (explicit === "folder" || explicit === "obsidian") return "folder";
+  const sourcePath = String(binding?.source_path || "").trim();
+  const leaf = sourcePath.split(/[\\/]/).pop() || "";
+  return leaf.includes(".") ? "file" : "folder";
+}
+
+function knowledgeLocalBindingKinds(notebook) {
+  const kinds = new Set(knowledgeLocalBindings(notebook).map(knowledgeLocalBindingKind));
+  return { file: kinds.has("file"), folder: kinds.has("folder") };
+}
+
+function knowledgeLocalBindingSummary(notebook) {
+  const bindings = knowledgeLocalBindings(notebook);
+  if (!bindings.length) return { label: "未链接资料", title: "尚未链接文件或文件夹" };
+  const folders = bindings.filter((binding) => knowledgeLocalBindingKind(binding) === "folder").length;
+  const files = bindings.filter((binding) => knowledgeLocalBindingKind(binding) === "file").length;
+  const counts = [];
+  if (folders) counts.push(`${folders} 个文件夹`);
+  if (files) counts.push(`${files} 个文件`);
+  const names = bindings.map((binding) => pathLeaf(binding.source_path)).filter(Boolean);
+  const title = `已链接：${names.join("、")}`;
+  const visibleNames = names.slice(0, 2).join("、");
+  const more = names.length > 2 ? ` 等 ${names.length} 项` : "";
+  return {
+    label: `已链接 ${counts.join(" · ") || `${bindings.length} 个来源`}${visibleNames ? `：${visibleNames}${more}` : ""}`,
+    title,
+  };
+}
+
 function selectedKnowledgeNotebooks() {
   const selected = new Set(sanitizeKnowledgeScopeIds());
   return (state.workspace?.notebooks || []).filter((notebook) => selected.has(String(notebook.notebook_id)));
+}
+
+function knowledgeScopeDialogSelection() {
+  const draft = Array.isArray(state.knowledgeScopeDraftIds)
+    ? state.knowledgeScopeDraftIds
+    : state.knowledgeScopeIds;
+  return sanitizeKnowledgeScopeIds(draft || []);
+}
+
+function knowledgeScopeSelectionsEqual(left = [], right = []) {
+  const a = new Set((left || []).map(String));
+  const b = new Set((right || []).map(String));
+  return a.size === b.size && [...a].every((id) => b.has(id));
 }
 
 function persistKnowledgeScopes() {
@@ -1757,6 +2496,9 @@ function setKnowledgeScope(notebook, { close = true, toggle = false } = {}) {
 
 function removeKnowledgeScope(notebookId) {
   state.knowledgeScopeIds = (state.knowledgeScopeIds || []).filter((id) => id !== notebookId);
+  if (Array.isArray(state.knowledgeScopeDraftIds)) {
+    state.knowledgeScopeDraftIds = state.knowledgeScopeDraftIds.filter((id) => String(id) !== String(notebookId));
+  }
   persistKnowledgeScopes();
   renderKnowledgeScopeSurfaces();
   if (byId("knowledgeScopeDialog")?.open) renderKnowledgeScopeDialog();
@@ -1774,13 +2516,47 @@ function setZoteroCollectionScope(notebook, key, name) {
   closeKnowledgeScopeDialog();
 }
 
+function zoteroMetadataItems(notebook) {
+  return Array.isArray(notebook?.metadata?.zotero?.items)
+    ? notebook.metadata.zotero.items.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function zoteroMetadataItemForKnowledgeItem(item, notebook) {
+  const records = zoteroMetadataItems(notebook);
+  if (!records.length) return null;
+  const doi = String(item?.doi || "").trim().toLowerCase().replace(/^https?:\/\/(?:dx\.)?doi\.org\//, "");
+  if (doi) {
+    const byDoi = records.find((record) => String(record.doi || "").trim().toLowerCase().replace(/^https?:\/\/(?:dx\.)?doi\.org\//, "") === doi);
+    if (byDoi) return byDoi;
+  }
+  const title = String(item?.title || "").trim().toLowerCase().replace(/[^\w]+/g, "");
+  if (title.length >= 8) {
+    const byTitle = records.find((record) => String(record.title || "").trim().toLowerCase().replace(/[^\w]+/g, "") === title);
+    if (byTitle) return byTitle;
+  }
+  const fileName = String(item?.path || item?.source_url || "").replace(/\\/g, "/").split("/").at(-1)?.toLowerCase();
+  if (fileName) {
+    const byAttachment = records.find((record) => (record.attachments || []).some((attachment) => String(attachment?.path || "").replace(/\\/g, "/").split("/").at(-1)?.toLowerCase() === fileName));
+    if (byAttachment) return byAttachment;
+  }
+  return null;
+}
+
+function zoteroTagValues(item) {
+  const raw = Array.isArray(item?.tags) ? item.tags : [];
+  return raw.map((tag) => typeof tag === "object" ? tag.tag : tag).map((tag) => String(tag || "").trim()).filter(Boolean);
+}
+
 function activeKnowledgeScopePayload() {
-  const notebook = selectedKnowledgeNotebooks()[0];
+  const selected = selectedKnowledgeNotebooks();
+  const notebook = selected.find((item) => String(item.notebook_id) === String(state.notebook?.notebook_id)) || selected[0];
   if (!notebook) return null;
+  const subscope = state.knowledgeSubscope?.type === "zotero-tag" ? null : state.knowledgeSubscope;
   return {
     notebook_id: notebook.notebook_id,
     library_kind: String(notebook.metadata?.library_kind || "folder"),
-    ...(state.knowledgeSubscope || {}),
+    ...(subscope || {}),
   };
 }
 
@@ -1788,6 +2564,11 @@ function activeKnowledgeScopePayloads() {
   return selectedKnowledgeNotebooks().map((notebook) => ({
     notebook_id: notebook.notebook_id,
     library_kind: String(notebook.metadata?.library_kind || "folder"),
+    ...(String(notebook.notebook_id) === String(state.notebook?.notebook_id)
+      && state.knowledgeSubscope?.type !== "zotero-tag"
+      && state.knowledgeSubscope
+      ? state.knowledgeSubscope
+      : {}),
   }));
 }
 
@@ -1829,14 +2610,86 @@ function renderKnowledgeScopeSurfaces() {
 
 function openKnowledgeScopeDialog() {
   closeAttachmentMenus();
+  state.knowledgeScopeDraftIds = [...sanitizeKnowledgeScopeIds()];
   renderKnowledgeScopeDialog();
   const dialog = byId("knowledgeScopeDialog");
   if (dialog && !dialog.open) dialog.showModal();
 }
 
 function closeKnowledgeScopeDialog() {
+  // Closing with the X or by opening another setup flow is intentionally a
+  // cancel action.  Only the explicit footer action commits the draft.
+  state.knowledgeScopeDraftIds = null;
   const dialog = byId("knowledgeScopeDialog");
   if (dialog?.open) dialog.close();
+}
+
+function syncKnowledgeScopeDialogFooter() {
+  const status = byId("knowledgeScopeDraftStatus");
+  if (!status) return;
+  const text = status.querySelector("[data-knowledge-scope-status-text]");
+  if (!text) return;
+  const selected = knowledgeScopeDialogSelection();
+  const committed = sanitizeKnowledgeScopeIds();
+  text.textContent = knowledgeScopeSelectionsEqual(selected, committed)
+    ? "仅建立本地链接与索引，不上传原文件"
+    : `${selected.length ? `已选择 ${selected.length} 个知识库` : "未选择知识库"} · 点击完成后生效`;
+  status.classList.toggle("is-dirty", !knowledgeScopeSelectionsEqual(selected, committed));
+}
+
+function syncKnowledgeScopeDialogSelection() {
+  const target = byId("knowledgeScopeContent");
+  if (!target) return;
+  const selected = new Set(knowledgeScopeDialogSelection());
+  target.querySelectorAll("[data-knowledge-scope-row]").forEach((row) => {
+    const active = selected.has(String(row.dataset.notebookId || ""));
+    row.classList.toggle("is-active", active);
+    const button = row.querySelector(".knowledge-scope-row-main");
+    if (button) button.setAttribute("aria-pressed", String(active));
+    const mark = row.querySelector(".knowledge-scope-selected");
+    if (mark) mark.hidden = !active;
+  });
+  syncKnowledgeScopeDialogFooter();
+}
+
+function toggleKnowledgeScopeDraft(notebookId) {
+  const notebook = (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === String(notebookId));
+  if (!notebook || !notebookHasSearchableContent(notebook)) return;
+  const selected = new Set(knowledgeScopeDialogSelection());
+  const id = String(notebook.notebook_id);
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  state.knowledgeScopeDraftIds = [...selected];
+  // This is deliberately DOM-local: no workspace render, index request, or
+  // history refresh is needed to acknowledge a checkbox-like interaction.
+  syncKnowledgeScopeDialogSelection();
+}
+
+function applyKnowledgeScopeSelection() {
+  const nextIds = knowledgeScopeDialogSelection();
+  const previousActiveId = String(state.notebook?.notebook_id || "");
+  state.knowledgeScopeIds = nextIds;
+  const nextActive = nextIds.length
+    ? (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === previousActiveId && nextIds.includes(String(item.notebook_id)))
+      || (state.workspace?.notebooks || []).find((item) => nextIds.includes(String(item.notebook_id)))
+    : null;
+  if (nextActive) {
+    if (String(nextActive.notebook_id) !== previousActiveId) state.knowledgeSubscope = null;
+    state.notebook = nextActive;
+    window.localStorage.setItem("scansci.knowledge.scope", String(nextActive.notebook_id));
+  } else if (!nextIds.length) {
+    state.knowledgeSubscope = null;
+    window.localStorage.setItem("scansci.knowledge.scope", "");
+  }
+  persistKnowledgeScopes();
+  state.knowledgeScopeDraftIds = null;
+  // One committed update is enough.  The expensive render is kept out of the
+  // repeated select/deselect path above.
+  renderWorkspace();
+  if (state.activeView === "mode" && state.activeMode === "library") renderMode();
+  const dialog = byId("knowledgeScopeDialog");
+  if (dialog?.open) dialog.close();
+  toast(nextIds.length ? `已应用 ${nextIds.length} 个知识库` : "已移除本轮知识库范围");
 }
 
 function syncKnowledgeScopeRefreshButton() {
@@ -1859,6 +2712,9 @@ async function refreshKnowledgeScopeCounts() {
     const notebooks = workspace?.notebooks || [];
     state.workspace = workspace;
     state.knowledgeScopeIds = sanitizeKnowledgeScopeIds();
+    if (Array.isArray(state.knowledgeScopeDraftIds)) {
+      state.knowledgeScopeDraftIds = sanitizeKnowledgeScopeIds(state.knowledgeScopeDraftIds);
+    }
     state.notebook = notebooks.find((notebook) => String(notebook.notebook_id) === activeNotebookId)
       || notebooks[0]
       || null;
@@ -1880,26 +2736,38 @@ function renderKnowledgeScopeDialog() {
   if (!target) return;
   syncKnowledgeScopeRefreshButton();
   const notebooks = state.workspace?.notebooks || [];
-  const selected = new Set(state.knowledgeScopeIds || []);
+  const selected = new Set(knowledgeScopeDialogSelection());
   const rows = notebooks.map((notebook) => {
     const kind = knowledgeKind(notebook);
     const ready = notebookHasSearchableContent(notebook);
     const active = ready && selected.has(String(notebook.notebook_id));
     const count = Number(notebook.counts?.sources || 0);
-    const action = ready ? "toggle-notebook-scope" : unavailableKnowledgeAction(notebook);
-    const label = ready ? `${count} 个文档` : unavailableKnowledgeLabel(notebook);
-    // Selection is intentionally the only right-side affordance.  An
-    // unavailable or unselected library must not render a placeholder or
-    // navigation glyph here: it looks like a selected state at a glance.
+    const personal = knowledgeSourceKind(notebook) === "personal";
+    const bindingSummary = knowledgeLocalBindingSummary(notebook);
+    const action = ready ? "toggle-notebook-scope" : "knowledge-scope-unavailable";
+    const label = ready
+      ? `${count} 个文档${bindingSummary.label === "未链接资料" ? "" : ` · ${bindingSummary.label}`}`
+      : bindingSummary.label;
     const selectionMark = active
       ? `<span class="knowledge-scope-selected" aria-label="已选中">${uiIcon("check")}</span>`
+      : `<span class="knowledge-scope-selected" aria-label="已选中" hidden>${uiIcon("check")}</span>`;
+    const linkedKinds = knowledgeLocalBindingKinds(notebook);
+    const resourceButtons = [
+      linkedKinds.file ? "" : `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="向 ${escapeHtml(knowledgeScopeTitle(notebook))} 链接文件" title="链接文件">${uiIcon("file-plus")}</button>`,
+      linkedKinds.folder ? "" : `<button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="向 ${escapeHtml(knowledgeScopeTitle(notebook))} 链接文件夹" title="链接文件夹">${uiIcon("folder-open")}</button>`,
+    ].filter(Boolean);
+    const resourceActions = personal
+      ? resourceButtons.length
+        ? `<div class="knowledge-scope-resource-actions">${resourceButtons.join("")}</div>`
+        : `<span class="knowledge-scope-resource-status" title="文件与文件夹已连接">已全部连接</span>`
       : "";
-    return `<button type="button" class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-action="${action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}` : `${unavailableKnowledgeLabel(notebook)}：${knowledgeScopeTitle(notebook)}`)}"><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small title="${escapeHtml(ready ? `${count} 个文档可检索` : "尚无可检索内容")}">${escapeHtml(label)}</small>${selectionMark}</button>`;
+    return `<div class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-knowledge-scope-row data-notebook-id="${escapeHtml(notebook.notebook_id)}"><button type="button" class="knowledge-scope-row-main" data-action="${ready ? "toggle-knowledge-scope-draft" : action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}` : `${knowledgeScopeTitle(notebook)}尚无可检索内容`)}" aria-pressed="${ready ? String(active) : "false"}" ${ready ? "" : "disabled"}><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small title="${escapeHtml(ready ? `${count} 个文档可检索；${bindingSummary.title}` : bindingSummary.title)}">${escapeHtml(label)}</small>${selectionMark}</button>${resourceActions}</div>`;
   }).join("");
-  target.innerHTML = `<section class="knowledge-scope-connect"><button type="button" data-action="create-empty-library"><img src="/knowledge-personal.svg" alt="" /><span>个人知识库</span>${uiIcon("plus")}</button><button type="button" data-action="choose-zotero-library"><img src="/zotero-logo.svg" alt="" /><span>Zotero</span>${uiIcon("plus")}</button><button type="button" data-action="choose-obsidian-vault"><img src="/obsidian-logo.svg" alt="" /><span>Obsidian</span>${uiIcon("plus")}</button></section><section class="knowledge-scope-list"><header><h3>选择知识库</h3><span>可多选</span></header>${rows || `<div class="knowledge-scope-empty">先链接一个本地知识库</div>`}</section>`;
+  target.innerHTML = `<section class="knowledge-scope-connect"><button type="button" data-action="create-empty-library"><img src="/knowledge-personal.svg" alt="" /><span>个人知识库</span>${uiIcon("plus")}</button><button type="button" data-action="choose-zotero-library"><img src="/zotero-logo.svg" alt="" /><span>Zotero</span>${uiIcon("plus")}</button><button type="button" data-action="choose-obsidian-vault"><img src="/obsidian-logo.svg" alt="" /><span>Obsidian</span>${uiIcon("plus")}</button></section><section class="knowledge-scope-list"><header><h3>选择知识库</h3><span>可多选</span></header><p class="knowledge-scope-hint">选择个人知识库后，可在右侧直接链接文件或文件夹。</p>${rows || `<div class="knowledge-scope-empty">先创建一个个人知识库</div>`}</section>`;
   hydrateIcons(target);
   target.querySelector(".knowledge-scope-connect")?.insertAdjacentHTML("beforeend", `<button type="button" data-action="connect-notion"><img src="/notion-logo.png" alt="" /><span>Notion</span>${uiIcon("plus")}</button>`);
   hydrateIcons(target);
+  syncKnowledgeScopeDialogFooter();
 }
 
 function knowledgeLogoUrl(kind) {
@@ -1927,8 +2795,41 @@ function isConversationModel(model) {
   return !capabilities.has("embedding") && !capabilities.has("reranking");
 }
 
-function isSelectableConversationModel(model) {
-  return isConversationModel(model) && String(model?.readiness || "production") === "production";
+function modelHealthKey(providerId, modelId) {
+  return `${String(providerId || "")}::${String(modelId || "")}`;
+}
+
+function modelHealthEntry(providerId, modelId) {
+  return state.modelHealth?.models?.[modelHealthKey(providerId, modelId)] || null;
+}
+
+function localModelSnapshotReady(modelId) {
+  const wanted = String(modelId || "");
+  return (state.localModelMarket?.installed || []).some((item) => (
+    String(item?.id || "") === wanted
+    && Boolean(item?.ready)
+    && item?.runtime_compatible !== false
+  ));
+}
+
+function isSelectableConversationModel(model, provider = null) {
+  const capabilities = new Set(model?.capabilities || []);
+  // ASR is a preprocessing capability, not a text-generation model.  Keep
+  // it in Settings → 模型路由, but never put it in the chat-model picker.
+  if (capabilities.has("audio") && !["reasoning", "writing", "vision", "tool", "coding"].some((item) => capabilities.has(item))) {
+    return false;
+  }
+  if (!isConversationModel(model) || String(model?.readiness || "production") !== "production") return false;
+  if (!provider) return true;
+  const isLocal = provider.kind === "local" || provider.auth_mode === "local" || String(provider.id || "").startsWith("local-runtime-");
+  if (!isLocal) return true;
+  const health = modelHealthEntry(provider.id, model.id);
+  if (health) return ["ready", "connected"].includes(String(health.status || ""));
+  // Keep the initial render migration-safe if an older embedded page loads
+  // before the health endpoint responds. Once a snapshot exists, local models
+  // without a ready cache entry must stay out of the picker.
+  if (!state.modelHealth?.checked_at) return provider.id === "local-evidence" || localModelSnapshotReady(model.id);
+  return provider.id === "local-evidence";
 }
 
 function parseTokenCapacity(value) {
@@ -2155,11 +3056,14 @@ function setComposerThinkingLevel(value) {
 function composerModelMenuMarkup(current = {}) {
   const providers = (state.settings?.providers || []).filter(isProviderUsable);
   const groups = providers.map((provider) => {
-    const models = (provider.models || []).filter(isSelectableConversationModel);
+    const models = (provider.models || []).filter((model) => isSelectableConversationModel(model, provider));
     if (!models.length) return "";
     const rows = models.map((model) => {
       const selected = provider.id === current.provider_id && model.id === current.model_id;
-      const tags = model.capabilities?.includes("vision") ? '<span class="composer-model-tag">视觉</span>' : "";
+      const tags = [
+        model.capabilities?.includes("vision") ? '<span class="composer-model-tag">视觉</span>' : "",
+        model.capabilities?.includes("audio") ? '<span class="composer-model-tag">语音</span>' : "",
+      ].join("");
       return `<button type="button" class="composer-model-option ${selected ? "is-selected" : ""}" data-action="select-composer-model" data-model-value="${escapeHtml(`${provider.id}::${model.id}`)}" role="option" aria-selected="${selected ? "true" : "false"}"><span class="composer-model-option-name">${escapeHtml(model.name || model.id)}</span>${tags}<span class="composer-model-check" aria-hidden="true">${uiIcon("check")}</span></button>`;
     }).join("");
     return `<section class="composer-model-group"><span>${escapeHtml(provider.name)}</span>${rows}</section>`;
@@ -2198,7 +3102,21 @@ async function setActiveComposerModel(value) {
 }
 
 function isProviderUsable(provider) {
-  return Boolean(provider?.enabled) && (provider.kind === "local" || provider.auth_mode === "managed" || Boolean(provider.api_key_configured));
+  if (!provider?.enabled) return false;
+  // An Ollama model is only selectable after the exact model has been
+  // confirmed by /api/tags.  The resource page still shows the install/setup
+  // action while this is false.
+  if (String(provider?.id || "").startsWith("local-runtime-") && provider?.logo === "ollama") {
+    const health = state.modelHealth?.providers?.[provider.id];
+    return health ? ["ready", "connected"].includes(String(health.status || "")) : Boolean(state.ollama?.reachable && state.ollama?.model_ready);
+  }
+  const isLocal = provider.kind === "local" || provider.auth_mode === "local" || String(provider.id || "").startsWith("local-runtime-");
+  if (isLocal) {
+    if (provider.id === "local-evidence") return true;
+    const health = state.modelHealth?.providers?.[provider.id];
+    return health ? ["ready", "connected", "partial"].includes(String(health.status || "")) : Boolean(provider.auth_mode === "local" && provider.base_url);
+  }
+  return provider.auth_mode === "managed" || Boolean(provider.api_key_configured);
 }
 
 const COMPOSER_IMAGE_LIMIT = 4;
@@ -2220,6 +3138,17 @@ function composerKey(inputId) {
 
 function currentModelSupportsVision() {
   return Boolean(activeModel().model?.capabilities?.includes("vision"));
+}
+
+function localAudioModelReady() {
+  return (state.localModelMarket?.installed || state.localInstalled || []).some((item) => {
+    const id = String(item?.id || "").toLowerCase();
+    const legacyQwen = id === "qwen/qwen3-asr-0.6b";
+    return Boolean(item?.ready)
+      && item?.runtime_compatible !== false
+      && !legacyQwen
+      && (item?.kind === "audio" || id.includes("asr") || id.includes("whisper"));
+  });
 }
 
 function composerImagePreviewMarkup(images = []) {
@@ -2248,11 +3177,11 @@ function renderComposerImages(key) {
   target.innerHTML = images.map((image) => `<figure class="composer-image-card"><img src="${escapeHtml(image.data_url)}" alt="${escapeHtml(image.name)}" /><figcaption>${escapeHtml(image.name)}</figcaption><button type="button" data-action="remove-composer-image" data-composer-key="${key}" data-image-id="${escapeHtml(image.id)}" aria-label="移除 ${escapeHtml(image.name)}">×</button></figure>`).join("");
 }
 
-function fileToDataUrl(file) {
+function fileToDataUrl(file, errorMessage = "无法读取附件") {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("无法读取图片"));
+    reader.onerror = () => reject(new Error(errorMessage));
     reader.readAsDataURL(file);
   });
 }
@@ -2500,11 +3429,163 @@ function navigationLocation() {
     settings: state.activeSettings,
     extensions: state.activeExtensions,
     task: state.activeTaskId,
+    direct: state.directConversationId,
   };
 }
 
+const COMPOSER_AUDIO_LIMIT = 4;
+const COMPOSER_AUDIO_MAX_BYTES = 50 * 1024 * 1024;
+const COMPOSER_AUDIO_TOTAL_BYTES = 100 * 1024 * 1024;
+const COMPOSER_AUDIO_RECORDING_LIMIT_MS = 5 * 60 * 1000;
+const COMPOSER_AUDIO_TYPES = new Set([
+  "audio/wav", "audio/wave", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/x-m4a",
+  "audio/flac", "audio/ogg", "audio/aac", "audio/webm",
+]);
+
+function composerAudioPreviewMarkup(audio = []) {
+  if (!audio.length) return "";
+  return `<div class="user-audio-preview-list">${audio.map((item) => `<span class="user-audio-preview"><span>${uiIcon("file-audio")}</span><strong>${escapeHtml(item.name || "语音")}</strong></span>`).join("")}</div>`;
+}
+
+function renderComposerAudio(key) {
+  const target = byId(`${key}AudioAttachments`);
+  if (!target) return;
+  const audio = state.composerAudio[key] || [];
+  target.hidden = !audio.length;
+  target.innerHTML = audio.map((item) => `<article class="composer-audio-card"><span class="composer-audio-icon">${uiIcon("file-audio")}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(formatFileSize(item.size))}</small></span><button type="button" data-action="remove-composer-audio" data-composer-key="${escapeHtml(key)}" data-audio-id="${escapeHtml(item.id)}" aria-label="移除 ${escapeHtml(item.name)}">×</button></article>`).join("");
+  const recording = state.composerRecordings[key];
+  document.querySelectorAll(`[data-action="toggle-composer-recording"][data-composer-key="${key}"]`).forEach((button) => {
+    const active = Boolean(recording);
+    button.classList.toggle("is-recording", active);
+    button.setAttribute("aria-pressed", String(active));
+    const label = button.querySelector("span:last-child");
+    if (label) label.textContent = active ? "停止录音" : "录制语音";
+  });
+}
+
+async function toggleComposerRecording(key) {
+  const existing = state.composerRecordings[key];
+  if (existing) {
+    existing.recorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+    toast("当前环境不支持麦克风录音，请使用“添加语音”上传音频文件。", true);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"]
+      .find((type) => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type)) || "";
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const chunks = [];
+    const recording = { recorder, stream, chunks, timer: 0, discard: false };
+    recorder.addEventListener("dataavailable", (event) => {
+      if (event.data?.size) chunks.push(event.data);
+    });
+    recorder.addEventListener("stop", async () => {
+      window.clearTimeout(recording.timer);
+      stream.getTracks().forEach((track) => track.stop());
+      if (state.composerRecordings[key] === recording) state.composerRecordings[key] = null;
+      renderComposerAudio(key);
+      if (recording.discard) return;
+      if (!chunks.length) return;
+      const type = recorder.mimeType || mimeType || "audio/webm";
+      const extension = type.includes("ogg") ? "ogg" : "webm";
+      const file = new File(
+        [new Blob(chunks, { type })],
+        `录音-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`,
+        { type },
+      );
+      try {
+        await addComposerAudio(key, [file]);
+        toast("录音已添加");
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    state.composerRecordings[key] = recording;
+    recorder.start();
+    recording.timer = window.setTimeout(() => {
+      if (state.composerRecordings[key] === recording && recorder.state === "recording") {
+        recorder.stop();
+        toast("录音已达到 5 分钟上限");
+      }
+    }, COMPOSER_AUDIO_RECORDING_LIMIT_MS);
+    renderComposerAudio(key);
+    toast("正在录音，再次点击即可停止");
+  } catch (error) {
+    stream?.getTracks?.().forEach((track) => track.stop());
+    toast(error?.name === "NotAllowedError" ? "麦克风权限未开启，请允许 ScanSci 使用麦克风。" : `无法开始录音：${error.message}`, true);
+  }
+}
+
+async function addComposerAudio(key, files) {
+  const incoming = [...files].filter(Boolean);
+  if (!incoming.length) return;
+  const existing = state.composerAudio[key] || [];
+  if (existing.length + incoming.length > COMPOSER_AUDIO_LIMIT) {
+    toast(`一次最多可以添加 ${COMPOSER_AUDIO_LIMIT} 个音频文件`, true);
+    return;
+  }
+  const accepted = [];
+  let totalBytes = existing.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  for (const file of incoming) {
+    if (!COMPOSER_AUDIO_TYPES.has(String(file.type || "").toLowerCase())) {
+      toast("仅支持 WAV、MP3、M4A、FLAC、OGG、AAC 或 WebM 音频", true);
+      continue;
+    }
+    if (!file.size || file.size > COMPOSER_AUDIO_MAX_BYTES) {
+      toast("单个音频文件不能超过 50 MB", true);
+      continue;
+    }
+    if (totalBytes + file.size > COMPOSER_AUDIO_TOTAL_BYTES) {
+      toast("本次音频附件总大小不能超过 100 MB", true);
+      break;
+    }
+    totalBytes += file.size;
+    accepted.push({
+      id: `audio-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name: file.name || `语音 ${existing.length + accepted.length + 1}`,
+      mime_type: String(file.type || "audio/wav").toLowerCase(),
+      size: file.size,
+      data_url: await fileToDataUrl(file, "无法读取音频文件"),
+    });
+  }
+  if (!accepted.length) return;
+  state.composerAudio[key] = [...existing, ...accepted];
+  renderComposerAudio(key);
+}
+
+function removeComposerAudio(key, audioId) {
+  state.composerAudio[key] = (state.composerAudio[key] || []).filter((item) => item.id !== audioId);
+  renderComposerAudio(key);
+}
+
+function clearComposerAudio(key) {
+  const recording = state.composerRecordings[key];
+  if (recording) {
+    recording.discard = true;
+    window.clearTimeout(recording.timer);
+    if (recording.recorder.state === "recording") recording.recorder.stop();
+    recording.stream.getTracks().forEach((track) => track.stop());
+    state.composerRecordings[key] = null;
+  }
+  state.composerAudio[key] = [];
+  renderComposerAudio(key);
+}
+
+function audioPayloadForComposer(key) {
+  return (state.composerAudio[key] || []).map((item) => ({
+    name: item.name,
+    mime_type: item.mime_type,
+    data_url: item.data_url,
+  }));
+}
+
 function navigationKey(location) {
-  return [location.view, location.mode, location.settings, location.extensions, location.task].join("::");
+  return [location.view, location.mode, location.settings, location.extensions, location.task, location.direct].join("::");
 }
 
 function updateChromeControls() {
@@ -2538,10 +3619,13 @@ function moveNavigation(delta) {
   state.activeSettings = location.settings;
   state.activeExtensions = location.extensions || "skills";
   state.activeTaskId = location.task;
+  state.directConversationId = location.direct || "";
   setView(location.view, { record: false });
   if (location.view === "conversation" && location.task) {
     const run = state.runs.find((item) => item.run_id === location.task);
     if (run) openTask(run.run_id, { record: false });
+  } else if (location.view === "conversation" && location.direct) {
+    openDirectConversation(location.direct, { record: false });
   }
   renderTasks();
   updateChromeControls();
@@ -2738,9 +3822,11 @@ async function controlDesktopWindow(method) {
   if (!api || typeof api[method] !== "function") return;
   const result = await api[method]();
   if (method !== "toggle_maximize_window" || !result?.ok) return;
+  const maximized = Boolean(result.maximized);
+  document.documentElement.classList.toggle("desktop-window-maximized", maximized);
+  document.body.classList.toggle("desktop-window-maximized", maximized);
   const button = document.querySelector('[data-action="toggle-maximize-window"]');
   if (!button) return;
-  const maximized = Boolean(result.maximized);
   button.setAttribute("aria-label", maximized ? "还原窗口" : "最大化窗口");
   button.setAttribute("title", maximized ? "还原窗口" : "最大化窗口");
 }
@@ -2792,7 +3878,14 @@ function setView(name, { record = true } = {}) {
   updateSidebarNavigation();
   document.querySelectorAll(".app-view").forEach((view) => view.classList.toggle("is-active", view.dataset.view === name));
   document.documentElement.scrollTop = 0;
-  if (name === "settings") renderSettings();
+  if (name === "settings") {
+    renderSettings();
+    const settingsContent = byId("settingsContent");
+    if (settingsContent) {
+      settingsContent.scrollTop = 0;
+      settingsContent.scrollLeft = 0;
+    }
+  }
   if (name === "mode") renderMode();
   if (name === "extensions") renderExtensions();
   if (name === "mcp") renderMcpMarketplaceView();
@@ -2818,19 +3911,22 @@ function openMode(mode) {
 }
 
 function openSettings(panel = "general") {
-  // Routing is automatic. Keep old deep links/history entries from reopening
-  // the retired manual model-role screen.
-  state.activeSettings = panel === "routing" ? "general" : panel;
+  // Keep old deep links working while moving model roles and document tools
+  // into the user-facing default-capabilities page.
+  const openResourceGuide = panel === "resources";
+  state.activeSettings = ["routing", "document-processing", "resources"].includes(panel) ? "defaults" : panel;
   if (panel === "models" && state.settings?.active_model?.provider_id) {
     state.selectedProviderId = state.settings.active_model.provider_id;
   }
   setView("settings");
+  if (openResourceGuide) openResourceGuideOverlay();
 }
 
 function openExtensions(tab = "skills") {
   state.activeExtensions = ["plugins", "skills", "market"].includes(tab) ? tab : "skills";
   setView("extensions");
   refreshExtensions({ quiet: true, includeMarket: state.activeExtensions === "market" }).catch((error) => toast(error.message, true));
+  refreshExtensionUpdates({ quiet: true }).catch(() => {});
 }
 
 function openMcpMarketplace() {
@@ -2840,6 +3936,7 @@ function openMcpMarketplace() {
 
 function startTask() {
   state.activeTaskId = "";
+  state.directConversationId = "";
   state.sessionId = null;
   state.sessionTokens = 0;
   state.contextUsagePercent = 0;
@@ -2848,6 +3945,7 @@ function startTask() {
   closeContextUsagePopovers();
   renderContextUsage();
   window.localStorage.removeItem("scansci.active.task");
+  window.localStorage.removeItem("scansci.active.direct");
   window.localStorage.removeItem("scansci.active.session");
   state.directMessages = [];
   clearComposerSkills("home");
@@ -3010,16 +4108,31 @@ function renderTasks() {
   const query = state.historyQuery.trim().toLowerCase();
   const archived = state.historyView === "archived";
   const availableRuns = state.runs.filter((run) => Boolean(run.archived) === archived);
-  const runs = availableRuns.filter((run) => [run.title, run.status, run.updated_at].join(" ").toLowerCase().includes(query));
-  if (!availableRuns.length) {
+  const availableRecords = [
+    ...availableRuns,
+    ...(archived ? [] : state.directConversations),
+  ].sort((left, right) => String(right.updated_at || "").localeCompare(String(left.updated_at || "")));
+  const records = availableRecords.filter((record) => {
+    const searchable = record.kind === "direct"
+      ? [record.title, record.preview, record.updated_at, "直接对话", "已完成"]
+      : [record.title, record.status, record.updated_at];
+    return searchable.join(" ").toLowerCase().includes(query);
+  });
+  if (!availableRecords.length) {
     target.innerHTML = `<p class="history-empty">${archived ? "暂无归档对话" : "暂无对话"}</p>`;
     return;
   }
-  if (!runs.length) {
+  if (!records.length) {
     target.innerHTML = '<p class="history-empty">没有匹配的历史对话</p>';
     return;
   }
-  target.innerHTML = runs.slice(0, 80).map((run) => {
+  target.innerHTML = records.slice(0, 80).map((record) => {
+    if (record.kind === "direct") {
+      const conversationId = String(record.conversation_id || "");
+      const active = !state.activeTaskId && state.directConversationId === conversationId;
+      return `<div class="task-row" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status completed">已完成</time></button></div>`;
+    }
+    const run = record;
     const open = state.historyMenuRunId === run.run_id;
     const manageDisabled = Boolean(run.cancellable || run.status === "needs_confirmation");
     const organizeAction = archived ? "restore-task" : "archive-task";
@@ -3135,6 +4248,89 @@ async function deleteTask(runId) {
   toast("对话已删除");
 }
 
+function newDirectConversationId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `direct-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function directConversationTitle(messages = state.directMessages) {
+  const firstUser = (messages || []).find((message) => message?.role === "user" && String(message.content || "").trim());
+  return compact(String(firstUser?.content || "直接对话").split(/\r?\n/, 1)[0], 120);
+}
+
+function directHistoryMessage(message) {
+  const copy = { ...(message || {}) };
+  delete copy.streaming;
+  delete copy.control_run_id;
+  if (Array.isArray(copy.images)) {
+    copy.images = copy.images.map((image) => ({
+      name: image?.name || "用户图片",
+      ...(image?.type ? { type: image.type } : {}),
+      ...(image?.size ? { size: image.size } : {}),
+    }));
+  }
+  if (Array.isArray(copy.audio)) {
+    copy.audio = copy.audio.map((audio) => ({
+      name: audio?.name || "语音",
+      ...(audio?.mime_type ? { mime_type: audio.mime_type } : {}),
+      ...(audio?.size ? { size: audio.size } : {}),
+      ...(audio?.audio_url ? { audio_url: audio.audio_url } : {}),
+    }));
+  }
+  if (Array.isArray(copy.sources)) {
+    copy.sources = copy.sources.map((source) => ({
+      ...(source?.name ? { name: source.name } : {}),
+      ...(source?.title ? { title: source.title } : {}),
+      ...(source?.doc_id ? { doc_id: source.doc_id } : {}),
+      ...(source?.doi ? { doi: source.doi } : {}),
+      ...(source?.file_url ? { file_url: source.file_url } : {}),
+    }));
+  }
+  return copy;
+}
+
+function upsertDirectConversation(record) {
+  if (!record?.conversation_id) return;
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  const preview = String(record.preview || [...messages].reverse().find((message) => message?.content)?.content || "");
+  const summary = {
+    kind: "direct",
+    conversation_id: String(record.conversation_id),
+    title: String(record.title || directConversationTitle(messages)),
+    preview: compact(preview, 180),
+    created_at: String(record.created_at || new Date().toISOString()),
+    updated_at: String(record.updated_at || new Date().toISOString()),
+    message_count: Number(record.message_count || messages.length || 0),
+    session_id: String(record.session_id || ""),
+    model: record.model || null,
+  };
+  state.directConversations = [
+    summary,
+    ...state.directConversations.filter((item) => item.conversation_id !== summary.conversation_id),
+  ].sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  renderTasks();
+}
+
+async function persistDirectConversation() {
+  const messages = state.directMessages
+    .filter((message) => message && !message.streaming)
+    .map(directHistoryMessage);
+  if (!messages.length) return null;
+  if (!state.directConversationId) state.directConversationId = newDirectConversationId();
+  window.localStorage.setItem("scansci.active.direct", state.directConversationId);
+  const saved = await request("/api/chat/history", {
+    method: "POST",
+    body: JSON.stringify({
+      conversation_id: state.directConversationId,
+      title: directConversationTitle(messages),
+      session_id: state.sessionId || "",
+      messages,
+    }),
+  });
+  upsertDirectConversation(saved);
+  return saved;
+}
+
 function runStatusLabel(run) {
   if (run.cancel_requested) return "停止中";
   return ({ queued: "排队中", planning: "规划中", running: "执行中", verifying: "核验中", needs_confirmation: "待确认", waiting_input: "等待回答", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已停止" })[run.status] || run.status;
@@ -3189,11 +4385,20 @@ function renderSources() {
 
 async function legacyAskQuestion(event, inputId) {
   event.preventDefault();
+  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
+    toast("上一条回复仍在处理，请等待完成。", true);
+    return;
+  }
   const input = byId(inputId);
   const key = composerKey(inputId);
   const images = imagePayloadForComposer(key);
+  const audio = audioPayloadForComposer(key);
+  if (state.composerRecordings[key]) {
+    toast("正在录音，请再次点击录制按钮停止后再发送。", true);
+    return;
+  }
   const sourceFiles = sourcePayloadForComposer(key);
-  const question = input.value.trim() || (sourceFiles.length ? `请将「${sourceFiles[0].name}」制作成一份科研幻灯片。` : images.length ? "请分析我粘贴的图片，并结合当前资料库回答。" : "");
+  const question = input.value.trim() || (sourceFiles.length ? `请将「${sourceFiles[0].name}」制作成一份科研幻灯片。` : images.length ? "请分析我粘贴的图片，并结合当前资料库回答。" : audio.length ? "请根据我上传的语音回答。" : "");
   if (!question) return;
   const mode = composerMode(inputId);
   const isDirectConversation = !state.notebook && mode === "general";
@@ -3211,35 +4416,38 @@ async function legacyAskQuestion(event, inputId) {
     toast("请先添加 PDF、Word、Markdown、TXT 或 HTML；制作幻灯片不需要资料库。", true);
     return;
   }
-  if (isDirectConversation && images.length) {
-    toast("图片对话请先打开资料库后再使用。", true);
+  if (images.length && mode === "slides") {
+    toast("制作幻灯片请使用文档附件；图片提问会交给通用对话处理。", true);
     return;
   }
-  if (images.length && mode !== "general") {
-    toast("图片提问目前仅支持“通用”模式", true);
+  if (audio.length && !localAudioModelReady()) {
+    toast("请先在设置 → 本地模型 → 模型市场下载 Qwen3 ASR 0.6B-hf", true);
+    openSettings("local-models");
     return;
   }
-  if (images.length && !currentModelSupportsVision()) {
-    toast("请先在模型菜单选择带“视觉”标签的模型", true);
-    return;
-  }
+  composerSubmissionInFlight = true;
   const button = event.currentTarget.querySelector("button[type=submit]");
+  if (!button) {
+    composerSubmissionInFlight = false;
+    toast("发送控件未准备好，请刷新后重试。", true);
+    return;
+  }
   button.disabled = true;
   let streamingMessage = null;
   byId("conversationTitle").textContent = compact(question, 80);
   applyContextPanelPreset(isDirectConversation || isStandaloneSlides ? "none" : ["writing", "deep-research"].includes(mode) ? "review" : "evidence");
   setView("conversation");
-  byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}<p>${escapeHtml(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
+  byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
   if (["writing", "deep-research"].includes(mode)) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
   try {
     if (isDirectConversation) {
-      const messages = [...state.directMessages, { role: "user", content: question, created_at: new Date().toISOString() }].slice(-16);
+      const messages = [...state.directMessages, { role: "user", content: question, audio, created_at: new Date().toISOString() }].slice(-16);
       const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, created_at: new Date().toISOString() };
+      streamingMessage = { role: "assistant", content: "", streaming: true, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
       state.directMessages = [...messages, streamingMessage].slice(-16);
       renderDirectConversation();
       let completed = false;
-      await streamChat({ messages, thinking_level: currentThinkingLevel() }, (eventType, event) => {
+      await streamChatWithRecovery({ messages, audio, thinking_level: currentThinkingLevel() }, (eventType, event) => {
         if (eventType === "delta") {
           streamingMessage.content += String(event.content || "");
           scheduleDirectConversationRender();
@@ -3248,6 +4456,7 @@ async function legacyAskQuestion(event, inputId) {
         if (eventType === "done") {
           const message = {
             ...event.message,
+            model: modelIdentitySnapshot(event.model || event.message?.model || streamingMessage.model),
             usage: event.message?.usage || streamingMessage.usage,
             created_at: event.message?.created_at || new Date().toISOString(),
             processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -3298,9 +4507,18 @@ async function legacyAskQuestion(event, inputId) {
           toast("Pi Agent 当前不可用，已回退到直连模型——回答质量可能受限");
           return;
         }
+      }, {
+        onRetry: () => {
+          streamingMessage.content = "";
+          streamingMessage.error = "";
+          streamingMessage.failure = null;
+          streamingMessage.streaming = true;
+          renderDirectConversation();
+        },
       });
       if (!completed) throw new Error("The model stream ended before a final response was received.");
       input.value = "";
+      clearComposerAudio(key);
       return;
     }
     const { workflowType, workflowInput } = composerRun(mode, question, images, sourceFiles);
@@ -3319,24 +4537,33 @@ async function legacyAskQuestion(event, inputId) {
     });
     input.value = "";
     clearComposerImages(key);
+    clearComposerAudio(key);
     clearComposerSources(key);
   } catch (error) {
     if (isDirectConversation && streamingMessage) {
       streamingMessage.streaming = false;
-      streamingMessage.content ||= "生成回复时发生错误。";
+      // Keep any partial provider output, but do not present a fake answer
+      // sentence when the request failed before the first delta.
+      streamingMessage.content = String(streamingMessage.content || "");
       streamingMessage.error = error.message;
+      streamingMessage.failure = error.failure || null;
       renderDirectConversation();
       toast(error.message, true);
     } else {
       byId("answerArea").innerHTML = `<div class="error-state">${escapeHtml(error.message)}</div>`;
     }
   } finally {
+    composerSubmissionInFlight = false;
     button.disabled = false;
   }
 }
 
 async function askQuestion(event, inputId) {
   event.preventDefault();
+  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
+    toast("上一条回复仍在处理，请等待完成。", true);
+    return;
+  }
   // `Event.currentTarget` is only guaranteed while the synchronous submit
   // handler is running. General mode may await the route preview below; by
   // then browsers reset `currentTarget` to null. Capture the form/button
@@ -3355,6 +4582,11 @@ async function askQuestion(event, inputId) {
   const selectedSkills = skillRecordsForIds(selectedSkillIds);
   const selectedMode = composerMode(inputId);
   const images = imagePayloadForComposer(key);
+  const audio = audioPayloadForComposer(key);
+  if (state.composerRecordings[key]) {
+    toast("正在录音，请再次点击录制按钮停止后再发送。", true);
+    return;
+  }
   const sourceFiles = sourcePayloadForComposer(key);
   const activeRun = state.runs.find((item) => item.run_id === state.activeTaskId);
   // The selected historical task is the source of truth.  `activeView` can
@@ -3368,17 +4600,21 @@ async function askQuestion(event, inputId) {
     ? selectedMode === "slides"
       ? `请将《${sourceFiles[0].name}》制作成一份科研幻灯片。`
       : `请阅读《${sourceFiles[0].name}》并概括最重要的信息。`
-    : images.length ? "请分析我粘贴的图片。" : "");
+    : images.length ? "请分析我粘贴的图片。" : audio.length ? "请根据我上传的语音回答。" : "");
   if (!question) return;
   let mode = ["research", "academic"].includes(selectedMode) ? resolveResearchComposerMode(question) : selectedMode;
 
   // An open historical task is a chat thread. Composer modes only affect new
   // tasks; changing the mode must never fork an already-open conversation.
   const isTaskFollowUp = isTaskConversation;
-  if (isTaskFollowUp && (sourceFiles.length || images.length)) {
+  if (isTaskFollowUp && (sourceFiles.length || images.length || audio.length)) {
     toast("当前对话暂不支持追加附件，请先发送文字反馈。", true);
     return;
   }
+  // Claim the composer before the optional route preview.  The preview is an
+  // await point; without this synchronous guard, Enter plus a click could
+  // create two identical model requests before the submit button is disabled.
+  composerSubmissionInFlight = true;
   const isReviewWorkflow = inputId === "reviewQuestionInput";
   const selectedKnowledge = selectedKnowledgeNotebooks();
   const searchableKnowledgeSelected = selectedKnowledge.some((notebook) => Number(notebook.counts?.sources || 0) > 0);
@@ -3386,7 +4622,7 @@ async function askQuestion(event, inputId) {
   // General input stays general by default.  For an explicit, multi-step
   // product request the host may offer a durable route; the server repeats
   // this decision when creating the run, so this preview is never authority.
-  if (selectedMode === "general" && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length) {
+  if (selectedMode === "general" && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
     try {
       const decision = await previewFreeformTask(question, selectedSkillIds);
       if (decision?.route === "durable_run" && decision?.workflow_type) {
@@ -3402,14 +4638,17 @@ async function askQuestion(event, inputId) {
   const directChatMode = isDirectConversation && searchableKnowledgeSelected ? "knowledge" : mode;
   const isStandaloneSlides = mode === "slides" && sourceFiles.length > 0;
   if (mode === "knowledge" && !selectedKnowledge.length && !isTaskFollowUp) {
+    composerSubmissionInFlight = false;
     toast("知识库问答需要先选择一个知识库；通用和写作模式可直接使用。", true);
     return;
   }
   if (isDirectConversation && selectedKnowledge.length && !searchableKnowledgeSelected && !isTaskFollowUp) {
+    composerSubmissionInFlight = false;
     toast("所选知识库还没有可检索内容。请等待导入或索引完成，或改选其他知识库。", true);
     return;
   }
   if (["novelty", "idea"].includes(mode) && !state.notebook && !isTaskFollowUp) {
+    composerSubmissionInFlight = false;
     const workflowLabel = mode === "novelty" ? "证据查新" : "研究构思";
     toast(`${workflowLabel}需要一个知识库来保存全文和句级证据；请先新建或选择知识库。`, true);
     return;
@@ -3417,15 +4656,26 @@ async function askQuestion(event, inputId) {
   // A topic alone is sufficient to start a presentation project.  Source
   // material enriches the result but is not a precondition: shortcuts are
   // aids for getting started, not permission gates.
-  if (images.length && mode !== "general") {
-    toast("图片提问目前仅支持通用模式。", true);
+  if (images.length && mode === "slides") {
+    composerSubmissionInFlight = false;
+    toast("制作幻灯片请使用文档附件；图片提问会交给通用对话处理。", true);
     return;
   }
-  if (images.length && !currentModelSupportsVision()) {
-    toast("请先选择带有视觉能力的模型。", true);
+  if (audio.length && !["general", "writing", "knowledge"].includes(mode)) {
+    composerSubmissionInFlight = false;
+    toast("语音提问目前用于通用对话、写作或知识库问答。", true);
+    return;
+  }
+  if (audio.length && !localAudioModelReady()) {
+    composerSubmissionInFlight = false;
+    toast("请先在设置 → 本地模型 → 模型市场下载 Qwen3 ASR 0.6B-hf。", true);
+    openSettings("local-models");
     return;
   }
   if (mode === "academic" && !isTaskFollowUp && !routedTask) {
+    // Academic planning returns before the main request finally block.
+    // Release the claim explicitly after its await completes below.
+    composerSubmissionInFlight = false;
     try {
       await openAcademicSearchPlan(question, { inputId, key, sourceFiles, images, skills: selectedSkillIds });
     } catch (error) {
@@ -3443,7 +4693,7 @@ async function askQuestion(event, inputId) {
     renderPendingTaskFollowUp(activeRun, question, selectedSkills);
   } else {
     state.conversationAutoFollow = true;
-    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}<p>${escapeHtml(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
+    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
     followLatestConversationMessage();
   }
   if (mode === "deep-research" || (mode === "knowledge" && state.evidenceOutputMode === "review")) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
@@ -3474,24 +4724,27 @@ async function askQuestion(event, inputId) {
       return;
     }
     if (isDirectConversation) {
+      if (!state.directConversationId) state.directConversationId = newDirectConversationId();
+      window.localStorage.setItem("scansci.active.direct", state.directConversationId);
       const knowledgeScopes = selectedKnowledge.map((notebook) => ({
         notebook_id: String(notebook.notebook_id),
         title: knowledgeScopeTitle(notebook),
       }));
-      const userMessage = { role: "user", content: question, skills: selectedSkills, sources: sourceFiles, images, created_at: new Date().toISOString() };
+      const userMessage = { role: "user", content: question, skills: selectedSkills, sources: sourceFiles, images, audio, created_at: new Date().toISOString() };
       const messages = [...state.directMessages, userMessage].filter((message) => !message.streaming).slice(-16);
       const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, mode: directChatMode, trace: [], knowledgeScopes, created_at: new Date().toISOString() };
+      streamingMessage = { role: "assistant", content: "", streaming: true, mode: directChatMode, trace: [], knowledgeScopes, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
       state.directMessages = [...messages, streamingMessage].slice(-16);
       state.conversationAutoFollow = true;
       renderDirectConversation({ forceFollow: true });
       let completed = false;
       state.streaming = true;
       activeDirectChatController = new AbortController();
-      await streamChat(
+      await streamChatWithRecovery(
         {
           messages,
           images,
+          audio,
           source_files: sourceFiles,
           thinking_level: currentThinkingLevel(),
           chat_mode: directChatMode,
@@ -3500,6 +4753,8 @@ async function askQuestion(event, inputId) {
           ...(selectedKnowledge.length ? { notebook_ids: selectedKnowledge.map((notebook) => notebook.notebook_id) } : {}),
           ...(activeKnowledgeScopePayload() ? { knowledge_scope: activeKnowledgeScopePayload() } : {}),
           ...(selectedKnowledge.length ? { knowledge_scopes: activeKnowledgeScopePayloads() } : {}),
+          conversation_id: state.directConversationId,
+          session_id: state.sessionId || "",
           skills: selectedSkillIds,
         },
         (eventType, payload) => {
@@ -3541,8 +4796,10 @@ async function askQuestion(event, inputId) {
             const result = payload.result || payload;
             const message = {
               ...result.message,
+              model: modelIdentitySnapshot(result.model || result.message?.model || payload.model || streamingMessage.model),
               mode: directChatMode,
               knowledgeScopes,
+              agent_runtime: result.agent_runtime || null,
               usage: result.message?.usage || streamingMessage.usage,
               created_at: result.message?.created_at || new Date().toISOString(),
               processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -3558,12 +4815,29 @@ async function askQuestion(event, inputId) {
             scheduleDirectConversationRender();
           }
         },
-        { signal: activeDirectChatController.signal },
+        {
+          signal: activeDirectChatController.signal,
+          onRetry: () => {
+            streamingMessage.content = "";
+            streamingMessage.error = "";
+            streamingMessage.failure = null;
+            streamingMessage.streaming = true;
+            streamingMessage.trace = [];
+            renderDirectConversation({ forceFollow: true });
+          },
+        },
       );
       if (!completed) throw new Error("模型流在最终回复到达前结束。");
+      try {
+        await persistDirectConversation();
+      } catch (historyError) {
+        console.warn("Direct conversation history could not be saved", historyError);
+        toast("回复已完成，但历史保存失败；请稍后重试。", true);
+      }
       input.value = "";
       clearComposerSkills(key);
       clearComposerImages(key);
+      clearComposerAudio(key);
       clearComposerSources(key);
       return;
     }
@@ -3590,6 +4864,7 @@ async function askQuestion(event, inputId) {
     input.value = "";
     clearComposerSkills(key);
     clearComposerImages(key);
+    clearComposerAudio(key);
     clearComposerSources(key);
   } catch (error) {
     if (error?.name === "AbortError") {
@@ -3605,10 +4880,13 @@ async function askQuestion(event, inputId) {
       toast(error.message, true);
     } else if (isDirectConversation && streamingMessage) {
       streamingMessage.streaming = false;
-      streamingMessage.content ||= "生成回复时发生错误。";
+      // Keep any partial provider output, but do not present a fake answer
+      // sentence when the request failed before the first delta.
+      streamingMessage.content = String(streamingMessage.content || "");
       streamingMessage.error = error.message;
       streamingMessage.failure = error.failure || null;
       renderDirectConversation();
+      persistDirectConversation().catch((historyError) => console.warn("Failed to save failed direct conversation", historyError));
       toast(error.message, true);
     } else {
       byId("answerArea").innerHTML = `<div class="error-state">${escapeHtml(error.message)}</div>`;
@@ -3617,6 +4895,7 @@ async function askQuestion(event, inputId) {
     activeDirectChatController = null;
     state.activeStreamRunId = "";
     state.streaming = false;
+    composerSubmissionInFlight = false;
     button.disabled = false;
   }
 }
@@ -3665,13 +4944,34 @@ function messageModelIdentity(model = null) {
   const active = activeModel();
   const providerId = String(model?.provider_id || active.provider?.id || "scansci-managed");
   const modelId = String(model?.model_id || active.model?.id || "");
-  const provider = providerForId(providerId);
+  const configuredProvider = providerForId(providerId);
+  // A message may be rendered long after the user has selected another
+  // provider.  Prefer the identity captured with that message, while still
+  // using the current catalog to resolve a missing display name for older
+  // conversations.
+  const provider = {
+    ...configuredProvider,
+    id: providerId,
+    name: String(model?.provider_name || configuredProvider?.name || providerId || "ScanSci"),
+    logo: String(model?.provider_logo || configuredProvider?.logo || providerId || "scansci-managed"),
+  };
   const configuredModel = provider?.models?.find((item) => String(item.id) === modelId);
   return {
     provider,
     providerId,
     modelId,
-    modelName: configuredModel?.name || modelId || "ScanSci",
+    modelName: String(model?.model_name || configuredModel?.name || modelId || "ScanSci"),
+  };
+}
+
+function modelIdentitySnapshot(model = null) {
+  const identity = messageModelIdentity(model);
+  return {
+    provider_id: identity.providerId,
+    model_id: identity.modelId,
+    provider_name: identity.provider?.name || identity.providerId,
+    provider_logo: identity.provider?.logo || identity.providerId,
+    model_name: identity.modelName,
   };
 }
 
@@ -3747,7 +5047,7 @@ function conversationMessageMarkup({
   const isUser = role === "user";
   const identity = messageModelIdentity(model);
   const body = contentMarkup || (isUser
-    ? `<div class="user-turn-bubble"><p>${escapeHtml(content)}</p></div>`
+    ? `<div class="user-turn-bubble"><p>${renderAssistantInline(content)}</p></div>`
     : `<div class="answer-sentence">${renderAssistantContent(content)}</div>`);
   const avatar = isUser ? userAvatarMarkup() : `<span class="message-avatar is-assistant">${providerLogo(identity.provider)}</span>`;
   const name = isUser ? "你" : (identity.modelName ? `${identity.modelName} | ${identity.provider?.name || "ScanSci"}` : "ScanSci");
@@ -3851,7 +5151,7 @@ function renderPendingTaskFollowUp(run, question, skills = []) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: question,
-    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${escapeHtml(question)}</p></div>`,
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${renderAssistantInline(question)}</p></div>`,
     createdAt: new Date().toISOString(),
     classes: "is-pending-follow-up",
   });
@@ -3860,6 +5160,7 @@ function renderPendingTaskFollowUp(run, question, skills = []) {
     content: "",
     contentMarkup: '<div class="answer-sentence"></div>',
     createdAt: new Date().toISOString(),
+    model: modelIdentitySnapshot(),
     label: "自动",
     extra: '<div class="generation-indicator" role="status" aria-label="正在生成回复"><span class="generation-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>',
     classes: "is-pending-follow-up",
@@ -3884,13 +5185,14 @@ function renderFailedTaskFollowUp(run, question, error, skills = []) {
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: question,
-    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${escapeHtml(question)}</p></div>`,
+    contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skills)}<p>${renderAssistantInline(question)}</p></div>`,
     createdAt: new Date().toISOString(),
   });
   const failedAnswer = conversationMessageMarkup({
     role: "assistant",
     content: "这次追问没有完成，原有对话和任务结果仍然保留。",
     createdAt: new Date().toISOString(),
+    model: run?.model || modelIdentitySnapshot(),
     label: "未完成",
     extra: `<p class="stream-error">${escapeHtml(error?.message || "请求失败，请稍后重试。")}</p>`,
     promptContent: question,
@@ -3931,11 +5233,7 @@ function directEvidenceAnswerMarkup(message, index, cursor = "") {
     return `<section class="direct-evidence-answer knowledge-catalog-answer" data-direct-evidence-answer="${index}"><header><div><small>${isList ? "题录检索" : "目录统计"} · 已索引文献</small><strong>${documentCount}<em>篇</em></strong></div><span>共 ${totalDocuments} 篇</span></header>${termsMarkup}${scopeNote}${results}${cursor}</section>`;
   }
   if (reader.presentation === "article") {
-    const knownCitationIds = new Set((reader.citations || []).map((citation) => String(citation.citation_id || "")));
-    const tokenized = String(reader.text || message.content || "").replace(/\[(\d+)\]/g, (marker, citationId) => (
-      knownCitationIds.has(citationId) ? `§§SCANSCI_CITATION_${citationId}§§` : marker
-    ));
-    const article = renderAssistantContent(tokenized).replace(/§§SCANSCI_CITATION_(\d+)§§/g, (_token, citationId) => citationMarkerMarkup(citationId));
+    const article = citationTextMarkup(reader.text || message.content || "", reader.citations || []);
     const scopeNote = reader.scope_note
       ? `<p class="direct-evidence-scope">${escapeHtml(reader.scope_note)}</p>`
       : "";
@@ -3943,7 +5241,7 @@ function directEvidenceAnswerMarkup(message, index, cursor = "") {
   }
   if (!sentences.length) {
     return message.content
-      ? `<div class="answer-sentence">${renderAssistantContent(message.content)}${cursor}</div>`
+      ? `<div class="answer-sentence">${citationTextMarkup(message.content, reader.citations || [])}${cursor}</div>`
       : "";
   }
   const body = sentences.map((sentence) => {
@@ -3956,6 +5254,58 @@ function directEvidenceAnswerMarkup(message, index, cursor = "") {
   return `<div class="direct-evidence-answer" data-direct-evidence-answer="${index}">${scopeNote}${body}${cursor}</div>`;
 }
 
+function directFailureMarkup(message, index) {
+  const failure = message.failure && typeof message.failure === "object" ? message.failure : {};
+  const reason = String(failure.message || message.error || "这次回复没有完成，请稍后重试。");
+  const detail = String(failure.detail || "").trim();
+  const retryable = failure.retryable !== false;
+  const retryAction = retryable
+    ? `<button type="button" class="stream-retry-button" data-action="retry-direct-message" data-message-index="${index}">重试</button>`
+    : "";
+  return `<section class="stream-error-card" role="alert"><strong>这次回复没有完成</strong><p>${escapeHtml(reason)}</p>${detail && detail !== reason ? `<small>${escapeHtml(detail)}</small>` : ""}<div class="stream-error-actions">${retryAction}</div></section>`;
+}
+
+function retryDirectMessage(index) {
+  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
+    toast("上一条回复仍在处理，请等待完成。", true);
+    return;
+  }
+  const failedIndex = Number(index);
+  const failed = state.directMessages[failedIndex];
+  if (!failed || failed.role !== "assistant") return;
+  const userIndex = [...state.directMessages.slice(0, failedIndex)]
+    .map((item, itemIndex) => ({ item, itemIndex }))
+    .reverse()
+    .find(({ item }) => item.role === "user")?.itemIndex;
+  const user = Number.isInteger(userIndex) ? state.directMessages[userIndex] : null;
+  if (!user?.content) {
+    toast("找不到这条消息对应的问题，请重新输入。", true);
+    return;
+  }
+
+  const key = state.activeView === "conversation" ? "chat" : "home";
+  state.composerSkills[key] = (user.skills || []).map((item) => skillRecord(item?.id || item)).filter(Boolean);
+  state.composerImages[key] = Array.isArray(user.images) ? user.images : [];
+  state.composerAudio[key] = Array.isArray(user.audio) ? user.audio : [];
+  state.composerSources[key] = Array.isArray(user.sources) ? user.sources : [];
+  renderComposerSkills(key);
+  renderComposerImages(key);
+  renderComposerAudio(key);
+  renderComposerSources(key);
+  state.directMessages = state.directMessages.filter((_, itemIndex) => itemIndex !== failedIndex && itemIndex !== userIndex);
+  renderDirectConversation();
+
+  const input = byId(key === "chat" ? "chatQuestionInput" : "homeQuestionInput") || byId("chatQuestionInput") || byId("homeQuestionInput");
+  if (!input) {
+    toast("输入框尚未准备好，请重新输入问题。", true);
+    return;
+  }
+  input.value = String(user.content);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+  input.form?.requestSubmit();
+}
+
 function renderDirectConversation({ forceFollow = false } = {}) {
   const scrollSnapshot = conversationScrollSnapshot();
   const turns = state.directMessages.map((message, index) => {
@@ -3963,7 +5313,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       return conversationMessageMarkup({
         role: "user",
         content: message.content,
-        contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(message.skills || [])}${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}<p>${escapeHtml(message.content)}</p></div>`,
+        contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(message.skills || [])}${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}${composerAudioPreviewMarkup(message.audio || [])}<p>${renderAssistantInline(message.content)}</p></div>`,
         createdAt: message.created_at,
       });
     }
@@ -3973,8 +5323,12 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     const answer = message.reader_answer
       ? directEvidenceAnswerMarkup(message, index, cursor)
       : (message.content ? `<div class="answer-sentence">${renderAssistantContent(message.content)}${cursor}</div>` : "");
+    const visionRoute = message.agent_runtime?.vision_route || null;
+    const visionNotice = visionRoute?.model_id
+      ? `<p class="vision-route-notice">图片由 ${escapeHtml(visionRoute.provider_name || visionRoute.provider_id || "本地视觉模型")} 的 ${escapeHtml(visionRoute.model_id)} 处理${visionRoute.mode === "cloud" ? "（云端）" : "（本地）"}</p>`
+      : "";
     const generation = message.streaming ? '<div class="generation-indicator" role="status" aria-label="正在生成回复"><span class="generation-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>' : "";
-    const error = message.error ? `<p class="stream-error">${escapeHtml(message.error)}</p>` : "";
+    const error = message.error ? directFailureMarkup(message, index) : "";
     const interaction = interactionMarkup(message.interaction);
     const modeLabel = composerModeLabels[message.mode] || "通用对话";
     const promptContent = [...state.directMessages.slice(0, index)]
@@ -3983,9 +5337,10 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     return conversationMessageMarkup({
       role: "assistant",
       content: message.content,
-      contentMarkup: answer,
+      contentMarkup: visionNotice + answer,
       createdAt: message.created_at,
       usage: message.usage,
+      model: message.model,
       label: modeLabel,
       processing,
       extra: `${interaction}${generation}${error}`,
@@ -4377,21 +5732,15 @@ function renderDownloadGuides(content) {
 
 function renderInlineSlideTemplateGallery() {
   const selected = selectedSlideTemplate();
-  const plugin = state.slideTemplatesPlugin || {};
-  const pluginVersion = String(plugin.version_label || plugin.version || "").trim();
-  const pipelineLabel = plugin.latest_pipeline ? "最新版链路" : "兼容链路";
-  const pluginLabel = `EasySlides${pluginVersion ? ` ${pluginVersion}` : ""} · ${pipelineLabel}`;
   if (!state.slideTemplatesAvailable || !state.slideTemplates.length) {
-    return `<header class="mode-workbench-head slide-template-gallery-head"><div><h2>选择演示模板</h2><p>模板库暂不可用。连接 EasySlides 后，可在这里直接选择模板。</p></div><span class="slide-template-gallery-selection is-unavailable">模板库未连接</span></header>`;
+    return `<header class="mode-workbench-head slide-template-gallery-head"><div><h2>选择演示模板</h2><p>模板库暂不可用，请稍后重试。</p></div><span class="slide-template-gallery-selection is-unavailable">暂不可用</span></header>`;
   }
   const cards = state.slideTemplates.map((template) => {
     const isSelected = template.id === selected?.id;
-    const isNative = ["easyslides-semantic", "easyslides-classic"].includes(template.generation_mode);
-    const rendererBadge = `<span class="slide-template-renderer ${isNative ? "is-native" : "is-compat"}">${uiIcon(isNative ? "sparkles" : "layers")} ${isNative ? "EasySlides 原生" : "兼容模板"}</span>`;
     const description = compact(template.description || template.use_cases || template.summary || "用于学术汇报", 52);
-    return `<article class="slide-template-gallery-card ${isSelected ? "is-selected" : ""}"><button type="button" class="slide-template-gallery-select" data-action="select-inline-slide-template" data-template-id="${escapeHtml(template.id)}" aria-pressed="${String(isSelected)}" aria-label="使用 ${escapeHtml(template.name)} 模板"><span class="slide-template-gallery-preview"><img src="${escapeHtml(template.preview_url)}" alt="${escapeHtml(template.name)} 模板封面" loading="lazy" />${isSelected ? `<span class="slide-template-gallery-check">${uiIcon("check")}</span>` : ""}</span><span class="slide-template-gallery-copy"><strong>${escapeHtml(template.name)}</strong>${rendererBadge}<small>${escapeHtml(description)}</small></span></button><button type="button" class="slide-template-gallery-preview-action" data-action="preview-inline-slide-template" data-template-id="${escapeHtml(template.id)}" aria-label="预览 ${escapeHtml(template.name)} 模板">${uiIcon("eye")}<span>预览</span></button></article>`;
+    return `<article class="slide-template-gallery-card ${isSelected ? "is-selected" : ""}"><button type="button" class="slide-template-gallery-select" data-action="select-inline-slide-template" data-template-id="${escapeHtml(template.id)}" aria-pressed="${String(isSelected)}" aria-label="使用 ${escapeHtml(template.name)} 模板"><span class="slide-template-gallery-preview"><img src="${escapeHtml(template.preview_url)}" alt="${escapeHtml(template.name)} 模板封面" loading="lazy" />${isSelected ? `<span class="slide-template-gallery-check">${uiIcon("check")}</span>` : ""}</span><span class="slide-template-gallery-copy"><strong>${escapeHtml(template.name)}</strong><small>${escapeHtml(description)}</small></span></button><button type="button" class="slide-template-gallery-preview-action" data-action="preview-inline-slide-template" data-template-id="${escapeHtml(template.id)}" aria-label="预览 ${escapeHtml(template.name)} 模板">${uiIcon("eye")}<span>预览</span></button></article>`;
   }).join("");
-  return `<header class="mode-workbench-head slide-template-gallery-head"><div><h2>选择演示模板</h2><p>点击模板即可选用；需要查看完整风格时，点击卡片右上角的“预览”。</p></div><span class="slide-template-gallery-selection" title="${escapeHtml(pluginLabel)}">${uiIcon("presentation")}已选 · ${escapeHtml(selected?.name || "模板")} · ${escapeHtml(pluginLabel)}</span></header><div class="slide-template-gallery" role="group" aria-label="学术 PPT 模板">${cards}</div>`;
+  return `<header class="mode-workbench-head slide-template-gallery-head"><div><h2>选择演示模板</h2><p>选择模板即可用于本次演示；需要查看完整风格时点击“预览”。</p></div><span class="slide-template-gallery-selection">${uiIcon("presentation")}已选 · ${escapeHtml(selected?.name || "模板")}</span></header><div class="slide-template-gallery" role="group" aria-label="学术 PPT 模板">${cards}</div>`;
 }
 
 function evidenceReviewWorkbenchContent() {
@@ -4620,6 +5969,12 @@ function openLibraryPathDialog(kind = "folder") {
       hint: "会连接本机 PDF 书架并保留原文件位置；需在“文档处理”启用解析后，PDF 正文才会加入问答。",
       placeholder: "例如 C:\\Users\\你\\Zotero\\storage",
     },
+    "zotero-data": {
+      title: "手动配置 Zotero",
+      label: "Zotero 数据目录",
+      hint: "选择包含 zotero.sqlite 的文件夹，不要选择 storage 子文件夹；ScanSci 只读这个目录。",
+      placeholder: "例如 C:\\Users\\你\\Zotero",
+    },
     empty: {
       title: "创建空知识库",
       label: "知识库名称",
@@ -4634,7 +5989,16 @@ function openLibraryPathDialog(kind = "folder") {
   byId("libraryPathHint").textContent = descriptor.hint;
   byId("libraryPathSubmit").textContent = state.libraryImportKind === "empty" ? "创建" : "链接";
   input.placeholder = descriptor.placeholder;
-  input.value = state.libraryImportKind === "files" ? "" : state.libraryImportKind === "folder" ? String(state.notebook?.root_path || "") : "";
+  const rememberedZoteroPath = state.zoteroConnectionIssue?.dataDir
+    || state.notebook?.metadata?.zotero?.configured_data_dir
+    || "";
+  input.value = state.libraryImportKind === "files"
+    ? ""
+    : state.libraryImportKind === "folder"
+      ? String(state.notebook?.root_path || "")
+      : state.libraryImportKind === "zotero-data"
+        ? String(rememberedZoteroPath)
+        : "";
   if (!dialog.open) dialog.showModal();
   window.setTimeout(() => input.focus(), 0);
 }
@@ -4645,6 +6009,7 @@ function closeLibraryPathDialog() {
 }
 
 async function chooseLibraryFolder(kind = "folder", notebookId = "") {
+  state.libraryImportNotebookId = notebookId || state.notebook?.notebook_id || "";
   state.libraryImportGuided = false;
   closeAttachmentMenus();
   const nativePicker = window.pywebview?.api?.choose_library_folder;
@@ -4656,6 +6021,20 @@ async function chooseLibraryFolder(kind = "folder", notebookId = "") {
   if (!path) return;
   if (kind === "zotero") await registerZoteroLibrary(path);
   else await bindLibraryFolder(path, kind, notebookId);
+}
+
+async function chooseZoteroDataDirectory(notebookId = "") {
+  const targetNotebookId = notebookId || state.notebook?.notebook_id || "";
+  state.libraryImportNotebookId = targetNotebookId;
+  state.libraryImportGuided = false;
+  closeAttachmentMenus();
+  const nativePicker = window.pywebview?.api?.choose_library_folder;
+  if (typeof nativePicker !== "function") {
+    openLibraryPathDialog("zotero-data");
+    return;
+  }
+  const path = String(await nativePicker() || "").trim();
+  if (path) await connectLocalZotero(targetNotebookId, path);
 }
 
 async function chooseOnboardingLibraryFolder(kind = "folder") {
@@ -4705,6 +6084,7 @@ async function chooseBrowserLibraryFolder(kind = "folder", notebookId = "") {
 }
 
 async function chooseLibraryFiles(notebookId = state.notebook?.notebook_id || "") {
+  state.libraryImportNotebookId = notebookId || state.notebook?.notebook_id || "";
   closeAttachmentMenus();
   const nativePicker = window.pywebview?.api?.choose_library_files;
   if (typeof nativePicker !== "function") {
@@ -4762,7 +6142,8 @@ function guidedImportJobMarkup() {
   return `<section class="data-import-progress ${failed ? "is-failed" : completed ? "is-complete" : "is-running"}" aria-live="polite"><span>${uiIcon(icon)}</span><div><strong>${escapeHtml(job.phase || "正在接入资料")}</strong><p>${escapeHtml(job.detail || "正在建立本地可检索索引")}</p><div class="data-import-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><i class="${progressWidthClass(progress)}"></i></div><small>${failed ? escapeHtml(job.error || "资料未能完成解析") : completed ? "已完成 · 资料仍保留在原位置" : `${progress}% · 可留在此页查看进度`}</small></div>${action}</section>`;
 }
 
-async function startGuidedLibraryImport(path, kind = "folder", notebookId = "") {
+async function startGuidedLibraryImport(path, kind = "folder", notebookId = "", dataDir = "") {
+  if (kind === "zotero") return connectLocalZotero(notebookId, dataDir || path);
   return bindLibraryFolder(path, kind, notebookId);
 }
 
@@ -4790,6 +6171,15 @@ async function pollGuidedLibraryImport() {
         progress: Number(job.progress || 0),
         error: String(job.error || "资料索引未完成"),
       };
+      if (String(job.library_kind || "") === "zotero") {
+        const notebook = (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === notebookId) || state.notebook;
+        state.zoteroConnectionIssue = {
+          notebookId,
+          dataDir: String(job.data_dir || notebook?.metadata?.zotero?.configured_data_dir || ""),
+          message: String(job.error || "Zotero 全文索引未完成"),
+          diagnostic: null,
+        };
+      }
     }
     if (notebookId && job.state === "completed") {
       await refreshKnowledgeIndexStatus(notebookId);
@@ -4891,20 +6281,57 @@ async function registerZoteroLibrary(path) {
   await applyLibraryImport(result, `已连接 Zotero 文献库 · ${result.zotero?.pdf_count || 0} 篇 PDF`);
 }
 
-async function connectLocalZotero(notebookId = "") {
+async function connectLocalZotero(notebookId = "", dataDir = "") {
+  const targetNotebookId = notebookId || state.notebook?.notebook_id || "";
+  const configuredDataDir = String(dataDir || "").trim();
+  state.zoteroConnectionIssue = null;
   toast("正在读取本机 Zotero 文献元数据…");
-  const result = await request("/api/library/zotero/local", {
-    method: "POST",
-    body: JSON.stringify({ notebook_id: notebookId }),
-  });
-  const indexedCount = Number(result.notebook?.counts?.sources || 0);
-  const itemCount = Number(result.zotero?.item_count || 0);
-  const message = indexedCount
-    ? `已连接本机 Zotero · 已建立 ${indexedCount} 个可检索文档`
-    : itemCount
-      ? `已读取 Zotero 的 ${itemCount} 条文献，但未找到可检索的 PDF 正文`
-      : "未读取到 Zotero 文献，请确认本机资料库中已有条目";
-  await applyLibraryImport(result, message);
+  try {
+    const payload = { notebook_id: targetNotebookId };
+    if (configuredDataDir) payload.data_dir = configuredDataDir;
+    const result = await request("/api/library/zotero/local", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const indexedCount = Number(result.notebook?.counts?.sources || 0);
+    const itemCount = Number(result.zotero?.item_count || 0);
+    const message = indexedCount
+      ? `已连接本机 Zotero · 已建立 ${indexedCount} 个可检索文档`
+      : itemCount
+        ? `已读取 Zotero 的 ${itemCount} 条文献，但未找到可检索的 PDF 正文`
+        : "未读取到 Zotero 文献，请确认本机资料库中已有条目";
+    await applyLibraryImport(result, message);
+    return result;
+  } catch (error) {
+    const failurePayload = error?.payload || {};
+    const failedNotebook = failurePayload.notebook || null;
+    if (failurePayload.workspace) state.workspace = failurePayload.workspace;
+    if (failedNotebook) {
+      state.notebook = (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === String(failedNotebook.notebook_id)) || failedNotebook;
+    }
+    const issueNotebookId = failedNotebook?.notebook_id || targetNotebookId;
+    let diagnostic = null;
+    try {
+      const statusResult = await request("/api/library/zotero/status", {
+        method: "POST",
+        body: JSON.stringify({ data_dir: configuredDataDir }),
+      });
+      diagnostic = statusResult.zotero || null;
+    } catch (_statusError) {
+      // The connection card remains useful even if the diagnostic probe is unavailable.
+    }
+    state.zoteroConnectionIssue = {
+      notebookId: String(issueNotebookId || ""),
+      dataDir: configuredDataDir,
+      message: String(error?.message || "无法连接本机 Zotero"),
+      diagnostic,
+    };
+    closeLibraryPathDialog();
+    if (state.activeView === "mode" && state.activeMode === "library") renderMode();
+    renderWorkspace();
+    toast("Zotero 连接未完成，请按页面提示配置数据目录", true);
+    return null;
+  }
 }
 
 async function connectNotion(notebookId = "") {
@@ -4921,19 +6348,29 @@ async function connectNotion(notebookId = "") {
 
 async function applyLibraryImport(result, message) {
   state.workspace = result.workspace || await request("/api/workspace");
+  if (result.zotero?.connected) state.zoteroConnectionIssue = null;
   const notebookId = result.notebook?.notebook_id || state.notebook?.notebook_id;
   state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === notebookId) || result.notebook || null;
   state.knowledgeQuery = "";
   state.knowledgeVisibleLimit = 200;
   state.knowledgePreviewSourceId = "";
+  const activeNotebookId = String(state.notebook?.notebook_id || notebookId || "");
+  const previousScopeIds = new Set((state.knowledgeScopeIds || []).map(String));
   state.knowledgeScopeIds = sanitizeKnowledgeScopeIds();
-  if (state.notebook?.notebook_id && notebookHasSearchableContent(state.notebook) && !state.knowledgeScopeIds.includes(state.notebook.notebook_id)) {
-    state.knowledgeScopeIds.push(state.notebook.notebook_id);
+  if (activeNotebookId && notebookHasSearchableContent(state.notebook) && !state.knowledgeScopeIds.includes(activeNotebookId)) {
+    state.knowledgeScopeIds.push(activeNotebookId);
+  }
+  if (Array.isArray(state.knowledgeScopeDraftIds)) {
+    state.knowledgeScopeDraftIds = [...new Set([
+      ...state.knowledgeScopeDraftIds.map(String),
+      ...state.knowledgeScopeIds.filter((id) => !previousScopeIds.has(String(id))).map(String),
+    ])];
   }
   persistKnowledgeScopes();
   state.capabilities = await request("/api/capabilities");
   closeLibraryPathDialog();
   renderWorkspace();
+  if (byId("knowledgeScopeDialog")?.open) renderKnowledgeScopeDialog();
   if (state.onboardingOpen) renderResourceOnboarding();
   if (state.activeView === "mode" && state.activeMode === "library") renderMode();
   if (result.index_run) {
@@ -5089,7 +6526,7 @@ function syncSlideTemplateDocks() {
     // still useful without taking over the conversation.
     dock.hidden = mode !== "slides" || key === "home";
     const label = dock.querySelector("[data-slide-template-label]");
-    if (label) label.textContent = template?.name || (state.slideTemplatesAvailable ? "选择模板" : "EasySlides 未连接");
+    if (label) label.textContent = template?.name || (state.slideTemplatesAvailable ? "选择模板" : "模板库暂不可用");
     const button = dock.querySelector("[data-action='open-slide-templates']");
     if (button) button.disabled = !state.slideTemplatesAvailable;
   });
@@ -5097,7 +6534,7 @@ function syncSlideTemplateDocks() {
 
 function openSlideTemplateDialog() {
   if (!state.slideTemplatesAvailable) {
-    toast("未找到 EasySlides 模板库", true);
+    toast("未找到演示模板库", true);
     return;
   }
   state.previewSlideTemplateId = state.selectedSlideTemplateId || state.slideTemplates[0].id;
@@ -5295,18 +6732,18 @@ function runUserPromptText(run) {
 function runUserPromptMarkup(run) {
   const text = runUserPromptText(run);
   if (run.workflow_type === "novelty_check") {
-    return `<strong>研究问题</strong><br>${escapeHtml(run.input?.problem || "")}<br><br><strong>主张的新颖性</strong><br>${escapeHtml(run.input?.novelty || "")}`;
+    return `<strong>研究问题</strong><br>${renderAssistantInline(run.input?.problem || "")}<br><br><strong>主张的新颖性</strong><br>${renderAssistantInline(run.input?.novelty || "")}`;
   }
   if (run.workflow_type === "research_idea") {
-    return `<strong>研究方向</strong><br>${escapeHtml(run.input?.direction || "")}${run.input?.constraints ? `<br><br><strong>现实约束</strong><br>${escapeHtml(run.input.constraints)}` : ""}`;
+    return `<strong>研究方向</strong><br>${renderAssistantInline(run.input?.direction || "")}${run.input?.constraints ? `<br><br><strong>现实约束</strong><br>${renderAssistantInline(run.input.constraints)}` : ""}`;
   }
   if (run.workflow_type === "paper_download_batch") {
-    return `<strong>文献清单 · ${escapeHtml(String((run.input?.identifiers || []).length))} 篇</strong><br>${escapeHtml((run.input?.identifiers || []).slice(0, 8).join("\n"))}`;
+    return `<strong>文献清单 · ${escapeHtml(String((run.input?.identifiers || []).length))} 篇</strong><br>${renderAssistantInline((run.input?.identifiers || []).slice(0, 8).join("\n"))}`;
   }
   if (run.workflow_type === "paper_search_download") {
-    return `${run.input?.author ? `<strong>作者</strong><br>${escapeHtml(run.input.author)}<br><br>` : ""}${run.input?.query ? `<strong>主题</strong><br>${escapeHtml(run.input.query)}<br><br>` : ""}<strong>数量</strong><br>${escapeHtml(String(run.input?.limit || 20))} 篇`;
+    return `${run.input?.author ? `<strong>作者</strong><br>${renderAssistantInline(run.input.author)}<br><br>` : ""}${run.input?.query ? `<strong>主题</strong><br>${renderAssistantInline(run.input.query)}<br><br>` : ""}<strong>数量</strong><br>${escapeHtml(String(run.input?.limit || 20))} 篇`;
   }
-  return escapeHtml(text);
+  return renderAssistantInline(text);
 }
 
 function runAggregateUsage(run) {
@@ -5448,6 +6885,7 @@ function runCompletionMessageMarkup(run) {
   if (!content) return "";
   const artifact = run.output_artifact || {};
   const payload = artifact.payload || {};
+  const citations = citationRecordsForRun(run);
   const resources = runArtifactFiles(run);
   const files = resources.filter((path) => localResourceKind(path) !== "folder");
   const folders = [
@@ -5468,6 +6906,7 @@ function runCompletionMessageMarkup(run) {
   return conversationMessageMarkup({
     role: "assistant",
     content,
+    contentMarkup: `<div class="answer-sentence">${citationTextMarkup(content, citations)}</div>`,
     createdAt: run.completed_at || run.updated_at,
     model: run.model,
     label: run.status === "completed" ? "任务交付" : "任务状态",
@@ -5613,6 +7052,7 @@ function renderRun(run) {
     } else {
       restoreConversationScroll(scrollSnapshot);
     }
+    bindRunCitations(run);
     return;
   }
   state.reviewDocument = null;
@@ -5628,7 +7068,7 @@ function renderRun(run) {
     contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skillRecordsForIds(run.input?.skills || []))}${composerSourcePreviewMarkup(run.input?.source_files || [])}${composerImagePreviewMarkup(run.input?.images || [])}<p>${userPrompt}</p></div>`,
     createdAt: run.created_at,
   });
-  const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "EasySlides", pdf_to_ppt: "PPTX" })[run.workflow_type] || "科研任务";
+  const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "演示项目", pdf_to_ppt: "PPTX" })[run.workflow_type] || "科研任务";
   const active = !["completed", "failed", "cancelled", "paused"].includes(String(run.status || ""));
   const runResult = resultMarkup ? `<section class="run-result">${resultMarkup}</section>` : "";
   const executionTitle = active
@@ -5644,20 +7084,26 @@ function renderRun(run) {
   byId("answerArea").innerHTML = `<article class="run-shell">${userMessage}${executionLog}${runCompletionMessageMarkup(run)}</article>`;
   const taskConversation = taskConversationMarkup(run);
   if (taskConversation) answerArea.querySelector(".run-shell")?.insertAdjacentHTML("beforeend", taskConversation);
-  bindRunCitations(artifact?.payload || {});
+  bindRunCitations(run);
   restoreConversationScroll(scrollSnapshot);
 }
 
 function taskConversationMarkup(run) {
   const messages = Array.isArray(run.messages) ? run.messages : [];
   if (!messages.length) return "";
+  const runCitations = citationRecordsForRun(run);
   const turns = messages.map((message, index) => {
     const promptContent = message.role === "assistant"
       ? [...messages.slice(0, index)].reverse().find((item) => item.role === "user")?.content || runUserPromptText(run)
       : "";
+    const reader = message.reader_answer || message.metadata?.reader_answer || {};
+    const citations = reader.citations?.length ? reader.citations : runCitations;
     return conversationMessageMarkup({
       role: message.role,
       content: message.content,
+      contentMarkup: message.role === "assistant" && citations.length
+        ? `<div class="answer-sentence">${citationTextMarkup(message.content, citations)}</div>`
+        : "",
       createdAt: message.created_at,
       usage: message.usage,
       model: run.model,
@@ -5688,7 +7134,6 @@ function slideProjectArtifactMarkup(payload, runId = "") {
   const slides = outline.slides || [];
   const nativeEasySlides = payload.render_mode === "native" || String(payload.renderer || "").startsWith("easyslides");
   const slideCount = Number(payload.slide_count) || slides.length;
-  const rendererName = payload.renderer_label || (nativeEasySlides ? "EasySlides" : "ScanSci 兼容排版器");
   const qualityPassed = payload.quality_gate?.status === "pass";
   state.activeSlidePlan = nativeEasySlides ? null : (payload.slide_plan || null);
   if (payload.pptx_path) {
@@ -5699,15 +7144,15 @@ function slideProjectArtifactMarkup(payload, runId = "") {
       ? `<img class="slide-project-cover" src="/api/runs/${encodeURIComponent(runId)}/preview" alt="${escapeHtml(outline.title || "演示文稿预览")}" />`
       : (template?.preview_url ? `<img class="slide-project-cover" src="${escapeHtml(template.preview_url)}" alt="${escapeHtml(template.name || "所选模板预览")}" />` : `<div class="slide-project-cover">${uiIcon("presentation")}<b>PPTX</b></div>`);
     const templateName = template?.name ? ` · ${template.name}` : "";
-    const qualityLabel = qualityPassed ? " · 已通过质量检查" : nativeEasySlides ? " · 质量检查未通过" : "";
+    const resultLabel = qualityPassed || nativeEasySlides ? "已生成" : "已生成 · 需要检查";
     const exportHint = nativeEasySlides
-      ? "已由 EasySlides 生成原生可编辑 PPTX，可直接下载继续修改。"
-      : "“下载 PPTX”保存当前成品；也可使用兼容排版器重新导出。";
-    return `<div class="slide-project-artifact is-pptx">${preview}<div class="slide-project-copy"><span>${escapeHtml(rendererName)}${escapeHtml(qualityLabel)}</span><h3>${escapeHtml(outline.title || "科研幻灯片")}</h3><p>${escapeHtml(`${slideCount} 页${templateName} · ${payload.planning?.mode === "skill-aware-model" ? "已应用科研内容规划" : "基于源文件生成"}`)}</p>${sourceNames ? `<small>${escapeHtml(sourceNames)}</small>` : ""}${payload.pptx_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.pptx_path, payload.download_name || localPathLeaf(payload.pptx_path), { inline: true })}</div>` : ""}<p class="slide-export-hint">${escapeHtml(exportHint)}</p><div class="slide-download-actions">${enhancedDownload}${download}</div></div></div>`;
+      ? "下载后可继续编辑。"
+      : "可下载 PPTX，也可重新排版导出。";
+    return `<div class="slide-project-artifact is-pptx">${preview}<div class="slide-project-copy"><span>${escapeHtml(resultLabel)}</span><h3>${escapeHtml(outline.title || "科研幻灯片")}</h3><p>${escapeHtml(`${slideCount} 页${templateName}`)}</p>${sourceNames ? `<small>来源：${escapeHtml(sourceNames)}</small>` : ""}${payload.pptx_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.pptx_path, payload.download_name || localPathLeaf(payload.pptx_path), { inline: true })}</div>` : ""}<p class="slide-export-hint">${escapeHtml(exportHint)}</p><div class="slide-download-actions">${enhancedDownload}${download}</div></div></div>`;
   }
   const preview = template?.preview_url ? `<img class="slide-project-cover" src="${escapeHtml(template.preview_url)}" alt="${escapeHtml(template.name || "幻灯片模板")}" />` : '<div class="slide-project-cover"></div>';
-  const slideSummary = slides.length ? `${slides.length} 页 · ${outline.evidence_linked ? "已绑定来源" : "待绑定来源"}` : "EasySlides 项目";
-  return `<div class="slide-project-artifact">${preview}<div class="slide-project-copy"><span>EasySlides project</span><h3>${escapeHtml(template?.name || "学术幻灯片")}</h3><p>${escapeHtml(slideSummary)}</p>${payload.project_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.project_path, "", { inline: true })}</div>` : ""}</div></div>`;
+  const slideSummary = slides.length ? `${slides.length} 页 · ${outline.evidence_linked ? "已绑定来源" : "待绑定来源"}` : "演示项目";
+  return `<div class="slide-project-artifact">${preview}<div class="slide-project-copy"><span>演示文稿</span><h3>${escapeHtml(template?.name || "学术幻灯片")}</h3><p>${escapeHtml(slideSummary)}</p>${payload.project_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.project_path, "打开项目", { folder: true, inline: true })}</div>` : ""}</div></div>`;
 }
 
 async function exportActiveSlidePlan(button) {
@@ -6280,8 +7725,33 @@ function genericArtifactMarkup(artifact) {
   return `<article class="artifact-card"><span class="artifact-type">${escapeHtml(artifact.artifact_type)}</span><h3>${escapeHtml(artifact.title)}</h3><p>${escapeHtml(artifact.summary || payload.message || "研究产物已保存")}</p>${filePath}${rowMarkup}${external}</article>`;
 }
 
-function bindRunCitations(result) {
-  bindCitationInteractions(result);
+function bindRunCitations(result, scope = byId("answerArea")) {
+  if (result?.output_artifact || Array.isArray(result?.messages)) {
+    bindCitationInteractions({ reader_answer: { citations: citationRecordsForRun(result) } }, scope);
+    return;
+  }
+  bindCitationInteractions(result, scope);
+}
+
+async function openDirectConversation(conversationId, { record = true } = {}) {
+  const id = String(conversationId || "").trim();
+  if (!id) return;
+  const conversation = await request(`/api/chat/history/${encodeURIComponent(id)}`);
+  state.activeTaskId = "";
+  state.directConversationId = id;
+  state.directMessages = Array.isArray(conversation.messages) ? conversation.messages : [];
+  state.sessionId = conversation.session_id || null;
+  state.lastRunRenderKey = "";
+  window.localStorage.removeItem("scansci.active.task");
+  window.localStorage.setItem("scansci.active.direct", id);
+  const latestAssistant = [...state.directMessages].reverse().find((message) => message.role === "assistant");
+  const mode = String(latestAssistant?.mode || "general");
+  applyContextPanelPreset(mode === "knowledge" ? "knowledge" : "none");
+  byId("conversationTitle").textContent = compact(conversation.title || directConversationTitle(state.directMessages), 80);
+  setView("conversation", { record });
+  renderDirectConversation({ forceFollow: false });
+  void restoreSessionStats();
+  renderTasks();
 }
 
 async function openTask(id, { record = true } = {}) {
@@ -6300,7 +7770,9 @@ async function openTask(id, { record = true } = {}) {
     }
     upsertRun(displayRun);
     state.activeTaskId = displayRun.run_id;
+    state.directConversationId = "";
     window.localStorage.setItem("scansci.active.task", displayRun.run_id);
+    window.localStorage.removeItem("scansci.active.direct");
     state.sessionId = `research-run-${displayRun.run_id}`;
     window.localStorage.setItem("scansci.active.session", state.sessionId);
     void restoreSessionStats(estimateRunSessionStats(displayRun));
@@ -6338,7 +7810,7 @@ const modeDefinitions = {
   tools: { overline: "ScanSci Suite", title: "功能" },
   review: { overline: "Evidence Studio", title: "文献综述" },
   atlas: { overline: "Paper Atlas", title: "研究图谱" },
-  ppt: { overline: "EasySlides", title: "PPT Studio" },
+  ppt: { overline: "演示文稿", title: "PPT" },
   download: { overline: "scansci-pdf · open access", title: "论文获取" },
   journal: { overline: "Journal Scout", title: "期刊查询" },
   verify: { overline: "Citation Lab", title: "引文核查" },
@@ -6492,6 +7964,9 @@ function knowledgeSourceItems(notebook) {
 }
 
 function knowledgeItemSearchText(item, notebook) {
+  const zoteroRecord = knowledgeSourceKind(notebook) === "zotero"
+    ? zoteroMetadataItemForKnowledgeItem(item, notebook)
+    : null;
   return [
     knowledgeFolderName(item, notebook),
     item.title,
@@ -6501,6 +7976,8 @@ function knowledgeItemSearchText(item, notebook) {
     item.creators,
     item.doi,
     item.date,
+    ...zoteroTagValues(item),
+    ...zoteroTagValues(zoteroRecord),
   ].filter(Boolean).join(" ").toLowerCase();
 }
 
@@ -6584,9 +8061,48 @@ function renderNotionTree(notebook, items) {
     .join("");
 }
 
+function renderZoteroConnectionGuide(notebook, issue) {
+  const diagnostic = issue?.diagnostic || {};
+  const selectedPath = issue?.dataDir
+    || diagnostic.data_dir
+    || notebook?.metadata?.zotero?.configured_data_dir
+    || "";
+  const databaseLabel = diagnostic.database_readable
+    ? "数据目录已找到且可读"
+    : diagnostic.installed
+      ? "数据目录已找到，但数据库不可读"
+      : "尚未找到可读的数据目录";
+  const apiLabel = diagnostic.api_running ? "本机 API 已开启" : "本机 API 未开启（可选）";
+  const databaseClass = diagnostic.database_readable ? "is-ready" : "is-warning";
+  const apiClass = diagnostic.api_running ? "is-ready" : "is-neutral";
+  const databaseDetail = diagnostic.database_error ? String(diagnostic.database_error) : "";
+  return `<section class="zotero-connect-guide" role="alert" aria-live="polite">
+    <header class="zotero-connect-guide-head">
+      <span class="zotero-guide-mark">${uiIcon("triangle-alert")}</span>
+      <div><span class="zotero-guide-eyebrow">ZOTERO 连接未完成</span><strong>只需要配置一个目录</strong><p>ScanSci 需要读取 Zotero 数据目录中的文献元数据和附件位置。</p></div>
+    </header>
+    <div class="zotero-guide-target"><span>要配置什么</span><code>包含 zotero.sqlite 的文件夹</code><small>通常是 Zotero 文件夹本身，不是 storage 子文件夹。</small></div>
+    <ol class="zotero-guide-steps">
+      <li>打开 Zotero：<b>设置 → 高级 → 文件和文件夹 → 显示数据目录</b>。</li>
+      <li>点击“选择数据目录”，选中刚才打开的文件夹。</li>
+      <li>如果仍然失败，再在同一页打开“允许本机其他应用与 Zotero 通信”，然后重新检测。</li>
+    </ol>
+    <div class="zotero-guide-checks"><span class="${databaseClass}"><i></i>${databaseLabel}</span><span class="${apiClass}"><i></i>${apiLabel}</span></div>
+    ${selectedPath ? `<p class="zotero-guide-path" title="${escapeHtml(selectedPath)}">当前尝试：<code>${escapeHtml(selectedPath)}</code></p>` : ""}
+    <div class="zotero-guide-actions"><button type="button" class="primary-button" data-action="choose-zotero-data-directory" data-notebook-id="${escapeHtml(notebook?.notebook_id || "")}">${uiIcon("folder-open")}选择数据目录</button><button type="button" class="secondary-button" data-action="retry-zotero-connection" data-notebook-id="${escapeHtml(notebook?.notebook_id || "")}">${uiIcon("refresh-cw")}重新检测</button></div>
+    <details class="zotero-guide-error"><summary>查看刚才的错误</summary><p>${escapeHtml(issue?.message || "未返回具体错误")}</p>${databaseDetail ? `<small>数据库检测：${escapeHtml(databaseDetail)}</small>` : ""}</details>
+  </section>`;
+}
+
 function renderKnowledgeTree(notebook, items) {
+  const zoteroIssue = knowledgeSourceKind(notebook) === "zotero"
+    && state.zoteroConnectionIssue
+    && String(state.zoteroConnectionIssue.notebookId || "") === String(notebook?.notebook_id || "")
+    ? renderZoteroConnectionGuide(notebook, state.zoteroConnectionIssue)
+    : "";
   if (!items.length) {
     if (knowledgeSourceKind(notebook) === "zotero") {
+      if (zoteroIssue) return zoteroIssue;
       const connected = Boolean(notebook?.metadata?.zotero?.connected);
       return `<div class="ima-library-empty"><strong>${connected ? "未找到可检索的 PDF 正文" : "尚未连接本机 Zotero"}</strong><span>${connected ? "请确认文献已附加可读取的 PDF，再重新读取。" : "连接后会自动读取文献与可访问的 PDF。"}</span><button type="button" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(notebook?.notebook_id || "")}">${uiIcon(connected ? "refresh-cw" : "link")} ${connected ? "重新读取 Zotero" : "连接本机 Zotero"}</button></div>`;
     }
@@ -6612,7 +8128,7 @@ function renderKnowledgeTree(notebook, items) {
     if (!groups.has(folder)) groups.set(folder, []);
     groups.get(folder).push(item);
   });
-  return [...groups.entries()].map(([folder, entries]) => `<details class="ima-folder"${state.knowledgeTreeExpanded !== false ? " open" : ""}><summary>${uiIcon("chevron-right")}<span>${uiIcon("folder-open")}</span><strong>${escapeHtml(folder)}</strong><small>${entries.length}</small></summary><div>${entries.map((item) => renderKnowledgeFileRow(item, notebook, items)).join("")}</div></details>`).join("");
+  return `${zoteroIssue}${[...groups.entries()].map(([folder, entries]) => `<details class="ima-folder"${state.knowledgeTreeExpanded !== false ? " open" : ""}><summary>${uiIcon("chevron-right")}<span>${uiIcon("folder-open")}</span><strong>${escapeHtml(folder)}</strong><small>${entries.length}</small></summary><div>${entries.map((item) => renderKnowledgeFileRow(item, notebook, items)).join("")}</div></details>`).join("")}`;
 }
 
 // External sources are fixed integration slots. Only personal libraries can be added.
@@ -6704,7 +8220,8 @@ function renderImaLibraryMode() {
   const notebooks = state.workspace?.notebooks || [];
   const active = state.notebook || notebooks[0] || null;
   const kind = knowledgeSourceKind(active);
-  const items = knowledgeSourceItems(active);
+  const allItems = knowledgeSourceItems(active);
+  const items = allItems;
   const query = String(state.knowledgeQuery || "").trim().toLowerCase();
   const matchingItems = query
     ? items.filter((item) => knowledgeItemSearchText(item, active).includes(query))
@@ -6737,9 +8254,14 @@ function renderImaLibraryMode() {
     : kind === "zotero"
       ? `<button type="button" class="ima-scope-toggle" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${escapeHtml(zoteroActionLabel)}</button>`
       : `<span class="ima-scope-toggle is-disabled">导入后可用于对话</span>`;
+  const linkedKinds = knowledgeLocalBindingKinds(active);
+  const localLibraryActions = [
+    linkedKinds.file ? "" : `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("link")}链接文件</button>`,
+    linkedKinds.folder ? "" : `<button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("folder-open")}链接文件夹</button>`,
+  ].filter(Boolean).join("") || `<span class="ima-library-linked-status" title="文件与文件夹已连接">已全部连接</span>`;
   const libraryToolbarActions = kind === "zotero"
     ? `<button type="button" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon(zoteroConnected ? "refresh-cw" : "link")} ${escapeHtml(zoteroActionLabel)}</button>`
-    : `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("link")}链接文件</button><button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("folder-open")}链接文件夹</button>`;
+    : localLibraryActions;
   const previewPanel = !activeReady
     ? `<div class="ima-preview-empty">${uiIcon("circle-alert")}<span>导入资料后可基于证据问答</span></div>`
     : preview
@@ -6750,7 +8272,7 @@ function renderImaLibraryMode() {
     `比较「${activeTitle}」中不同文献的观点`,
     `找出「${activeTitle}」尚未解决的问题`,
   ] : [];
-  const resultLabel = query
+  let resultLabel = query
     ? `${matchingItems.length} 个结果${remainingItems ? ` · 已显示 ${visibleItems.length}` : ""}`
     : remainingItems
       ? `已显示 ${visibleItems.length}`
@@ -6813,7 +8335,6 @@ function renderAtlasMode() {
 }
 
 function renderDownloadMode() {
-  const directory = state.capabilities?.download_directory || "downloads";
   const strategies = [
     ["oa_first", "开放获取优先"],
     ["gray_oa", "灰色文献与开放存档"],
@@ -6828,14 +8349,13 @@ function renderDownloadMode() {
   const batchPreview = batchCount
     ? `<div class="paper-batch-preview"><div class="paper-batch-preview-head"><span>已识别 ${batchCount} 个标识符</span><button type="button" class="paper-batch-clear" data-action="clear-batch-identifiers">清空</button></div><ul class="paper-batch-list">${state.pendingBatchIdentifiers.map((id) => `<li>${escapeHtml(id)}</li>`).join("")}</ul>${torControls}<button type="button" class="primary-button paper-batch-submit" data-action="start-batch-download">批量获取 (${batchCount})</button></div>`
     : "";
-  return `<section class="paper-fetch-stage"><div class="paper-fetch-card"><span class="paper-fetch-eyebrow">SCANSCI · FULL TEXT</span><h1>获取论文全文</h1><p>输入 DOI 或 arXiv ID，优先从开放获取与灰色文献存档中查找可直接保存的 PDF。</p><form id="paperDownloadForm" class="paper-fetch-composer"><input id="paperIdentifier" required placeholder="输入 DOI 或 arXiv ID，例如 10.1038/..." autofocus /><button type="submit">获取</button></form><div class="paper-batch-dropzone"><label for="paperBatchFile"><span>批量获取：上传 .txt / .bib / .csv 文件，按行或字段解析 DOI 与 arXiv ID</span></label><input type="file" id="paperBatchFile" accept=".txt,.bib,.csv,text/plain" data-action="pick-batch-file" /></div>${batchPreview}<div class="paper-fetch-options"><div class="paper-strategy"><span>来源策略</span><button type="button" class="paper-strategy-trigger" data-action="toggle-download-strategy" aria-haspopup="listbox" aria-expanded="${state.downloadStrategyOpen}">${escapeHtml(selected[1])}${uiIcon("chevron-down")}</button>${state.downloadStrategyOpen ? `<div class="paper-strategy-menu" role="listbox">${menu}</div>` : ""}</div><span>保存至 ${escapeHtml(directory)}</span></div><p class="paper-fetch-footnote">无需资料库、无需模型 API。灰色文献包括机构仓储、预印本和公开报告；不会绕过付费墙。</p></div><div class="mode-results paper-fetch-results" id="modeResults"></div></section>`;
+  return `<section class="paper-fetch-stage"><div class="paper-fetch-card"><span class="paper-fetch-eyebrow">SCANSCI · FULL TEXT</span><h1>获取论文全文</h1><p>输入 DOI 或 arXiv ID，优先从开放获取与灰色文献存档中查找可直接保存的 PDF。</p><form id="paperDownloadForm" class="paper-fetch-composer"><input id="paperIdentifier" required placeholder="输入 DOI 或 arXiv ID，例如 10.1038/..." autofocus /><button type="submit">获取</button></form><div class="paper-batch-dropzone"><label for="paperBatchFile"><span>批量获取：上传 .txt / .bib / .csv 文件，按行或字段解析 DOI 与 arXiv ID</span></label><input type="file" id="paperBatchFile" accept=".txt,.bib,.csv,text/plain" data-action="pick-batch-file" /></div>${batchPreview}<div class="paper-fetch-options"><div class="paper-strategy"><span>来源策略</span><button type="button" class="paper-strategy-trigger" data-action="toggle-download-strategy" aria-haspopup="listbox" aria-expanded="${state.downloadStrategyOpen}">${escapeHtml(selected[1])}${uiIcon("chevron-down")}</button>${state.downloadStrategyOpen ? `<div class="paper-strategy-menu" role="listbox">${menu}</div>` : ""}</div><span>文件会保存到本机</span></div><p class="paper-fetch-footnote">无需资料库、无需模型 API。灰色文献包括机构仓储、预印本和公开报告；不会绕过付费墙。</p></div><div class="mode-results paper-fetch-results" id="modeResults"></div></section>`;
 }
 
 function renderPptMode() {
-  const directory = state.capabilities?.presentation_directory || "presentations";
   const template = selectedSlideTemplate();
-  return `${modeIntro("先生成有来源绑定的叙事大纲，再创建 EasySlides 项目；最终导出可编辑 PPTX。", directory)}
-    <section class="ppt-layout"><form class="mode-form" id="pptOutlineForm"><label><span>汇报主题</span><input id="pptTopic" placeholder="默认使用当前项目名称" /></label><label><span>模板</span><button type="button" class="secondary-button" data-action="open-slide-templates">${escapeHtml(template?.name || "选择 EasySlides 模板")}</button></label><div class="form-row"><button type="submit" class="primary-button">生成大纲</button><button type="button" class="secondary-button" data-action="create-ppt-project">创建 EasySlides 项目</button></div></form><div class="ppt-preview" id="modeResults"><div class="ppt-placeholder"><span>16:9</span><p>大纲会显示在这里</p></div></div></section>`;
+  return `${modeIntro("先生成有来源绑定的叙事大纲，再创建可编辑 PPTX。")}
+    <section class="ppt-layout"><form class="mode-form" id="pptOutlineForm"><label><span>汇报主题</span><input id="pptTopic" placeholder="默认使用当前项目名称" /></label><label><span>模板</span><button type="button" class="secondary-button" data-action="open-slide-templates">${escapeHtml(template?.name || "选择演示模板")}</button></label><div class="form-row"><button type="submit" class="primary-button">生成大纲</button><button type="button" class="secondary-button" data-action="create-ppt-project">创建演示文稿</button></div></form><div class="ppt-preview" id="modeResults"><div class="ppt-placeholder"><span>16:9</span><p>大纲会显示在这里</p></div></div></section>`;
 }
 
 function renderJournalResults(payload) {
@@ -6861,14 +8381,96 @@ function renderAtlasResults(payload) {
 
 function renderPptOutline(payload) {
   const slides = payload.slides || payload.outline?.slides || [];
-  const project = payload.project_path ? `<p class="project-path">项目已创建：<code>${escapeHtml(payload.project_path)}</code></p>` : "";
   const template = payload.template || payload.outline?.template;
-  const templateCard = template ? `<div class="slide-project-artifact"><img class="slide-project-cover" src="${escapeHtml(template.preview_url)}" alt="" /><div class="slide-project-copy"><span>EasySlides template</span><h3>${escapeHtml(template.name)}</h3><p>${escapeHtml(template.description || template.tone || template.summary || "")}</p>${payload.project_path ? `<code>${escapeHtml(payload.project_path)}</code>` : ""}</div></div>` : "";
-  byId("modeResults").innerHTML = `${project}${templateCard}<div class="slide-list">${slides.map((slide) => `<article><b>${escapeHtml(slide.index)}</b><div><strong>${escapeHtml(slide.title)}</strong><p>${escapeHtml(slide.purpose)}</p></div><span>${(slide.source_ids || []).length} 来源</span></article>`).join("")}</div>`;
+  const projectLink = payload.project_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.project_path, "打开项目", { folder: true, inline: true })}</div>` : "";
+  const templateCard = template ? `<div class="slide-project-artifact"><img class="slide-project-cover" src="${escapeHtml(template.preview_url)}" alt="" /><div class="slide-project-copy"><span>演示模板</span><h3>${escapeHtml(template.name)}</h3><p>${escapeHtml(template.description || template.tone || template.summary || "")}</p>${projectLink}</div></div>` : "";
+  byId("modeResults").innerHTML = `${templateCard}<div class="slide-list">${slides.map((slide) => `<article><b>${escapeHtml(slide.index)}</b><div><strong>${escapeHtml(slide.title)}</strong><p>${escapeHtml(slide.purpose)}</p></div><span>${(slide.source_ids || []).length} 来源</span></article>`).join("")}</div>`;
 }
 
-const ONBOARDING_RETRIEVAL_MODELS = ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B"];
+const ONBOARDING_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B";
+const ONBOARDING_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B";
+const ONBOARDING_RETRIEVAL_MODELS = [ONBOARDING_EMBEDDING_MODEL, ONBOARDING_RERANKER_MODEL];
 const ONBOARDING_CHAT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct";
+const ONBOARDING_AUDIO_MODEL = "Qwen/Qwen3-ASR-0.6B-hf";
+// Keep the recommended vision path inside ScanSci's own local-model market.
+// Ollama remains available as an advanced manual connection, but it is not a
+// prerequisite for the guided download flow.
+const ONBOARDING_VISION_MODEL = "openbmb/MiniCPM-V-4.6-BNB";
+const ONBOARDING_RESOURCE_ORDER = ["embedding", "reranking", "chat", "vision", "audio"];
+
+const ONBOARDING_RESOURCE_DEFINITIONS = {
+  embedding: {
+    id: "embedding",
+    jobId: `model:${ONBOARDING_EMBEDDING_MODEL}`,
+    legacyJobId: "retrieval-core",
+    models: [ONBOARDING_EMBEDDING_MODEL],
+    runtime: "huggingface",
+    eyebrow: "推荐 · 语义检索",
+    title: "嵌入模型",
+    description: "把问题和文献内容转换为向量，提升知识库检索的召回率。",
+    detail: "Qwen3 Embedding 0.6B",
+    icon: "sparkles",
+  },
+  reranking: {
+    id: "reranking",
+    jobId: `model:${ONBOARDING_RERANKER_MODEL}`,
+    legacyJobId: "retrieval-core",
+    models: [ONBOARDING_RERANKER_MODEL],
+    runtime: "huggingface",
+    eyebrow: "推荐 · 结果优化",
+    title: "重排模型",
+    description: "对候选文献和证据片段再次排序，减少无关结果。",
+    detail: "Qwen3 Reranker 0.6B",
+    icon: "filter",
+  },
+  chat: {
+    id: "chat",
+    jobId: `model:${ONBOARDING_CHAT_MODEL}`,
+    models: [ONBOARDING_CHAT_MODEL],
+    runtime: "huggingface",
+    eyebrow: "可选 · 本地对话",
+    title: "小型本地对话模型",
+    description: "在网络不稳定或想离线工作时，提供一个可在本机运行的基础对话模型。",
+    detail: "Qwen2.5 1.5B Instruct",
+    icon: "brain",
+  },
+  vision: {
+    id: "vision",
+    jobId: `model:${ONBOARDING_VISION_MODEL}`,
+    models: [ONBOARDING_VISION_MODEL],
+    runtime: "huggingface",
+    vision: true,
+    eyebrow: "可选 · 视觉理解",
+    title: "视觉模型",
+    description: "直接由 ScanSci 在本机运行，读取图片、图表和扫描页面。",
+    detail: "MiniCPM-V 4.6 · BNB 4-bit",
+    icon: "eye",
+  },
+  audio: {
+    id: "audio",
+    jobId: `model:${ONBOARDING_AUDIO_MODEL}`,
+    models: [ONBOARDING_AUDIO_MODEL],
+    runtime: "huggingface",
+    audio: true,
+    eyebrow: "可选 · 语音转写",
+    title: "语音模型",
+    description: "把上传或录制的语音转成文字，再交给当前对话模型。",
+    detail: "Qwen3 ASR 0.6B",
+    icon: "audio",
+  },
+};
+
+const LEGACY_RETRIEVAL_RESOURCE = {
+  id: "retrieval",
+  jobId: "retrieval-core",
+  models: ONBOARDING_RETRIEVAL_MODELS,
+  runtime: "huggingface",
+  eyebrow: "推荐 · 知识库能力",
+  title: "研究检索组件",
+  description: "用于语义检索、知识库问答和证据重排；没有它仍可使用基础关键词检索。",
+  detail: "Qwen3 Embedding + Reranker",
+  icon: "sparkles",
+};
 
 function onboardingPreferences() {
   return {
@@ -6881,58 +8483,48 @@ function onboardingPreferences() {
 function resourceInstallSnapshot(resource) {
   const installed = state.localModelMarket?.installed || [];
   const jobs = state.localModelInstall?.jobs || [];
-  const runtimeReady = Boolean(state.localRuntime?.installed);
-  const definition = resource === "chat"
-    ? {
-      id: "chat",
-      jobId: `model:${ONBOARDING_CHAT_MODEL}`,
-      models: [ONBOARDING_CHAT_MODEL],
-      eyebrow: "可选 · 本地对话",
-      title: "小型本地对话模型",
-      description: "在网络不稳定或想离线工作时，提供一个可在本机运行的基础对话模型。",
-      detail: "Qwen2.5 1.5B Instruct",
-      icon: "brain",
-    }
-    : {
-      id: "retrieval",
-      jobId: "retrieval-core",
-      models: ONBOARDING_RETRIEVAL_MODELS,
-      eyebrow: "推荐 · 知识库能力",
-      title: "研究检索组件",
-      description: "用于语义检索、知识库问答和证据重排；没有它仍可使用基础关键词检索。",
-      detail: "Qwen3 Embedding + Reranker",
-      icon: "sparkles",
-    };
-  const ready = definition.models.every((modelId) => installed.some((item) => item.id === modelId && item.ready));
-  const job = jobs.find((item) => item.job_id === definition.jobId) || null;
-  const runtimeJob = state.localRuntime?.install_job || null;
+  const resourceId = String(resource || "retrieval");
+  const definition = ONBOARDING_RESOURCE_DEFINITIONS[resourceId] || LEGACY_RETRIEVAL_RESOURCE;
+  const usesOllama = Boolean(definition.ollama);
+  const localRuntimeMode = String(state.localRuntime?.mode || "");
+  const runtimeReady = usesOllama
+    ? Boolean(state.ollama?.reachable)
+    : Boolean(state.localRuntime?.installed) && (!definition.audio || ["source", "embedded", "component"].includes(localRuntimeMode));
+  const isInstalledReady = (modelId) => installed.some((item) => item.id === modelId && item.ready && item.runtime_compatible !== false);
+  const ready = usesOllama ? Boolean(state.ollama?.model_ready) : definition.models.every(isInstalledReady);
+  const directJob = jobs.find((item) => item.job_id === definition.jobId) || null;
+  const legacyJob = definition.legacyJobId ? jobs.find((item) => item.job_id === definition.legacyJobId) || null : null;
+  const job = directJob || legacyJob;
+  const runtimeJob = usesOllama ? null : state.localRuntime?.install_job || null;
   const runtimeJobState = String(runtimeJob?.state || "idle");
   const runtimeActive = ["queued", "installing"].includes(runtimeJobState);
   const runtimeFailed = ["failed", "cancelled", "interrupted"].includes(runtimeJobState);
   const jobState = String(job?.state || "idle");
-  const active = ["queued", "downloading"].includes(jobState);
+  const active = ["queued", "downloading", "installing"].includes(jobState);
   const failed = ["failed", "cancelled", "interrupted"].includes(jobState);
+  const paused = jobState === "paused";
   const displayJob = !runtimeReady && (runtimeActive || runtimeFailed) ? runtimeJob : job;
-  const progress = ready || jobState === "ready"
+  const progress = ready || (!usesOllama && jobState === "ready")
     ? 100
     : Math.max(0, Math.min(100, Math.round(Number(displayJob?.progress || 0) * 100)));
   return {
     ...definition,
     job: displayJob,
     runtimeReady,
+    ollama: usesOllama,
     state: !runtimeReady
       ? runtimeActive ? "runtime_installing" : runtimeFailed ? "runtime_failed" : "runtime_required"
-      : ready || jobState === "ready" ? "ready" : active ? jobState : failed ? "failed" : "idle",
+      : ready || (!usesOllama && jobState === "ready") ? "ready" : active ? jobState : paused ? "paused" : failed ? jobState : "idle",
     progress,
   };
 }
 
 function resourceInstallStatusCopy(resource) {
   if (resource.state === "runtime_required") return {
-    label: "需要运行时",
+    label: "需要准备本地能力",
     hint: state.localRuntime?.install_available
-      ? "先安装 ScanSci 提供的本地运行能力，再下载模型。"
-      : "当前发行渠道未提供本地运行能力；不会下载无法执行的模型。",
+      ? "首次使用时会自动准备 ScanSci 本地运行能力，随后继续下载模型。"
+      : "自动准备通道暂不可用；可从官方发布页下载本地运行组件后安装。",
   };
   if (resource.state === "runtime_installing") return {
     label: `安装运行组件 ${resource.progress}%`,
@@ -6944,20 +8536,26 @@ function resourceInstallStatusCopy(resource) {
   };
   if (resource.state === "ready") return { label: "已就绪", hint: "已保存在本机，可随时使用。" };
   if (resource.state === "queued") return { label: "准备下载", hint: "正在连接可用下载源。" };
+  if (resource.state === "installing") return { label: `下载中 ${resource.progress}%`, hint: resource.job?.current_model || resource.detail };
   if (resource.state === "downloading") return { label: `下载中 ${resource.progress}%`, hint: resource.job?.current_model || resource.detail };
+  if (resource.state === "paused") return { label: "已暂停", hint: "可以继续下载，已接收内容会自动复用。" };
+  if (resource.state === "interrupted") return { label: "下载已中断", hint: "可以继续下载，已接收内容会自动复用。" };
   if (resource.state === "failed") return { label: resource.job?.state === "interrupted" ? "下载已中断" : "下载未完成", hint: resource.job?.error || resource.job?.message || "可重试；已下载内容会继续复用。" };
   return { label: "尚未下载", hint: resource.detail };
 }
 
 function resourceSetupCard(resource) {
   const copy = resourceInstallStatusCopy(resource);
-  const active = ["queued", "downloading", "runtime_installing"].includes(resource.state);
+  const active = ["queued", "downloading", "installing", "runtime_installing"].includes(resource.state);
+  const retryable = ["failed", "interrupted", "cancelled"].includes(resource.state);
   const actionLabel = resource.state === "ready"
     ? "已就绪"
     : resource.state === "runtime_required"
-      ? state.localRuntime?.install_available ? "安装本地运行能力" : "查看本地运行设置"
-    : ["failed", "runtime_failed"].includes(resource.state)
-      ? "重试下载"
+      ? state.localRuntime?.install_available ? "准备本地能力" : "查看安装选项"
+    : ["failed", "runtime_failed", "interrupted", "cancelled"].includes(resource.state)
+      ? resource.state === "runtime_failed" ? "继续安装" : "重试下载"
+    : resource.state === "paused"
+      ? "继续下载"
       : active
         ? "正在下载"
         : "立即下载";
@@ -6965,34 +8563,36 @@ function resourceSetupCard(resource) {
     ? `<div class="resource-download-detail"><small>${escapeHtml(downloadJobTelemetry(resource.job) || "正在建立下载连接")}</small><div class="resource-setup-progress" role="progressbar" aria-label="${escapeHtml(resource.title)} 下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${resource.progress}"><span class="${progressWidthClass(resource.progress)}"></span></div></div>`
     : "";
   const action = ["runtime_required", "runtime_failed"].includes(resource.state)
-    ? `<button type="button" data-action="${state.localRuntime?.install_available ? "install-local-runtime" : "open-local-runtime-setup"}">${uiIcon(state.localRuntime?.install_available ? (resource.state === "runtime_failed" ? "refresh" : "download") : "settings")}${escapeHtml(actionLabel)}</button>`
+    ? `<button type="button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}">${uiIcon(resource.state === "runtime_failed" ? "refresh" : "download")}${escapeHtml(actionLabel)}</button>`
     : resource.state === "runtime_installing"
       ? `<span class="resource-install-running">${uiIcon("loader-circle")}</span>`
     : resource.state === "ready"
       ? `<span>${uiIcon("check")}</span>`
-      : `<button type="button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}" ${active ? "disabled" : ""}>${uiIcon(resource.state === "failed" ? "refresh" : "download")}${escapeHtml(actionLabel)}</button>`;
+      : `<button type="button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}" ${active ? "disabled" : ""}>${uiIcon(retryable ? "refresh" : "download")}${escapeHtml(actionLabel)}</button>`;
   return `<article class="resource-setup-card is-${escapeHtml(resource.state)}"><div class="resource-setup-mark">${uiIcon(resource.icon)}</div><div class="resource-setup-copy"><span>${escapeHtml(resource.eyebrow)}</span><h3>${escapeHtml(resource.title)}</h3><p>${escapeHtml(resource.description)}</p><small>${escapeHtml(copy.hint)}</small>${progress}</div><div class="resource-setup-action"><b>${escapeHtml(copy.label)}</b>${action}</div></article>`;
 }
 
 function resourceSetupCardsMarkup() {
-  return [resourceInstallSnapshot("retrieval"), resourceInstallSnapshot("chat")].map(resourceSetupCard).join("");
+  return ONBOARDING_RESOURCE_ORDER.map((resourceId) => resourceInstallSnapshot(resourceId)).map(resourceSetupCard).join("");
 }
 
 function resourceSettingsRow(resource) {
   const copy = resourceInstallStatusCopy(resource);
-  const active = ["queued", "downloading", "runtime_installing"].includes(resource.state);
-  const actionLabel = resource.state === "failed" ? "重试" : "下载";
-  const progress = active
-    ? `<div class="resource-download-detail"><small>${escapeHtml(downloadJobTelemetry(resource.job) || "正在建立下载连接")}</small><div class="resource-settings-row-progress" role="progressbar" aria-label="${escapeHtml(resource.title)} 下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${resource.progress}"><span class="${progressWidthClass(resource.progress)}"></span></div></div>`
-    : "";
-  const action = resource.state === "ready"
+  const status = resource.state === "ready"
     ? `<span class="resource-settings-row-ready">${uiIcon("check")} 已就绪</span>`
-    : ["runtime_required", "runtime_failed"].includes(resource.state)
-      ? `<button type="button" class="resource-settings-row-action" data-action="${state.localRuntime?.install_available ? "install-local-runtime" : "open-local-runtime-setup"}">${state.localRuntime?.install_available ? (resource.state === "runtime_failed" ? "重试安装" : "安装本地运行能力") : "查看本地运行设置"}</button>`
-    : active
-      ? `<span class="resource-settings-row-state">${escapeHtml(copy.label)}</span>`
-      : `<button type="button" class="resource-settings-row-action" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}">${uiIcon(resource.state === "failed" ? "refresh" : "download")}${actionLabel}</button>`;
-  return `<article class="resource-settings-row is-${escapeHtml(resource.state)}"><span class="resource-settings-row-icon">${uiIcon(resource.icon)}</span><div class="resource-settings-row-copy"><strong>${escapeHtml(resource.title)}</strong><small>${escapeHtml(resource.state === "ready" ? resource.detail : copy.hint)}</small>${progress}</div><div class="resource-settings-row-end">${action}</div></article>`;
+    : ["queued", "downloading", "installing", "runtime_installing"].includes(resource.state)
+      ? `<span class="resource-settings-row-state">下载任务在本地模型中</span>`
+      : ["runtime_required", "runtime_failed"].includes(resource.state)
+        ? `<span class="resource-settings-row-state">需要本地运行时</span>`
+        : ["failed", "interrupted", "cancelled"].includes(resource.state)
+          ? `<span class="resource-settings-row-state">下载未完成</span>`
+          : `<span class="resource-settings-row-state">按需配置</span>`;
+  const detail = resource.state === "ready"
+    ? resource.detail
+    : resource.id === "vision"
+      ? "图片优先使用可用的本地视觉模型；没有时自动尝试云端视觉或 OCR。"
+      : copy.hint;
+  return `<article class="resource-settings-row is-${escapeHtml(resource.state)}"><span class="resource-settings-row-icon">${uiIcon(resource.icon)}</span><div class="resource-settings-row-copy"><strong>${escapeHtml(resource.title)}</strong><small>${escapeHtml(detail)}</small></div><div class="resource-settings-row-end"><div class="resource-settings-row-status">${status}</div><button type="button" class="resource-settings-row-action is-quiet" data-action="open-local-models">管理</button></div></article>`;
 }
 
 function connectedDataSourceCount() {
@@ -7026,10 +8626,37 @@ function onboardingSourceCard({ kind, action, title, description, actionLabel })
 
 function renderDataOnboarding() {
   const sources = connectedDataSourceCount();
-  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("library")}</div><h1 id="resourceOnboardingTitle">把资料留在原处，<br />让证据变得可用。</h1><p>选择你愿意连接的资料源。ScanSci 只读取内容、建立本地索引与引用定位，不会移动或上传原文件。</p><div class="resource-onboarding-note"><span>${uiIcon("map-pin")}</span><p>每条回答都可回到文档、章节和原文证据片段。扫描件无法读取时会明确提示你启用 OCR。</p></div></aside><main class="resource-onboarding-main data-onboarding-main"><header><div><span>资料接入</span><h2>从一个资料源开始就够了</h2><p>连接后会自动完成：文档 → 章节 → 原文证据片段。其他资料源可随后在知识库中添加。</p></div><span class="resource-onboarding-step">02 / 02</span></header><div class="data-source-grid">${onboardingSourceCard({ kind: "folder", action: "onboarding-connect-folder", title: "本地文件夹", description: "递归读取论文、报告、Markdown 和常见办公文档。", actionLabel: "选择文件夹" })}${onboardingSourceCard({ kind: "zotero", action: "onboarding-connect-zotero", title: "Zotero", description: "连接本机文献库与其已管理的论文附件。", actionLabel: "连接 Zotero" })}${onboardingSourceCard({ kind: "obsidian", action: "onboarding-connect-obsidian", title: "Obsidian", description: "保留 Vault 的笔记层级，并为每个段落建立定位。", actionLabel: "选择 Vault" })}${onboardingSourceCard({ kind: "notion", action: "onboarding-connect-notion", title: "Notion", description: "使用你的 Integration 同步已授权的页面和数据库。", actionLabel: "连接 Notion" })}</div>${guidedImportJobMarkup()}<footer><p>${sources ? `<strong>已连接 ${sources} 个资料源。</strong> 你可完成配置；资料仍会在后台建立语义索引。` : "不接入资料也可先体验 ScanSci；随时可在 设置 · 资源配置 或 知识库 中继续。"}</p><div><button type="button" class="resource-skip-button" data-action="back-resource-onboarding">上一步</button><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button>${sources ? `<button type="button" class="resource-finish-button" data-action="finish-data-onboarding">完成并开始 ${uiIcon("arrow-up-right")}</button>` : ""}</div></footer></main></section></div>`;
+  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("library")}</div><h1 id="resourceOnboardingTitle">把资料留在原处，<br />让证据变得可用。</h1><p>选择你愿意连接的资料源。ScanSci 只读取内容、建立本地索引与引用定位，不会移动或上传原文件。</p><div class="resource-onboarding-note"><span>${uiIcon("map-pin")}</span><p>每条回答都可回到文档、章节和原文证据片段。扫描件无法读取时会明确提示你启用 OCR。</p></div></aside><main class="resource-onboarding-main data-onboarding-main"><header><div><span>资料接入</span><h2>从一个资料源开始就够了</h2><p>连接后会自动完成：文档 → 章节 → 原文证据片段。其他资料源可随后在知识库中添加。</p></div><span class="resource-onboarding-step">02 / 02</span></header><div class="data-source-grid">${onboardingSourceCard({ kind: "folder", action: "onboarding-connect-folder", title: "本地文件夹", description: "递归读取论文、报告、Markdown 和常见办公文档。", actionLabel: "选择文件夹" })}${onboardingSourceCard({ kind: "zotero", action: "onboarding-connect-zotero", title: "Zotero", description: "连接本机文献库与其已管理的论文附件。", actionLabel: "连接 Zotero" })}${onboardingSourceCard({ kind: "obsidian", action: "onboarding-connect-obsidian", title: "Obsidian", description: "保留 Vault 的笔记层级，并为每个段落建立定位。", actionLabel: "选择 Vault" })}${onboardingSourceCard({ kind: "notion", action: "onboarding-connect-notion", title: "Notion", description: "使用你的 Integration 同步已授权的页面和数据库。", actionLabel: "连接 Notion" })}</div>${guidedImportJobMarkup()}<footer><p>${sources ? `<strong>已连接 ${sources} 个资料源。</strong> 你可完成配置；资料仍会在后台建立语义索引。` : "不接入资料也可先体验 ScanSci；随时可在 设置 · 默认能力 或 知识库 中继续。"}</p><div><button type="button" class="resource-skip-button" data-action="back-resource-onboarding">上一步</button><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button>${sources ? `<button type="button" class="resource-finish-button" data-action="finish-data-onboarding">完成并开始 ${uiIcon("arrow-up-right")}</button>` : ""}</div></footer></main></section></div>`;
 }
 
-function renderResourceOnboarding() {
+function renderResourceGuideOverlay() {
+  const snapshots = ONBOARDING_RESOURCE_ORDER.map((resourceId) => resourceInstallSnapshot(resourceId));
+  const readyCount = snapshots.filter((resource) => resource.state === "ready").length;
+  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL</span><div class="resource-onboarding-glyph">${uiIcon("download")}</div><h1 id="resourceGuideTitle">需要什么，<br />再下载什么。</h1><p>本地模型都是可选能力。下载完成后会显示“已就绪”，ScanSci 会在需要时自动使用。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>默认能力 · 按需添加</span><h2>选择你现在需要的本地能力</h2><p>只点击需要的卡片；首次使用会自动准备 ScanSci 本地运行能力，然后继续下载。</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span></header><div class="resource-setup-cards resource-guide-resource-list">${snapshots.map(resourceSetupCard).join("")}</div><footer><p>关闭后可以从“默认能力”页右上角再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button><button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成 ${uiIcon("check")}</button></div></footer></main></section></div>`;
+}
+
+function openResourceGuideOverlay() {
+  state.onboardingMode = "resources";
+  state.onboardingOpen = true;
+  renderResourceOnboarding();
+}
+
+async function closeResourceGuideOverlay(result = "skip") {
+  state.onboardingMode = "";
+  if (result === "complete") {
+    await persistOnboardingPreferences(
+      { resource_setup_completed: true },
+      "本地能力配置已完成；之后可随时再次打开引导",
+      { close: true },
+    );
+    return;
+  }
+  state.onboardingOpen = false;
+  renderResourceOnboarding();
+  toast("已跳过本地能力配置；需要时可在默认能力页重新打开。", false);
+}
+
+function renderLegacyResourceOnboarding() {
   const host = byId("resourceOnboarding");
   if (!host) return;
   if (!state.onboardingOpen || !state.settings) {
@@ -7044,19 +8671,66 @@ function renderResourceOnboarding() {
     return;
   }
   host.hidden = false;
-  host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>资源配置</span><h2>按需添加，不打扰开始研究</h2><p>建议先下载检索组件；下一步可以连接你的资料。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>本地检索组件是可选项。资料接入后，ScanSci 才能把回答精确定位回你的原文证据。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
+  host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>资源配置</span><h2>按能力分别添加</h2><p>嵌入和重排负责知识库检索；视觉、语音和本地对话按需开启。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>每项模型都可单独下载。跳过不会影响基础使用，之后可在设置里继续。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
   hydrateIcons(host);
+}
+
+function renderResourceOnboarding() {
+  const steps = [
+    ["welcome", "认识工作区"],
+    ["models", "按需配置模型"],
+    ["knowledge", "连接研究资料"],
+  ];
+  const current = steps.some(([id]) => id === state.onboardingStep) ? state.onboardingStep : "welcome";
+  const currentIndex = Math.max(0, steps.findIndex(([id]) => id === current));
+  const stepRail = steps.map(([id, label], index) => `<li class="guide-step ${id === current ? "is-current" : index < currentIndex ? "is-complete" : ""}"><span>${index < currentIndex ? uiIcon("check") : index + 1}</span><small>${label}</small></li>`).join("");
+  const panels = {
+    welcome: `<header><div><span>认识 ScanSci</span><h2>先熟悉研究桌面</h2><p>这里是你的研究工作台。模型和资料都按需配置，不会因为第一次打开就强迫你下载或连接任何东西。</p></div><span class="resource-onboarding-step">01 / 03</span></header><div class="guide-feature-grid"><article><span class="guide-feature-icon">${uiIcon("message-circle")}</span><div><strong>新建研究</strong><p>直接描述你想完成的事，ScanSci 会根据任务选择合适的研究流程。</p></div></article><article><span class="guide-feature-icon">${uiIcon("library")}</span><div><strong>知识库</strong><p>你的文件、Zotero 和笔记都从这里接入，原文件仍留在原来的位置。</p></div></article><article><span class="guide-feature-icon">${uiIcon("settings")}</span><div><strong>设置</strong><p>模型、运行时和外观都在设置中管理，随时可以回来调整。</p></div></article></div><div class="guide-tip">${uiIcon("sparkles")}<span>你现在就可以跳过引导，先试着提一个问题。</span></div><footer><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">跳过引导</button><button type="button" class="resource-finish-button" data-action="onboarding-next">下一步 ${uiIcon("arrow-right")}</button></footer>`,
+    models: `<header><div><span>默认能力</span><h2>需要时，再下载模型</h2><p>本地模型不是使用 ScanSci 的前置条件。需要更好的语义检索、离线对话、视觉或语音能力时，从默认能力页打开按需配置。</p></div><span class="resource-onboarding-step">02 / 03</span></header><div class="guide-destination"><span class="guide-destination-icon">${uiIcon("download")}</span><div><span>设置 · 默认能力</span><h3>按能力查看默认推荐</h3><p>嵌入、重排、对话、视觉和语音分组显示；每张卡片都写清用途、大小和下载状态。</p><div class="guide-destination-tags"><b>默认推荐</b><b>可跳过</b><b>下载后本地保存</b></div></div><button type="button" class="guide-destination-action" data-action="onboarding-open-models">打开本地能力引导 ${uiIcon("arrow-up-right")}</button></div><div class="guide-tip">${uiIcon("shield-check")}<span>没有模型时仍可使用基础关键词检索和已配置的云端模型。</span></div><footer><button type="button" class="resource-skip-button" data-action="onboarding-back">上一步</button><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">跳过引导</button><button type="button" class="resource-finish-button" data-action="onboarding-next">下一步 ${uiIcon("arrow-right")}</button></div></footer>`,
+    knowledge: `<header><div><span>资料接入</span><h2>资料，从知识库开始</h2><p>连接文件夹、个人文件、Zotero 或其他资料源都在知识库页面完成。你可以先创建空的个人知识库，之后再添加内容。</p></div><span class="resource-onboarding-step">03 / 03</span></header><div class="guide-destination is-library"><span class="guide-destination-icon">${uiIcon("library")}</span><div><span>工作区 · 知识库</span><h3>选择知识库，再链接文件或文件夹</h3><p>知识库负责管理资料和索引；对话框里的“知识库”按钮只负责选择本轮要检索的范围。</p><div class="guide-destination-tags"><b>原文件不移动</b><b>可随时添加</b><b>支持 Zotero</b></div></div><button type="button" class="guide-destination-action" data-action="onboarding-open-knowledge">打开知识库 ${uiIcon("arrow-up-right")}</button></div><div class="guide-tip">${uiIcon("map-pin")}<span>先不接入也没关系，随时可以从左侧“知识库”进入。</span></div><footer><button type="button" class="resource-skip-button" data-action="onboarding-back">上一步</button><button type="button" class="resource-finish-button" data-action="skip-resource-onboarding">完成引导 ${uiIcon("check")}</button></footer>`,
+  };
+  const host = byId("resourceOnboarding");
+  if (!host) return;
+  if (!state.onboardingOpen || !state.settings) {
+    host.hidden = true;
+    host.innerHTML = "";
+    return;
+  }
+  if (state.onboardingMode === "resources") {
+    host.hidden = false;
+    host.innerHTML = renderResourceGuideOverlay();
+    hydrateIcons(host);
+    return;
+  }
+  host.hidden = false;
+  host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card guide-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside guide-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(current === "knowledge" ? "library" : current === "models" ? "settings" : "sparkles")}</div><h1 id="resourceOnboardingTitle">把研究桌面<br />用顺手。</h1><p>三步认识 ScanSci，配置按需进行，想跳过也完全可以。</p><ol class="guide-step-rail">${stepRail}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>设置和资料只保存在这台电脑上；你可以随时回到对应页面继续。</p></div></aside><main class="resource-onboarding-main guide-onboarding-main">${panels[current]}</main></section></div>`;
+  hydrateIcons(host);
+}
+
+function resourceInstallGuideGroup(resourceIds, eyebrow, title, description) {
+  const cards = resourceIds
+    .map((resourceId) => resourceInstallSnapshot(resourceId))
+    .map(resourceSetupCard)
+    .join("");
+  return `<section class="resource-install-group"><header><div><span>${escapeHtml(eyebrow)}</span><h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p></div><em>${resourceIds.length} 项</em></header><div class="resource-install-grid">${cards}</div></section>`;
 }
 
 function renderResourceSetupSettings() {
   const sourceCount = connectedDataSourceCount();
-  const dataStatus = sourceCount ? `已连接 ${sourceCount} 个资料源` : "尚未接入资料";
-  const resourceRows = [resourceInstallSnapshot("retrieval"), resourceInstallSnapshot("chat")].map(resourceSettingsRow).join("");
-  const taskEntries = downloadTaskEntries({ includeReady: true }).slice(0, 6);
-  const downloadTasks = taskEntries.length
-    ? `<section class="download-task-section"><header><div><h2>下载任务</h2><p>关闭应用后仍保留状态；再次开始会复用已下载内容。</p></div>${state.downloadStatusError ? `<span class="download-task-connection-error">${uiIcon("wifi-off")}进度连接正在重试</span>` : ""}</header><div class="download-task-list">${taskEntries.map(downloadTaskRow).join("")}</div></section>`
-    : "";
-  return `<section class="resource-settings-page resource-settings-page--compact"><header class="resource-settings-heading"><div><h1>资源配置</h1><p>只显示需要你处理的资源；资料和模型始终保留在这台电脑上。</p></div><button type="button" class="quiet-text-button" data-action="reopen-resource-onboarding">首次配置</button></header>${downloadTasks}<section class="resource-settings-list" aria-label="资源配置列表">${resourceRows}<article class="resource-settings-row resource-settings-data-row"><span class="resource-settings-row-icon">${uiIcon(sourceCount ? "check" : "library")}</span><div class="resource-settings-row-copy"><strong>资料接入</strong><small>${escapeHtml(dataStatus)}${sourceCount ? " · 已建立本地索引" : " · 连接后自动建立文档、章节与证据片段"}</small></div><div class="resource-settings-row-end"><button type="button" class="resource-settings-row-action is-quiet" data-action="open-data-onboarding">${sourceCount ? "管理" : "接入资料"}${uiIcon("arrow-right")}</button></div></article></section><p class="resource-settings-footnote">未下载检索模型时，ScanSci 仍会使用基础关键词检索。</p></section>`;
+  const snapshots = ONBOARDING_RESOURCE_ORDER.map((resourceId) => resourceInstallSnapshot(resourceId));
+  const readyCount = snapshots.filter((resource) => resource.state === "ready").length;
+  const activeCount = snapshots.filter((resource) => ["queued", "downloading", "installing", "runtime_installing"].includes(resource.state)).length;
+  const summary = activeCount
+    ? `${readyCount}/${snapshots.length} 项已就绪 · ${activeCount} 项正在处理`
+    : `${readyCount}/${snapshots.length} 项已就绪 · 其余按需安装`;
+  const dataSummary = sourceCount ? `已连接 ${sourceCount} 个资料源` : "尚未接入资料";
+  return `<section class="resource-settings-page resource-install-page"><header class="resource-install-heading"><div><span>RESOURCES</span><h1>资源配置</h1><p>模型下载只有一个入口：资源配置。下载完成后，去“默认能力”选择它们的用途；“本地模型”只负责检测、自动路由和可选手动连接。</p></div><button type="button" class="quiet-text-button" data-action="reopen-resource-onboarding">查看使用引导</button></header>
+    <section class="resource-install-summary"><div class="resource-install-summary-mark">${uiIcon(readyCount ? "check" : "download")}</div><div><strong>${escapeHtml(summary)}</strong><p>模型只保存在这台电脑上；已完成的资源不会重复显示下载进度。</p></div><button type="button" class="resource-install-summary-action" data-action="open-settings" data-settings-panel="defaults">选择默认能力 ${uiIcon("arrow-right")}</button></section>
+    ${resourceInstallGuideGroup(["embedding", "reranking"], "知识库检索", "让文献更容易被找到", "嵌入模型建立语义索引，重排模型帮助 ScanSci 从候选片段中挑出更相关的证据。")}
+    ${resourceInstallGuideGroup(["chat", "vision", "audio"], "本地助手与多模态", "按需添加离线能力", "本地对话、图片理解和语音转写彼此独立；不需要的能力可以跳过。")}
+    ${localRuntimeChannelRecoveryMarkup(state.localRuntime)}
+    <section class="resource-install-data-card"><span>${uiIcon(sourceCount ? "check" : "library")}</span><div><strong>资料接入</strong><p>${escapeHtml(dataSummary)}${sourceCount ? " · 已建立本地索引" : " · 连接后自动建立文档、章节与证据片段"}</p></div><button type="button" class="resource-install-data-action" data-action="open-data-onboarding">${sourceCount ? "管理资料" : "接入资料"} ${uiIcon("arrow-right")}</button></section>
+    <p class="resource-install-footnote">没有安装检索模型时，ScanSci 仍会使用基础关键词检索；运行外部 Ollama、LM Studio 或 llama.cpp 连接，请到“本地模型”中的高级设置。</p></section>`;
 }
 
 async function persistOnboardingPreferences(patch, message, { close = false } = {}) {
@@ -7074,26 +8748,35 @@ async function persistOnboardingPreferences(patch, message, { close = false } = 
 }
 
 async function startOnboardingResource(resourceId) {
-  const resource = resourceInstallSnapshot(resourceId === "chat" ? "chat" : "retrieval");
-  if (["ready", "queued", "downloading"].includes(resource.state)) return;
+  const resource = resourceInstallSnapshot(resourceId);
+  if (["ready", "queued", "downloading", "installing"].includes(resource.state)) return;
   if (["runtime_required", "runtime_installing", "runtime_failed"].includes(resource.state)) {
+    state.pendingLocalModelResource = resource.id;
+    if (resource.state === "runtime_installing") {
+      renderResourceOnboarding();
+      toast("本地运行能力正在准备；完成后会自动继续下载模型。");
+      return;
+    }
+    if (state.localRuntime?.install_available) {
+      const job = await request("/api/local-runtime/install", { method: "POST", body: "{}" });
+      state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
+      scheduleLocalRuntimeInstallPoll();
+      renderResourceOnboarding();
+      renderDownloadActivity();
+      toast("正在准备本地能力，完成后会自动继续下载模型。");
+      return;
+    }
     state.activeView = "settings";
     state.activeSettings = "local-models";
     renderWorkspace();
     document.querySelector(".local-runtime-disclosure")?.setAttribute("open", "");
-    toast(
-      resource.state === "runtime_installing"
-        ? "本地运行组件仍在安装；右上角可持续查看进度。"
-        :
-      state.localRuntime?.install_available
-        ? "请先安装 ScanSci 本地运行能力；模型尚未开始下载。"
-        : "当前渠道没有提供本地运行能力；ScanSci 不会下载无法执行的模型。",
-      resource.state !== "runtime_installing",
-    );
+    toast("当前发行包没有可用的自动准备通道；请在本地模型页安装 ScanSci 本地运行组件后重试。", true);
     return;
   }
   const endpoint = resource.id === "retrieval" ? "/api/resources/retrieval/download" : "/api/local-models/download";
-  const payload = resource.id === "retrieval" ? {} : { id: ONBOARDING_CHAT_MODEL };
+  const payload = resource.id === "retrieval"
+    ? {}
+    : { id: resource.models[0], runtime: resource.runtime || "huggingface" };
   const job = await request(endpoint, { method: "POST", body: JSON.stringify(payload) });
   mergeLocalModelInstall(job);
   scheduleLocalModelInstallPoll();
@@ -7103,8 +8786,100 @@ async function startOnboardingResource(resourceId) {
   toast(`${resource.title} 已开始下载；右上角可持续查看进度。`);
 }
 
+const knowledgeSettingsPreviewModels = {
+  embedding: [
+    { id: "auto", name: "Agent 自动选择（推荐）", meta: "按本机可用性 · 不固定模型", note: "有合适的本地模型就使用；否则自动回退到基础检索" },
+    { id: "qwen3-embedding-0.6b", name: "Qwen3 Embedding 0.6B", meta: "本地 · 614 MB · 1024 维", note: "适合中文科研文献，速度和效果平衡" },
+    { id: "bge-m3", name: "BAAI/bge-m3", meta: "本地 · 2.2 GB · 1024 维", note: "多语言兼容方案，资源占用更高" },
+    { id: "offline-keyword", name: "基础关键词检索", meta: "内置 · 无需模型", note: "没有向量索引时的可靠回退" },
+  ],
+  reranking: [
+    { id: "auto", name: "Agent 自动选择（推荐）", meta: "按本机可用性 · 不固定模型", note: "有重排模型就使用；没有时直接返回嵌入检索结果" },
+    { id: "qwen3-reranker-0.6b", name: "Qwen3 Reranker 0.6B", meta: "本地 · 640 MB · 已安装", note: "对候选片段重新排序，提高命中质量" },
+    { id: "bge-reranker-v2-m3", name: "BAAI/bge-reranker-v2-m3", meta: "本地 · 2.2 GB · 可下载", note: "多语言重排方案，适合跨语言资料库" },
+    { id: "no-reranker", name: "不使用重排", meta: "基础模式 · 更快", note: "直接使用嵌入检索结果" },
+  ],
+};
+
+function knowledgeSettingsPreviewModel(role) {
+  const selectedId = state.knowledgeSettingsPreview?.[role] || "";
+  return (knowledgeSettingsPreviewModels[role] || []).find((item) => item.id === selectedId)
+    || knowledgeSettingsPreviewModels[role]?.[0]
+    || { id: "", name: "未指定", meta: "使用系统回退", note: "" };
+}
+
+function knowledgeSettingsPreviewOptions(role) {
+  const selectedId = state.knowledgeSettingsPreview?.[role] || "";
+  return (knowledgeSettingsPreviewModels[role] || []).map((item) => `<option value="${escapeHtml(item.id)}" data-model-name="${escapeHtml(item.name)}" data-model-meta="${escapeHtml(item.meta)}" ${item.id === selectedId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
+}
+
+function renderKnowledgeSettingsPreview() {
+  const preview = state.knowledgeSettingsPreview || {};
+  const notebook = state.notebook || {};
+  const title = notebook.title || "光伏生态文献";
+  const sourceCount = Number(notebook.counts?.sources || 420);
+  const chunkCount = Number(notebook.counts?.evidence || 3186);
+  const embedding = knowledgeSettingsPreviewModel("embedding");
+  const reranking = knowledgeSettingsPreviewModel("reranking");
+  const embeddingChanged = !["auto", "qwen3-embedding-0.6b"].includes(embedding.id);
+  const rerankingChanged = !["auto", "qwen3-reranker-0.6b", "no-reranker"].includes(reranking.id);
+  const pendingNotice = embeddingChanged
+    ? `<div class="knowledge-settings-notice is-warning">${uiIcon("info")}<span><strong>保存后需要重建向量索引。</strong>原文档不会被修改，重建完成前仍可继续使用当前索引。</span></div>`
+    : "";
+  const advanced = preview.advancedOpen
+    ? `<div class="knowledge-settings-advanced-body">
+        <div class="knowledge-settings-advanced-grid">
+          <label class="knowledge-settings-field"><span>文本切分</span><select aria-label="文本切分方式"><option selected>按语义段落</option><option>按固定长度</option><option>按标题层级</option></select><small>改变切分方式后需要重建索引。</small></label>
+          <label class="knowledge-settings-field"><span>每次返回片段</span><select aria-label="每次返回片段数量"><option>6 个</option><option selected>8 个</option><option>12 个</option><option>16 个</option></select><small>只影响回答时送给模型的证据数量。</small></label>
+          <label class="knowledge-settings-field"><span>最低相似度</span><select aria-label="最低相似度"><option>不限制</option><option selected>0.35</option><option>0.45</option><option>0.55</option></select><small>过滤明显不相关的片段。</small></label>
+        </div>
+        <p class="knowledge-settings-advanced-note">高级设置只作用于“${escapeHtml(title)}”。如果你不确定，保持默认即可。</p>
+      </div>`
+    : "";
+  return `<section class="knowledge-settings-preview" aria-labelledby="knowledgeSettingsTitle">
+    <header class="knowledge-settings-heading">
+      <div class="knowledge-settings-breadcrumb"><button type="button" data-action="preview-open-library">${uiIcon("arrow-left")}知识库</button><span>/</span><strong>${escapeHtml(title)}</strong></div>
+      <div class="knowledge-settings-heading-status"><span class="knowledge-settings-status-pill">${uiIcon("check")}检索已就绪</span><span>仅对当前知识库生效</span></div>
+      <h1 id="knowledgeSettingsTitle">检索设置</h1>
+      <p>控制这个知识库如何找到和排序文献；其他知识库和默认助手模型不会被改变。</p>
+    </header>
+
+    <main class="knowledge-settings-main">
+      <section class="knowledge-settings-index-card">
+        <header class="knowledge-settings-card-heading"><div><span class="knowledge-settings-kicker">知识库</span><h2>${escapeHtml(title)}</h2><p>已建立本地索引，回答时会优先使用这里的资料。</p></div><span class="knowledge-settings-index-state">${uiIcon("check")}索引可用</span></header>
+        <div class="knowledge-settings-metrics"><div><b>${sourceCount.toLocaleString("zh-CN")}</b><span>篇文献</span></div><div><b>${chunkCount.toLocaleString("zh-CN")}</b><span>个证据片段</span></div><div><b>2026/08/07</b><span>最近更新</span></div></div>
+        ${embeddingChanged ? `<button type="button" class="knowledge-settings-quiet-action" data-action="preview-knowledge-rebuild">${uiIcon("refresh")}重建索引</button>` : ""}
+      </section>
+
+      <section class="knowledge-settings-model-card">
+        <header class="knowledge-settings-section-heading"><div><span class="knowledge-settings-kicker">检索模型</span><h2>找到并排序相关内容</h2><p>嵌入模型决定召回范围，重排模型决定结果顺序。</p></div></header>
+        <div class="knowledge-settings-model-list">
+          <article class="knowledge-settings-model-row">
+            <span class="knowledge-settings-model-icon is-embedding">${uiIcon("database")}</span>
+            <div class="knowledge-settings-model-copy"><span>嵌入模型</span><strong>${escapeHtml(embedding.name)}</strong><p>把文献和问题转换成可比较的向量；更换后需要重建索引。</p></div>
+            <div class="knowledge-settings-model-control"><select data-preview-knowledge-select="embedding" aria-label="选择嵌入模型">${knowledgeSettingsPreviewOptions("embedding")}</select><small class="${embeddingChanged ? "is-warning" : ""}">${embeddingChanged ? "保存后重建索引" : "已启用"}</small></div>
+          </article>
+          <article class="knowledge-settings-model-row">
+            <span class="knowledge-settings-model-icon is-reranking">${uiIcon("filter")}</span>
+            <div class="knowledge-settings-model-copy"><span>重排模型</span><strong>${escapeHtml(reranking.name)}</strong><p>对召回的候选片段重新排序；更换后不需要重建向量。</p></div>
+            <div class="knowledge-settings-model-control"><select data-preview-knowledge-select="reranking" aria-label="选择重排模型">${knowledgeSettingsPreviewOptions("reranking")}</select><small class="${rerankingChanged ? "is-warning" : ""}">${rerankingChanged ? "待保存" : "已启用"}</small></div>
+          </article>
+        </div>
+        ${pendingNotice}
+      </section>
+
+      <section class="knowledge-settings-advanced-section ${preview.advancedOpen ? "is-open" : ""}">
+        <button type="button" class="knowledge-settings-advanced-trigger" data-action="toggle-preview-knowledge-advanced" aria-expanded="${preview.advancedOpen ? "true" : "false"}"><span><b>高级检索设置</b><small>切分、返回数量和阈值</small></span><span class="knowledge-settings-advanced-arrow">${uiIcon("chevron-down")}</span></button>
+        ${advanced}
+      </section>
+
+      <footer class="knowledge-settings-actions"><span>配置仅保存到当前知识库</span><button type="button" class="knowledge-settings-save" data-action="preview-knowledge-save">保存检索设置</button></footer>
+    </main>
+  </section>`;
+}
+
 function renderSettings() {
-  if (state.activeSettings === "routing") state.activeSettings = "general";
+  if (["routing", "document-processing"].includes(state.activeSettings)) state.activeSettings = "defaults";
   applyAppearancePreferences();
   document.querySelectorAll(".settings-nav").forEach((button) => button.classList.toggle("is-active", button.dataset.settingsPanel === state.activeSettings));
   const target = byId("settingsContent");
@@ -7112,23 +8887,28 @@ function renderSettings() {
     target.innerHTML = '<div class="error-state">设置尚未载入。</div>';
     return;
   }
-  if (state.activeSettings === "resources") target.innerHTML = renderResourceSetupSettings();
-  else if (state.activeSettings === "models") target.innerHTML = renderModelsSettings();
-  else if (state.activeSettings === "local-models") target.innerHTML = renderLocalModelsSettings();
-  else if (state.activeSettings === "document-processing") target.innerHTML = renderDocumentProcessingSettings();
-  else if (state.activeSettings === "skills") target.innerHTML = renderRecordsSettings("skills");
-  else if (state.activeSettings === "mcp") target.innerHTML = renderMcpMarketplaceSettings();
-  else if (state.activeSettings === "plugins") target.innerHTML = renderRecordsSettings("plugins");
-  else if (state.activeSettings === "about") target.innerHTML = renderAboutSettings();
-  else target.innerHTML = renderGeneralSettings();
+  let settingsMarkup = "";
+  if (state.activeSettings === "resources") settingsMarkup = renderResourceSetupSettings();
+  else if (state.activeSettings === "knowledge-preview") settingsMarkup = renderKnowledgeSettingsPreview();
+  else if (state.activeSettings === "defaults") settingsMarkup = renderDefaultCapabilitiesSettings();
+  else if (state.activeSettings === "models") settingsMarkup = renderModelsSettings();
+  else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettings();
+  else if (state.activeSettings === "document-processing") settingsMarkup = renderDocumentProcessingSettings();
+  else if (state.activeSettings === "skills") settingsMarkup = renderRecordsSettings("skills");
+  else if (state.activeSettings === "mcp") settingsMarkup = renderMcpMarketplaceSettings();
+  else if (state.activeSettings === "plugins") settingsMarkup = renderRecordsSettings("plugins");
+  else if (state.activeSettings === "about") settingsMarkup = renderAboutSettings();
+  else settingsMarkup = renderGeneralSettings();
+  target.innerHTML = `<div class="settings-surface">${settingsMarkup}</div>`;
   hydrateIcons(target);
+  hydrateSettingsSelects(target);
   renderDownloadActivity();
 }
 
 function renderExtensions() {
   const target = byId("extensionsContent");
   if (!target) return;
-  const skills = state.extensions.skills || state.settings?.skills || [];
+  const skills = mergedExtensionSkills();
   const plugins = (state.settings?.plugins || []).filter((item) => !item.uninstalled);
   const tab = state.activeExtensions;
   const panels = {
@@ -7139,28 +8919,83 @@ function renderExtensions() {
   const tabs = [
     ["plugins", "插件", plugins.length],
     ["skills", "技能", skills.length],
-    ["market", "市场", "skills.sh"],
+    ["market", "市场", state.extensions.marketplace?.length || 0],
   ].map(([id, label, count]) => `<button type="button" class="extension-tab ${tab === id ? "is-active" : ""}" data-extension-tab="${id}" aria-current="${tab === id ? "page" : "false"}"><span>${label}</span><small>${escapeHtml(count)}</small></button>`).join("");
   target.innerHTML = `<div class="extensions-shell">
+    ${renderExtensionUpdateSummary()}
     <nav class="extension-tabs" aria-label="插件和技能页面">${tabs}</nav>
     <section class="extension-panel">${panels[tab]}</section>
   </div>${renderExtensionDetail()}`;
+  const refreshButton = document.querySelector(".extensions-refresh");
+  if (refreshButton) {
+    const isLoading = Boolean(state.extensionUpdates.loading);
+    refreshButton.disabled = isLoading;
+    refreshButton.textContent = isLoading
+      ? "↻ 检查中"
+      : state.extensionUpdates.error
+        ? "↻ 重试"
+        : "↻ 检查更新";
+  }
+}
+
+function extensionSkillUpdate(id) {
+  return (state.extensionUpdates.skills || []).find((item) => String(item.id || "") === String(id || "")) || null;
+}
+
+function extensionPluginUpdate(id) {
+  return (state.extensionUpdates.plugins || []).find((item) => String(item.id || "") === String(id || "")) || null;
+}
+
+function renderExtensionUpdateSummary() {
+  const updateCount = (state.extensionUpdates.skills || []).filter((item) => item.available).length
+    + (state.extensionUpdates.mcp || []).filter((item) => item.available).length
+    + (state.extensionUpdates.plugins || []).filter((item) => item.available).length;
+  const checked = state.extensionUpdates.checked_at ? new Date(state.extensionUpdates.checked_at) : null;
+  const checkedText = checked && !Number.isNaN(checked.getTime())
+    ? `上次检查 ${checked.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`
+    : "尚未检查扩展更新";
+  const message = state.extensionUpdates.loading
+    ? "正在检查 Skill、MCP 和内置插件…"
+    : state.extensionUpdates.error
+      ? "检查更新失败"
+      : updateCount
+        ? `发现 ${updateCount} 项可更新内容`
+        : checkedText;
+  const tone = state.extensionUpdates.error ? "is-error" : updateCount ? "is-available" : "";
+  return `<section class="extension-update-summary ${tone}"><span class="extension-update-summary-mark">${uiIcon(state.extensionUpdates.loading ? "refresh" : updateCount ? "sparkles" : "shield-check")}</span><div><strong>${escapeHtml(message)}</strong><small>${state.extensionUpdates.error ? escapeHtml(state.extensionUpdates.error) : "后台只检查版本；下载和替换仍需你确认"}</small></div></section>`;
+}
+
+function mergedExtensionSkills() {
+  const installed = Array.isArray(state.extensions.skills) ? state.extensions.skills : [];
+  const configured = Array.isArray(state.settings?.skills) ? state.settings.skills : [];
+  if (!installed.length) return configured.filter((item) => !item?.uninstalled);
+
+  const configuredById = new Map(
+    configured.map((item) => [String(item?.id || ""), item]).filter(([id]) => id),
+  );
+  return installed
+    .map((item) => {
+      const setting = configuredById.get(String(item?.id || ""));
+      return setting
+        ? { ...item, enabled: Boolean(setting.enabled), uninstalled: Boolean(setting.uninstalled) }
+        : item;
+    })
+    .filter((item) => !item?.uninstalled);
 }
 
 function renderExtensionDetail() {
   const detail = state.extensionDetail;
   if (!detail) return "";
-  const records = detail.kind === "skills" ? (state.extensions.skills || []) : (state.settings.plugins || []);
+  const records = detail.kind === "skills" ? mergedExtensionSkills() : (state.settings.plugins || []);
   const item = records.find((row) => row.id === detail.id);
   if (!item) return "";
-  const source = detail.kind === "skills" ? (item.path || item.source || "内置") : (item.source || "未指定来源");
   const title = detail.kind === "skills" ? "Skill" : "插件";
   const operations = Array.isArray(item.skills) && item.skills.length ? `<section class="extension-detail-operations"><span>包含能力</span>${item.skills.map((skill) => `<p>${escapeHtml(skill)}</p>`).join("")}</section>` : "";
   const security = detail.kind === "skills" ? item.security_scan : null;
   const securityCounts = security?.counts || {};
   const securityMarkup = security?.verdict ? `<section class="extension-detail-security is-${escapeHtml(String(security.verdict).toLowerCase())}"><span>${uiIcon("shield-check")}</span><div><small>安装安全检查</small><strong>${escapeHtml(security.verdict)}</strong><p>${escapeHtml(security.scanned_at || "")} · ${escapeHtml(String(Number(securityCounts.critical || 0) + Number(securityCounts.high || 0)))} 高风险 · ${escapeHtml(String(Number(securityCounts.medium || 0)))} 需审查</p></div></section>` : "";
   const remove = item.builtin ? "" : `<button type="button" class="extension-remove" data-action="uninstall-extension" data-extension-kind="${detail.kind}" data-extension-id="${escapeHtml(item.id)}">卸载</button>`;
-  return `<div class="extension-detail-backdrop" data-action="close-extension-detail"><section class="extension-detail-card" data-action="extension-detail-content" role="dialog" aria-modal="true" aria-label="${escapeHtml(item.name)} 详情"><header>${extensionRecordMark(detail.kind, item)}<div><span>${title}</span><h2>${escapeHtml(item.name)}</h2></div><button type="button" data-action="close-extension-detail" aria-label="关闭">${uiIcon("x")}</button></header><p>${escapeHtml(item.description || "尚未添加说明")}</p>${operations}${securityMarkup}<dl><div><dt>标识</dt><dd><code>${escapeHtml(item.id)}</code></dd></div><div><dt>来源</dt><dd><code>${escapeHtml(source)}</code></dd></div><div><dt>状态</dt><dd>${item.enabled ? "已启用" : "已停用"}</dd></div></dl><footer>${remove}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="${detail.kind}" data-record-id="${escapeHtml(item.id)}" ${item.enabled ? "checked" : ""} /><span>${item.enabled ? "启用" : "已停用"}</span></label></footer></section></div>`;
+  return `<div class="extension-detail-backdrop" data-action="close-extension-detail"><section class="extension-detail-card" data-action="extension-detail-content" role="dialog" aria-modal="true" aria-label="${escapeHtml(item.name)} 详情"><header>${extensionRecordMark(detail.kind, item)}<div><span>${title}</span><h2>${escapeHtml(item.name)}</h2></div><button type="button" data-action="close-extension-detail" aria-label="关闭">${uiIcon("x")}</button></header><p>${escapeHtml(item.description || "尚未添加说明")}</p>${operations}${securityMarkup}<footer>${remove}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="${detail.kind}" data-record-id="${escapeHtml(item.id)}" ${item.enabled ? "checked" : ""} /><span>${item.enabled ? "启用" : "已停用"}</span></label></footer></section></div>`;
 }
 
 const BUILTIN_PLUGIN_LOGOS = Object.freeze({
@@ -7187,19 +9022,31 @@ function renderExtensionPlugins(plugins) {
   const rows = plugins.length ? plugins.map((plugin) => {
     const runtime = plugin.runtime || {};
     const runtimeText = runtime.ready === false ? (runtime.detail || "运行环境未就绪") : (runtime.detail || "可用");
-    return `<article class="extension-record plugin-record"><button type="button" class="extension-record-main" data-action="open-extension-detail" data-extension-kind="plugins" data-extension-id="${escapeHtml(plugin.id)}">${extensionRecordMark("plugins", plugin)}<div class="extension-record-copy"><div class="extension-record-title"><h3>${escapeHtml(plugin.name)}</h3><span>${plugin.builtin ? "内置" : "插件"}</span></div><p>${escapeHtml(plugin.description || "尚未添加说明")}</p></div></button><div class="extension-record-actions"><span class="extension-status ${runtime.ready === false ? "is-missing" : "is-ready"}">${escapeHtml(runtimeText)}</span><label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="plugins" data-record-id="${escapeHtml(plugin.id)}" ${plugin.enabled ? "checked" : ""} /><span>${plugin.enabled ? "启用" : "已停用"}</span></label></div></article>`;
+    const update = extensionPluginUpdate(plugin.id)
+      || (plugin.builtin && state.update?.available
+        ? {
+          available: true,
+          message: "随应用更新",
+        }
+        : null);
+    const updateMarkup = update?.available
+      ? `<button type="button" class="extension-update-button" data-action="${update.can_install ? "install-app-update" : "check-app-update"}">应用更新</button>`
+      : plugin.builtin ? `<span class="extension-status is-bundled">随应用更新</span>` : "";
+    return `<article class="extension-record plugin-record"><button type="button" class="extension-record-main" data-action="open-extension-detail" data-extension-kind="plugins" data-extension-id="${escapeHtml(plugin.id)}">${extensionRecordMark("plugins", plugin)}<div class="extension-record-copy"><div class="extension-record-title"><h3>${escapeHtml(plugin.name)}</h3><span>${plugin.builtin ? "内置" : "插件"}</span></div><p>${escapeHtml(plugin.description || "尚未添加说明")}</p></div></button><div class="extension-record-actions"><span class="extension-status ${runtime.ready === false ? "is-missing" : "is-ready"}">${escapeHtml(runtimeText)}</span>${updateMarkup}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="plugins" data-record-id="${escapeHtml(plugin.id)}" ${plugin.enabled ? "checked" : ""} /><span>${plugin.enabled ? "启用" : "已停用"}</span></label></div></article>`;
   }).join("") : `<div class="extension-empty"><span>${uiIcon("puzzle")}</span><strong>还没有插件来源</strong><p>登记受信任的本地路径或远程来源后，可在这里统一启停和维护。</p></div>`;
-  return `<div class="extension-panel-summary"><p>内置办公与 LaTeX 插件由 Pi 直接调用；MCP 服务器在左侧独立管理。</p><span class="panel-count">${plugins.length} 项</span></div>
+  return `<div class="extension-panel-summary"><p>内置办公与 LaTeX 插件由 Pi 直接调用；它们随 ScanSci 应用包安全更新，MCP 服务器在左侧独立管理。</p><span class="panel-count">${plugins.length} 项</span></div>
     <section class="extension-record-list">${rows}</section>
     <form class="extension-form plugin-form" id="extensionPluginForm"><div class="extension-form-copy"><strong>登记插件来源</strong><span>仅保存元数据，不会自动启动或执行插件。</span></div><label><span>名称</span><input name="plugin-name" required maxlength="100" placeholder="例如：文献管理连接器" /></label><label><span>来源</span><input name="plugin-source" required maxlength="500" placeholder="本地路径或受信任的插件地址" /></label><label class="extension-form-wide"><span>说明（可选）</span><input name="plugin-description" maxlength="400" placeholder="它会为研究流程提供什么能力？" /></label><button type="submit" class="extension-primary">登记插件</button></form>`;
 }
 
 function renderExtensionSkills(skills) {
   const rows = skills.length ? skills.map((skill) => {
-    const securityLabel = skill.security_scan?.verdict ? ` · ${skill.security_scan.verdict === "SAFE" ? "已检查" : "风险已确认"}` : "";
-    const sourceLabel = skill.builtin ? "内置能力" : `${({ local: "本地导入", git: "Git 仓库", archive: "压缩包", marketplace: "skills.sh 市场" }[skill.source_type] || "手动登记")}${securityLabel}`;
     const status = skill.available ? "可用" : "缺少文件";
-    return `<article class="extension-record skill-record"><button type="button" class="extension-record-main" data-action="open-extension-detail" data-extension-kind="skills" data-extension-id="${escapeHtml(skill.id)}">${extensionRecordMark("skills", skill)}<div class="extension-record-copy"><div class="extension-record-title"><h3>${escapeHtml(skill.name || skill.id)}</h3><span>${escapeHtml(sourceLabel)}</span></div><p>${escapeHtml(skill.description || "尚未添加说明")}</p></div></button><div class="extension-record-actions"><span class="extension-status ${skill.available ? "is-ready" : "is-missing"}">${status}</span><label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="skills" data-record-id="${escapeHtml(skill.id)}" ${skill.enabled ? "checked" : ""} /><span>${skill.enabled ? "启用" : "已停用"}</span></label></div></article>`;
+    const update = extensionSkillUpdate(skill.id);
+    const updateMarkup = update?.available
+      ? `<button type="button" class="extension-update-button" data-action="update-skill" data-extension-id="${escapeHtml(skill.id)}">更新</button>`
+      : skill.builtin ? `<span class="extension-status is-bundled">随应用更新</span>` : update?.state === "manual" ? `<span class="extension-status is-manual">手动来源</span>` : update?.state === "error" ? `<span class="extension-status is-missing">检查失败</span>` : "";
+    return `<article class="extension-record skill-record"><button type="button" class="extension-record-main" data-action="open-extension-detail" data-extension-kind="skills" data-extension-id="${escapeHtml(skill.id)}">${extensionRecordMark("skills", skill)}<div class="extension-record-copy"><div class="extension-record-title"><h3>${escapeHtml(skill.name || skill.id)}</h3></div><p>${escapeHtml(skill.description || "尚未添加说明")}</p></div></button><div class="extension-record-actions"><span class="extension-status ${skill.available ? "is-ready" : "is-missing"}">${status}</span>${updateMarkup}<label class="extension-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="skills" data-record-id="${escapeHtml(skill.id)}" ${skill.enabled ? "checked" : ""} /><span>${skill.enabled ? "启用" : "已停用"}</span></label></div></article>`;
   }).join("") : `<div class="extension-empty"><span>${uiIcon("wand")}</span><strong>还没有可用技能</strong><p>从本地文件夹、Git 仓库、压缩包或市场中安装一个 Skill。</p></div>`;
   return `<section class="extension-record-list skill-list">${rows}</section>`;
 }
@@ -7212,7 +9059,7 @@ function renderExtensionMarket() {
   const sourceChips = sources.map((source) => `<span>${escapeHtml(source)}</span>`).join("");
   const empty = state.extensions.marketplaceLoaded ? `<div class="extension-empty market-empty"><span>${uiIcon("search")}</span><strong>没有匹配的市场技能</strong><p>换一个关键词，或点击刷新市场以同步公开目录。</p></div>` : `<div class="extension-empty market-empty"><span>${uiIcon("refresh")}</span><strong>正在连接技能市场</strong><p>首次加载会同步公开目录；之后可手动刷新。</p></div>`;
   const cards = items.length ? items.map((item) => `<article class="market-card"><div class="market-card-top"><span class="market-orb">${uiIcon("wand")}</span><a href="${escapeHtml(safeExternalUrl(item.url))}" target="_blank" rel="noopener" aria-label="在浏览器打开 ${escapeHtml(item.name || item.slug)}">${uiIcon("arrow-up-right")}</a></div><h3>${escapeHtml(item.name || item.slug)}</h3><p>${escapeHtml(item.source || "公开来源")}</p><div class="market-card-meta"><span>${item.installs ? `${Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(item.installs)} 安装` : "待同步安装数"}</span><span>${escapeHtml(item.sourceType || "Skill")}</span></div><button type="button" class="market-install" data-action="install-market-skill" data-market-skill-id="${escapeHtml(item.id)}">安装到技能库 <b>${uiIcon("plus")}</b></button></article>`).join("") : empty;
-  return `<div class="market-status-row"><span class="market-connection ${state.extensions.marketplaceOffline ? "is-offline" : ""}">${state.extensions.marketplaceOffline ? "离线示例" : "已连接 skills.sh"}</span></div>
+  return `<div class="market-status-row"><span class="market-connection ${state.extensions.marketplaceOffline ? "is-offline" : ""}">${state.extensions.marketplaceOffline ? "离线示例" : "市场已连接"}</span></div>
     <section class="market-toolbar"><label class="market-search">${uiIcon("search")}<input id="extensionsMarketSearch" type="search" value="${escapeHtml(state.marketplaceQuery)}" placeholder="搜索技能名称、描述或来源" autocomplete="off" /></label><div class="market-source-chips"><b>来源</b><span class="is-selected">全部</span>${sourceChips}</div></section>
     <section class="market-grid">${cards}</section>`;
 }
@@ -7246,6 +9093,39 @@ async function refreshExtensions({ marketOnly = false, quiet = false, includeMar
   if (!quiet && market) toast(market.offline ? "市场暂不可用，正在显示可安装示例" : "市场已刷新");
 }
 
+async function refreshExtensionUpdates({ quiet = false } = {}) {
+  if (state.extensionUpdates.loading) return;
+  state.extensionUpdates = { ...state.extensionUpdates, loading: true, error: "" };
+  if (state.activeView === "extensions") renderExtensions();
+  try {
+    const payload = await request("/api/extension-updates");
+    const skillPayload = payload.skills || {};
+    const mcpPayload = payload.mcp || {};
+    state.extensionUpdates = {
+      checked_at: payload.checked_at || "",
+      loading: false,
+      skills: skillPayload.skills || [],
+      mcp: mcpPayload.updates || [],
+      plugins: payload.plugins || [],
+      app: payload.app || null,
+      error: "",
+    };
+    if (state.activeView === "extensions") renderExtensions();
+    if (!quiet) {
+      const count = (state.extensionUpdates.skills || []).filter((item) => item.available).length
+        + (state.extensionUpdates.mcp || []).filter((item) => item.available).length
+        + (state.extensionUpdates.plugins || []).filter((item) => item.available).length;
+      toast(count ? `发现 ${count} 项可更新内容` : "Skill、MCP 和插件均已是最新");
+    }
+    return payload;
+  } catch (error) {
+    state.extensionUpdates = { ...state.extensionUpdates, loading: false, error: error.message || "暂时无法检查更新" };
+    if (state.activeView === "extensions") renderExtensions();
+    if (!quiet) throw error;
+    return null;
+  }
+}
+
 const skillSecurityVerdictMeta = Object.freeze({
   SAFE: { label: "可以安装", summary: "未发现阻断项", icon: "shield-check" },
   REVIEW: { label: "需要审查", summary: "发现需要人工判断的风险", icon: "triangle-alert" },
@@ -7266,6 +9146,7 @@ function renderSkillSecurityReview() {
   const scan = pending.scan || {};
   const verdict = String(scan.verdict || "BLOCKED").toUpperCase();
   const meta = skillSecurityVerdictMeta[verdict] || skillSecurityVerdictMeta.BLOCKED;
+  const isUpdate = pending.operation === "update";
   const scanners = (scan.scanners || []).map((scanner) => {
     const status = String(scanner.status || "FAIL").toUpperCase();
     const icon = status === "PASS" ? "check" : status === "WARN" ? "triangle-alert" : "x";
@@ -7276,16 +9157,21 @@ function renderSkillSecurityReview() {
   const counts = scan.counts || {};
   const findingSummary = `${Number(counts.critical || 0) + Number(counts.high || 0)} 高风险 · ${Number(counts.medium || 0)} 需审查 · ${Number(counts.low || 0)} 低风险`;
   const acknowledgement = verdict === "REVIEW"
-    ? `<label class="skill-security-ack"><input type="checkbox" id="skillSecurityAcknowledge" /><span><strong>我已阅读全部风险</strong><small>我理解这个 Skill 可能执行动态代码或包含难以自动审查的内容。</small></span></label>`
+    ? `<label class="skill-security-ack"><input type="checkbox" id="skillSecurityAcknowledge" /><span><strong>我已阅读全部风险并确认${isUpdate ? "更新" : "安装"}</strong><small>我理解这个 Skill 可能执行动态代码或包含难以自动审查的内容。</small></span></label>`
     : "";
-  target.innerHTML = `<section class="skill-security-verdict is-${verdict.toLowerCase()}"><span>${uiIcon(meta.icon)}</span><div><small>${escapeHtml(verdict)}</small><h3>${escapeHtml(meta.label)}</h3><p>${escapeHtml(scan.recommendation || meta.summary)}</p></div><b>${escapeHtml(findingSummary)}</b></section>
+  const actionLabel = isUpdate ? (verdict === "REVIEW" ? "理解风险并更新" : "确认更新") : (verdict === "REVIEW" ? "理解风险并安装" : "确认安装");
+  target.innerHTML = `<section class="skill-security-verdict is-${verdict.toLowerCase()}"><span>${uiIcon(meta.icon)}</span><div><small>${escapeHtml(verdict)}</small><h3>${escapeHtml(isUpdate ? meta.label.replace("安装", "更新") : meta.label)}</h3><p>${escapeHtml(scan.recommendation || meta.summary)}</p></div><b>${escapeHtml(findingSummary)}</b></section>
     <dl class="skill-security-provenance"><div><dt>来源</dt><dd title="${escapeHtml(scan.source_label || "")}">${escapeHtml(scan.source_label || "未知来源")}</dd></div><div><dt>隔离快照</dt><dd><code>${escapeHtml(String(scan.fingerprint || "").slice(0, 26))}…</code></dd></div><div><dt>内容</dt><dd>${escapeHtml(String(scan.package_count || 0))} 个 Skill · ${escapeHtml(String(scan.file_count || 0))} 个文件 · ${escapeHtml(formatFileSize(scan.byte_count || 0))}${packageNames ? ` · ${packageNames}` : ""}</dd></div></dl>
     <section class="skill-security-scanners"><header><strong>内置扫描器</strong><span>不会运行 Skill 中的任何代码</span></header><ul>${scanners}</ul></section>
     ${findings ? `<details class="skill-security-findings" ${verdict !== "SAFE" ? "open" : ""}><summary><span>安全发现</span><b>${escapeHtml(String((scan.findings || []).length))}</b></summary><ol>${findings}</ol></details>` : '<div class="skill-security-clean"><span>✓</span><p><strong>静态检查通过</strong><small>仍请确认来源可信，并只授予任务需要的权限。</small></p></div>'}
     ${acknowledgement}`;
   installButton.hidden = verdict === "BLOCKED";
   installButton.disabled = verdict === "BLOCKED" || verdict === "REVIEW";
-  installButton.textContent = verdict === "REVIEW" ? "理解风险并安装" : "确认安装";
+  installButton.textContent = actionLabel;
+  const title = byId("skillSecurityTitle");
+  if (title) title.textContent = isUpdate ? "更新前安全检查" : "安装前安全检查";
+  const description = byId("skillSecurityDescription");
+  if (description) description.textContent = isUpdate ? "扫描远程新版本；确认后只会替换这份已经检查的内容。" : "扫描的是隔离快照；确认后只会安装这份已经检查的内容。";
   const expiry = new Date(pending.expires_at || "");
   byId("skillSecurityExpiry").textContent = Number.isNaN(expiry.getTime()) ? "隔离快照会自动清理" : `隔离快照 ${expiry.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} 失效`;
 }
@@ -7299,12 +9185,32 @@ async function installSkill(sourceType, source) {
   toast("正在隔离并检查 Skill…");
   try {
     const result = await request("/api/skills/scan", { method: "POST", body: JSON.stringify({ source_type: sourceType, source }) });
-    state.skillInstallReview = { ...result, sourceType, source };
+    state.skillInstallReview = { ...result, sourceType, source, operation: "install" };
     renderSkillSecurityReview();
     const dialog = byId("skillSecurityDialog");
     if (dialog && !dialog.open) dialog.showModal();
     const verdict = String(result.scan?.verdict || "BLOCKED").toUpperCase();
     toast(verdict === "BLOCKED" ? "安全检查已阻止安装" : verdict === "REVIEW" ? "检查完成，请人工审查风险" : "安全检查通过，请确认安装", verdict === "BLOCKED");
+  } finally {
+    state.skillInstallBusy = false;
+  }
+}
+
+async function scanSkillUpdate(recordId) {
+  if (state.skillInstallBusy) {
+    toast("正在检查另一个 Skill，请稍候");
+    return;
+  }
+  state.skillInstallBusy = true;
+  toast("正在获取 Skill 新版本并检查…");
+  try {
+    const result = await request("/api/skills/update/scan", { method: "POST", body: JSON.stringify({ record_id: recordId }) });
+    state.skillInstallReview = { ...result, operation: "update", recordId };
+    renderSkillSecurityReview();
+    const dialog = byId("skillSecurityDialog");
+    if (dialog && !dialog.open) dialog.showModal();
+    const verdict = String(result.scan?.verdict || "BLOCKED").toUpperCase();
+    toast(verdict === "BLOCKED" ? "新版本未通过安全检查" : verdict === "REVIEW" ? "更新版本需要人工审查" : "新版本检查通过，请确认更新", verdict === "BLOCKED");
   } finally {
     state.skillInstallBusy = false;
   }
@@ -7332,20 +9238,29 @@ async function confirmSkillInstall() {
     return;
   }
   button.disabled = true;
-  button.textContent = "正在安装…";
+  const isUpdate = pending.operation === "update";
+  button.textContent = isUpdate ? "正在更新…" : "正在安装…";
   try {
-    const result = await request("/api/skills/install", {
+    const requestOptions = {
       method: "POST",
-      body: JSON.stringify({ scan_id: pending.scan_id, decision: "install", acknowledge_risk: acknowledgeRisk }),
-    });
+      body: JSON.stringify({ scan_id: pending.scan_id, decision: isUpdate ? "update" : "install", acknowledge_risk: acknowledgeRisk }),
+    };
+    const result = isUpdate
+      ? await request("/api/skills/update", requestOptions)
+      : await request("/api/skills/install", requestOptions);
     state.settings = result.settings || state.settings;
     state.extensions.skills = result.skills || [];
     closeSkillSecurityReview({ discard: false });
     byId("skillInstallForm")?.reset();
     renderModelSelectors();
     renderExtensions();
-    const count = (result.installed || []).length;
-    toast(count ? `已安全安装 ${count} 个 Skill` : "Skill 已安全安装");
+    if (isUpdate) {
+      await refreshExtensionUpdates({ quiet: true });
+      toast(`已安全更新 ${result.updated?.name || "Skill"}`);
+    } else {
+      const count = (result.installed || []).length;
+      toast(count ? `已安全安装 ${count} 个 Skill` : "Skill 已安全安装");
+    }
   } catch (error) {
     renderSkillSecurityReview();
     throw error;
@@ -7357,38 +9272,36 @@ async function installMarketSkill(skillId) {
 }
 
 function settingsHeading(title, description) {
-  return `<header class="settings-heading"><div><h1>${escapeHtml(title)}</h1><p>${escapeHtml(description)}</p></div><span class="save-indicator">${escapeHtml(copy("localSaved"))}</span></header>`;
+  return `<header class="settings-page-heading settings-heading"><div><h1>${escapeHtml(title)}</h1><p>${escapeHtml(description)}</p></div><span class="save-indicator">${escapeHtml(copy("localSaved"))}</span></header>`;
 }
 
 function renderGeneralSettings() {
-  const counts = state.notebook?.counts || {};
   const { provider, model } = activeModel();
-  const readyTools = (state.capabilities?.tools || []).filter((tool) => ["ready", "external"].includes(tool.status)).length;
   const appearance = appearancePreferences();
-  const languageChoices = [
-    ["zh-CN", "中文", "简体中文"],
-    ["en", "English", "English"],
-  ].map(([value, title, note]) => `<label class="appearance-choice"><input type="radio" name="appearance-locale" value="${value}" ${appearance.locale === value ? "checked" : ""} /><span class="appearance-choice-copy"><b>${title}</b><small>${note}</small></span><i aria-hidden="true"></i></label>`).join("");
-  const themeChoices = [
-    ["system", "layout"],
-    ["light", "sun"],
-    ["dark", "moon"],
-  ].map(([value, icon]) => `<label class="appearance-choice appearance-theme-choice"><input type="radio" name="appearance-theme" value="${value}" ${appearance.theme === value ? "checked" : ""} /><span class="appearance-option-icon">${uiIcon(icon)}</span><span class="appearance-choice-copy"><b>${escapeHtml(copy(value))}</b><small>${escapeHtml(copy(`${value}Detail`))}</small></span><i aria-hidden="true"></i></label>`).join("");
-  const accentChoices = ["jade", "ocean", "plum", "amber"].map((value) => `<label class="accent-choice" data-accent-choice="${value}"><input type="radio" name="appearance-accent" value="${value}" ${appearance.accent === value ? "checked" : ""} /><span class="accent-swatch" aria-hidden="true"></span><span>${escapeHtml(copy(value))}</span></label>`).join("");
+  const option = (value, label, selected) => `<option value="${escapeHtml(value)}" ${selected === value ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  const accentHex = {
+    jade: "#1F7D4E",
+    ocean: "#1875B6",
+    plum: "#7652AD",
+    amber: "#BB7518",
+  };
+  const accentOption = (value) => `<option value="${escapeHtml(value)}" data-accent-color="${accentHex[value]}" ${appearance.accent === value ? "selected" : ""}>${accentHex[value]}</option>`;
   const modelLabel = provider ? `${provider.name} · ${model?.name || ""}` : (appearance.locale === "en" ? "Not selected" : "未选择");
-  return `${settingsHeading(copy("settingsTitle"), copy("settingsDescription"))}
-    <form id="generalPreferencesForm" class="general-preferences-form">
-      <section class="settings-card appearance-card">
-        <header class="appearance-card-heading"><span class="appearance-card-mark">${uiIcon("sliders")}</span><div><h2>${escapeHtml(copy("appearanceTitle"))}</h2><p>${escapeHtml(copy("appearanceDescription"))}</p></div></header>
-        <div class="appearance-rule"></div>
-        <section class="appearance-setting-group"><div class="appearance-setting-copy"><h3>${escapeHtml(copy("interfaceLanguage"))}</h3><p>${escapeHtml(copy("interfaceLanguageHint"))}</p></div><div class="appearance-choice-grid">${languageChoices}</div></section>
-        <section class="appearance-setting-group"><div class="appearance-setting-copy"><h3>${escapeHtml(copy("appearanceTheme"))}</h3><p>${escapeHtml(copy("appearanceThemeHint"))}</p></div><div class="appearance-choice-grid appearance-theme-grid">${themeChoices}</div></section>
-        <section class="appearance-setting-group"><div class="appearance-setting-copy"><h3>${escapeHtml(copy("accentColor"))}</h3><p>${escapeHtml(copy("accentColorHint"))}</p></div><div class="accent-choice-grid">${accentChoices}</div></section>
-        <footer class="settings-footer-actions"><button type="submit" class="save-button">${escapeHtml(copy("saveAppearance"))}</button></footer>
+  return `<section class="settings-minimal-page general-settings-page">
+    <header class="settings-page-heading"><div><h1>${escapeHtml(copy("settingsTitle"))}</h1><p>${escapeHtml(copy("settingsDescription"))}</p></div></header>
+    <form id="generalPreferencesForm" class="settings-minimal-form">
+      <section class="settings-minimal-section"><h2>${escapeHtml(copy("appearanceTitle"))}</h2>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("interfaceLanguage"))}</strong><small>${escapeHtml(copy("interfaceLanguageHint"))}</small></span><select name="appearance-locale">${option("zh-CN", "简体中文", appearance.locale)}${option("en", "English", appearance.locale)}</select></label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("appearanceTheme"))}</strong><small>${escapeHtml(copy("appearanceThemeHint"))}</small></span><select name="appearance-theme">${option("system", copy("system"), appearance.theme)}${option("light", copy("light"), appearance.theme)}${option("dark", copy("dark"), appearance.theme)}</select></label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("accentColor"))}</strong><small>${escapeHtml(copy("accentColorHint"))}</small></span><select name="appearance-accent">${["jade", "ocean", "plum", "amber"].map(accentOption).join("")}</select></label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("fontScale"))}</strong><small>${escapeHtml(copy("fontScaleHint"))}</small></span><select name="appearance-font-scale">${option("small", copy("fontSmall"), appearance.font_scale)}${option("medium", copy("fontMedium"), appearance.font_scale)}${option("large", copy("fontLarge"), appearance.font_scale)}</select></label>
       </section>
+      <footer class="settings-minimal-actions"><span>${escapeHtml(copy("localSaved"))}</span><button type="submit" class="save-button">${escapeHtml(copy("saveAppearance"))}</button></footer>
     </form>
-    <section class="settings-card"><h2>${escapeHtml(copy("currentWorkspace"))}</h2><p>${escapeHtml(state.notebook?.title || copy("noWorkspace"))}</p><div class="setting-metrics"><div class="setting-metric"><b>${escapeHtml(counts.sources || 0)}</b><span>${escapeHtml(copy("sources"))}</span></div><div class="setting-metric"><b>${escapeHtml(counts.citations || 0)}</b><span>${escapeHtml(copy("citations"))}</span></div><div class="setting-metric"><b>${escapeHtml(counts.layers || 0)}</b><span>${escapeHtml(copy("layers"))}</span></div></div><p class="local-note">${escapeHtml(copy("currentModel"))}：${escapeHtml(modelLabel)}。${escapeHtml(copy("modelKeyNote"))}</p></section>
-    <section class="settings-card"><h2>${escapeHtml(copy("runtimeStatus"))}</h2><p>${readyTools} ${escapeHtml(copy("readyTools"))}</p></section>`;
+    <section class="settings-minimal-section settings-info-section"><h2>${escapeHtml(copy("currentWorkspace"))}</h2>
+      <div class="settings-row is-static"><span><strong>${escapeHtml(state.notebook?.title || copy("noWorkspace"))}</strong><small>${escapeHtml(copy("currentModel"))}</small></span><span class="settings-row-value">${escapeHtml(modelLabel)}</span></div>
+    </section>
+  </section>`;
 }
 
 function updateStatusCopy(update = state.update || {}) {
@@ -7450,10 +9363,13 @@ function renderModelsSettings() {
   const query = state.providerQuery.trim().toLocaleLowerCase();
   const matchesQuery = (item) => !query || `${item.name} ${item.category || ""} ${item.summary || ""}`.toLocaleLowerCase().includes(query);
   const catalogProviders = allProviders.filter((item) => item.kind !== "local" && matchesQuery(item));
-  const localProviders = allProviders.filter((item) => item.kind === "local");
-  const providerRow = (item, sortable = item.kind !== "local") => `<article class="cherry-provider-item ${item.id === provider.id ? "is-active" : ""} ${item.enabled ? "is-enabled" : "is-disabled"}" ${sortable ? `draggable="true" data-provider-drag-id="${escapeHtml(item.id)}"` : ""}><span class="cherry-provider-drag" aria-hidden="true" title="拖拽排序">${uiIcon("grip-vertical")}</span><button type="button" class="cherry-provider-button" data-action="select-provider" data-provider-id="${escapeHtml(item.id)}" aria-current="${item.id === provider.id ? "page" : "false"}">${providerLogo(item)}<span>${escapeHtml(item.name)}</span></button><button type="button" class="cherry-provider-status" data-action="toggle-provider-enabled" data-provider-id="${escapeHtml(item.id)}" aria-pressed="${item.enabled ? "true" : "false"}" title="${item.enabled ? "停用服务商" : "启用服务商"}">${item.enabled ? "ON" : "OFF"}</button></article>`;
+  // ON/OFF is the single source of truth for the provider's enabled state in
+  // the catalog. A second health/status label made the row wrap and repeated
+  // the same enabled/disabled meaning in a less scannable form.
+  const providerRow = (item, sortable = item.kind !== "local") => `<article class="cherry-provider-item ${item.id === provider.id ? "is-active" : ""} ${item.enabled ? "is-enabled" : "is-disabled"}" ${sortable ? `draggable="true" data-provider-drag-id="${escapeHtml(item.id)}"` : ""}><span class="cherry-provider-drag" aria-hidden="true" title="拖拽排序">${uiIcon("grip-vertical")}</span><button type="button" class="cherry-provider-button" data-action="select-provider" data-provider-id="${escapeHtml(item.id)}" aria-current="${item.id === provider.id ? "page" : "false"}">${providerLogo(item)}<span>${escapeHtml(item.name)}</span></button><button type="button" class="cherry-provider-status" data-action="toggle-provider-enabled" data-provider-id="${escapeHtml(item.id)}" aria-pressed="${item.enabled ? "true" : "false"}" aria-label="${item.enabled ? "停用服务商" : "启用服务商"}" title="${item.enabled ? "停用服务商" : "启用服务商"}"><span aria-hidden="true"></span></button></article>`;
   const providerItems = catalogProviders.map((item) => providerRow(item, !query)).join("");
-  const localRuntimeNotice = localProviders.length ? `<section class="cherry-local-runtime-notice"><span>${uiIcon("folder-open")}</span><div><strong>本机运行能力</strong><p>离线检索和已发现的 Hugging Face 模型不属于 API 服务商，统一在“本地模型”中管理。</p><button type="button" data-action="open-local-models">打开本地模型 ${uiIcon("arrow-up-right")}</button></div></section>` : "";
+  // Local runtime guidance belongs to the dedicated Local Models page.
+  const localRuntimeNotice = "";
   const groupedModels = new Map();
   const modelQuery = state.modelQuery.trim().toLocaleLowerCase();
   provider.models.forEach((model, index) => {
@@ -7469,11 +9385,11 @@ function renderModelsSettings() {
   const isManaged = provider.auth_mode === "managed";
   const keyField = isManaged ? `<p class="cherry-field-hint">此模型由 ScanSci 托管提供，使用时无需配置 API 密钥。</p>` : provider.kind !== "local" ? `<div class="cherry-key-row"><label class="cherry-field cherry-secret-field"><span>API 密钥${provider.api_key_configured ? '<em>已保存</em>' : ""}</span><span class="cherry-secret-control"><input name="provider-api-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${provider.api_key_configured ? "••••••••••••••••" : "输入后仅保存在系统凭据管理器"}" /><button type="button" class="cherry-secret-toggle" data-action="toggle-provider-key" aria-label="${provider.api_key_configured ? "显示已保存的 API 密钥" : "显示 API 密钥"}" aria-pressed="false" title="${provider.api_key_configured ? "显示已保存的密钥" : "显示密钥"}">${uiIcon("eye")}</button></span></label><button type="button" class="cherry-detect-button" data-action="test-provider" ${!provider.api_key_configured ? "disabled" : ""}>检 测</button></div><p class="cherry-field-hint">${provider.api_key_configured ? "密钥默认隐藏；仅在点击眼睛时从本机凭据管理器读取。" : "多个密钥可用英文逗号分隔。"}</p>` : `<p class="cherry-field-hint">内置证据引擎不需要 API 密钥。</p>`;
   const restoreDefaultButton = isBuiltInProvider(provider) ? '<button type="button" class="cherry-restore-default" data-action="restore-provider-default">恢复默认</button>' : "";
-  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key">移除密钥</button>' : ""}<button type="submit" class="cherry-save-button">保存</button>`;
+  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key">移除密钥</button>' : ""}<button type="button" class="cherry-text-button" data-action="refresh-model-health" ${state.modelHealth?.loading ? "disabled" : ""}>${state.modelHealth?.loading ? "检查中…" : "刷新状态"}</button><button type="submit" class="cherry-save-button">保存</button>`;
   return `<section class="cherry-model-services"><aside class="cherry-provider-catalog"><label class="cherry-provider-search"><svg class="cherry-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 5 5"></path></svg><input id="modelServiceSearch" type="search" value="${escapeHtml(state.providerQuery)}" placeholder="搜索模型平台..." autocomplete="off" /></label><div class="cherry-provider-scroll">${providerItems || '<div class="cherry-provider-empty">没有匹配的模型平台</div>'}${localRuntimeNotice}</div><button class="cherry-add-provider" type="button" data-action="add-provider">＋&nbsp; 添加</button></aside><main class="cherry-provider-panel"><form id="modelProviderForm"><header class="cherry-provider-header"><div><div class="cherry-provider-name">${providerLogo(provider)}<h1>${escapeHtml(provider.name)}</h1><button type="button" class="cherry-mini-gear" aria-label="服务商设置">⚙</button></div>${kindField}</div><div class="cherry-provider-header-actions">${providerHeaderActions}<span class="cherry-provider-header-divider" aria-hidden="true"></span><label class="cherry-toggle"><input name="provider-enabled" type="checkbox" ${provider.enabled ? "checked" : ""} /><span></span></label></div></header><section class="cherry-connection-section">${customNameField}${keyField}<label class="cherry-field"><span>API 地址 <i>⌁</i></span><input name="provider-base-url" value="${escapeHtml(provider.base_url || "")}" placeholder="https://api.example.com/v1" maxlength="500" ${isManaged ? "readonly" : ""} /></label><p class="cherry-endpoint-preview">预览：${escapeHtml(provider.base_url ? `${provider.base_url.replace(/\/$/, "")}/chat/completions` : "请填写服务商 API 地址")}</p></section><section class="cherry-model-section"><header><div class="cherry-model-section-title"><h2>模型</h2><b>${provider.models.length}</b></div><label class="cherry-model-search"><span>⌕</span><input id="modelListSearch" type="search" value="${escapeHtml(state.modelQuery)}" placeholder="搜索模型..." aria-label="搜索模型" autocomplete="off" /></label><div class="cherry-model-actions"><button type="button" class="cherry-fetch-button" data-action="fetch-provider-models" ${provider.kind === "local" || !provider.model_listing ? "disabled" : ""}>↻&nbsp; 获取模型列表</button><button type="button" class="cherry-plus-button" data-action="add-model" aria-label="添加模型">＋</button></div></header><div class="cherry-model-list">${modelRows || `<div class="cherry-provider-empty">${modelQuery ? "没有匹配的模型" : "尚未添加模型"}</div>`}</div></section><footer class="cherry-provider-footer"><button type="button" class="cherry-remove-provider" data-action="remove-provider" ${isBuiltInProvider(provider) ? "disabled" : ""}>移除服务商</button></footer>${modelEditorMarkup(provider)}</form></main></section>`;
 }
 
-function renderLocalModelsSettings() {
+function renderLegacyLocalModelsSettings() {
   const presets = (state.presets?.local_models || []).map((item) => `<button type="button" class="quiet-add-chip" data-action="add-local-preset" data-preset-id="${escapeHtml(item.id)}">＋ ${escapeHtml(item.name)}</button>`).join("");
   const installedItems = state.localModelMarket?.installed || [];
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
@@ -7499,68 +9415,312 @@ function renderLocalModelsSettings() {
       ? runtimeJob.error || runtimeJob.message || "安装未完成；继续安装会复用已下载内容。"
     : runtime.install_available
       ? "由 ScanSci 提供并按需安装；核心程序保持轻量，安装完成后可下载本地模型。"
-      : "当前发行渠道未提供本地运行能力；可连接 Ollama、LM Studio 使用已有模型，但不会下载无法执行的 Hugging Face 权重。";
+      : "当前发行渠道未提供本地运行能力；可连接 Ollama、LM Studio 使用已有模型，也可稍后手动安装。";
   const capabilityLabel = (kind) => ({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用");
+  const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
+  const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
+  const incompatibleInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible === false).length;
+  const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
   const installed = installedItems.map((item) => {
     const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
     const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
-    return `<article class="quiet-model-row"><span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.architecture || item.model_type || "Hugging Face")} · 自动发现</p><div class="local-capability-tags"><span>${capabilityLabel(kind)}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div></div><span class="quiet-row-note">${item.ready ? "已就绪" : "下载未完成"}</span><span class="quiet-row-size">${size}</span></article>`;
-  }).join("") || '<div class="quiet-empty">未发现本地 Hugging Face 快照。</div>';
-  const catalog = (state.localModelMarket?.catalog || []).map((item) => `<article class="quiet-model-row"><span class="quiet-model-mark is-muted">↓</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "Hugging Face")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span>${item.downloads ? `<span>${Intl.NumberFormat("zh-CN", { notation: "compact" }).format(item.downloads)} 下载</span>` : ""}</div></div>${item.installed ? `<span class="quiet-row-note">${item.ready ? "已安装" : "未完成"}</span>` : runtimeReady ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}">下载</button>` : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`}</article>`).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
+    const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
+    const status = unsupportedAudio ? "需下载原生格式" : item.ready ? "已就绪" : "下载未完成";
+    const detail = unsupportedAudio && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : "";
+    return `<article class="quiet-model-row"><span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span><div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${capabilityLabel(kind)}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${detail}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
+  }).join("") || '<div class="quiet-empty">未发现本地模型。</div>';
+  const ollama = state.ollama || {};
+  const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
+  const catalog = (state.localModelMarket?.catalog || []).map((item) => {
+    const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
+    const ready = isOllama ? Boolean(ollama.model_ready || item.ready) : Boolean(item.ready);
+    const installed = isOllama ? ready : Boolean(item.installed);
+    const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? audioRuntimeReady : runtimeReady;
+    const job = (state.localModelInstall?.jobs || []).find((candidate) => (
+      Array.isArray(candidate?.models) && candidate.models.includes(item.id)
+    )) || null;
+    const jobState = String(job?.state || "");
+    const jobActive = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(jobState);
+    const jobRetryable = ["failed", "cancelled", "interrupted", "paused"].includes(jobState);
+    const action = installed
+      ? `<span class="quiet-row-note">已安装</span>`
+      : jobActive
+        ? `<span class="quiet-row-note">${escapeHtml(downloadJobStatus(job).label)} · ${escapeHtml(downloadJobProgressSummary(job))}</span>`
+      : jobRetryable && job?.job_id
+        ? `<button type="button" class="quiet-text-button" data-action="control-download-task" data-download-kind="model" data-download-action="${jobState === "paused" ? "resume" : "retry"}" data-job-id="${escapeHtml(job.job_id)}">${jobState === "paused" ? "继续" : "重试"}</button>`
+      : canDownload
+        ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
+        : isOllama
+          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
+          : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
+    const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
+    return `<article class="quiet-model-row"><span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span><span>${status}</span></div></div>${action}</article>`;
+  }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   const runtimeRows = (state.settings.local_models || []).map((item, index) => ({ item, index })).filter(({ item }) => item.runtime !== "builtin").map(({ item, index }) => `<details class="quiet-runtime-row"><summary><span class="quiet-model-mark">◌</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.runtime)} · ${item.enabled ? "可用" : "已停用"}</small></span><span class="quiet-row-note">配置</span></summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>启用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button><button type="button" class="quiet-danger-button" data-action="remove-local-model" data-local-index="${index}">移除</button></div></div></details>`).join("") || '<div class="quiet-empty">尚未添加外部本地运行时。</div>';
-  const retrievalIds = new Set(["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B"]);
-  const retrievalReady = [...retrievalIds].every((id) => installedItems.some((item) => item.id === id && item.ready));
-  const retrievalJob = (state.localModelInstall?.jobs || []).find((item) => item.job_id === "retrieval-core") || null;
-  const retrievalState = !runtimeReady ? "runtime_required" : retrievalReady ? "ready" : String(retrievalJob?.state || "idle");
-  const retrievalProgress = retrievalReady ? 100 : Math.max(0, Math.min(100, Math.round(Number(retrievalJob?.progress || 0) * 100)));
-  const retrievalActive = ["queued", "downloading"].includes(retrievalState);
-  const retrievalNeedsRetry = ["failed", "cancelled", "interrupted"].includes(retrievalState);
-  const retrievalTitle = retrievalReady
-    ? "Qwen3 Embedding 0.6B + Qwen3 Reranker 0.6B"
-    : "基础关键词检索";
-  const retrievalDescription = !runtimeReady
-    ? runtimeDescription
-    : retrievalReady
-    ? "用于资料库语义检索与证据重排"
-    : "尚未安装 Qwen 检索模型；不会假称语义检索";
-  const retrievalStateLabel = retrievalState === "runtime_required" ? "需要运行时" : retrievalReady ? "已就绪" : retrievalActive ? `下载中 ${retrievalProgress}%` : retrievalNeedsRetry ? (retrievalState === "interrupted" ? "下载已中断" : "下载失败") : "未下载";
-  const retrievalAction = retrievalState === "runtime_required"
-    ? runtimeAction
-    : retrievalReady
-    ? `<span class="local-model-primary-ready">${uiIcon("check")} 已就绪</span>`
-    : retrievalActive
-      ? `<span class="local-model-primary-state">${escapeHtml(retrievalStateLabel)}</span>`
-      : `<button type="button" class="local-model-primary-action" data-action="install-retrieval-models">${uiIcon(retrievalState === "failed" ? "refresh" : "download")}${retrievalState === "failed" ? "重试" : "下载"}</button>`;
-  const retrievalProgressMarkup = retrievalActive
-    ? `<div class="resource-download-detail"><small>${escapeHtml(downloadJobTelemetry(retrievalJob) || "正在建立下载连接")}</small><div class="local-model-primary-progress" role="progressbar" aria-label="研究检索组件下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${retrievalProgress}"><span class="${progressWidthClass(retrievalProgress)}"></span></div></div>`
-    : "";
-  return `<section class="quiet-settings-page local-models-page local-models-page--compact"><header class="quiet-page-heading"><div><h1>本地模型</h1><p>模型与资料均保留在这台电脑上。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">刷新</button></header>
-    <section class="local-model-primary"><span class="local-model-primary-icon">${uiIcon("library")}</span><div class="local-model-primary-copy"><span>知识库检索 · ${escapeHtml(retrievalStateLabel)}</span><strong>${escapeHtml(retrievalTitle)}</strong><p>${escapeHtml(retrievalDescription)}</p>${retrievalProgressMarkup}</div><div class="local-model-primary-end">${retrievalAction}</div></section>
-    <p class="local-model-fallback">离线或小型资料库时，会自动使用基础关键词检索。</p>
+  const capabilityCards = ONBOARDING_RESOURCE_ORDER
+    .map((resourceId) => resourceInstallSnapshot(resourceId))
+    .map(resourceSetupCard)
+    .join("");
+  return `<section class="quiet-settings-page local-models-page local-models-page--compact"><header class="quiet-page-heading"><div><h1>本地模型</h1><p>这里是本地运行时、已安装模型和下载任务的唯一管理入口。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">刷新</button></header>
+    <section class="local-capability-section"><header><div><h2>能力状态</h2><p>每项能力独立安装、校验和启用；完成后不再显示下载进度。</p></div><span>嵌入 · 重排 · 对话 · 视觉 · 语音</span></header><div class="local-capability-grid">${capabilityCards}</div><p class="local-model-fallback">没有安装语义检索模型时，ScanSci 仍会使用基础关键词检索。</p></section>
     <details class="local-model-disclosure"><summary><span>已发现的模型</span><em>${installedItems.length}</em></summary><div class="quiet-model-list">${installed}</div></details>
     <details class="local-model-disclosure local-runtime-disclosure"><summary><span>本地运行时</span><em>${runtimeReady ? "已就绪" : "需要配置"}</em></summary><div class="local-model-disclosure-body"><p>${escapeHtml(runtimeDescription)}</p><div class="quiet-add-chips">${presets}</div><form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存更改</button></footer></form></div></details>
     <details class="local-model-disclosure"><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${catalog}</div></div></details></section>`;
 }
 
-function renderDocumentProcessingSettings() {
+const LOCAL_MODEL_CATEGORY_GROUPS = [
+  {
+    id: "retrieval",
+    eyebrow: "知识库能力",
+    title: "知识库检索",
+    description: "先安装嵌入和重排模型，才能获得更好的语义检索和证据排序。",
+    resources: ["embedding", "reranking"],
+  },
+  {
+    id: "multimodal",
+    eyebrow: "按需启用",
+    title: "对话与多模态",
+    description: "本地对话、图片理解和语音转写互相独立，按照你的电脑和工作方式选择。",
+    resources: ["chat", "vision", "audio"],
+  },
+];
+
+const LOCAL_MODEL_RECOMMENDATION_META = {
+  embedding: { label: "嵌入模型", icon: "sparkles", size: "约 1 GB", runtime: "Transformers" },
+  reranking: { label: "重排模型", icon: "filter", size: "约 1 GB", runtime: "Transformers" },
+  chat: { label: "本地对话模型", icon: "brain", size: "约 3 GB", runtime: "Transformers" },
+  vision: { label: "视觉模型", icon: "eye", size: "约 1.1 GB", runtime: "Transformers" },
+  audio: { label: "语音模型", icon: "audio", size: "约 2 GB", runtime: "Transformers" },
+};
+
+function localRecommendationCatalogItem(resource) {
+  const definition = ONBOARDING_RESOURCE_DEFINITIONS[resource];
+  const modelId = definition?.models?.[0] || "";
+  const catalogItem = (state.localModelMarket?.catalog || []).find((item) => item.id === modelId) || {};
+  const meta = LOCAL_MODEL_RECOMMENDATION_META[resource] || {};
+  return {
+    ...catalogItem,
+    id: modelId,
+    kind: catalogItem.kind || resource,
+    runtime: catalogItem.runtime || definition?.runtime || "huggingface",
+    name: catalogItem.name || definition?.detail || modelId,
+    description: catalogItem.description || definition?.description || "ScanSci 推荐的本地模型。",
+    size_hint: catalogItem.size_hint || meta.size || "按模型大小计算",
+  };
+}
+
+function localRecommendationStatus(resource) {
+  const job = resource.job || {};
+  const jobState = String(job.state || "");
+  if (resource.state === "ready") return { label: "已就绪", tone: "ready" };
+  if (["queued", "downloading", "installing", "runtime_installing"].includes(resource.state)) {
+    return { label: `${downloadJobStatus(job).label} · ${resource.progress}%`, tone: "loading" };
+  }
+  if (resource.state === "runtime_required") return { label: "需要准备本地能力", tone: "muted" };
+  if (resource.state === "runtime_failed") return { label: "运行时未完成", tone: "error" };
+  if (resource.state === "paused" || jobState === "paused") return { label: "已暂停", tone: "warning" };
+  if (["failed", "cancelled", "interrupted"].includes(resource.state) || ["failed", "cancelled", "interrupted"].includes(jobState)) {
+    return { label: "下载未完成", tone: "error" };
+  }
+  return { label: "尚未下载", tone: "muted" };
+}
+
+function localRecommendationAction(resource, item) {
+  const job = resource.job || {};
+  const jobState = String(job.state || "");
+  const active = ["queued", "downloading", "installing", "pausing", "cancelling", "runtime_installing"].includes(resource.state) || ["queued", "downloading", "installing"].includes(jobState);
+  if (resource.state === "ready") return `<span class="local-model-card-ready">${uiIcon("check")} 已安装</span>`;
+  if (active) return `<span class="local-model-card-progress-label">${escapeHtml(downloadJobTelemetry(job) || "正在准备本地模型")} · ${resource.progress}%</span>`;
+  if (["runtime_required", "runtime_failed"].includes(resource.state)) {
+    return `<button type="button" class="local-model-card-button is-secondary" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}">${uiIcon(resource.state === "runtime_failed" ? "refresh" : "download")} ${resource.state === "runtime_failed" ? "继续准备" : "准备本地能力"}</button>`;
+  }
+  if (["paused", "failed", "cancelled", "interrupted"].includes(resource.state) || ["paused", "failed", "cancelled", "interrupted"].includes(jobState)) {
+    if (job.job_id) {
+      const action = jobState === "paused" ? "resume" : "retry";
+      return `<button type="button" class="local-model-card-button" data-action="control-download-task" data-download-kind="model" data-download-action="${action}" data-job-id="${escapeHtml(job.job_id)}">${uiIcon(action === "resume" ? "play" : "refresh")} ${action === "resume" ? "继续下载" : "重试下载"}</button>`;
+    }
+  }
+  return `<button type="button" class="local-model-card-button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}">${uiIcon("download")} 下载</button>`;
+}
+
+function localRecommendationCard(resourceId) {
+  const definition = ONBOARDING_RESOURCE_DEFINITIONS[resourceId];
+  const meta = LOCAL_MODEL_RECOMMENDATION_META[resourceId] || {};
+  const resource = resourceInstallSnapshot(resourceId);
+  const item = localRecommendationCatalogItem(resourceId);
+  const status = localRecommendationStatus(resource);
+  return `<article class="local-model-recommendation is-${escapeHtml(status.tone)}"><header><span class="local-model-recommendation-icon">${uiIcon(meta.icon || definition.icon)}</span><div><span class="local-model-recommendation-type">${escapeHtml(meta.label || definition.title)}</span><h3>${escapeHtml(item.name)}</h3></div><em class="local-model-recommendation-status is-${escapeHtml(status.tone)}">${escapeHtml(status.label)}</em></header><p>${escapeHtml(item.description)}</p><div class="local-model-recommendation-meta"><span>${escapeHtml(item.size_hint || meta.size || "按模型大小计算")}</span><b>默认推荐</b></div><footer>${localRecommendationAction(resource, item)}</footer></article>`;
+}
+
+function localModelMarketRow(item, recommendedIds) {
+  const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
+  const ollama = state.ollama || {};
+  const incompatible = item.runtime_compatible === false;
+  const ready = !incompatible && (isOllama ? Boolean(ollama.model_ready || item.ready) : Boolean(item.ready));
+  const installed = isOllama ? ready : Boolean(item.installed);
+  const runtime = state.localRuntime || {};
+  const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? Boolean(runtime.installed) && ["source", "embedded", "component"].includes(String(runtime.mode || "")) : Boolean(runtime.installed);
+  const job = (state.localModelInstall?.jobs || []).find((candidate) => Array.isArray(candidate?.models) && candidate.models.includes(item.id)) || null;
+  const jobState = String(job?.state || "");
+  const active = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(jobState);
+  const retryable = ["failed", "cancelled", "interrupted", "paused"].includes(jobState);
+  const action = incompatible
+    ? `<span class="quiet-row-note">格式不兼容</span>`
+    : installed
+    ? `<span class="quiet-row-note">已安装</span>`
+    : active
+      ? `<span class="quiet-row-note">${escapeHtml(downloadJobStatus(job).label)} · ${escapeHtml(downloadJobProgressSummary(job))}</span>`
+      : retryable && job?.job_id
+        ? `<button type="button" class="quiet-text-button" data-action="control-download-task" data-download-kind="model" data-download-action="${jobState === "paused" ? "resume" : "retry"}" data-job-id="${escapeHtml(job.job_id)}">${jobState === "paused" ? "继续" : "重试"}</button>`
+        : canDownload
+          ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
+          : isOllama
+            ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装 / 启动 Ollama</button>`
+            : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
+  const status = incompatible ? "当前格式不可运行" : isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
+  const kind = item.kind || "chat";
+  return `<article class="quiet-model-row ${recommendedIds.has(item.id) ? "is-recommended" : ""}"><span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span><div><strong>${escapeHtml(item.name || item.id)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span><span>${escapeHtml(status)}</span></div></div>${action}</article>`;
+}
+
+function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
+  if (runtime.installed) return "";
+  const report = runtime.channels;
+  const channels = Array.isArray(report?.channels) ? report.channels : [];
+  const checked = Boolean(report?.checked_at);
+  const available = Boolean(report?.available);
+  const summary = !checked
+    ? "自动下载通道尚未检查"
+    : available
+      ? "自动下载通道可用"
+      : "自动下载暂不可用，可手动安装";
+  const channelRows = channels.length
+    ? `<div class="local-runtime-channel-list">${channels.map((item) => `<div><span>${escapeHtml(item.label || "下载通道")}</span><b class="${item.valid ? "is-ready" : "is-failed"}">${item.valid ? "可用" : "不可用"}</b></div>`).join("")}</div>`
+    : `<p class="local-runtime-channel-empty">点击“检查通道”后，ScanSci 会逐个验证清单是否可读；启动时不会因为网络探测而卡住。</p>`;
+  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0";
+  const checking = Boolean(runtime.channelsChecking);
+  return `<section class="local-runtime-recovery"><header><div><span>下载通道</span><strong>${escapeHtml(checking ? "正在检查自动通道…" : summary)}</strong></div><button type="button" class="quiet-text-button" data-action="check-local-runtime-channels" ${checking ? "disabled" : ""}>${uiIcon("refresh")} ${checking ? "检查中…" : checked ? "重新检查" : "检查通道"}</button></header>${channelRows}<div class="local-runtime-manual-fallback"><div><strong>网络仍不可用？可以手动安装</strong><p>从官方发布页下载 ZIP；如果是分片包，请把 JSON 清单和全部分片一起选中，ScanSci 会校验后再安装。</p></div><div class="local-runtime-recovery-actions"><button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地文件</button><a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开官方发布页 ${uiIcon("arrow-up-right")}</a></div></div></section>`;
+}
+
+function renderLocalModelsSettings() {
+  const installedItems = state.localModelMarket?.installed || [];
+  const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
+  const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
+  const incompatibleInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible === false).length;
+  const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
+  const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
+  const runtimeReady = Boolean(runtime.installed);
+  const runtimeJob = runtime.install_job || {};
+  const runtimeInstalling = ["queued", "installing"].includes(runtimeJob.state);
+  const runtimeNeedsRetry = ["failed", "cancelled", "interrupted"].includes(runtimeJob.state);
+  const runtimeProgress = Math.max(0, Math.min(100, Math.round(Number(runtimeJob.progress || 0) * 100)));
+  const ollama = state.ollama || {};
+  const presets = (state.presets?.local_models || [])
+    .filter((item) => ["ollama", "lm-studio", "llama.cpp"].includes(String(item.runtime || "").toLowerCase()))
+    .map((item) => `<button type="button" class="quiet-add-chip" data-action="add-local-preset" data-preset-id="${escapeHtml(item.id)}">＋ ${escapeHtml(item.name)}</button>`)
+    .join("");
+  const runtimeAction = runtimeReady
+    ? `<span class="local-model-primary-ready">${uiIcon("check")} 本地能力已就绪</span>`
+    : runtimeInstalling
+      ? `<span class="local-model-primary-state">${escapeHtml(runtimeJob.message || "正在安装")} ${runtimeProgress}%<small>${escapeHtml(downloadJobTelemetry(runtimeJob))}</small></span>`
+      : runtimeNeedsRetry && runtime.install_available
+        ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("refresh")} 继续安装</button>`
+        : runtime.install_available
+          ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")} 安装本地能力</button>`
+          : `<button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 查看安装选项</button>`;
+  const runtimeDescription = runtimeReady
+    ? "本地模型会在需要时自动加载；不需要用户选择运行时。"
+    : runtimeInstalling
+      ? "ScanSci 正在准备本地能力，完成后会自动纳入 Agent 的选择范围。"
+      : runtimeNeedsRetry
+        ? runtimeJob.error || runtimeJob.message || "安装未完成；继续安装会复用已下载内容。"
+        : runtime.install_available
+          ? "可选安装。没有本地模型时，ScanSci 仍会使用基础能力。"
+          : "可在默认能力页中按需添加；也可以手动连接已有的 Ollama、LM Studio 或 llama.cpp。";
+  const installed = installedItems.map((item) => {
+    const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
+    const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
+    const incompatible = item.runtime_compatible === false;
+    const status = incompatible ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : item.ready ? "可用" : "未完成";
+    return `<article class="quiet-model-row"><span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span><div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
+  }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
+  const manualRuntimeItems = (state.settings.local_models || [])
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !["builtin", "local-huggingface"].includes(String(item.runtime || "").toLowerCase()));
+  const manualRuntimeCount = manualRuntimeItems.length;
+  const runtimeRows = manualRuntimeItems
+    .map(({ item, index }) => {
+      const runtimeName = { ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp" }[String(item.runtime || "").toLowerCase()] || item.runtime || "本地运行时";
+      return `<article class="local-runtime-row"><header class="local-runtime-row-header"><div class="local-runtime-row-copy"><span class="local-runtime-row-icon">${uiIcon("cpu")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(runtimeName)} · ${item.enabled ? "Agent 可用" : "已停用"}</small></div></div><button type="button" class="local-runtime-remove" data-action="remove-local-model" data-local-index="${index}">移除</button></header><details class="local-runtime-edit"><summary>编辑连接</summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>允许 Agent 使用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button></div></div></details></article>`;
+    })
+    .join("") || '<div class="quiet-empty">没有手动连接也没关系，Agent 会优先检测 ScanSci 本地能力。</div>';
+  const installedByKind = (kind) => installedItems
+    .filter((item) => item.ready && item.runtime_compatible !== false && String(item.kind || "") === kind)
+    .sort((left, right) => {
+      const priority = (item) => {
+        const id = String(item.id || "").toLowerCase();
+        if (id.includes("qwen3")) return 0;
+        if (id.includes("bge")) return 1;
+        return 2;
+      };
+      return priority(left) - priority(right)
+        || Number(left.size_bytes || 0) - Number(right.size_bytes || 0)
+        || String(left.id || "").localeCompare(String(right.id || ""));
+    })[0];
+  const externalByKind = (kind) => (state.settings.local_models || []).find((item) => item.enabled && item.model_id && Array.isArray(item.capabilities) && item.capabilities.includes(kind));
+  const autoRoute = (kind) => {
+    const installedModel = installedByKind(kind);
+    if (installedModel) return { name: installedModel.name || installedModel.id, note: "本机已安装；Agent 按需加载", tone: "ready" };
+    const externalModel = externalByKind(kind);
+    if (externalModel) return { name: externalModel.name || externalModel.id, note: "已连接；调用前自动检测", tone: "ready" };
+    if (kind === "vision" && ollama.reachable && ollama.model_ready) return { name: "Ollama · MiniCPM-V 4.6", note: "已检测到外部连接；需要图片时自动使用", tone: "ready" };
+    if (["embedding", "reranking"].includes(kind)) return { name: "基础检索回退", note: "未安装语义模型，检索仍保持可用", tone: "fallback" };
+    return { name: "未配置（按需回退）", note: "需要时自动提示，不影响文字对话", tone: "muted" };
+  };
+  const agentRoutes = [
+    ["embedding", "知识库检索", "找到相关文献"],
+    ["reranking", "证据排序", "把更相关的片段排在前面"],
+    ["vision", "图片理解", "读取图表、截图和扫描页"],
+    ["audio", "语音识别", "把录音转换成文字"],
+  ].map(([kind, title, description]) => {
+    const route = autoRoute(kind);
+    return `<article class="local-agent-route is-${route.tone}"><span class="local-agent-route-mark">${uiIcon(kind === "vision" ? "eye" : kind === "audio" ? "audio" : kind === "reranking" ? "filter" : "database")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p></div><div class="local-agent-route-target"><b>${escapeHtml(route.name)}</b><small>${escapeHtml(route.note)}</small></div></article>`;
+  }).join("");
+  const runtimeRecovery = !runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "";
+  return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
+    <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${runtimeReady ? escapeHtml(runtimeDescription) : "本地模型是可选项；基础对话和关键词检索无需额外安装。"}</span><button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button></footer></section>
+    ${runtimeRecovery}
+    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list">${installed}</div></section>
+    <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
+    <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
+}
+
+function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", embedded = false) {
   const processing = state.settings.document_processing || {};
   const ocr = processing.ocr || { provider: "system", base_url: "", languages: ["zh", "en"], enabled: true };
   const mineru = processing.mineru || { provider: "mineru", base_url: "https://mineru.net", enabled: false };
   const ocrLanguages = new Set(ocr.languages || []);
   const paddleSelected = ocr.provider === "paddle";
   const ocrConnection = ocr.provider === "custom" ? `<div class="document-service-fields"><label class="setting-field"><span>API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "")}" placeholder="https://ocr.example.com/v1" maxlength="500" /></label><label class="setting-field"><span>API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "可选，保存后仅存于系统凭据管理器"}" /></label></div>` : ocr.provider === "system" ? `<p class="document-service-note">使用系统 OCR 识别扫描页与图片中的中英文文字，无需填写 API 密钥。</p>` : "";
-  const paddleGuide = ocr.provider !== "custom" ? `<aside class="paddle-ocr-guide ${paddleSelected ? "is-configuring" : ""}"><span class="paddle-ocr-guide-icon">P</span><div class="paddle-ocr-guide-main"><header><strong>PaddleOCR</strong><em>飞桨 AI Studio · 可选</em></header><p>${paddleSelected ? "粘贴个人 Access Token 即可；令牌仅保存在这台电脑的系统凭据管理器中。" : "需要更强的扫描件识别时，可使用个人 AI Studio Access Token。"}</p>${paddleSelected ? `<label class="setting-field paddle-ocr-token-field"><span>Access Token</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "粘贴 AI Studio Access Token"}" ${ocr.api_key_configured ? "" : "required"} /></label>` : ""}</div><div class="paddle-ocr-guide-actions"><a href="https://aistudio.baidu.com/account/accessToken" target="_blank" rel="noreferrer">获取 Token ${uiIcon("arrow-up-right")}</a>${paddleSelected ? "" : `<button type="button" data-action="configure-paddle-ocr">开始配置</button>`}</div></aside>` : "";
+  const paddleGuide = paddleSelected ? `<aside class="paddle-ocr-guide is-configuring"><span class="paddle-ocr-guide-icon">P</span><div class="paddle-ocr-guide-main"><header><strong>PaddleOCR</strong><em>飞桨 AI Studio</em></header><p>需要 PaddleOCR 时填写 Access Token；令牌只保存在这台电脑。</p><label class="setting-field paddle-ocr-token-field"><span>Access Token</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存；输入新值以替换" : "粘贴 AI Studio Access Token"}" ${ocr.api_key_configured ? "" : "required"} /></label></div><div class="paddle-ocr-guide-actions"><a href="https://aistudio.baidu.com/account/accessToken" target="_blank" rel="noreferrer">获取 Token ${uiIcon("arrow-up-right")}</a></div></aside>` : "";
   const mineruName = mineru.provider === "mineru" ? "MinerU" : "自定义文档解析服务";
-  return `${settingsHeading("文档处理", "配置扫描页识别与学术 PDF 解析服务。密钥不会写入工作区文件。")}
-    <form id="documentProcessingForm" class="document-processing-form">
+  const heading = embedded
+    ? `<header class="default-tools-heading"><div><span>文档处理工具</span><h2>OCR 与文档解析</h2><p>这里选择的是处理工具，不是对话模型。密钥只保存在这台电脑的系统凭据管理器中。</p></div><em>按需配置</em></header>`
+    : settingsHeading("文档处理", "配置扫描页识别与学术 PDF 解析服务。密钥不会写入工作区文件。");
+  return `${heading}
+    <form id="${escapeHtml(formId)}" class="document-processing-form${embedded ? " embedded-document-processing-form" : ""}">
       <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR 服务</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="system" ${ocr.provider === "system" ? "selected" : ""}>系统 OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<div class="document-language-row"><span>识别语言</span><div class="language-chips"><label><input name="ocr-language" type="checkbox" value="zh" ${ocrLanguages.has("zh") ? "checked" : ""} />中文</label><label><input name="ocr-language" type="checkbox" value="en" ${ocrLanguages.has("en") ? "checked" : ""} />English</label></div></div>${ocrConnection}</section>
       <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档解析</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">可填写多个 MinerU 密钥时请使用英文逗号分隔；密钥仅保存在当前电脑的系统凭据管理器中。</p></section>
       <div class="settings-footer-actions"><button type="submit" class="save-button">保存文档处理配置</button></div>
-    </form>`;
+    </form>`.replace('<h2>OCR 服务</h2>', '<h2>OCR</h2>').replace('<h2>文档解析</h2>', '<h2>文档处理</h2>');
 }
 
-function collectDocumentProcessingForm() {
-  const form = byId("documentProcessingForm");
+function renderDocumentProcessingSettings() {
+  return renderDocumentProcessingFormMarkup();
+}
+
+function collectDocumentProcessingForm(formId = "") {
+  const form = byId(formId) || byId("documentProcessingForm") || byId("defaultDocumentProcessingForm");
   if (!form) return state.settings.document_processing;
   state.settings.document_processing = {
     ocr: {
@@ -7578,38 +9738,143 @@ function collectDocumentProcessingForm() {
   return state.settings.document_processing;
 }
 
+function uniqueModelLabelParts(parts) {
+  const seen = new Set();
+  return parts
+    .map((part) => String(part || "").trim())
+    .filter((part) => {
+      const key = part.toLocaleLowerCase();
+      if (!part || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function modelOptionLabel(meta, modelName) {
+  const name = String(modelName || "").trim();
+  const metaParts = String(meta || "")
+    .split("·")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (metaParts[metaParts.length - 1] === name) metaParts.pop();
+  return [...uniqueModelLabelParts(metaParts), name].filter(Boolean).join(" · ");
+}
+
+function modelOptionMeta(provider, source = "") {
+  const providerName = String(provider?.name || "").trim();
+  if (provider?.kind === "local") return providerName || "本地";
+  if (provider?.auth_mode === "local") {
+    const runtime = String(provider?.runtime || "").trim().toLowerCase();
+    return {
+      ollama: "Ollama",
+      "lm-studio": "LM Studio",
+      "llama.cpp": "llama.cpp",
+      "local-huggingface": "本地 Hugging Face",
+    }[runtime] || "本地运行时";
+  }
+  const sourceName = provider?.auth_mode === "managed" ? "ScanSci" : source;
+  return uniqueModelLabelParts([sourceName, providerName]).join(" · ");
+}
+
+function localModelOptionMeta(model) {
+  const runtime = String(model?.runtime || "").trim().toLowerCase();
+  return {
+    builtin: "ScanSci",
+    ollama: "Ollama",
+    "lm-studio": "LM Studio",
+    "llama.cpp": "llama.cpp",
+    "local-huggingface": "本地 Hugging Face",
+  }[runtime] || "本地";
+}
+
+function settingsModelOptionAttributes(modelName, modelMeta) {
+  return `data-model-name="${escapeHtml(modelName)}" data-model-meta="${escapeHtml(modelMeta)}"`;
+}
+
 function modelTargetOptions(selected = "", capability = "") {
-  const options = ['<option value="">未指定</option>'];
+  const automatic = selected === "auto" || selected === "local:builtin-evidence";
+  const options = [`<option value="auto" ${automatic ? "selected" : ""} ${settingsModelOptionAttributes("Agent 自动选择（推荐）", "ScanSci Agent")}>Agent 自动选择（推荐）</option>`];
   for (const provider of (state.settings.providers || []).filter(isProviderUsable)) {
+    if (provider.id === "local-evidence") continue;
     for (const model of provider.models || []) {
       if (capability && !(model.capabilities || []).includes(capability)) continue;
       const value = `provider:${provider.id}:${model.id}`;
-      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>API · ${escapeHtml(provider.name)} · ${escapeHtml(model.name)}</option>`);
+      const source = provider.kind === "local" ? "本地" : provider.auth_mode === "managed" ? "ScanSci" : "API";
+      const modelName = String(model.name || model.id);
+      const modelMeta = modelOptionMeta(provider, source);
+      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
     }
   }
   for (const model of state.settings.local_models || []) {
-    if (capability && model.runtime !== "builtin") continue;
+    if (model.enabled === false || model.runtime_compatible === false) continue;
+    const capabilities = new Set(model.capabilities || []);
+    const builtinRetrieval = model.runtime === "builtin" && ["embedding", "reranking", "retrieval"].includes(capability);
+    if (builtinRetrieval) continue;
+    if (capability && !capabilities.has(capability) && !builtinRetrieval) continue;
     const value = `local:${model.id}`;
-    options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""}>本地 · ${escapeHtml(model.name)}</option>`);
+    const modelName = String(model.name || model.id);
+    const modelMeta = localModelOptionMeta(model);
+    options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
   }
   return options.join("");
 }
 
-function renderRoutingSettings() {
-  const definitions = [
-    ["reasoning", "推理", "规划任务、比较证据与作出判断"],
-    ["writing", "写作", "回答、综述与长文生成"],
-    ["retrieval", "检索", "从本地资料库召回候选证据"],
-    ["embedding", "嵌入", "构建语义索引"],
-    ["reranking", "重排", "对候选片段重新排序"],
-    ["vision", "视觉", "理解论文图表、图片和扫描页"],
-    ["slides", "演示", "规划 PPT 结构与讲述节奏"],
-  ];
+function defaultConversationModelOptions(selected = "") {
+  const options = ['<option value="">未指定（使用系统回退）</option>'];
+  const seen = new Set();
+  for (const provider of (state.settings.providers || [])) {
+    for (const model of provider.models || []) {
+      const value = `${provider.id}::${model.id}`;
+      if (seen.has(value) || !isConversationModel(model)) continue;
+      const usable = isProviderUsable(provider) && isSelectableConversationModel(model, provider);
+      if (!usable && value !== selected) continue;
+      seen.add(value);
+      const source = provider.kind === "local" ? "本地" : provider.auth_mode === "managed" ? "ScanSci" : "API";
+      const modelName = String(model.name || model.id);
+      const modelMeta = modelOptionMeta(provider, source);
+      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
+    }
+  }
+  return options.join("");
+}
+
+function defaultCapabilityRow({ id, title, description, capability, conversation = false }) {
   const roles = state.settings.model_roles || {};
-  const rows = definitions.map(([id, name, description]) => `<label class="routing-row"><span><strong>${name}</strong><small>${description}</small></span><select data-model-role="${id}">${modelTargetOptions(roles[id] || "")}</select></label>`).join("");
-  return `${settingsHeading("模型路由", "为不同科研任务指定模型。模型服务与本地模型可以各司其职。")}
-    <section class="routing-callout"><span>R</span><div><strong>任务级切换仍然保留</strong><p>主页选择的是当前对话模型；这里定义 Agent 在后台检索、写作、视觉和演示任务中的默认分工。</p></div></section>
-    <form id="modelRoleForm"><section class="routing-list">${rows}</section><div class="settings-footer-actions"><button type="submit" class="save-button">保存模型路由</button></div></form>`;
+  const options = conversation
+    ? defaultConversationModelOptions(`${state.settings.active_model?.provider_id || ""}::${state.settings.active_model?.model_id || ""}`)
+    : modelTargetOptions(roles[id] || "", capability);
+  return `<label class="default-capability-row"><span class="default-capability-copy"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span><select name="${conversation ? "default-conversation-model" : `model-role-${id}`}" ${conversation ? "data-default-conversation-model" : `data-model-role="${escapeHtml(id)}"`}>${options}</select></label>`;
+}
+
+function defaultCapabilityPanel(eyebrow, title, description, rows) {
+  return `<section class="settings-minimal-section default-capability-panel"><header><h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p></header><div class="default-capability-list">${rows}</div></section>`;
+}
+
+function renderDefaultCapabilitiesSettings() {
+  const assistantRows = defaultCapabilityRow({ conversation: true, title: "默认助手模型", description: "对话、任务、写作和演示统一使用。" });
+  const multimodalRows = [
+    { id: "vision", title: "视觉模型", description: "理解图片、图表和扫描页面。", capability: "vision" },
+    { id: "audio", title: "语音模型", description: "把录音转成文字。", capability: "audio" },
+  ].map((item) => defaultCapabilityRow(item)).join("");
+  const retrievalRows = [
+    { id: "embedding", title: "嵌入模型", description: "建立知识库语义索引。", capability: "embedding" },
+    { id: "reranking", title: "重排模型", description: "提高证据片段排序。", capability: "reranking" },
+    { id: "retrieval", title: "基础检索", description: "语义模型不可用时的关键词回退。", capability: "retrieval" },
+  ].map((item) => defaultCapabilityRow(item)).join("");
+  return `<section class="settings-minimal-page default-capabilities-page"><header class="settings-page-heading default-capabilities-heading"><div><h1>默认能力</h1><p>选择 ScanSci 在不同任务中默认使用的能力。</p></div><button type="button" class="quiet-text-button" data-action="open-resource-guide">添加本地能力 ${uiIcon("arrow-right")}</button></header>
+    <form id="defaultCapabilitiesForm"><div class="settings-minimal-sections">
+      ${defaultCapabilityPanel("助手", "默认助手", "对话、任务、写作和演示使用同一个默认模型。", assistantRows)}
+      ${defaultCapabilityPanel("多模态", "图片与语音", "没有配置时，相关功能会自动使用可用回退。", multimodalRows)}
+      ${defaultCapabilityPanel("知识库", "语义检索", "嵌入和重排可以独立选择；基础检索始终可用。", retrievalRows)}
+    </div><footer class="settings-minimal-actions"><span>配置仅保存在此电脑</span><button type="submit" class="save-button">保存默认能力</button></footer></form>
+    <section class="default-tools-section default-tools-disclosure">${renderDocumentProcessingFormMarkup("defaultDocumentProcessingForm", true)}</section>
+  </section>`;
+}
+
+// Keep the old function name as a compatibility shim for deep links created by
+// earlier releases.  The visible settings entry is now “默认能力”.
+function renderRoutingSettings() {
+  return renderDefaultCapabilitiesSettings();
 }
 
 function renderRecordsSettings(kind) {
@@ -7664,7 +9929,6 @@ function renderMcpMarketplaceSettings() {
   const items = mcpCatalogItems();
   const installed = state.settings?.mcp_servers || [];
   const installedIds = new Set(installed.map((item) => item.catalog_id).filter(Boolean));
-  const source = catalogue.source || { name: "Official MCP Registry", api_version: "v0.1" };
   const tabs = [
     ["public", "发现 MCP", `${catalogue.items?.length || 0}`],
     ["mine", "我的服务器", `${installed.length}`],
@@ -7674,7 +9938,7 @@ function renderMcpMarketplaceSettings() {
     ? renderMyMcpServers(installed)
     : renderMcpMarketplaceCards(items, installedIds, catalogue.loading);
   return `<section class="mcp-marketplace">
-    <header class="mcp-market-hero"><div class="mcp-market-hero-copy"><p class="mcp-market-eyebrow">MCP MARKETPLACE</p><h1>MCP 广场</h1><p>为研究任务挑选可连接的工具、数据和服务。以官方 MCP Registry 为统一供给端，并用科研学科标签完成筛选。</p><div class="mcp-source-line">${uiIcon("server")}<span>${escapeHtml(source.name)} · ${escapeHtml(source.api_version || "v0.1")}</span><a href="${escapeHtml(source.url || "https://registry.modelcontextprotocol.io/")}" target="_blank" rel="noopener">查看来源 ${uiIcon("arrow-up-right")}</a></div></div><div class="mcp-market-orbit" aria-hidden="true"><i></i><b></b><em></em></div></header>
+    <header class="mcp-market-hero"><div class="mcp-market-hero-copy"><p class="mcp-market-eyebrow">工具市场</p><h1>MCP 广场</h1><p>为研究任务挑选可连接的工具、数据和服务。</p></div><div class="mcp-market-orbit" aria-hidden="true"><i></i><b></b><em></em></div></header>
     <div class="mcp-market-toolbar"><nav class="mcp-market-tabs" aria-label="MCP 市场页面">${tabs}</nav><div class="mcp-market-toolbar-actions"><button type="button" class="mcp-create-button" data-action="open-mcp-manual">${uiIcon("plus")}创建 MCP</button><button type="button" class="mcp-sync-button" data-action="sync-mcp-marketplace" ${catalogue.loading ? "disabled" : ""}>${uiIcon("refresh")}${catalogue.loading ? "正在同步" : "同步官方目录"}</button></div></div>
     ${state.mcpMarketplaceTab === "public" ? controls : ""}
     ${content}
@@ -7701,14 +9965,16 @@ function renderMcpMarketplaceCards(items, installedIds, loading) {
     const joined = installedIds.has(item.id);
     const disciplines = (item.disciplines || []).slice(0, 2).map((identifier) => `<span class="mcp-discipline-tag">${escapeHtml(mcpDisciplineLabel(identifier))}</span>`).join("");
     const tags = (item.tags || []).slice(0, 2).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("");
-    return `<article class="mcp-market-card"><div class="mcp-card-top"><span class="mcp-card-icon">${uiIcon("server")}</span><span class="mcp-card-version">v${escapeHtml(item.version || "—")}</span></div><h2 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h2><p>${escapeHtml(item.description)}</p><div class="mcp-card-tags">${disciplines}${tags}</div><footer><span class="mcp-card-source">${uiIcon("check")}官方目录</span><span class="mcp-card-transport">${escapeHtml(mcpTransportLabel(item))}</span></footer><button type="button" class="mcp-install-button ${joined ? "is-added" : ""}" data-action="${joined ? "mcp-set-tab" : "install-mcp-marketplace"}" ${joined ? 'data-mcp-tab="mine"' : `data-mcp-id="${escapeHtml(item.id)}"`}>${joined ? `${uiIcon("check")}已加入` : `${uiIcon("plus")}加入我的服务器`}</button></article>`;
+    return `<article class="mcp-market-card"><div class="mcp-card-top"><span class="mcp-card-icon">${uiIcon("server")}</span></div><h2 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h2><p>${escapeHtml(item.description)}</p><div class="mcp-card-tags">${disciplines}${tags}</div><footer><span class="mcp-card-transport">${escapeHtml(mcpTransportLabel(item))}</span></footer><button type="button" class="mcp-install-button ${joined ? "is-added" : ""}" data-action="${joined ? "mcp-set-tab" : "install-mcp-marketplace"}" ${joined ? 'data-mcp-tab="mine"' : `data-mcp-id="${escapeHtml(item.id)}"`}>${joined ? `${uiIcon("check")}已加入` : `${uiIcon("plus")}加入我的服务器`}</button></article>`;
   }).join("")}</section>`;
 }
 
 function renderMyMcpServers(servers) {
   const records = servers.length ? servers.map((server) => {
     const connector = ({ zotero: "Zotero", obsidian: "Obsidian", general: "通用" })[server.connector_kind] || "通用";
-    return `<article class="mcp-owned-record"><span class="mcp-owned-icon">${uiIcon("server")}</span><div><header><h2>${escapeHtml(server.name)}</h2><span>${escapeHtml(server.source || "自定义 MCP")} · ${connector}</span></header><p>${escapeHtml(server.description || "未添加说明")}</p><small>${escapeHtml(server.transport === "streamable-http" ? server.endpoint : [server.command, server.args].filter(Boolean).join(" ") || "等待填写连接信息")}</small><small>${server.allow_write ? "已授权写操作" : "只读工具；写操作未授权"}</small></div><div class="mcp-owned-actions"><button type="button" data-action="test-mcp-server" data-record-id="${escapeHtml(server.id)}">测试</button><label class="mcp-enabled-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" ${server.enabled ? "checked" : ""} /><span>${server.enabled ? "启用" : "停用"}</span></label><button type="button" data-action="remove-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" aria-label="移除 ${escapeHtml(server.name)}">${uiIcon("x")}</button></div></article>`;
+    const update = (state.mcpMarketplace.updates || []).find((item) => String(item.id || "") === String(server.id || ""));
+    const updateMarkup = update?.available ? `<button type="button" class="mcp-update-button" data-action="update-mcp-marketplace" data-record-id="${escapeHtml(server.id)}">更新</button>` : "";
+    return `<article class="mcp-owned-record"><span class="mcp-owned-icon">${uiIcon("server")}</span><div><header><h2>${escapeHtml(server.name)}</h2><span>${escapeHtml(server.source || "自定义 MCP")} · ${connector}</span></header><p>${escapeHtml(server.description || "未添加说明")}</p><small>${escapeHtml(server.transport === "streamable-http" ? server.endpoint : [server.command, server.args].filter(Boolean).join(" ") || "等待填写连接信息")}</small><small>${server.allow_write ? "已授权写操作" : "只读工具；写操作未授权"}</small></div><div class="mcp-owned-actions"><button type="button" data-action="test-mcp-server" data-record-id="${escapeHtml(server.id)}">测试</button>${updateMarkup}<label class="mcp-enabled-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" ${server.enabled ? "checked" : ""} /><span>${server.enabled ? "启用" : "停用"}</span></label><button type="button" data-action="remove-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" aria-label="移除 ${escapeHtml(server.name)}">${uiIcon("x")}</button></div></article>`;
   }).join("") : `<div class="mcp-market-empty is-mine">${uiIcon("server")}<strong>还没有已保存的 MCP</strong><p>从“发现 MCP”添加官方目录中的服务器，或登记自己的本地/远程连接。</p></div>`;
   return `<section class="mcp-owned-list">${records}</section><button type="button" class="mcp-manual-trigger" data-action="open-mcp-manual">${uiIcon("plus")}创建自定义 MCP</button>`;
 }
@@ -7734,6 +10000,7 @@ async function loadMcpMarketplace({ force = false } = {}) {
   try {
     const payload = await request("/api/mcp/marketplace");
     state.mcpMarketplace = { ...payload, loaded: true, loading: false };
+    maybeAutoSyncMcpMarketplace();
     return state.mcpMarketplace;
   } finally {
     if (state.mcpMarketplace.loading) state.mcpMarketplace.loading = false;
@@ -7741,14 +10008,22 @@ async function loadMcpMarketplace({ force = false } = {}) {
   }
 }
 
-async function syncMcpMarketplace() {
+function maybeAutoSyncMcpMarketplace() {
+  const last = Number(window.localStorage.getItem("scansci.mcp.market.last-sync") || 0);
+  if (last && Date.now() - last < 24 * 60 * 60 * 1000) return;
+  window.localStorage.setItem("scansci.mcp.market.last-sync", String(Date.now()));
+  syncMcpMarketplace({ quiet: true }).catch(() => {});
+}
+
+async function syncMcpMarketplace({ quiet = false } = {}) {
   state.mcpMarketplace.loading = true;
   refreshMcpMarketplaceSurface();
   try {
     const payload = await request("/api/mcp/marketplace/sync", { method: "POST", body: "{}" });
     state.mcpMarketplace = { ...payload, loaded: true, loading: false };
     const count = payload.sync?.fetched || payload.cached_count || 0;
-    toast(`已从官方目录同步 ${count} 个科研相关 MCP`);
+    window.localStorage.setItem("scansci.mcp.market.last-sync", String(Date.now()));
+    if (!quiet) toast(`已从官方目录同步 ${count} 个科研相关 MCP`);
   } catch (error) {
     state.mcpMarketplace.loading = false;
     throw error;
@@ -7851,16 +10126,80 @@ function collectLocalModelsForm() {
 async function refreshLocalModelMarket() {
   const query = String(state.localModelMarket?.query || "").trim();
   state.localModelMarket.loading = true;
-  const [installed, catalog, runtime] = await Promise.all([
+  const [installed, catalog, runtime, ollama] = await Promise.all([
     request("/api/local-models/installed"),
     request(`/api/local-models/market${query ? `?q=${encodeURIComponent(query)}` : ""}`),
     request("/api/local-runtime").catch(() => state.localRuntime),
+    request("/api/ollama/status").catch(() => state.ollama),
   ]);
   state.localModelMarket = { installed: installed.models || [], catalog: catalog.items || [], source: catalog.source || "", query, loading: false };
-  state.localRuntime = runtime || state.localRuntime;
+  state.localRuntime = { ...(state.localRuntime || {}), ...(runtime || {}) };
+  state.ollama = ollama || state.ollama;
   state.settings = await request("/api/settings");
+  await refreshModelHealth({ render: false });
   renderModelSelectors();
-  if (state.activeView === "settings" && state.activeSettings === "local-models") renderSettings();
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+}
+
+async function updateMcpMarketplaceServer(identifier) {
+  const payload = await request("/api/mcp/marketplace/update", { method: "POST", body: JSON.stringify({ id: identifier }) });
+  state.settings = payload.settings || state.settings;
+  state.mcpMarketplace.updates = (state.mcpMarketplace.updates || []).map((item) => item.id === identifier ? (payload.update || item) : item);
+  renderModelSelectors();
+  refreshMcpMarketplaceSurface();
+  toast(payload.updated ? "MCP 配置已更新；尚未启动连接进程" : "这个 MCP 已是最新版本");
+}
+
+async function checkLocalRuntimeChannels() {
+  state.localRuntime = { ...(state.localRuntime || {}), channelsChecking: true };
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  try {
+    const report = await request("/api/local-runtime/channels");
+    state.localRuntime = { ...(state.localRuntime || {}), channels: report, channelsChecking: false };
+    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    const healthy = (report.channels || []).filter((item) => item.valid).length;
+    toast(healthy ? `已找到 ${healthy} 个可用资源通道` : "自动资源通道暂不可用，可使用本地文件安装", !healthy);
+    return report;
+  } catch (error) {
+    state.localRuntime = { ...(state.localRuntime || {}), channelsChecking: false };
+    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    throw error;
+  }
+}
+
+async function chooseLocalRuntimeFiles() {
+  const picker = window.pywebview?.api?.choose_local_runtime_files;
+  if (typeof picker !== "function") {
+    toast("浏览器预览不能读取本地路径，请在 ScanSci 桌面应用中选择组件文件。", true);
+    return;
+  }
+  const paths = Array.from(await picker() || []).map(String).filter(Boolean);
+  if (!paths.length) return;
+  const job = await request("/api/local-runtime/install-local", {
+    method: "POST",
+    body: JSON.stringify({ paths }),
+  });
+  state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
+  scheduleLocalRuntimeInstallPoll();
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  renderDownloadActivity();
+  toast("已开始校验本地组件；校验通过后才会启用。");
+}
+
+async function refreshModelHealth({ render = true } = {}) {
+  state.modelHealth = { ...(state.modelHealth || {}), loading: true };
+  try {
+    const snapshot = await request("/api/model-health");
+    state.modelHealth = { ...(snapshot || {}), loading: false };
+  } catch (error) {
+    state.modelHealth = { ...(state.modelHealth || {}), loading: false, error: error?.message || "无法读取模型状态" };
+    if (render) throw error;
+  }
+  if (render) {
+    renderModelSelectors();
+    if (state.activeView === "settings" && ["models", "local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  }
+  return state.modelHealth;
 }
 
 function collectModelRoleForm() {
@@ -7868,6 +10207,26 @@ function collectModelRoleForm() {
     state.settings.model_roles[select.dataset.modelRole] = select.value;
   });
   return state.settings.model_roles;
+}
+
+function collectDefaultCapabilitiesForm() {
+  const form = byId("defaultCapabilitiesForm");
+  if (!form) return state.settings.model_roles;
+  const conversation = String(form.elements["default-conversation-model"]?.value || "");
+  if (conversation.includes("::")) {
+    const separator = conversation.indexOf("::");
+    const providerId = conversation.slice(0, separator);
+    const modelId = conversation.slice(separator + 2);
+    if (providerId && modelId) {
+      state.settings.active_model = { provider_id: providerId, model_id: modelId };
+      // The product exposes one user-facing assistant model.  Keep the
+      // legacy role fields synchronized so task, writing, and slide flows use
+      // exactly the same model without making users configure them separately.
+      const reference = `provider:${providerId}:${modelId}`;
+      for (const role of ["reasoning", "writing", "slides"]) state.settings.model_roles[role] = reference;
+    }
+  }
+  return collectModelRoleForm();
 }
 
 function ensureActiveModel() {
@@ -7899,33 +10258,62 @@ function newRecord(kind, form) {
 }
 
 async function handleSettingsAction(action, element) {
+  if (action === "open-resource-guide") {
+    openResourceGuideOverlay();
+    return;
+  }
+  if (action === "close-resource-guide") {
+    await closeResourceGuideOverlay(element.dataset.resourceGuideResult || "skip");
+    return;
+  }
   if (action === "start-onboarding-resource") {
     await startOnboardingResource(element.dataset.resourceId || "retrieval");
     return;
   }
   if (action === "reopen-resource-onboarding") {
-    state.onboardingStep = "resources";
+    state.onboardingMode = "";
+    state.onboardingStep = "welcome";
     state.onboardingOpen = true;
     renderResourceOnboarding();
     return;
   }
   if (action === "open-data-onboarding") {
-    state.onboardingStep = "sources";
-    state.onboardingOpen = true;
+    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开知识库；资料接入可随时完成", { close: true });
+    openMode("library");
+    return;
+  }
+  if (action === "onboarding-next") {
+    state.onboardingStep = state.onboardingStep === "welcome" ? "models" : "knowledge";
     renderResourceOnboarding();
     return;
   }
+  if (action === "onboarding-back") {
+    state.onboardingStep = state.onboardingStep === "knowledge" ? "models" : "welcome";
+    renderResourceOnboarding();
+    return;
+  }
+  if (action === "onboarding-open-models") {
+    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开本地能力引导；模型可以按需下载", { close: true });
+    openSettings("resources");
+    return;
+  }
+  if (action === "onboarding-open-knowledge") {
+    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开知识库；资料可以按需接入", { close: true });
+    openMode("library");
+    return;
+  }
   if (action === "advance-resource-onboarding" || action === "finish-resource-onboarding") {
-    state.onboardingStep = "sources";
+    state.onboardingStep = "models";
     renderResourceOnboarding();
     return;
   }
   if (action === "back-resource-onboarding") {
-    state.onboardingStep = "resources";
+    state.onboardingStep = "welcome";
     renderResourceOnboarding();
     return;
   }
   if (action === "skip-resource-onboarding") {
+    state.onboardingMode = "";
     await persistOnboardingPreferences({ welcome_dismissed: true }, "已暂时跳过首次配置；可随时在设置中继续", { close: true });
     return;
   }
@@ -7963,6 +10351,7 @@ async function handleSettingsAction(action, element) {
       String(failed.path || ""),
       String(failed.library_kind || "folder"),
       String(failed.notebook_id || ""),
+      String(failed.data_dir || ""),
     );
     return;
   }
@@ -8067,6 +10456,7 @@ async function handleSettingsAction(action, element) {
     provider.enabled = false;
     await persistSettings("已移除提供商密钥");
     state.settings = await request(`/api/settings/providers/${encodeURIComponent(provider.id)}/api-key`, { method: "POST", body: JSON.stringify({ api_key: "" }) });
+    await refreshModelHealth({ render: false });
     renderModelSelectors();
     renderSettings();
     return;
@@ -8178,27 +10568,40 @@ async function handleSettingsAction(action, element) {
     const provider = collectProviderForm();
     await persistSettings("正在测试连接…");
     const result = await request(`/api/settings/providers/${encodeURIComponent(provider.id)}/test`, { method: "POST", body: "{}" });
+    await refreshModelHealth({ render: false });
+    renderSettings();
     toast(`${result.provider || provider.name}：${result.message || "连接正常"}`);
+    return;
+  }
+  if (action === "refresh-model-health") {
+    await refreshModelHealth();
+    toast("模型可用状态已刷新");
     return;
   }
   if (action === "add-local-preset") {
     collectLocalModelsForm();
     const preset = (state.presets?.local_models || []).find((item) => item.id === element.dataset.presetId);
     if (!preset) return;
+    state.localRuntimeManualOpen = true;
     const existing = state.settings.local_models.find((item) => item.id === preset.id);
     if (existing) {
       renderSettings();
+      document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
       toast(`${existing.name} 已在列表中`);
       return;
     }
     state.settings.local_models.push(structuredClone(preset));
     renderSettings();
+    document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
     return;
   }
   if (action === "remove-local-model") {
     collectLocalModelsForm();
-    state.settings.local_models.splice(Number(element.dataset.localIndex), 1);
+    const removed = state.settings.local_models.splice(Number(element.dataset.localIndex), 1)[0];
+    state.localRuntimeManualOpen = true;
     renderSettings();
+    if (removed) toast(`${removed.name || "本地连接"} 已移除；点击“保存手动连接”后生效`);
+    document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
     return;
   }
   if (action === "test-local-model") {
@@ -8212,10 +10615,23 @@ async function handleSettingsAction(action, element) {
     refreshLocalModelMarket().catch((error) => toast(error.message, true));
     return;
   }
+  if (action === "check-local-runtime-channels") {
+    checkLocalRuntimeChannels().catch((error) => toast(error.message, true));
+    return;
+  }
+  if (action === "choose-local-runtime-files") {
+    chooseLocalRuntimeFiles().catch((error) => toast(error.message, true));
+    return;
+  }
   if (action === "open-local-runtime-setup") {
-    state.activeSettings = "local-models";
-    renderSettings();
+    openSettings("local-models");
     document.querySelector(".local-runtime-disclosure")?.setAttribute("open", "");
+    return;
+  }
+  if (action === "open-ollama-setup") {
+    openSettings("local-models");
+    document.querySelector(".local-model-disclosure:last-of-type")?.setAttribute("open", "");
+    toast("请先安装并启动 Ollama，再回来下载 MiniCPM-V 4.6。", true);
     return;
   }
   if (action === "install-local-runtime") {
@@ -8243,11 +10659,11 @@ async function handleSettingsAction(action, element) {
     if (!repoId) return;
     element.disabled = true;
     element.textContent = "准备下载…";
-    request("/api/local-models/download", { method: "POST", body: JSON.stringify({ id: repoId }) })
+    request("/api/local-models/download", { method: "POST", body: JSON.stringify({ id: repoId, runtime: element.dataset.modelRuntime || "" }) })
       .then((job) => {
         mergeLocalModelInstall(job);
         scheduleLocalModelInstallPoll();
-        if (state.activeView === "settings" && state.activeSettings === "local-models") renderSettings();
+    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
         renderDownloadActivity();
         toast(`${repoId} 已开始下载；右上角可持续查看进度。`);
       })
@@ -8337,25 +10753,20 @@ function downloadReviewDocument() {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-async function saveReviewAsNote() {
-  if (!state.reviewDocument?.markdown) throw new Error("当前没有可保存的证据综述稿件。");
-  const notebookId = state.notebook?.notebook_id;
-  if (!notebookId) throw new Error("请先选择一个知识库。");
-  const result = await request(`/api/notebooks/${encodeURIComponent(notebookId)}/notes`, {
-    method: "POST",
-    body: JSON.stringify({
-      title: state.reviewDocument.title || "证据综述",
-      body: state.reviewDocument.markdown,
-      note_type: "literature_review",
-    }),
-  });
-  if (result.notebook) state.notebook = result.notebook;
-  state.workspace = await request("/api/workspace");
-  state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === notebookId) || state.notebook;
-  toast("综述已保存到当前知识库笔记");
+function saveReviewAsNote() {
+  openReviewSaveDialog();
 }
 
+document.addEventListener("change", (event) => {
+  const select = event.target.closest?.("select[data-preview-knowledge-select]");
+  if (!select || state.activeSettings !== "knowledge-preview") return;
+  const role = select.dataset.previewKnowledgeSelect === "reranking" ? "reranking" : "embedding";
+  state.knowledgeSettingsPreview[role] = select.value;
+  renderSettings();
+});
+
 document.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-settings-select]")) closeSettingsSelects();
   if (state.updateCardOpen && !event.target.closest("[data-app-update]")) toggleAppUpdateCard(false);
   if (!event.target.closest("[data-mode-picker]")) closeComposerModePickers();
   if (!event.target.closest("[data-composer-model]")) closeComposerModelPickers();
@@ -8384,6 +10795,11 @@ document.addEventListener("click", (event) => {
     state.activeSettings = settingsNav.dataset.settingsPanel;
     if (state.activeView === "settings") {
       renderSettings();
+      const settingsContent = byId("settingsContent");
+      if (settingsContent) {
+        settingsContent.scrollTop = 0;
+        settingsContent.scrollLeft = 0;
+      }
       recordNavigation();
       if (state.activeSettings === "mcp") loadMcpMarketplace().catch((error) => toast(error.message, true));
     }
@@ -8392,8 +10808,11 @@ document.addEventListener("click", (event) => {
   const element = event.target.closest("[data-action]");
   if (!element) return;
   const action = element.dataset.action;
-  if (action === "confirm-dialog-content") return;
+  if (action === "confirm-dialog-content" || action === "review-save-dialog-content") return;
   if (action === "cancel-confirm-dialog") settleConfirmation(false);
+  else if (action === "close-review-save-dialog") closeReviewSaveDialog();
+  else if (action === "choose-review-save-folder") chooseReviewSaveFolder().catch((error) => toast(error.message, true));
+  else if (action === "confirm-review-save-note") commitReviewAsNote().catch((error) => toast(error.message, true));
   else if (action === "accept-confirm-dialog") settleConfirmation(true);
   else if (action === "jump-conversation-latest") followLatestConversationMessage({ smooth: true });
   else if (action === "minimize-window") controlDesktopWindow("minimize_window").catch((error) => toast(error.message, true));
@@ -8403,6 +10822,18 @@ document.addEventListener("click", (event) => {
   else if (action === "close-app-update") toggleAppUpdateCard(false);
   else if (action === "check-app-update") refreshAppUpdate().catch((error) => toast(error.message, true));
   else if (action === "install-app-update") installAppUpdate().catch((error) => toast(error.message, true));
+  else if (action === "preview-open-library") openMode("library");
+  else if (action === "toggle-preview-knowledge-advanced") {
+    state.knowledgeSettingsPreview.advancedOpen = !state.knowledgeSettingsPreview.advancedOpen;
+    renderSettings();
+  }
+  else if (action === "preview-knowledge-use-recommended") {
+    const role = element.dataset.previewRole === "reranking" ? "reranking" : "embedding";
+    state.knowledgeSettingsPreview[role] = "auto";
+    renderSettings();
+  }
+  else if (action === "preview-knowledge-rebuild") toast("预览：索引检查完成，当前配置可以继续使用");
+  else if (action === "preview-knowledge-save") toast("预览：检索设置已保存");
   else if (action === "open-download-center") openSettings("resources");
   else if (action === "control-download-task") {
     element.disabled = true;
@@ -8418,9 +10849,18 @@ document.addEventListener("click", (event) => {
     const key = element.dataset.composerKey === "home" ? "home" : "chat";
     byId(`${key}ImageFileInput`)?.click();
   }
+  else if (action === "choose-composer-audio") {
+    const key = element.dataset.composerKey === "home" ? "home" : "chat";
+    byId(`${key}AudioFileInput`)?.click();
+  }
+  else if (action === "toggle-composer-recording") {
+    const key = element.dataset.composerKey === "home" ? "home" : "chat";
+    toggleComposerRecording(key);
+  }
   else if (action === "choose-composer-source") chooseComposerSources(element.dataset.composerKey === "home" ? "home" : "chat").catch((error) => toast(error.message, true));
   else if (action === "choose-presentation-sources") choosePresentationSources(element.dataset.composerKey === "home" ? "home" : "chat").catch((error) => toast(error.message, true));
   else if (action === "remove-composer-image") removeComposerImage(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.imageId || "");
+  else if (action === "remove-composer-audio") removeComposerAudio(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.audioId || "");
   else if (action === "remove-composer-source") removeComposerSource(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.sourceId || "");
   else if (action === "use-file-suggestion") useFileSuggestion(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.fileName || "当前文件", element.dataset.suggestion || "总结");
   else if (action === "open-ingestion-source") {
@@ -8432,6 +10872,15 @@ document.addEventListener("click", (event) => {
   else if (action === "choose-library-folder") chooseLibraryFolder("folder", element.dataset.notebookId || "").catch((error) => toast(error.message, true));
   else if (action === "choose-obsidian-vault") chooseLibraryFolder("obsidian", element.dataset.notebookId || "").catch((error) => toast(error.message, true));
   else if (action === "choose-zotero-library") connectLocalZotero(element.dataset.notebookId || "").catch((error) => toast(error.message, true));
+  else if (action === "choose-zotero-data-directory") chooseZoteroDataDirectory(element.dataset.notebookId || "").catch((error) => toast(error.message, true));
+  else if (action === "retry-zotero-connection") {
+    const notebookId = element.dataset.notebookId || state.notebook?.notebook_id || "";
+    const notebook = (state.workspace?.notebooks || []).find((item) => String(item.notebook_id) === String(notebookId)) || state.notebook;
+    const dataDir = state.zoteroConnectionIssue?.dataDir
+      || notebook?.metadata?.zotero?.configured_data_dir
+      || "";
+    connectLocalZotero(notebookId, dataDir).catch((error) => toast(error.message, true));
+  }
   else if (action === "connect-notion") connectNotion(element.dataset.notebookId || "").catch((error) => toast(error.message, true));
   else if (action === "choose-library-files") chooseLibraryFiles(element.dataset.notebookId || state.notebook?.notebook_id || "").catch((error) => toast(error.message, true));
   else if (action === "retry-evidence-index") {
@@ -8455,12 +10904,16 @@ document.addEventListener("click", (event) => {
   else if (action === "close-knowledge-file-search") closeKnowledgeFileSearch();
   else if (action === "open-knowledge-scope") openKnowledgeScopeDialog();
   else if (action === "close-knowledge-scope") closeKnowledgeScopeDialog();
+  else if (action === "apply-knowledge-scope") applyKnowledgeScopeSelection();
   else if (action === "clear-knowledge-scope") {
     setKnowledgeScope(null, { close: false });
     toast("已移除本轮知识库范围");
   }
   else if (action === "remove-knowledge-scope") {
     removeKnowledgeScope(element.dataset.notebookId || "");
+  }
+  else if (action === "toggle-knowledge-scope-draft") {
+    toggleKnowledgeScopeDraft(element.dataset.notebookId || "");
   }
   else if (action === "toggle-notebook-scope") {
     const notebook = (state.workspace?.notebooks || []).find((item) => item.notebook_id === element.dataset.notebookId);
@@ -8491,7 +10944,9 @@ document.addEventListener("click", (event) => {
   else if (action === "activate-library") {
     const notebook = (state.workspace?.notebooks || []).find((item) => item.notebook_id === element.dataset.notebookId);
     if (notebook) {
+      const previousNotebookId = state.notebook?.notebook_id;
       state.notebook = notebook;
+      if (String(previousNotebookId || "") !== String(notebook.notebook_id || "")) state.knowledgeSubscope = null;
       state.knowledgePreviewSourceId = "";
       state.knowledgeQuery = "";
       state.knowledgeVisibleLimit = 200;
@@ -8721,9 +11176,10 @@ document.addEventListener("click", (event) => {
     const source = (state.notebook?.sources || []).find((item) => String(item.doc_id) === String(element.dataset.docId));
     if (source) openSourceReader(source);
   }
+  else if (action === "retry-direct-message") retryDirectMessage(element.dataset.messageIndex || "");
   else if (action === "copy-conversation-message") copyConversationMessage(element).catch((error) => toast(error.message, true));
   else if (action === "copy-review-document") copyReviewDocument().catch((error) => toast(error.message, true));
-  else if (action === "save-review-note") saveReviewAsNote().catch((error) => toast(error.message, true));
+  else if (action === "save-review-note") saveReviewAsNote();
   else if (action === "download-review-document") downloadReviewDocument();
   else if (action === "select-all-review-sources") setReviewSourceSelection(true);
   else if (action === "clear-review-sources") setReviewSourceSelection(false);
@@ -8753,8 +11209,10 @@ document.addEventListener("click", (event) => {
   else if (action === "open-extensions") openExtensions();
   else if (action === "open-mcp-marketplace") openMcpMarketplace();
   else if (action === "test-mcp-server") testMcpServer(element.dataset.recordId || "").catch((error) => toast(error.message, true));
+  else if (action === "check-extension-updates") refreshExtensionUpdates().catch((error) => toast(error.message, true));
   else if (action === "refresh-marketplace") refreshExtensions({ marketOnly: true }).catch((error) => toast(error.message, true));
   else if (action === "install-market-skill") installMarketSkill(element.dataset.marketSkillId || "").catch((error) => toast(error.message, true));
+  else if (action === "update-skill") scanSkillUpdate(element.dataset.extensionId || "").catch((error) => toast(error.message, true));
   else if (action === "close-skill-security") closeSkillSecurityReview();
   else if (action === "confirm-skill-install") confirmSkillInstall().catch((error) => toast(error.message, true));
   else if (action === "open-extension-detail") {
@@ -8861,6 +11319,7 @@ document.addEventListener("click", (event) => {
   } else if (action === "open-settings") openSettings(element.dataset.settingsPanel || "general");
   else if (action === "sync-mcp-marketplace") syncMcpMarketplace().catch((error) => toast(error.message, true));
   else if (action === "install-mcp-marketplace") installMcpMarketplaceServer(element.dataset.mcpId || "").catch((error) => toast(error.message, true));
+  else if (action === "update-mcp-marketplace") updateMcpMarketplaceServer(element.dataset.recordId || "").catch((error) => toast(error.message, true));
   else if (action === "mcp-set-tab") {
     state.mcpMarketplaceTab = element.dataset.mcpTab === "mine" ? "mine" : "public";
     state.mcpManualOpen = false;
@@ -8889,6 +11348,10 @@ document.addEventListener("click", (event) => {
   else if (action === "open-task") {
     state.historyMenuRunId = "";
     openTask(element.dataset.taskId);
+  }
+  else if (action === "open-direct-conversation") {
+    state.historyMenuRunId = "";
+    openDirectConversation(element.dataset.conversationId).catch((error) => toast(error.message, true));
   }
   else handleSettingsAction(action, element).catch((error) => toast(error.message, true));
 });
@@ -8931,7 +11394,7 @@ document.addEventListener("change", (event) => {
     addComposerSources(key, files).catch((error) => toast(error.message, true));
     return;
   }
-  if (event.target.closest("#documentProcessingForm") && ["ocr-provider", "mineru-provider"].includes(event.target.name)) {
+  if (event.target.closest("#documentProcessingForm, #defaultDocumentProcessingForm") && ["ocr-provider", "mineru-provider"].includes(event.target.name)) {
     collectDocumentProcessingForm();
     renderSettings();
     return;
@@ -8939,9 +11402,20 @@ document.addEventListener("change", (event) => {
   if (event.target.dataset.action === "toggle-record") {
     const kind = event.target.dataset.recordKind;
     const key = kind === "mcp" ? "mcp_servers" : kind;
-    const record = state.settings[key].find((item) => item.id === event.target.dataset.recordId);
+    const recordId = event.target.dataset.recordId;
+    const configuredRecords = Array.isArray(state.settings?.[key]) ? state.settings[key] : [];
+    const runtimeRecords = kind === "skills" && Array.isArray(state.extensions.skills)
+      ? state.extensions.skills
+      : configuredRecords;
+    const record = configuredRecords.find((item) => item.id === recordId)
+      || runtimeRecords.find((item) => item.id === recordId);
     if (record) {
-      record.enabled = event.target.checked;
+      const enabled = event.target.checked;
+      record.enabled = enabled;
+      const configuredRecord = configuredRecords.find((item) => item.id === recordId);
+      if (configuredRecord) configuredRecord.enabled = enabled;
+      const runtimeRecord = runtimeRecords.find((item) => item.id === recordId);
+      if (runtimeRecord) runtimeRecord.enabled = enabled;
       persistSettings("启用状态已保存").catch((error) => toast(error.message, true));
     }
   }
@@ -9031,6 +11505,14 @@ document.addEventListener("keydown", (event) => {
     }
     if (trapConfirmationFocus(event)) return;
   }
+  if (state.reviewSaveDialog?.open) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeReviewSaveDialog();
+      return;
+    }
+    if (trapReviewSaveFocus(event)) return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && state.activeView === "library") {
     event.preventDefault();
     focusKnowledgeFileSearch();
@@ -9090,6 +11572,10 @@ document.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.id === "reviewSaveNewFolderInput") {
+    state.reviewSaveDialog.newFolderName = String(event.target.value || "");
+    return;
+  }
   if (event.target.matches("[data-knowledge-file-search]")) {
     state.knowledgeQuery = String(event.target.value || "");
     state.knowledgeVisibleLimit = 200;
@@ -9164,6 +11650,13 @@ document.addEventListener("change", (event) => {
     if (button) button.disabled = !event.target.checked;
     return;
   }
+  if (event.target.matches("[data-composer-audio-file]")) {
+    const key = event.target.dataset.composerAudioFile === "home" ? "home" : "chat";
+    const files = [...(event.target.files || [])];
+    event.target.value = "";
+    addComposerAudio(key, files).catch((error) => toast(error.message, true));
+    return;
+  }
   const toggle = event.target.closest("[data-update-auto-check]");
   if (!toggle) return;
   state.autoCheckUpdates = Boolean(toggle.checked);
@@ -9218,12 +11711,14 @@ document.addEventListener("submit", (event) => {
     if (!value) return;
     state.libraryImportGuided = false;
     const operation = state.libraryImportKind === "files"
-      ? importLibraryFiles(value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean))
+      ? importLibraryFiles(value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean), state.libraryImportNotebookId || state.notebook?.notebook_id || "")
       : state.libraryImportKind === "empty"
         ? createEmptyLibrary(value)
       : state.libraryImportKind === "zotero"
         ? registerZoteroLibrary(value)
-        : bindLibraryFolder(value, state.libraryImportKind);
+      : state.libraryImportKind === "zotero-data"
+        ? connectLocalZotero(state.libraryImportNotebookId || state.notebook?.notebook_id || "", value)
+      : bindLibraryFolder(value, state.libraryImportKind, state.libraryImportNotebookId || state.notebook?.notebook_id || "");
     operation.catch((error) => toast(error.message, true));
   }
   else if (event.target.id === "homeAskForm") askQuestion(event, "homeQuestionInput");
@@ -9243,6 +11738,7 @@ document.addEventListener("submit", (event) => {
       await persistSettings(key ? "提供商与密钥已保存" : "提供商已保存");
       if (!key || !provider) return;
       state.settings = await request(`/api/settings/providers/${encodeURIComponent(provider.id)}/api-key`, { method: "POST", body: JSON.stringify({ api_key: key }) });
+      await refreshModelHealth({ render: false });
       renderModelSelectors();
       renderSettings();
       toast("密钥已保存到系统凭据管理器");
@@ -9250,16 +11746,20 @@ document.addEventListener("submit", (event) => {
   } else if (event.target.id === "localModelsForm") {
     event.preventDefault();
     collectLocalModelsForm();
-    persistSettings("本地模型已保存").catch((error) => toast(error.message, true));
+    persistSettings("本地模型已保存").then(() => refreshModelHealth()).catch((error) => toast(error.message, true));
   } else if (event.target.id === "generalPreferencesForm") {
     event.preventDefault();
     collectAppearanceForm();
     persistSettings(copy("appearanceSaved")).catch((error) => toast(error.message, true));
-  } else if (event.target.id === "documentProcessingForm") {
+  } else if (event.target.id === "defaultCapabilitiesForm") {
+    event.preventDefault();
+    collectDefaultCapabilitiesForm();
+    persistSettings("默认能力已保存").catch((error) => toast(error.message, true));
+  } else if (["documentProcessingForm", "defaultDocumentProcessingForm"].includes(event.target.id)) {
     event.preventDefault();
     const ocrKey = String(event.target.elements["ocr-api-key"]?.value || "").trim();
     const mineruKey = String(event.target.elements["mineru-api-key"]?.value || "").trim();
-    collectDocumentProcessingForm();
+    collectDocumentProcessingForm(event.target.id);
     (async () => {
       await persistSettings(ocrKey || mineruKey ? "文档处理配置与密钥已保存" : "文档处理配置已保存");
       if (ocrKey) state.settings = await request("/api/settings/document-processing/ocr/api-key", { method: "POST", body: JSON.stringify({ api_key: ocrKey }) });
@@ -9378,7 +11878,7 @@ async function handlePptOutline(event) {
 
 async function createPptProject() {
   if (!state.notebook) throw new Error("请先打开一个资料库");
-  await startModeRun("ppt_project", { topic: byId("pptTopic")?.value || "", template_id: state.selectedSlideTemplateId }, "正在创建 EasySlides 项目并导入来源…");
+  await startModeRun("ppt_project", { topic: byId("pptTopic")?.value || "", template_id: state.selectedSlideTemplateId }, "正在创建演示文稿并导入来源…");
 }
 
 async function startModeRun(workflowType, input, loadingMessage) {
@@ -9420,21 +11920,17 @@ function renderModeArtifact(run) {
   else if (run.workflow_type === "citation_analysis") renderReferenceResults(payload);
   else if (run.workflow_type === "paper_atlas") renderAtlasResults(payload);
   else if (run.workflow_type === "paper_download") {
-    const files = (payload.files || []).map((file) => `<code>${escapeHtml(file)}</code>`).join("");
-    const source = payload.source ? `<small>来源：${escapeHtml(payload.source)}</small>` : "";
-    const attempts = Array.isArray(payload.attempts) && payload.attempts.length > 1
-      ? `<small>已尝试 ${payload.attempts.length} 个来源，仅保留一个可用版本</small>`
-      : "";
-    byId("modeResults").innerHTML = `<div class="download-result"><span>✓</span><div><strong>文献已保存</strong><p>${escapeHtml(payload.identifier || run.title)}</p>${source}${attempts}${files || `<code>${escapeHtml(payload.output_dir || artifact.file_path)}</code>`}</div></div>`;
+    const files = (payload.files || []).map((file) => localFileLinkMarkup(file, localPathLeaf(file), { inline: true })).join("");
+    const fallback = payload.output_dir || artifact.file_path;
+    const fileMarkup = files || (fallback ? localFileLinkMarkup(fallback, localPathLeaf(fallback), { inline: true }) : "");
+    byId("modeResults").innerHTML = `<div class="download-result"><span>✓</span><div><strong>文献已保存</strong><p>${escapeHtml(payload.identifier || run.title)}</p>${fileMarkup}</div></div>`;
   } else if (run.workflow_type === "paper_download_batch") {
     const items = Array.isArray(payload.items) ? payload.items : [];
     const completed = Number(payload.completed || 0);
     const failed = Number(payload.failed || 0);
     const failedIds = items.filter((item) => item.status === "failed").map((item) => item.identifier);
     const retry = failedIds.length ? `<button type="button" class="run-action" data-action="retry-batch-download" data-identifiers="${escapeHtml(failedIds.join("\n"))}">重试失败项 (${failedIds.length})</button>` : "";
-    const rotations = Number(payload.tor_rotations || 0);
-    const torNote = rotations ? `<small class="paper-batch-tor-note">Tor 轮换 ${rotations} 次</small>` : "";
-    byId("modeResults").innerHTML = `<section class="mode-run"><header><div><span>批量完成</span><strong>${escapeHtml(run.title)}</strong></div>${retry}</div></header><p class="paper-batch-summary">成功 ${completed}/${payload.total || items.length}，失败 ${failed}${torNote}</p><ul class="paper-batch-progress">${batchItemMarkup(items)}</ul></section>`;
+    byId("modeResults").innerHTML = `<section class="mode-run"><header><div><span>批量完成</span><strong>${escapeHtml(run.title)}</strong></div>${retry}</div></header><p class="paper-batch-summary">成功 ${completed}/${payload.total || items.length}，失败 ${failed}</p><ul class="paper-batch-progress">${batchItemMarkup(items)}</ul></section>`;
   } else if (["ppt_outline", "ppt_project"].includes(run.workflow_type)) {
     renderPptOutline(payload);
     if (run.workflow_type === "ppt_project") toast("PPT 项目已创建");
@@ -9607,6 +12103,14 @@ document.addEventListener("keydown", (event) => {
     window.setTimeout(() => byId("sourceFilter").focus(), 0);
   }
 });
+
+// Site icons are optional decoration. A blocked, offline, or icon-less site
+// must leave a stable globe affordance instead of a broken-image glyph.
+document.addEventListener("error", (event) => {
+  const image = event.target?.closest?.("img[data-site-icon]");
+  if (!image) return;
+  image.closest(".site-link-icon")?.classList.add("is-fallback");
+}, true);
 
 installSidebarResizer();
 installContextPanelResizer();

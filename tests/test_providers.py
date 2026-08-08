@@ -13,6 +13,7 @@ from scansci_html.rerankers import (
     JinaReranker,
     LexicalReranker,
     Qwen3Reranker,
+    SiliconFlowReranker,
     build_reranker,
 )
 
@@ -364,6 +365,94 @@ def test_build_reranker_accepts_injected_jina_model():
 
     assert isinstance(reranker, JinaReranker)
     assert reranker.model_name == "jinaai/jina-reranker-v3"
+
+
+def test_siliconflow_reranker_uses_rerank_api_and_keeps_tags_in_documents():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "results": [
+                    {"index": 1, "relevance_score": 0.91},
+                    {"index": 0, "relevance_score": 0.12},
+                ]
+            }
+
+    class FakeSession:
+        def post(self, url, *, headers, json, timeout):
+            calls.append((url, headers, json, timeout))
+            return FakeResponse()
+
+    reranker = SiliconFlowReranker(
+        base_url="https://api.siliconflow.cn/v1",
+        api_key="secret",
+        session=FakeSession(),
+    )
+    ranked = reranker.rerank(
+        "cortical activity",
+        [
+            {
+                "evidence_id": "doc1.s0001",
+                "title": "Control",
+                "text": "Cortical activity was unchanged.",
+                "tags": ["control"],
+            },
+            {
+                "evidence_id": "doc2.s0001",
+                "title": "Treatment",
+                "text": "Cortical activity increased in language regions.",
+                "tags": ["neural response"],
+            },
+        ],
+    )
+
+    assert [hit["evidence_id"] for hit in ranked] == ["doc2.s0001", "doc1.s0001"]
+    assert ranked[0]["siliconflow_score"] == 0.91
+    assert ranked[0]["routes"] == ["siliconflow-reranker"]
+    assert calls == [
+        (
+            "https://api.siliconflow.cn/v1/rerank",
+            {"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            {
+                "model": "BAAI/bge-reranker-v2-m3",
+                "query": "cortical activity",
+                "documents": [
+                    "Control Cortical activity was unchanged. Tags: control",
+                    "Treatment Cortical activity increased in language regions. Tags: neural response",
+                ],
+                "top_n": 2,
+                "return_documents": False,
+            },
+            30.0,
+        )
+    ]
+
+
+def test_siliconflow_reranker_falls_back_without_failing_the_workflow():
+    class FailingSession:
+        def post(self, *_args, **_kwargs):
+            raise RuntimeError("network unavailable")
+
+    reranker = build_reranker(
+        "siliconflow",
+        api_key="secret",
+        session=FailingSession(),
+    )
+    ranked = reranker.rerank(
+        "cortical activity",
+        [
+            {"evidence_id": "doc1", "text": "Cortical activity increased."},
+            {"evidence_id": "doc2", "text": "Gravity attracts bodies."},
+        ],
+    )
+
+    assert ranked[0]["evidence_id"] == "doc1"
+    assert "siliconflow-fallback" in ranked[0]["routes"]
+    assert reranker.last_error.startswith("RuntimeError:")
 
 
 def test_qwen3_reranker_uses_yes_no_logits_instead_of_flat_cross_encoder_scores():

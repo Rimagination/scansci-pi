@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import base64
+from dataclasses import asdict, dataclass, replace
+import io
 import importlib
+import json
 import os
 from pathlib import Path
 from queue import Empty
@@ -35,6 +38,8 @@ class LoadedLocalModel:
     torch: Any
     plan: LocalModelPlan
     input_device: str
+    processor: Any | None = None
+    is_vision: bool = False
 
 
 def choose_local_model_plan(
@@ -105,8 +110,108 @@ def choose_local_model_plan(
     )
 
 
+def _vision_snapshot_config(model_path: str | Path) -> dict[str, Any]:
+    path = Path(model_path).resolve() / "config.json"
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _is_vision_snapshot(model_path: str | Path) -> bool:
+    config = _vision_snapshot_config(model_path)
+    model_type = str(config.get("model_type", "")).casefold()
+    architectures = " ".join(str(value) for value in config.get("architectures", []) or []).casefold()
+    return bool(
+        isinstance(config.get("vision_config"), dict)
+        or "minicpmv" in model_type
+        or "minicpmv" in architectures
+        or "qwen3_vl" in model_type
+    )
+
+
+def _load_local_vision_model(model_path: str | Path, model_id: str) -> LoadedLocalModel:
+    """Load a local multimodal Transformers snapshot without text-only patches."""
+
+    resolved_path = Path(model_path).resolve()
+    config = _vision_snapshot_config(resolved_path)
+    quantization_config = config.get("quantization_config") if isinstance(config.get("quantization_config"), dict) else {}
+    quantization_method = str(quantization_config.get("quant_method", "")).casefold()
+    try:
+        torch = importlib.import_module("torch")
+        transformers = importlib.import_module("transformers")
+        AutoProcessor = getattr(transformers, "AutoProcessor")
+        AutoModelForImageTextToText = getattr(transformers, "AutoModelForImageTextToText", None)
+        if AutoModelForImageTextToText is None:
+            AutoModelForImageTextToText = getattr(transformers, "AutoModelForVision2Seq")
+    except (ImportError, AttributeError) as exc:  # pragma: no cover - optional runtime
+        raise RuntimeError("视觉模型需要完整的 Transformers 与图像处理运行组件。") from exc
+
+    weight_bytes = sum(
+        item.stat().st_size
+        for item in resolved_path.iterdir()
+        if item.is_file() and item.suffix.lower() in {".safetensors", ".bin", ".gguf"}
+    )
+    plan = choose_local_model_plan(torch, model_weight_gib=float(weight_bytes) / (1024**3))
+    if quantization_method == "bitsandbytes":
+        if not plan.device.startswith("cuda"):
+            raise RuntimeError(f"{model_id} 是 BNB 4-bit 视觉模型，需要 NVIDIA CUDA 显卡。")
+        try:
+            importlib.import_module("bitsandbytes")
+        except ImportError as exc:
+            raise RuntimeError("视觉模型需要 bitsandbytes，但本地运行组件未安装。") from exc
+        plan = replace(plan, quantization="4bit")
+    elif quantization_method == "gptq":
+        plan = replace(plan, quantization="gptq")
+
+    kwargs: dict[str, Any] = {"local_files_only": True, "low_cpu_mem_usage": True}
+    if plan.device.startswith("cuda"):
+        kwargs["device_map"] = "auto"
+        # Quantized checkpoints carry their own quantization config.  Passing
+        # dtype=auto preserves BNB/GPTQ storage choices and is supported by
+        # Transformers 5.x.
+        kwargs["dtype"] = "auto" if quantization_method else (
+            torch.bfloat16 if plan.compute_dtype == "bfloat16" else torch.float16
+        )
+
+    try:
+        processor = AutoProcessor.from_pretrained(str(resolved_path), local_files_only=True)
+        model = AutoModelForImageTextToText.from_pretrained(str(resolved_path), **kwargs)
+        if plan.device == "cpu":
+            model.to("cpu")
+        model.eval()
+        tokenizer = getattr(processor, "tokenizer", None)
+        input_device = str(next(model.parameters()).device)
+    except Exception as exc:
+        if plan.device.startswith("cuda") and "out of memory" in str(exc).lower():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"GPU 显存不足，无法加载 {model_id}；当前显存约 {plan.total_vram_gib:.1f} GB。"
+            ) from exc
+        raise RuntimeError(f"无法加载视觉模型 {model_id}（设备 {plan.device}）：{exc}") from exc
+
+    return LoadedLocalModel(
+        tokenizer=tokenizer,
+        model=model,
+        torch=torch,
+        plan=plan,
+        input_device=input_device,
+        processor=processor,
+        is_vision=True,
+    )
+
+
 def load_local_chat_model(model_path: str | Path, model_id: str) -> LoadedLocalModel:
     """Load a verified local snapshot using the resolved CUDA-aware plan."""
+
+    if _is_vision_snapshot(model_path):
+        return _load_local_vision_model(model_path, model_id)
 
     configure_text_only_transformers()
     try:
@@ -248,6 +353,66 @@ def normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, st
     return normalized
 
 
+def _local_image_from_url(value: str) -> Any:
+    """Decode a data URI into a PIL image without fetching remote URLs."""
+
+    source = str(value or "").strip()
+    if not source.startswith("data:") or "," not in source:
+        raise ValueError("本地视觉模型只接受已经随请求传入的图片数据")
+    _header, encoded = source.split(",", 1)
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        image_module = importlib.import_module("PIL.Image")
+        with image_module.open(io.BytesIO(raw)) as image:
+            return image.convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"无法读取视觉输入图片：{exc}") from exc
+
+
+def normalize_vision_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI image blocks into the native Transformers conversation format."""
+
+    normalized: list[dict[str, Any]] = []
+    for item in messages[-16:]:
+        content = item.get("content", "")
+        if not isinstance(content, list):
+            normalized.append({"role": str(item.get("role", "user")), "content": str(content)})
+            continue
+        parts: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type", "")).casefold()
+            if part_type == "text":
+                parts.append({"type": "text", "text": str(part.get("text", ""))})
+                continue
+            if part_type == "image_url":
+                image_url = part.get("image_url") if isinstance(part.get("image_url"), dict) else {}
+                parts.append({"type": "image", "image": _local_image_from_url(str(image_url.get("url", "")))})
+                continue
+            if part_type == "image":
+                source = part.get("image") or part.get("url")
+                if hasattr(source, "convert"):
+                    parts.append({"type": "image", "image": source})
+                else:
+                    parts.append({"type": "image", "image": _local_image_from_url(str(source or ""))})
+        if not parts:
+            parts = [{"type": "text", "text": ""}]
+        normalized.append({"role": str(item.get("role", "user")), "content": parts})
+    return normalized
+
+
+def _vision_processor_kwargs() -> dict[str, Any]:
+    try:
+        max_slice_nums = int(os.getenv("SCANSCI_VISION_MAX_SLICE_NUMS", "1"))
+    except ValueError:
+        max_slice_nums = 1
+    return {
+        "downsample_mode": os.getenv("SCANSCI_VISION_DOWNSAMPLE", "16x").strip() or "16x",
+        "max_slice_nums": max(1, min(max_slice_nums, 36)),
+    }
+
+
 def generate_local_chat_stream(
     loaded: LoadedLocalModel,
     messages: list[dict[str, Any]],
@@ -264,18 +429,35 @@ def generate_local_chat_stream(
     TextIteratorStreamer = getattr(streamers, "TextIteratorStreamer")
 
     cancel = cancel_event or threading.Event()
-    normalized = normalize_chat_messages(messages)
-    try:
-        prompt = loaded.tokenizer.apply_chat_template(
+    generation_kwargs: dict[str, Any] = {}
+    streamer_tokenizer = loaded.tokenizer
+    if loaded.is_vision and loaded.processor is not None:
+        normalized = normalize_vision_messages(messages)
+        processor_kwargs = _vision_processor_kwargs()
+        inputs = loaded.processor.apply_chat_template(
             normalized,
-            tokenize=False,
+            tokenize=True,
             add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            processor_kwargs=processor_kwargs,
         )
-    except Exception:
-        prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized) + "\nassistant:"
+        streamer_tokenizer = getattr(loaded.processor, "tokenizer", None) or loaded.tokenizer
+        generation_kwargs["downsample_mode"] = processor_kwargs["downsample_mode"]
+    else:
+        normalized = normalize_chat_messages(messages)
+        try:
+            prompt = loaded.tokenizer.apply_chat_template(
+                normalized,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            prompt = "\n".join(f"{item['role']}: {item['content']}" for item in normalized) + "\nassistant:"
+        inputs = loaded.tokenizer(prompt, return_tensors="pt")
     inputs = {
-        key: value.to(loaded.input_device)
-        for key, value in loaded.tokenizer(prompt, return_tensors="pt").items()
+        key: value.to(loaded.input_device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
     }
 
     class Cancelled(StoppingCriteria):
@@ -283,7 +465,7 @@ def generate_local_chat_stream(
             return cancel.is_set()
 
     streamer = TextIteratorStreamer(
-        loaded.tokenizer,
+        streamer_tokenizer,
         skip_prompt=True,
         skip_special_tokens=True,
         timeout=0.25,
@@ -294,6 +476,7 @@ def generate_local_chat_stream(
         try:
             loaded.model.generate(
                 **inputs,
+                **generation_kwargs,
                 max_new_tokens=max(1, min(int(max_new_tokens), 2048)),
                 do_sample=True,
                 temperature=0.6,

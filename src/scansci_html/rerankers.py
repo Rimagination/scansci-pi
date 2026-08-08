@@ -5,6 +5,8 @@ import importlib
 import re
 from typing import Any, Protocol
 
+import requests
+
 from .local_retrieval_runtime import (
     model_device,
     move_model_to_device,
@@ -43,8 +45,13 @@ class LexicalReranker:
             dense_score = float(hit.get("dense_score", 0.0))
             fts_score = float(hit.get("fts_score", 0.0))
             context_score = float(hit.get("context_score", 0.0))
+            tag_score = max(0.0, float(hit.get("tag_score", 0.0)))
             hit["matched_terms"] = matched_terms
-            hit["score"] = round(lexical_score + phrase_bonus + dense_score + fts_score + context_score, 6)
+            hit["tag_bonus"] = round(min(0.8, tag_score * 0.35), 6)
+            hit["score"] = round(
+                lexical_score + phrase_bonus + dense_score + fts_score + context_score + hit["tag_bonus"],
+                6,
+            )
             reranked.append(hit)
         reranked.sort(key=lambda hit: (-float(hit["score"]), str(hit.get("evidence_id", ""))))
         return reranked
@@ -80,6 +87,14 @@ class HybridPrefilterReranker(LexicalReranker):
         lexical_rank = _rank_by_evidence_id(lexical)
         dense_rank = _rank_by_evidence_id(dense, positive_field="dense_score")
         fts_rank = _rank_by_evidence_id(fts, positive_field="fts_score")
+        tag = sorted(
+            candidates,
+            key=lambda hit: (
+                -float(hit.get("tag_score", 0.0)),
+                str(hit.get("evidence_id", "")),
+            ),
+        )
+        tag_rank = _rank_by_evidence_id(tag, positive_field="tag_score")
         best_by_text: dict[str, dict[str, Any]] = {}
         for candidate in lexical:
             evidence_id = str(candidate.get("evidence_id", ""))
@@ -87,8 +102,10 @@ class HybridPrefilterReranker(LexicalReranker):
                 _rrf(dense_rank.get(evidence_id), weight=1.4)
                 + _rrf(fts_rank.get(evidence_id), weight=0.8)
                 + _rrf(lexical_rank.get(evidence_id), weight=0.45)
+                + _rrf(tag_rank.get(evidence_id), weight=0.35)
                 + max(0.0, float(candidate.get("dense_score", 0.0))) * 0.08
                 + max(0.0, float(candidate.get("fts_score", 0.0))) * 0.02
+                + min(0.03, max(0.0, float(candidate.get("tag_score", 0.0))) * 0.01)
                 + min(0.02, max(0.0, float(candidate.get("context_score", 0.0))) * 0.02)
             )
             hit = dict(candidate)
@@ -144,7 +161,7 @@ class CrossEncoderReranker:
             hit = dict(candidate)
             hit["matched_terms"] = _matched_terms(hit, query_terms)
             hit["cross_encoder_score"] = round(score, 6)
-            hit["score"] = round(score, 6)
+            hit["score"] = round(score + _neural_tag_bonus(hit), 6)
             routes = [str(route) for route in hit.get("routes", []) or []]
             if "cross-encoder" not in routes:
                 routes.append("cross-encoder")
@@ -189,13 +206,124 @@ class JinaReranker:
             hit = dict(candidate)
             hit["matched_terms"] = _matched_terms(hit, query_terms)
             hit["jina_score"] = round(score, 6)
-            hit["score"] = round(score, 6)
+            hit["score"] = round(score + _neural_tag_bonus(hit), 6)
             routes = [str(route) for route in hit.get("routes", []) or []]
             if "jina-reranker" not in routes:
                 routes.append("jina-reranker")
             hit["routes"] = routes
             reranked.append(hit)
         reranked.sort(key=lambda hit: (-float(hit["score"]), str(hit.get("evidence_id", ""))))
+        return reranked
+
+
+DEFAULT_SILICONFLOW_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+
+
+class SiliconFlowReranker:
+    """Remote reranker using SiliconFlow's ``/v1/rerank`` endpoint.
+
+    The remote service is an optional precision stage.  A failed request is
+    deliberately converted into a lexical rerank so a provider timeout,
+    missing network, or rate limit cannot abort the surrounding evidence
+    workflow.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://api.siliconflow.cn/v1",
+        api_key: str,
+        model_name: str = DEFAULT_SILICONFLOW_RERANKER_MODEL,
+        timeout: float = 30.0,
+        session: Any | None = None,
+        fallback: Reranker | None = None,
+    ) -> None:
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.api_key = str(api_key or "").strip()
+        self.model_name = str(model_name or DEFAULT_SILICONFLOW_RERANKER_MODEL).strip()
+        self.timeout = max(1.0, float(timeout))
+        if not self.base_url:
+            raise ValueError("SiliconFlow reranker requires a base_url")
+        if not self.api_key:
+            raise ValueError("SiliconFlow reranker requires an API key")
+        if not self.model_name:
+            raise ValueError("SiliconFlow reranker requires a model name")
+        self.session = session or requests.Session()
+        self.fallback = fallback or LexicalReranker()
+        # Do not include the API key in any identity used by caches or logs.
+        self.cache_key = f"siliconflow:{self.base_url}:{self.model_name}"
+        self.device = "remote"
+        self.last_error = ""
+
+    def rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        documents = [_candidate_text(candidate) for candidate in candidates]
+        try:
+            response = self.session.post(
+                f"{self.base_url}/rerank",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model_name,
+                    "query": str(query or ""),
+                    "documents": documents,
+                    "top_n": len(documents),
+                    "return_documents": False,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            raw_results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(raw_results, list):
+                raise RuntimeError("SiliconFlow reranker returned no results")
+            scores_by_index: dict[int, float] = {}
+            for result in raw_results:
+                if not isinstance(result, dict):
+                    continue
+                try:
+                    index = int(result["index"])
+                    score = float(result["relevance_score"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if 0 <= index < len(candidates):
+                    scores_by_index[index] = score
+            if len(scores_by_index) != len(candidates):
+                raise RuntimeError(
+                    f"SiliconFlow reranker returned {len(scores_by_index)} scores for "
+                    f"{len(candidates)} documents"
+                )
+            self.last_error = ""
+        except Exception as error:  # remote provider boundary
+            self.last_error = f"{type(error).__name__}: {str(error)[:240]}"
+            return self._fallback_rerank(query, candidates)
+
+        query_terms = _query_terms(query)
+        reranked: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidates):
+            remote_score = scores_by_index[index]
+            hit = dict(candidate)
+            hit["matched_terms"] = _matched_terms(hit, query_terms)
+            hit["siliconflow_score"] = round(remote_score, 6)
+            hit["score"] = round(remote_score + _neural_tag_bonus(hit), 6)
+            routes = [str(route) for route in hit.get("routes", []) or []]
+            if "siliconflow-reranker" not in routes:
+                routes.append("siliconflow-reranker")
+            hit["routes"] = routes
+            reranked.append(hit)
+        reranked.sort(key=lambda hit: (-float(hit["score"]), str(hit.get("evidence_id", ""))))
+        return reranked
+
+    def _fallback_rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reranked = self.fallback.rerank(query, candidates)
+        for hit in reranked:
+            routes = [str(route) for route in hit.get("routes", []) or []]
+            if "siliconflow-fallback" not in routes:
+                routes.append("siliconflow-fallback")
+            hit["routes"] = routes
         return reranked
 
 
@@ -268,7 +396,7 @@ class Qwen3Reranker:
             hit["qwen3_raw_score"] = round(float(score), 6)
             hit["evidence_quality"] = round(quality, 6)
             hit["qwen3_score"] = round(adjusted_score, 6)
-            hit["score"] = round(adjusted_score, 6)
+            hit["score"] = round(adjusted_score + _neural_tag_bonus(hit), 6)
             routes = [str(route) for route in hit.get("routes", []) or []]
             if "qwen3-reranker" not in routes:
                 routes.append("qwen3-reranker")
@@ -346,6 +474,10 @@ def build_reranker(
     max_length: int = 2048,
     instruction: str = "",
     device: str | None = None,
+    base_url: str = "",
+    api_key: str = "",
+    timeout: float = 30.0,
+    session: Any | None = None,
 ) -> Reranker:
     name = (provider or "local").strip().lower()
     if name in {"local", "lexical"}:
@@ -362,6 +494,14 @@ def build_reranker(
             model_name=model_name or DEFAULT_JINA_RERANKER_MODEL,
             model=model,
             device=device,
+        )
+    if name in {"siliconflow", "silicon-flow"}:
+        return SiliconFlowReranker(
+            base_url=base_url or "https://api.siliconflow.cn/v1",
+            api_key=api_key,
+            model_name=model_name or DEFAULT_SILICONFLOW_RERANKER_MODEL,
+            timeout=timeout,
+            session=session,
         )
     if name in {"qwen3", "qwen3-reranker", "qwen-reranker"}:
         return Qwen3Reranker(
@@ -432,15 +572,21 @@ def _validate_qwen3_reranker_model(model: Any) -> None:
 
 
 def _candidate_text(candidate: dict[str, Any]) -> str:
-    return " ".join(
-        part
-        for part in [
-            str(candidate.get("title", "")).strip(),
-            str(candidate.get("section", "")).strip(),
-            str(candidate.get("rerank_context_text", "") or candidate.get("text", "")).strip(),
-        ]
-        if part
-    )
+    parts = [
+        str(candidate.get("title", "")).strip(),
+        str(candidate.get("section", "")).strip(),
+        str(candidate.get("rerank_context_text", "") or candidate.get("text", "")).strip(),
+    ]
+    tags = ", ".join(str(tag).strip() for tag in list(candidate.get("tags", []) or []) if str(tag).strip())
+    if tags:
+        parts.append("Tags: " + tags)
+    return " ".join(part for part in parts if part)
+
+
+def _neural_tag_bonus(candidate: dict[str, Any]) -> float:
+    """Keep tag metadata as a small tie-breaker after neural reranking."""
+
+    return min(0.08, max(0.0, float(candidate.get("tag_score", 0.0))) * 0.02)
 
 
 def _rank_by_evidence_id(
@@ -529,6 +675,7 @@ def _matched_terms(row: dict[str, Any], query_terms: list[str]) -> list[str]:
                     str(row.get("text", "")),
                     str(row.get("title", "")),
                     str(row.get("section", "")),
+                    " ".join(str(tag) for tag in list(row.get("tags", []) or [])),
                 ]
             )
         )

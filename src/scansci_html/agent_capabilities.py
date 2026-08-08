@@ -99,6 +99,16 @@ _BUILTIN_CAPABILITIES: tuple[CapabilityDescriptor, ...] = (
         output_kinds=("web_candidates",), timeout_seconds=180,
     ),
     CapabilityDescriptor(
+        "agent_reach", "tool", "Agent Reach Internet Router", "Read or search public internet channels through ScanSci-owned zero-install backends.",
+        source="Panniantong/Agent-Reach / MIT / ScanSci adaptation",
+        output_kinds=("web_candidates", "page_content", "channel_status"), timeout_seconds=180,
+    ),
+    CapabilityDescriptor(
+        "browser_access", "tool", "Rendered Browser Access", "Read a public page through the bundled web-access CDP bridge when static readers cannot provide sufficient content.",
+        source="eze-is/web-access / MIT / ScanSci read-only bridge",
+        output_kinds=("page_content", "browser_status"), timeout_seconds=180,
+    ),
+    CapabilityDescriptor(
         "self_assess", "control", "执行自评", "基于当前轮次的工具记录检查缺口和下一步。",
         evidence_policy="off", output_kinds=("self_assessment",),
     ),
@@ -132,6 +142,8 @@ _CANONICAL_TOOL_IDS: tuple[str, ...] = (
     "verify_doi",
     "discover_papers",
     "search_web",
+    "agent_reach",
+    "browser_access",
     "search_journal",
     "audit_references",
     "build_presentation_outline",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+from PIL import Image
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,3 +23,16 @@ def test_desktop_build_embeds_scansci_icon() -> None:
 
     assert '"--icon", $iconPath' in build_script
     assert '"scansci.ico"' in build_script
+
+
+def test_scan_sci_mark_has_transparent_outer_canvas() -> None:
+    mark = ROOT / "src" / "scansci_html" / "web" / "scansci-mark.png"
+
+    with Image.open(mark) as image:
+        rgba = image.convert("RGBA")
+
+    assert rgba.getpixel((0, 0))[3] == 0
+    assert rgba.getpixel((511, 511))[3] == 0
+    assert rgba.getpixel((256, 256))[3] == 255
+    # The white magnifying glass is intentional and must stay opaque.
+    assert rgba.getpixel((256, 190))[3] == 255

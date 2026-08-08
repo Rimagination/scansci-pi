@@ -14,13 +14,25 @@ param(
     # release candidate to the exact source fingerprint that passed its gate.
     [string]$ReleaseSourceSha256 = "",
     [string]$CacheKey = "",
-    [string]$RuntimeManifestUrl = "",
+    # Keep direct/manual builds aligned with the public release contract. An
+    # empty value here makes a core package advertise model downloads without
+    # providing the runtime that executes them.
+    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
+    # Slim channel: do not embed node.exe or tectonic.exe in the bundle.
+    # The Pi sidecar and slide LaTeX engine then resolve them through the
+    # managed runtime components (see runtime_components.py) after one
+    # user-confirmed install.
+    [switch]$ExcludeRuntimes,
     [switch]$Clean
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $OutputDir) {
     $OutputDir = Join-Path $projectRoot "dist"
+}
+$runtimeUri = [Uri]$RuntimeManifestUrl
+if (-not $runtimeUri.IsAbsoluteUri -or $runtimeUri.Scheme -ne "https") {
+    throw "RuntimeManifestUrl must be an absolute HTTPS URL."
 }
 $entryPoint = Join-Path $projectRoot "scripts\scansci_desktop_entry.py"
 $pyInstallerHooks = Join-Path $projectRoot "scripts\pyinstaller_hooks"
@@ -142,7 +154,7 @@ $pyInstallerArgs = @(
     "--add-data", "$assetSource;scansci_html\web",
     "--add-data", "$skillAssetSource;scansci_html\builtin_skill_assets",
     "--add-data", "$piBundle;pi_runtime",
-    "--add-binary", "$nodeExe;pi_runtime",
+    $(if (-not $ExcludeRuntimes) { @("--add-binary", "$nodeExe;pi_runtime") } else { @() }),
     # python-pptx loads its default blank deck from package data at runtime;
     # include it explicitly so a packaged ScanSci can create PPTX files.
     "--collect-data", "pptx",
@@ -176,7 +188,10 @@ $pyInstallerArgs = @(
     "--specpath", $specPath,
     $entryPoint
 )
-if ($tectonicSource) {
+if ($ExcludeRuntimes) {
+    # Slide LaTeX resolves tectonic.exe through the managed runtime component.
+    Write-Warning "Tectonic is not embedded (slim channel); slide LaTeX uses the managed Tectonic component."
+} elseif ($tectonicSource) {
     $pyInstallerArgs = @("--add-binary", "$tectonicSource;scansci_html\runtime\latex") + $pyInstallerArgs
 } else {
     Write-Warning "Tectonic was not found. The packaged LaTeX plugin will require an existing TeX Live runtime."
@@ -237,6 +252,15 @@ if ($PackageProfile -eq "full") {
         "--hidden-import", "transformers.models.qwen3",
         "--hidden-import", "transformers.models.qwen3.configuration_qwen3",
         "--hidden-import", "transformers.models.qwen3.modeling_qwen3",
+        # Qwen3-ASR is loaded lazily by scansci_html.local_asr when the user
+        # sends an audio attachment.  PyInstaller cannot infer this dynamic
+        # AutoModelForMultimodalLM architecture from the string-based model
+        # registry, so keep the complete ASR family in the full profile.
+        "--hidden-import", "transformers.models.qwen3_asr",
+        "--hidden-import", "transformers.models.qwen3_asr.configuration_qwen3_asr",
+        "--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr",
+        "--hidden-import", "transformers.models.qwen3_asr.processing_qwen3_asr",
+        "--hidden-import", "scansci_html.local_asr",
         "--hidden-import", "transformers.models.qwen2.tokenization_qwen2_fast",
         "--hidden-import", "scansci_html.local_runtime_server"
     )
@@ -271,7 +295,17 @@ $excludedModules = @(
     # Never collect the benchmark tree into an end-user runtime. PyTorch's
     # single runtime dependency under torch.testing._internal is declared
     # explicitly above; the custom hook still excludes the rest as data.
-    "torch.utils.benchmark"
+    "torch.utils.benchmark",
+    # Scientific stack pulled in only through optional import chains
+    # (litellm's nvidia_riva audio module, pydub's effects, pymupdf layout).
+    # ScanSci core never imports scipy; keep the ~50 MB out of the bundle.
+    "scipy",
+    "sklearn",
+    # markitdown[all]'s audio transcription stack (pocketsphinx acoustic
+    # data + flac binaries for three platforms).  Voice input goes through
+    # ScanSci's own local ASR, never through markitdown.
+    "speech_recognition",
+    "pydub"
 )
 if ($PackageProfile -eq "core") {
     $excludedModules += @(

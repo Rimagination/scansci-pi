@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 from zipfile import ZipFile
 
+from scansci_html import app_update
 from scansci_html.app_update import APP_VERSION, AppUpdateService
 
 
@@ -17,6 +19,17 @@ def test_update_status_is_honest_without_release_channel(tmp_path: Path) -> None
     assert status["available"] is False
     assert status["current_version"] == APP_VERSION
     assert status["message"] == f"当前版本 v{APP_VERSION}"
+
+
+def test_packaged_update_service_uses_the_public_channel_when_environment_is_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+    service = AppUpdateService(updates_root=tmp_path)
+
+    assert service.manifest_url == app_update.DEFAULT_UPDATE_MANIFEST_URL
 
 
 def test_update_service_reads_verified_windows_release_manifest(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ import traceback
 from typing import Any, Iterator
 
 from .local_model_market import installed_models
+from .local_asr import LocalASRRuntime
 from .local_model_inference import (
     LoadedLocalModel,
     generate_local_chat_stream,
@@ -42,6 +43,7 @@ class LocalRuntimeServer:
         self._torch: Any | None = None
         self._device = "cpu"
         self._loaded: LoadedLocalModel | None = None
+        self._asr = LocalASRRuntime()
 
     @property
     def base_url(self) -> str:
@@ -53,6 +55,8 @@ class LocalRuntimeServer:
             raise ValueError("本地模型权重尚未完整下载，暂时不能启动。")
         if str(record.get("format")) != "transformers":
             raise ValueError("该模型是 GGUF 格式，请通过 llama.cpp 或 LM Studio 运行。")
+        if str(record.get("kind", "")) == "audio" and record.get("runtime_compatible") is False:
+            raise ValueError(str(record.get("runtime_message", "当前语音模型格式不受支持。")))
         self._model_id = str(record["id"])
         self._model_path = Path(str(record["path"])).resolve()
         self._server = ThreadingHTTPServer((self.host, self.port), self._handler())
@@ -88,13 +92,30 @@ class LocalRuntimeServer:
                 self._json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not found"}})
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path.rstrip("/") != "/v1/chat/completions":
+                endpoint = self.path.rstrip("/")
+                if endpoint not in {"/v1/chat/completions", "/v1/audio/transcriptions"}:
                     self._json(HTTPStatus.NOT_FOUND, {"error": {"message": "Not found"}})
                     return
                 cancel_event = threading.Event()
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if endpoint == "/v1/audio/transcriptions":
+                        if str(payload.get("model", "")) != runtime._model_id:
+                            raise ValueError("selected local speech model is no longer available")
+                        text = runtime.transcribe_audio(
+                            str(payload.get("audio_path", "")),
+                            language=str(payload.get("language", "") or ""),
+                        )
+                        self._json(
+                            HTTPStatus.OK,
+                            {
+                                "text": text,
+                                "model": runtime._model_id,
+                                "object": "audio.transcription",
+                            },
+                        )
+                        return
                     messages = payload.get("messages")
                     if not isinstance(messages, list) or not messages:
                         raise ValueError("messages is required")
@@ -168,6 +189,14 @@ class LocalRuntimeServer:
                 max_new_tokens=max_new_tokens,
                 cancel_event=cancel_event,
             )
+
+    def transcribe_audio(self, audio_path: str, *, language: str = "") -> str:
+        """Transcribe one file through the same isolated ASR runtime."""
+
+        if not str(audio_path or "").strip():
+            raise ValueError("audio_path is required")
+        with self._lock:
+            return self._asr.transcribe(self._model_id, audio_path, language=language)
 
     def wait(self) -> None:
         if self._thread is not None:

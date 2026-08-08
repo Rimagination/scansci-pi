@@ -653,6 +653,14 @@ def _ensure_cache_meta_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    # Earlier versions of this table were created without the schema_version
+    # column when the DDL did not yet include it.  Add the column in-place
+    # so the status report and future generations can track their baseline.
+    existing = {row[1] for row in connection.execute("pragma table_info('scansci_vector_cache_meta')")}
+    if "schema_version" not in existing:
+        connection.execute(
+            "alter table scansci_vector_cache_meta add column schema_version integer not null default 0"
+        )
 
 
 def migrate_embedding_caches(

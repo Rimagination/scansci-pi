@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -540,7 +541,11 @@ def load_workspace_summary(
             "notebooks": [],
             "counts": {"notebooks": 0, "sources": 0, "notes": 0, "layers": 0},
         }
-    with sqlite3.connect(workspace) as connection:
+    # ``with sqlite3.connect(...)`` manages only the transaction; it does not
+    # close the connection.  Close deterministically: on Windows an open
+    # sqlite handle keeps the file locked until GC, and a reference cycle can
+    # delay that past the caller's cleanup.
+    with closing(sqlite3.connect(workspace)) as connection:
         connection.row_factory = sqlite3.Row
         _initialize_schema(connection)
         notebook_where, params = _notebook_where(notebook_id)

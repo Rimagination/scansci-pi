@@ -962,7 +962,7 @@ def test_stream_chat_text_retries_two_rate_limits_before_delivery(monkeypatch):
     assert [event["type"] for event in events[:2]] == ["retry", "retry"]
     assert events[2]["content"] == "recovered after two retries"
     assert events[-1]["truncated"] is False
-    assert sleeps == [2.0, 4.0]
+    assert sleeps == [4.0, 8.0]
 
 
 def test_stream_chat_text_retries_a_statusless_connect_failure_before_delivery(monkeypatch):
@@ -1147,6 +1147,44 @@ def test_openai_compatible_vision_request_embeds_local_image_data():
     assert calls[0][0] == "https://example.test/v1/chat/completions"
     assert calls[0][2]["max_tokens"] == 2048
     assert calls[0][2]["messages"][0]["content"][1]["image_url"]["url"] == "data:image/png;base64,aGVsbG8="
+
+
+def test_inline_image_bytes_do_not_consume_text_input_budget():
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "image received"}}]}
+
+    class FakeSession:
+        def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    # This is deliberately much larger than the text budget.  It represents
+    # an inline image payload, not a prompt that should be rejected as text.
+    image_data = "A" * 400_000
+    result = complete_chat_text(
+        "openai-compatible",
+        base_url="http://127.0.0.1:17863/v1",
+        api_key="local",
+        model="vision-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                ],
+            }
+        ],
+        session=FakeSession(),
+    )
+
+    assert result == "image received"
 
 
 def test_plain_chat_rejects_oversized_input_before_network_request():

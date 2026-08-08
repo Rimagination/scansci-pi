@@ -51,12 +51,18 @@ bench/*.partial.summary.md
 bench/*.chart.html
 bench/sample_library/*.evidence.html
 releases/
+release/
 .scansci-diagnostics/
 
 # Local browser/runtime state
 agent-browser.json
 .scansci-browser-identity.json
 .scansci-notebook.json
+.scansci-attachments/
+.scansci-audio-attachments/
+.scansci-direct-chat-history.json
+.scansci-mcp-marketplace.json
+.tmp_update_preview.json
 
 # Local ScanSci runtime state and evidence indexes
 .scansci/
@@ -79,4 +85,3 @@ b/
 # User downloads and one-off local validation outputs
 downloads/
 icon-no-white-border.png
-document.body.innerText.includes('warnings.warn')

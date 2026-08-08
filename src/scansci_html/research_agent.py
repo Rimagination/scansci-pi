@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import hashlib
 import json
@@ -38,6 +38,8 @@ from .deep_research_evidence import build_task_fulltext_evidence, task_evidence_
 from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
 from .evidence_store import ensure_library_overview, knowledge_base_snapshot
 from .image_attachments import persist_image_attachments, vision_image_blocks
+from .audio_attachments import audio_attachment_asset, persist_audio_attachments
+from .capability_ledger import CapabilityDeliveryError, CapabilityLedger
 from .ingestion import ingest_sources, ingestion_context
 from .library_manager import import_library_files, notebook_evidence_db
 from .literature_review import _concise_review_title, retrieve_review_evidence, synthesize_literature_review
@@ -57,10 +59,13 @@ from .research_ideation import (
     plan_research_idea,
 )
 from .embeddings import HashingEmbeddingProvider
-from .rerankers import LexicalReranker
+from .rerankers import LexicalReranker, build_reranker
 from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
 from .model_transport import select_api_surface
 from .local_transformers_runtime import ensure_local_transformers_runtime
+from .local_asr import transcribe_local_audio
+from .local_model_market import QWEN3_ASR_LEGACY_MODEL_ID, installed_models
+from .ollama_runtime import ollama_status
 from .pi_agent import PiAgentClient, PiAgentRunError
 from .run_manifest import RunManifest
 from .qa.agent import answer_question
@@ -104,7 +109,9 @@ from .slide_studio import create_source_slide_deck, persist_slide_sources
 from .task_routing import route_freeform_task
 from .skill_runtime import resolve_skill_selection
 from .workspace import load_workspace_summary
+from .vision_routing import ocr_image_blocks, select_text_route, select_vision_route
 from .zotero_integration import zotero_status
+from .zotero_scope import resolve_zotero_tag_scope, sync_zotero_document_tags
 
 
 _GOOD_QUESTION_FIELDS = (
@@ -837,20 +844,17 @@ def _validate_pi_delivery(
     task_mode: str | None,
     user_text: str,
     tool_calls: list[dict[str, Any]] | None,
-) -> None:
+) -> CapabilityLedger:
     """Reject plans and unsupported completion claims at the delivery boundary."""
 
-    completed = {
-        str(item.get("name", ""))
-        for item in list(tool_calls or [])
-        if str(item.get("status", "")) == "completed"
-    }
-    missing = _missing_pi_tool_groups(task_mode, completed, user_text)
-    if missing:
-        rendered = " AND ".join("/".join(sorted(group)) for group in missing)
-        raise RuntimeError(f"ScanSci did not complete the required action: {rendered}")
+    ledger = CapabilityLedger.from_tool_calls(
+        _required_pi_tool_groups(task_mode, user_text),
+        tool_calls,
+    )
+    if not ledger.ready:
+        raise ledger.delivery_error()
     if not _pi_requires_tools(task_mode, user_text):
-        return
+        return ledger
     tail = str(text or "").strip()[-1_200:]
     if re.search(
         r"(?:\bI (?:will|shall)(?: now)?\b|\bLet me (?:now )?\b|\bNext,? I will\b)"
@@ -861,6 +865,16 @@ def _validate_pi_delivery(
         re.IGNORECASE | re.DOTALL,
     ):
         raise RuntimeError("Pi stopped at an execution plan instead of returning a completed result")
+    return ledger
+
+
+def _required_capability_preflight(task_contract: dict[str, Any]) -> CapabilityLedger:
+    """Fail early only when the host has already proven a required tool unavailable."""
+
+    ledger = CapabilityLedger.from_contract(task_contract)
+    if ledger.required_groups and ledger.unavailable_groups():
+        raise ledger.delivery_error(cause="Host capability preflight marked every candidate unavailable")
+    return ledger
 
 
 def _is_restart_request(text: str) -> bool:
@@ -1026,7 +1040,7 @@ def _selected_skill_requires_web(selected_skills: list[dict[str, Any]]) -> bool:
 
     return any(
         _has_selected_skill(selected_skills, identifier)
-        for identifier in {"web-access", "nature-academic-search"}
+        for identifier in {"web-access", "agent-reach", "nature-academic-search"}
     )
 
 
@@ -1348,7 +1362,9 @@ class _DirectChatRequest:
     selected_skills: list[dict[str, Any]]
     notebook_id: str
     notebook_ids: list[str]
+    knowledge_scope: dict[str, Any]
     manifest: RunManifest | None = None
+    vision_route: dict[str, Any] = field(default_factory=dict)
 
 
 class _DurableModelClient:
@@ -1522,6 +1538,7 @@ class ResearchAgentRuntime:
         self._managed_writing_clients: dict[tuple[str, str, str], Any] = {}
         self._local_evidence_models: dict[str, LocalEvidenceStack] = {}
         self._academic_discovery_models: dict[str, LocalEvidenceStack] = {}
+        self._zotero_tag_sync_cache: set[str] = set()
 
     def _wrap_model_client(self, client: Any) -> Any:
         context = getattr(self._model_event_context, "value", None)
@@ -2343,171 +2360,241 @@ class ResearchAgentRuntime:
         force_local_evidence = bool(payload.get("force_local_evidence", False))
         research_run_id = str(payload.get("_research_run_id", "") or "")
         image_attachments = list(payload.get("images", []) or [])
-        if image_attachments and (provider is None or provider.get("kind") == "local"):
-            raise ValueError("图片提问需要选择一个已配置的视觉模型")
         image_analysis: dict[str, Any] | None = None
+        if image_attachments:
+            blocks = vision_image_blocks(self.workspace, image_attachments)
+            active_model_id = str(active.get("model_id", "")).strip()
+            active_model_record = next(
+                (
+                    item
+                    for item in list(provider.get("models", []) or [])
+                    if str(item.get("id", "")) == active_model_id
+                ),
+                {},
+            ) if provider is not None else {}
+            active_has_vision = "vision" in {
+                str(value).strip().lower()
+                for value in list(active_model_record.get("capabilities", []) or [])
+            }
+            vision_provider = provider if active_has_vision else None
+            vision_model_id = active_model_id if active_has_vision else ""
+            vision_api_key = ""
+            if vision_provider is not None:
+                managed_vision = str(vision_provider.get("auth_mode", "")) == "managed"
+                vision_api_key = (
+                    "scansci-managed-gateway"
+                    if managed_vision
+                    else "local"
+                    if str(vision_provider.get("auth_mode", "")).strip().lower() == "local"
+                    or str(vision_provider.get("kind", "")).strip().lower() == "local"
+                    else get_provider_api_key(self.workspace, str(vision_provider.get("id", "")))
+                )
+                if not vision_api_key:
+                    vision_provider = None
+            if vision_provider is None:
+                try:
+                    selected_vision = select_vision_route(
+                        self.workspace,
+                        settings,
+                        active_provider_id=str(active.get("provider_id", "")),
+                        active_model_id=active_model_id,
+                        # Evidence answers must not silently ship user images
+                        # to a cloud vision provider the user never selected.
+                        # Only the explicitly selected model or a local vision
+                        # runtime qualifies; otherwise the OCR fallback below
+                        # keeps the image local.
+                        allow_cloud=False,
+                    )
+                except Exception:
+                    selected_vision = None
+                if selected_vision is not None:
+                    vision_provider = dict(selected_vision["provider"])
+                    vision_model_id = str(selected_vision["model_id"])
+                    vision_api_key = str(selected_vision.get("api_key", ""))
+            if vision_provider is not None and vision_api_key:
+                try:
+                    if str(vision_provider.get("id", "")) == "local-huggingface":
+                        # The loopback server is lazy by design.  Start the
+                        # selected local vision snapshot before the generic
+                        # OpenAI-compatible vision transport sends its first
+                        # request.
+                        ensure_local_transformers_runtime(vision_model_id)
+                    image_analysis = {
+                        "text": analyze_vision_images(
+                            str(vision_provider.get("kind", "")),
+                            base_url=str(vision_provider.get("base_url", "")),
+                            api_key=vision_api_key,
+                            model=vision_model_id,
+                            question=question,
+                            images=blocks,
+                        ),
+                        "image_count": len(image_attachments),
+                        "model": vision_model_id,
+                    }
+                except Exception as error:
+                    ocr = ocr_image_blocks(blocks)
+                    image_analysis = {
+                        "text": str(ocr.get("text", "")).strip()
+                        or "视觉模型本轮未能读取图片，且 OCR 未提取到可用文字。请不要根据图片猜测事实。",
+                        "image_count": len(image_attachments),
+                        "model": "本地 OCR（视觉模型失败后兜底）",
+                        "fallback_reason": f"{type(error).__name__}: {error}"[:240],
+                    }
+            else:
+                ocr = ocr_image_blocks(blocks)
+                image_analysis = {
+                    "text": str(ocr.get("text", "")).strip()
+                    or "当前没有可用的视觉模型，且 OCR 未提取到可用文字。请不要根据图片猜测事实。",
+                    "image_count": len(image_attachments),
+                    "model": "本地 OCR（视觉模型不可用时兜底）",
+                }
+        if image_attachments and image_analysis is not None:
+            analysis_text = str(image_analysis.get("text", "")).strip()
+            if analysis_text:
+                question = f"{question}\n\n【图片内容（{str(image_analysis.get('model', ''))}）】\n{analysis_text}"
         if provider is not None and provider.get("kind") != "local" and not force_local_evidence:
             managed = str(provider.get("auth_mode", "")) == "managed"
             api_key = "scansci-managed-gateway" if managed else get_provider_api_key(self.workspace, str(provider.get("id", "")))
-            if not api_key:
+            if not api_key and not image_attachments:
                 raise ValueError("当前生成模型尚未配置 API Key")
-            if image_attachments:
-                model_record = next(
-                    (item for item in provider.get("models", []) if str(item.get("id", "")) == str(active.get("model_id", ""))),
-                    {},
-                )
-                if "vision" not in set(model_record.get("capabilities", []) or []):
-                    raise ValueError("当前模型未启用视觉能力，请在对话框模型菜单选择带“视觉”标签的模型")
-                image_analysis = {
-                    "text": analyze_vision_images(
-                        str(provider.get("kind", "")),
+            task_mode = str(payload.get("task_mode", "evidence")).strip().lower() or "evidence"
+            requested_harness = str(payload.get("agent_harness", "")).strip().lower()
+            # Evidence answers have a product-owned retrieval, citation and
+            # verification pipeline below.  Running an additional model
+            # tool-planning loop first delays the answer and makes a
+            # gateway-side tool incompatibility look like a retrieval
+            # failure.  Keep Pi available when it is explicitly requested,
+            # but make the deterministic evidence workflow the default.
+            harness = requested_harness or (
+                "fixed-workflow"
+                if task_mode in {"auto", "evidence", "verified-answer"}
+                else "pi"
+            )
+            tool_calls: list[dict[str, Any]] = []
+            # PiAgentClient owns a local compatibility adapter for ScanSci's
+            # text-only managed gateway, so managed models must traverse the
+            # same real Pi session/tool loop as other production providers.
+            use_native_tool_loop = harness not in {"legacy", "fixed-workflow"}
+            if harness in {"deep", "deep-agent", "deep-agents"}:
+                try:
+                    model = build_deep_agent_model(
+                        provider_id=str(provider.get("id", "")),
+                        provider_kind=str(provider.get("kind", "")),
                         base_url=str(provider.get("base_url", "")),
                         api_key=api_key,
                         model=str(active.get("model_id", "")),
-                        question=question,
-                        images=vision_image_blocks(self.workspace, image_attachments),
-                    ),
-                    "image_count": len(image_attachments),
-                    "model": str(active.get("model_id", "")),
-                }
-            else:
-                task_mode = str(payload.get("task_mode", "evidence")).strip().lower() or "evidence"
-                requested_harness = str(payload.get("agent_harness", "")).strip().lower()
-                # Evidence answers have a product-owned retrieval, citation and
-                # verification pipeline below.  Running an additional model
-                # tool-planning loop first delays the answer and makes a
-                # gateway-side tool incompatibility look like a retrieval
-                # failure.  Keep Pi available when it is explicitly requested,
-                # but make the deterministic evidence workflow the default.
-                harness = requested_harness or (
-                    "fixed-workflow"
-                    if task_mode in {"auto", "evidence", "verified-answer"}
-                    else "pi"
-                )
-                tool_calls: list[dict[str, Any]] = []
-                # PiAgentClient owns a local compatibility adapter for ScanSci's
-                # text-only managed gateway, so managed models must traverse the
-                # same real Pi session/tool loop as other production providers.
-                use_native_tool_loop = harness not in {"legacy", "fixed-workflow"}
-                if harness in {"deep", "deep-agent", "deep-agents"}:
+                        thinking_level=thinking_level,
+                    )
+                    deep_agent = ScanSciDeepAgent(
+                        evidence_db=evidence_db,
+                        workspace=self.workspace,
+                        model=model,
+                    )
+                    deep_agent.embedding_provider = local_evidence.embedding_provider
+                    deep_agent.reranker = local_evidence.reranker
+                    result = deep_agent.answer(
+                        question,
+                        limit=limit,
+                        thread_id=str(payload.get("thread_id", "")),
+                        task_mode=str(payload.get("task_mode", "auto")),
+                    )
+                    agent_harness = "deep-agents"
+                except Exception as error:  # optional compatibility harness
+                    agent_fallback_error = f"{type(error).__name__}: {error}"
+            elif use_native_tool_loop:
+                try:
+                    pi_agent = PiAgentClient(
+                        workspace=self.workspace,
+                        evidence_db=evidence_db,
+                        root_evidence_db=self.evidence_db,
+                        additional_evidence_dbs=evidence_dbs[1:],
+                        notebook_ids=requested_notebook_ids,
+                        knowledge_scope=self._scope_for_notebook(payload, notebook),
+                    )
+                    pi_agent.embedding_provider = local_evidence.embedding_provider
+                    pi_agent.reranker = local_evidence.reranker
+                    if research_run_id:
+                        with self._active_pi_lock:
+                            self._active_pi_clients[research_run_id] = pi_agent
                     try:
-                        model = build_deep_agent_model(
-                            provider_id=str(provider.get("id", "")),
+                        pi_events = pi_agent.stream_chat(
                             provider_kind=str(provider.get("kind", "")),
                             base_url=str(provider.get("base_url", "")),
                             api_key=api_key,
-                            model=str(active.get("model_id", "")),
-                            thinking_level=thinking_level,
+                            model_id=str(active.get("model_id", "")),
+                            api_surface=select_api_surface(
+                                str(provider.get("api_surface", "chat_completions")),
+                                provider_kind=str(provider.get("kind", "")),
+                                provider_id=str(provider.get("id", "")),
+                                model=str(active.get("model_id", "")),
+                                responses_enabled=bool(provider.get("responses_enabled", False)),
+                            ),
+                            responses_enabled=bool(provider.get("responses_enabled", False)),
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are ScanSci. This endpoint requires a source-grounded answer. "
+                                        "Call build_verified_answer and use its verified result for delivery."
+                                    ),
+                                },
+                                {"role": "user", "content": question},
+                            ],
+                            # The managed text gateway does not expose native
+                            # tool calls or a separate reasoning budget. Keep
+                            # this one-action protocol non-reasoning so the
+                            # bounded output window contains the actual intent
+                            # instead of being exhausted by hidden thoughts.
+                            thinking_level="off" if managed else thinking_level,
+                            task_mode="verified-answer" if task_mode in {"auto", "evidence"} else task_mode,
+                            timeout_seconds=self.verified_answer_pi_timeout_seconds(managed=managed),
                         )
-                        deep_agent = ScanSciDeepAgent(
-                            evidence_db=evidence_db,
-                            workspace=self.workspace,
-                            model=model,
-                        )
-                        deep_agent.embedding_provider = local_evidence.embedding_provider
-                        deep_agent.reranker = local_evidence.reranker
-                        result = deep_agent.answer(
-                            question,
-                            limit=limit,
-                            thread_id=str(payload.get("thread_id", "")),
-                            task_mode=str(payload.get("task_mode", "auto")),
-                        )
-                        agent_harness = "deep-agents"
-                    except Exception as error:  # optional compatibility harness
-                        agent_fallback_error = f"{type(error).__name__}: {error}"
-                elif use_native_tool_loop:
-                    try:
-                        pi_agent = PiAgentClient(
-                            workspace=self.workspace,
-                            evidence_db=evidence_db,
-                            root_evidence_db=self.evidence_db,
-                            additional_evidence_dbs=evidence_dbs[1:],
-                            notebook_ids=requested_notebook_ids,
-                        )
-                        pi_agent.embedding_provider = local_evidence.embedding_provider
-                        pi_agent.reranker = local_evidence.reranker
+                        for pi_event in pi_events:
+                            if pi_event.get("type") == "tool.completed":
+                                tool_name = str(pi_event.get("name", ""))
+                                tool_calls.append({"name": tool_name, "status": "completed"})
+                                if tool_name == "build_verified_answer":
+                                    result = dict(pi_event.get("result", {}) or {})
+                            elif pi_event.get("type") == "cancelled":
+                                raise _RunCancelled("Pi Agent run was cancelled")
+                    finally:
                         if research_run_id:
                             with self._active_pi_lock:
-                                self._active_pi_clients[research_run_id] = pi_agent
-                        try:
-                            pi_events = pi_agent.stream_chat(
-                                provider_kind=str(provider.get("kind", "")),
-                                base_url=str(provider.get("base_url", "")),
-                                api_key=api_key,
-                                model_id=str(active.get("model_id", "")),
-                                api_surface=select_api_surface(
-                                    str(provider.get("api_surface", "chat_completions")),
-                                    provider_kind=str(provider.get("kind", "")),
-                                    provider_id=str(provider.get("id", "")),
-                                    model=str(active.get("model_id", "")),
-                                    responses_enabled=bool(provider.get("responses_enabled", False)),
-                                ),
-                                responses_enabled=bool(provider.get("responses_enabled", False)),
-                                messages=[
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            "You are ScanSci. This endpoint requires a source-grounded answer. "
-                                            "Call build_verified_answer and use its verified result for delivery."
-                                        ),
-                                    },
-                                    {"role": "user", "content": question},
-                                ],
-                                # The managed text gateway does not expose native
-                                # tool calls or a separate reasoning budget. Keep
-                                # this one-action protocol non-reasoning so the
-                                # bounded output window contains the actual intent
-                                # instead of being exhausted by hidden thoughts.
-                                thinking_level="off" if managed else thinking_level,
-                                task_mode="verified-answer" if task_mode in {"auto", "evidence"} else task_mode,
-                                timeout_seconds=self.verified_answer_pi_timeout_seconds(managed=managed),
-                            )
-                            for pi_event in pi_events:
-                                if pi_event.get("type") == "tool.completed":
-                                    tool_name = str(pi_event.get("name", ""))
-                                    tool_calls.append({"name": tool_name, "status": "completed"})
-                                    if tool_name == "build_verified_answer":
-                                        result = dict(pi_event.get("result", {}) or {})
-                                elif pi_event.get("type") == "cancelled":
-                                    raise _RunCancelled("Pi Agent run was cancelled")
-                        finally:
-                            if research_run_id:
-                                with self._active_pi_lock:
-                                    if self._active_pi_clients.get(research_run_id) is pi_agent:
-                                        self._active_pi_clients.pop(research_run_id, None)
-                            pi_agent.close()
-                        agent_harness = "pi-agent-sdk"
-                        if result is None:
-                            agent_fallback_error = "Pi Agent did not finalize through build_verified_answer"
-                    except _RunCancelled:
-                        raise
-                    except Exception as error:  # provider tool compatibility boundary
-                        # Do not fail the user's evidence task merely because a
-                        # nominally OpenAI-compatible endpoint implements a
-                        # different tool/message schema.  The fixed workflow
-                        # below retains the same retrieval and citation gates.
-                        agent_fallback_error = f"{type(error).__name__}: {error}"
-                        if isinstance(error, PiAgentRunError):
-                            agent_fallback_failure = dict(error.failure or {})
-                if result is None:
-                    rag_client = build_chat_json_client(
-                        str(provider.get("kind", "")),
-                        base_url=str(provider.get("base_url", "")),
-                        api_key=api_key,
-                        model=str(active.get("model_id", "")),
-                        session=managed_gateway_session() if managed else None,
-                        thinking_mode="disabled" if managed else None,
-                        api_surface=str(provider.get("api_surface", "chat_completions")),
-                        provider_id=str(provider.get("id", "")),
-                        responses_enabled=bool(provider.get("responses_enabled", False)),
-                    )
-                    answer_options = {
-                        "answer_provider": "llm",
-                        "verification_provider": "llm",
-                        "query_rewrite_provider": "llm",
-                        "chat_client": rag_client,
-                    }
-                    agent_harness = "provider-neutral-workflow"
+                                if self._active_pi_clients.get(research_run_id) is pi_agent:
+                                    self._active_pi_clients.pop(research_run_id, None)
+                        pi_agent.close()
+                    agent_harness = "pi-agent-sdk"
+                    if result is None:
+                        agent_fallback_error = "Pi Agent did not finalize through build_verified_answer"
+                except _RunCancelled:
+                    raise
+                except Exception as error:  # provider tool compatibility boundary
+                    # Do not fail the user's evidence task merely because a
+                    # nominally OpenAI-compatible endpoint implements a
+                    # different tool/message schema.  The fixed workflow
+                    # below retains the same retrieval and citation gates.
+                    agent_fallback_error = f"{type(error).__name__}: {error}"
+                    if isinstance(error, PiAgentRunError):
+                        agent_fallback_failure = dict(error.failure or {})
+            if result is None:
+                rag_client = build_chat_json_client(
+                    str(provider.get("kind", "")),
+                    base_url=str(provider.get("base_url", "")),
+                    api_key=api_key,
+                    model=str(active.get("model_id", "")),
+                    session=managed_gateway_session() if managed else None,
+                    thinking_mode="disabled" if managed else None,
+                    api_surface=str(provider.get("api_surface", "chat_completions")),
+                    provider_id=str(provider.get("id", "")),
+                    responses_enabled=bool(provider.get("responses_enabled", False)),
+                )
+                answer_options = {
+                    "answer_provider": "llm",
+                    "verification_provider": "llm",
+                    "query_rewrite_provider": "llm",
+                    "chat_client": rag_client,
+                }
+                agent_harness = "provider-neutral-workflow"
         if result is None:
             if not evidence_db.exists():
                 raise FileNotFoundError(f"Evidence store does not exist: {evidence_db}")
@@ -2519,6 +2606,7 @@ class ResearchAgentRuntime:
                     root_evidence_db=self.evidence_db,
                     additional_evidence_dbs=available_evidence_dbs[1:],
                     notebook_ids=requested_notebook_ids,
+                    knowledge_scope=self._scope_for_notebook(payload, notebook),
                     embedding_provider=local_evidence.embedding_provider,
                     reranker=local_evidence.reranker,
                 )
@@ -2543,6 +2631,12 @@ class ResearchAgentRuntime:
                     per_document_limit=per_document_limit,
                     embedding_provider=local_evidence.embedding_provider,
                     reranker=local_evidence.reranker,
+                    filters=self._knowledge_filters_for_notebook(
+                        notebook,
+                        evidence_db,
+                        self._scope_for_notebook(payload, notebook),
+                        question,
+                    ),
                     **answer_options,
                 )
             steps = list(dict(result.get("agentic_trace", {}) or {}).get("steps", []) or [])
@@ -2574,6 +2668,14 @@ class ResearchAgentRuntime:
                 "compatibility_error": "",
                 "compatibility_failure": {"reason": "", "retryable": False},
             }
+        scope_resolution = self._knowledge_scope_resolution(
+            notebook,
+            evidence_db,
+            self._scope_for_notebook(payload, notebook),
+            question,
+        )
+        if scope_resolution.get("active") and str(scope_resolution.get("type", "")) != "zotero-tag":
+            result["knowledge_scope"] = scope_resolution
         reader_answer = dict(result.get("reader_answer", {}) or {})
         citations = []
         for citation in list(reader_answer.get("citations", []) or []):
@@ -2602,6 +2704,25 @@ class ResearchAgentRuntime:
             and chat_request.provider_kind != "local"
             and all(isinstance(item.get("content"), str) for item in chat_request.messages)
         )
+
+    @staticmethod
+    def _vision_direct_fallback(
+        chat_request: _DirectChatRequest,
+        *,
+        task_mode: str,
+        user_text: str,
+    ) -> bool:
+        """Keep ordinary image questions on the multimodal direct path.
+
+        ``_direct_chat_request`` deliberately converts images into provider
+        message blocks.  Pi's bridge is text-only, so such a request cannot be
+        sent through the tool loop even when the selected model is otherwise
+        tool-capable.  A visual question does not by itself authorize a web,
+        knowledge-base, or artifact action; when no concrete tool is required,
+        direct vision completion is the correct route.
+        """
+
+        return bool(chat_request.vision_route) and not _pi_requires_tools(task_mode, user_text)
 
     @staticmethod
     def _pi_task_mode(chat_mode: str) -> str:
@@ -3065,6 +3186,7 @@ class ResearchAgentRuntime:
             root_evidence_db=self.evidence_db,
             additional_evidence_dbs=evidence_dbs[1:],
             notebook_ids=requested_notebook_ids,
+            knowledge_scope=chat_request.knowledge_scope,
             embedding_provider=local_evidence.embedding_provider if local_evidence else None,
             reranker=local_evidence.reranker if local_evidence else None,
             active_run_id=active_run_id,
@@ -3240,7 +3362,9 @@ class ResearchAgentRuntime:
         effect_started = False
         completed_web_search: dict[str, Any] | None = None
         completed_document_summary: dict[str, Any] | None = None
-        completed_tool_names: set[str] = set()
+        capability_ledger = CapabilityLedger(
+            _required_pi_tool_groups(task_mode, self._last_user_text(chat_request.messages))
+        )
         try:
             model_event_kwargs: dict[str, Any] = {
                 "task_mode": task_mode,
@@ -3263,27 +3387,23 @@ class ResearchAgentRuntime:
                 if event_type == "delta" and str(event.get("content", "")):
                     effect_started = True
                 elif event_type in {"tool.completed", "tool.failed"}:
-                    effect_started = True
+                    capability_ledger.record_event(event)
                     if event_type == "tool.completed":
                         completed_tool_name = str(event.get("name", ""))
-                        completed_tool_names.add(completed_tool_name)
                         if completed_tool_name in {"discover_papers", "search_web"}:
                             completed_web_search = dict(event.get("result", {}) or {})
                         elif completed_tool_name == "summarize_documents":
                             completed_document_summary = dict(event.get("result", {}) or {})
+                    # Read-only lookups can be repeated safely.  A writer or
+                    # downloader crosses the effect boundary and must never
+                    # be replayed blindly after a failure.
+                    effect_started = effect_started or capability_ledger.has_non_idempotent_effect
                 elif event_type == "status" and str(event.get("status", "")) == "tool_started":
-                    effect_started = True
+                    capability_ledger.record_event(event)
+                    effect_started = effect_started or capability_ledger.has_non_idempotent_effect
                 yield event
-            missing_groups = _missing_pi_tool_groups(
-                task_mode,
-                completed_tool_names,
-                self._last_user_text(chat_request.messages),
-            )
-            if missing_groups:
-                rendered = " AND ".join("/".join(sorted(group)) for group in missing_groups)
-                raise RuntimeError(
-                    f"Pi finished without the required tool result: {rendered}"
-                )
+            if not capability_ledger.ready:
+                raise capability_ledger.delivery_error()
         except _RunCancelled:
             raise
         except Exception as error:
@@ -3340,20 +3460,25 @@ class ResearchAgentRuntime:
                     fallback_attempted=True,
                 )
                 return
-            if _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages)):
+            if (
+                _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages))
+                and capability_ledger.safe_retry_allowed()
+            ):
                 # No text, tool start, or persisted effect escaped the failed
-                # attempt, so rebuilding the Pi session is safe.  This
-                # handles transient empty responses and corrupted/stale
-                # session state without asking the user to press send again.
+                # attempt, or only idempotent read-only tools failed, so
+                # rebuilding the Pi session is safe.  The ledger mirrors
+                # Reasonix's turn-scoped recovery rule and prevents a
+                # failed writer/downloader from being replayed blindly.
                 if session_id:
                     self._forget_pi_session(session_id)
+                capability_ledger.mark_recovery_attempt()
                 yield {
                     "type": "retry",
                     "reason": "agent_session",
                     "delay_seconds": 0,
                     "error": f"{type(error).__name__}: {error}"[:500],
+                    "capability_ledger": capability_ledger.to_dict(),
                 }
-                retry_completed_tool_names: set[str] = set()
                 try:
                     retry_kwargs = {
                         "task_mode": task_mode,
@@ -3369,28 +3494,17 @@ class ResearchAgentRuntime:
                         retry_kwargs.pop("active_run_id", None)
                         retry_events = self._pi_model_events(chat_request, **retry_kwargs)
                     for retry_event in retry_events:
-                        retry_type = str(retry_event.get("type", ""))
-                        if retry_type == "tool.completed":
-                            retry_completed_tool_names.add(str(retry_event.get("name", "")))
+                        capability_ledger.record_event(retry_event)
                         yield retry_event
-                    retry_missing = _missing_pi_tool_groups(
-                        task_mode,
-                        retry_completed_tool_names,
-                        self._last_user_text(chat_request.messages),
-                    )
-                    if retry_missing:
-                        rendered = " AND ".join(
-                            "/".join(sorted(group)) for group in retry_missing
-                        )
-                        raise RuntimeError(
-                            f"Fresh Pi session did not complete the required action: {rendered}"
-                        )
+                    if not capability_ledger.ready:
+                        raise capability_ledger.delivery_error()
                     return
                 except Exception as recovery_error:
-                    raise RuntimeError(
-                        "Pi required tool loop failed before producing a result, "
-                        "and a fresh-session recovery also failed"
-                    ) from recovery_error
+                    if isinstance(recovery_error, CapabilityDeliveryError):
+                        raise
+                    raise capability_ledger.delivery_error(cause=recovery_error)
+            if _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages)):
+                raise capability_ledger.delivery_error(cause=error)
             yield {
                 "type": "compatibility.fallback",
                 "error": f"{type(error).__name__}: {error}"[:500],
@@ -3428,6 +3542,13 @@ class ResearchAgentRuntime:
         fragments: list[str] = []
         usage: dict[str, int] = {}
         tool_calls: list[dict[str, str]] = []
+        resolved_task_mode = str(task_mode or self._pi_task_mode(chat_request.chat_mode))
+        capability_ledger = CapabilityLedger(
+            _required_pi_tool_groups(
+                resolved_task_mode,
+                self._last_user_text(chat_request.messages),
+            )
+        )
         session: dict[str, Any] = {}
         control: dict[str, Any] = {}
         compactions: list[dict[str, Any]] = []
@@ -3459,9 +3580,15 @@ class ResearchAgentRuntime:
                         if isinstance(value, int)
                     }
             elif event_type == "tool.completed":
+                capability_ledger.record_event(event)
                 tool_calls.append({"name": str(event.get("name", "")), "status": "completed"})
             elif event_type == "tool.failed":
-                tool_calls.append({"name": str(event.get("name", "")), "status": "failed"})
+                capability_ledger.record_event(event)
+                tool_calls.append({
+                    "name": str(event.get("name", "")),
+                    "status": "failed",
+                    "error": str(event.get("error", ""))[:500],
+                })
             elif event_type == "session":
                 session = {
                     "session_id": str(event.get("session_id", "")),
@@ -3478,22 +3605,8 @@ class ResearchAgentRuntime:
                 )
             elif event_type == "cancelled":
                 raise _RunCancelled("Pi Agent run was cancelled")
-        completed_tool_names = {
-            str(item.get("name", ""))
-            for item in tool_calls
-            if str(item.get("status", "")) == "completed"
-        }
-        missing_groups = _missing_pi_tool_groups(
-            task_mode,
-            completed_tool_names,
-            self._last_user_text(chat_request.messages),
-        )
-        if missing_groups:
-            rendered = " AND ".join("/".join(sorted(group)) for group in missing_groups)
-            raise RuntimeError(
-                f"Pi finished without the required tool result: {rendered}"
-            )
-        resolved_task_mode = str(task_mode or self._pi_task_mode(chat_request.chat_mode))
+        if not capability_ledger.ready:
+            raise capability_ledger.delivery_error()
         workflow_type = ""
         if active_run_id:
             try:
@@ -3522,6 +3635,7 @@ class ResearchAgentRuntime:
                 "task_profile": dict(task_contract.get("task_profile", {}) or {}),
                 "task_contract": task_contract,
                 "tool_calls": tool_calls,
+                "capability_ledger": capability_ledger.to_dict(),
                 "session": session,
                 "control": control,
                 "compactions": compactions,
@@ -3690,6 +3804,7 @@ class ResearchAgentRuntime:
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run a normal model conversation without requiring imported evidence."""
 
+        payload, audio_info = self._prepare_direct_audio(payload)
         ingestion = self._ingest_direct_attachments(payload)
         attachment_context = ingestion_context(self.workspace, str(ingestion["job_id"])) if ingestion else ""
         chat_request = self._direct_chat_request(payload, attachment_context=attachment_context)
@@ -3707,8 +3822,25 @@ class ResearchAgentRuntime:
         user_text = self._last_user_text(chat_request.messages)
         task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
         task_profile = dict(task_contract.get("task_profile", {}) or {})
+        vision_direct = self._vision_direct_fallback(
+            chat_request,
+            task_mode=pi_task_mode,
+            user_text=user_text,
+        )
+        if vision_direct:
+            # A selected knowledge composer or web toggle must not turn a
+            # plain "explain this image" request into a tool task.  There is
+            # no explicit evidence/search action to complete in this turn.
+            pi_task_mode = "general"
+            task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+            task_profile = dict(task_contract.get("task_profile", {}) or {})
+        _required_capability_preflight(task_contract)
         pi_eligible = not local_facts and self._pi_eligible(chat_request, payload)
-        pi_needed = not local_facts and _pi_should_run(pi_task_mode, user_text, task_profile)
+        pi_needed = (
+            not local_facts
+            and not vision_direct
+            and _pi_should_run(pi_task_mode, user_text, task_profile)
+        )
         if pi_needed and not pi_eligible:
             raise ValueError(
                 "这个请求需要调用 ScanSci 的受限工具，但当前模型不支持 Pi 工具循环；"
@@ -3727,6 +3859,8 @@ class ResearchAgentRuntime:
             "compatibility_fallback": False,
             "compatibility_error": "",
         }
+        if audio_info:
+            agent_runtime["audio"] = audio_info
         if local_facts:
             text, usage = local_facts, {}
         elif pi_eligible and pi_needed:
@@ -3795,15 +3929,19 @@ class ResearchAgentRuntime:
                 text, usage = completion
             else:
                 text, usage = completion, {}
+        if chat_request.vision_route:
+            agent_runtime["vision_route"] = dict(chat_request.vision_route)
         text = _normalize_direct_chat_output(text, chat_request.selected_skills)
         text = _repair_scientific_rewrite(user_text, text)
         text, temporal_guarded = _guard_temporal_delivery(user_text, text)
-        _validate_pi_delivery(
+        delivery_ledger = _validate_pi_delivery(
             text,
             task_mode=pi_task_mode,
             user_text=self._last_user_text(chat_request.messages),
             tool_calls=list(agent_runtime.get("tool_calls", []) or []),
         )
+        if delivery_ledger.required_groups:
+            agent_runtime["capability_ledger"] = delivery_ledger.to_dict()
         text, repair_usage, repaired = self._repair_good_question_if_needed(chat_request, text)
         usage = _merge_usage(usage, repair_usage)
         trace = self._direct_process_trace(
@@ -3827,6 +3965,8 @@ class ResearchAgentRuntime:
             "mode": chat_request.chat_mode,
             "trace": trace,
         }
+        if audio_info:
+            message["audio"] = list(audio_info.get("attachments", []) or [])
         if usage:
             message["usage"] = usage
         result = {
@@ -4079,12 +4219,16 @@ class ResearchAgentRuntime:
             text = str(text).strip()
             if not text:
                 raise RuntimeError("The model returned an empty response")
-            _validate_pi_delivery(
+            delivery_ledger = _validate_pi_delivery(
                 text,
                 task_mode=pi_task_mode,
                 user_text=self._last_user_text(chat_request.messages),
                 tool_calls=list(agent_runtime.get("tool_calls", []) or []),
             )
+            if delivery_ledger.required_groups:
+                agent_runtime["capability_ledger"] = delivery_ledger.to_dict()
+            if chat_request.vision_route:
+                agent_runtime["vision_route"] = dict(chat_request.vision_route)
             message = self.store.append_message(
                 run_id,
                 role="assistant",
@@ -4373,9 +4517,23 @@ class ResearchAgentRuntime:
             input={
                 "attachmentCount": len(list(payload.get("source_files", []) or [])),
                 "imageCount": len(list(payload.get("images", []) or [])),
+                "audioCount": len(list(payload.get("audio", []) or [])),
             },
         )
         try:
+            audio_info: dict[str, Any] = {}
+            if payload.get("audio"):
+                yield run_event(STEP_STARTED, run_id=run_id, stepName="transcribe_audio")
+                payload, audio_info = self._prepare_direct_audio(payload)
+                yield run_event(
+                    STEP_FINISHED,
+                    run_id=run_id,
+                    stepName="transcribe_audio",
+                    result={
+                        "attachments": list(audio_info.get("attachments", []) or []),
+                        "transcripts": list(audio_info.get("transcripts", []) or []),
+                    },
+                )
             ingestion = None
             attachment_context = ""
             if payload.get("source_files"):
@@ -4436,11 +4594,28 @@ class ResearchAgentRuntime:
             user_text = self._last_user_text(chat_request.messages)
             task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
             task_profile = dict(task_contract.get("task_profile", {}) or {})
+            vision_direct = self._vision_direct_fallback(
+                chat_request,
+                task_mode=pi_task_mode,
+                user_text=user_text,
+            )
+            if vision_direct:
+                # See the synchronous path above: a visual answer is a
+                # direct multimodal completion unless the user explicitly
+                # requested a tool-backed action.
+                pi_task_mode = "general"
+                task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+                task_profile = dict(task_contract.get("task_profile", {}) or {})
+            _required_capability_preflight(task_contract)
             pi_eligible = (
                 not local_facts
                 and self._pi_eligible(chat_request, payload)
             )
-            pi_needed = not local_facts and _pi_should_run(pi_task_mode, user_text, task_profile)
+            pi_needed = (
+                not local_facts
+                and not vision_direct
+                and _pi_should_run(pi_task_mode, user_text, task_profile)
+            )
             if pi_needed and not pi_eligible:
                 raise ValueError(
                     "这个请求需要调用 ScanSci 的受限工具，但当前模型不支持 Pi 工具循环；"
@@ -4464,6 +4639,8 @@ class ResearchAgentRuntime:
                 "model_fallback": None,
                 "effective_model_id": chat_request.model_id,
             }
+            if audio_info:
+                agent_runtime["audio"] = audio_info
             trace = self._direct_process_trace(
                 chat_request,
                 had_attachments=bool(ingestion),
@@ -4834,12 +5011,16 @@ class ResearchAgentRuntime:
                 if pi_needed:
                     raise RuntimeError("模型连续达到输出上限，ScanSci 没有把不完整内容标记为完成；请缩小问题范围后重试。")
                 text = text.rstrip() + "\n\n（模型输出达到本轮上限，内容尚未完整；请缩小范围后重试，或继续追问未完成部分。）"
-            _validate_pi_delivery(
+            delivery_ledger = _validate_pi_delivery(
                 text,
                 task_mode=pi_task_mode,
                 user_text=self._last_user_text(chat_request.messages),
                 tool_calls=list(agent_runtime.get("tool_calls", []) or []),
             )
+            if delivery_ledger.required_groups:
+                agent_runtime["capability_ledger"] = delivery_ledger.to_dict()
+            if chat_request.vision_route:
+                agent_runtime["vision_route"] = dict(chat_request.vision_route)
             if temporal_guarded:
                 trace.append({
                     "title": "校验时效性",
@@ -4889,6 +5070,8 @@ class ResearchAgentRuntime:
                 "mode": chat_request.chat_mode,
                 "trace": trace,
             }
+            if audio_info:
+                message["audio"] = list(audio_info.get("attachments", []) or [])
             if usage:
                 message["usage"] = usage
                 yield run_event(CUSTOM, run_id=run_id, name="usage", value=usage)
@@ -5428,6 +5611,7 @@ class ResearchAgentRuntime:
                 "question": question,
                 "notebook_id": notebook_ids[0],
                 "notebook_ids": notebook_ids,
+                "knowledge_scope": dict(chat_request.knowledge_scope or {}),
                 "thinking_level": chat_request.thinking_level,
                 "limit": 20,
                 "max_quotes": 12,
@@ -5445,6 +5629,7 @@ class ResearchAgentRuntime:
             }
         )
         source_reader = dict(result.get("reader_answer", {}) or {})
+        knowledge_scope = dict(result.get("knowledge_scope", {}) or {})
         citations = self._article_citations_from_evidence(
             list(result.get("evidence_table", []) or []),
             limit=12,
@@ -5558,6 +5743,8 @@ class ResearchAgentRuntime:
             "reader_answer": reader_answer,
             "citation_verification": verification,
         }
+        if knowledge_scope.get("active") and str(knowledge_scope.get("type", "")) != "zotero-tag":
+            message["knowledge_scope"] = knowledge_scope
         if usage:
             message["usage"] = usage
         yield run_event(TEXT_MESSAGE_END, run_id=run_id, messageId=message_id)
@@ -5588,6 +5775,7 @@ class ResearchAgentRuntime:
         match_terms: list[str],
         *,
         preview_limit: int,
+        scope_doc_ids: set[str] | None = None,
     ) -> tuple[int, int, list[dict[str, Any]]]:
         """Return distinct source documents matching a catalogue query.
 
@@ -5598,6 +5786,13 @@ class ResearchAgentRuntime:
 
         if not evidence_db.is_file():
             return 0, 0, []
+        normalized_scope_ids = {
+            str(doc_id).strip()
+            for doc_id in (scope_doc_ids or set())
+            if str(doc_id).strip()
+        } if scope_doc_ids is not None else None
+        if normalized_scope_ids is not None and not normalized_scope_ids:
+            return 0, 0, []
         terms = list(dict.fromkeys(
             str(term or "").strip().casefold()
             for term in match_terms
@@ -5606,8 +5801,6 @@ class ResearchAgentRuntime:
         try:
             with sqlite3.connect(evidence_db) as connection:
                 connection.row_factory = sqlite3.Row
-                total_row = connection.execute("select count(*) as total from source_documents").fetchone()
-                total_documents = int(dict(total_row or {}).get("total", 0) or 0)
                 has_document_cards = bool(
                     connection.execute(
                         "select 1 from sqlite_master where type = 'table' and name = 'document_cards'"
@@ -5626,24 +5819,42 @@ class ResearchAgentRuntime:
                     + "from source_documents as sd"
                     + card_join
                 )
-                parameters: list[str] = []
-                where_clause = ""
+                scope_clause = ""
+                scope_parameters: list[str] = []
+                if normalized_scope_ids is not None:
+                    scope_values = sorted(normalized_scope_ids)
+                    scope_parts: list[str] = []
+                    for offset in range(0, len(scope_values), 500):
+                        chunk = scope_values[offset:offset + 500]
+                        placeholders = ", ".join("?" for _ in chunk)
+                        scope_parts.append(f"sd.doc_id in ({placeholders})")
+                        scope_parameters.extend(chunk)
+                    scope_clause = "(" + " or ".join(scope_parts) + ")"
+                term_clauses: list[str] = []
                 if terms:
-                    clauses: list[str] = []
                     for term in terms:
-                        clauses.append(
+                        term_clauses.append(
                             "(instr(lower(sd.title), ?) > 0 or exists ("
                             "select 1 from evidence_spans as es where es.doc_id = sd.doc_id "
                             "and (instr(lower(es.title), ?) > 0 or instr(lower(es.text), ?) > 0)"
                             "))"
                         )
-                        parameters.extend([term, term, term])
-                    where_clause = " where " + " or ".join(clauses)
+                where_parts = [part for part in [scope_clause, f"({' or '.join(term_clauses)})" if term_clauses else ""] if part]
+                where_clause = " where " + " and ".join(where_parts) if where_parts else ""
+                parameters: list[str] = [*scope_parameters]
+                for term in terms:
+                    parameters.extend([term, term, term])
+                total_where_clause = f" where {scope_clause}" if scope_clause else ""
                 matched_row = connection.execute(
                     "select count(*) as total from source_documents as sd" + where_clause,
                     parameters,
                 ).fetchone()
                 matched_documents = int(dict(matched_row or {}).get("total", 0) or 0)
+                total_row = connection.execute(
+                    "select count(*) as total from source_documents as sd" + total_where_clause,
+                    scope_parameters,
+                ).fetchone()
+                total_documents = int(dict(total_row or {}).get("total", 0) or 0)
                 if preview_limit > 0:
                     query += where_clause
                     query += " order by coalesce(sd.publication_year, 0) desc, sd.title collate nocase limit ?"
@@ -5659,6 +5870,7 @@ class ResearchAgentRuntime:
         *,
         notebook_ids: list[str],
         request: dict[str, Any],
+        knowledge_scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a transparent, full-library inventory answer for direct chat."""
 
@@ -5676,6 +5888,7 @@ class ResearchAgentRuntime:
             "evidence_spans": 0,
         }
         titles: list[str] = []
+        applied_scope: dict[str, Any] | None = None
         for notebook_id in notebook_ids:
             notebook = self._notebook(notebook_id)
             metadata = dict(notebook.get("metadata", {}) or {})
@@ -5690,10 +5903,19 @@ class ResearchAgentRuntime:
             overview = ensure_library_overview(evidence_db)
             for key in overview_totals:
                 overview_totals[key] += int(overview.get(key, 0) or 0)
+            scope_resolution = self._knowledge_scope_resolution(notebook, evidence_db, knowledge_scope)
+            scope_doc_ids = (
+                {str(doc_id).strip() for doc_id in list(scope_resolution.get("doc_ids", []) or []) if str(doc_id).strip()}
+                if scope_resolution.get("active")
+                else None
+            )
+            if scope_resolution.get("active"):
+                applied_scope = dict(scope_resolution)
             database_total, database_matched, database_rows = self._catalog_rows_from_evidence_db(
                 evidence_db,
                 terms,
                 preview_limit=max(0, 50 - len(rows)),
+                scope_doc_ids=scope_doc_ids,
             )
             total_documents += database_total
             matched_documents += database_matched
@@ -5714,7 +5936,7 @@ class ResearchAgentRuntime:
                 str(item.get("title", "")).casefold(),
             )
         )
-        return {
+        result = {
             "operation": str(request.get("operation", "count") or "count"),
             "planner": str(request.get("planner", "deterministic") or "deterministic"),
             "planner_confidence": float(request.get("confidence", 1.0) or 1.0),
@@ -5727,6 +5949,15 @@ class ResearchAgentRuntime:
             "hidden_count": max(0, matched_documents - len(rows)),
             "library_overview": overview_totals,
         }
+        if applied_scope is not None:
+            result["knowledge_scope"] = applied_scope
+        return result
+
+    @staticmethod
+    def _catalog_scope_label(catalog: dict[str, Any]) -> str:
+        # Tag matching is an internal retrieval signal, never a user-facing
+        # scope or explanation.
+        return ""
 
     def _knowledge_catalog_follow_up_result(
         self,
@@ -5752,10 +5983,23 @@ class ResearchAgentRuntime:
                 if str(notebook_id).strip()
             )
         )
-        catalog = self._knowledge_catalog_summary(
-            notebook_ids=notebook_ids,
-            request=request,
-        )
+        try:
+            catalog = self._knowledge_catalog_summary(
+                notebook_ids=notebook_ids,
+                request=request,
+                knowledge_scope=chat_request.knowledge_scope,
+            )
+        except TypeError as error:
+            # Keep older task extensions and test doubles usable while the
+            # scoped catalogue callback rolls out.  Only retry the legacy
+            # signature for the specific unexpected keyword; real callback
+            # errors must still surface.
+            if "knowledge_scope" not in str(error):
+                raise
+            catalog = self._knowledge_catalog_summary(
+                notebook_ids=notebook_ids,
+                request=request,
+            )
         titles = list(catalog.get("library_titles", []) or [])
         scope_label = "、".join(str(title) for title in titles if str(title).strip()) or "所选知识库"
         terms = list(catalog.get("match_terms", []) or [])
@@ -5765,6 +6009,7 @@ class ResearchAgentRuntime:
         operation = str(catalog.get("operation", "count") or "count")
         items = list(catalog.get("items", []) or [])
         preview_titles = [str(item.get("title", "")).strip() for item in items if str(item.get("title", "")).strip()][:5]
+        catalog_scope_label = self._catalog_scope_label(catalog)
         if terms:
             if operation == "list":
                 text = (
@@ -5785,6 +6030,9 @@ class ResearchAgentRuntime:
             if operation == "list" and preview_titles:
                 text += " 例如：" + "；".join(preview_titles) + "。"
             scope_note = "按资料库中的文献记录去重，不以原文证据片段计数。"
+        if catalog_scope_label:
+            text += f" {catalog_scope_label}。"
+            scope_note += f" {catalog_scope_label}；未匹配的条目不会自动回退到全库。"
         trace = [
             {
                 "title": "读取已建索引的资料库目录",
@@ -5856,7 +6104,11 @@ class ResearchAgentRuntime:
             raise ValueError("A knowledge-base catalogue count question is required")
 
         yield run_event(TEXT_MESSAGE_START, run_id=run_id, messageId=message_id, role="assistant")
-        catalog = self._knowledge_catalog_summary(notebook_ids=notebook_ids, request=request)
+        catalog = self._knowledge_catalog_summary(
+            notebook_ids=notebook_ids,
+            request=request,
+            knowledge_scope=chat_request.knowledge_scope,
+        )
         titles = list(catalog.get("library_titles", []) or [])
         scope_label = "、".join(titles) or "已选知识库"
         terms = list(catalog.get("match_terms", []) or [])
@@ -5865,6 +6117,7 @@ class ResearchAgentRuntime:
         total_documents = int(catalog.get("total_documents", 0) or 0)
         operation = str(catalog.get("operation", "count") or "count")
         planner = str(catalog.get("planner", "deterministic") or "deterministic")
+        catalog_scope_label = self._catalog_scope_label(catalog)
         if terms:
             if operation == "list":
                 text = (
@@ -5887,6 +6140,9 @@ class ResearchAgentRuntime:
                 else f"{scope_label} 当前共有 {total_documents} 篇已索引文献，题录可在下方展开查看。"
             )
             scope_note = f"{'题录检索' if operation == 'list' else '统计'}口径：按资料库中的文献记录去重，不以原文证据片段计数。"
+        if catalog_scope_label:
+            text += f" {catalog_scope_label}。"
+            scope_note += f" {catalog_scope_label}；未匹配的条目不会自动回退到全库。"
         trace = [
             *([
                 {
@@ -5977,6 +6233,7 @@ class ResearchAgentRuntime:
                 "question": question,
                 "notebook_id": notebook_ids[0],
                 "notebook_ids": notebook_ids,
+                "knowledge_scope": dict(chat_request.knowledge_scope or {}),
                 "thinking_level": chat_request.thinking_level,
                 # The answer_sync fallback still uses the active writing model
                 # when it is configured, but always keeps the fixed retrieval,
@@ -5985,6 +6242,7 @@ class ResearchAgentRuntime:
                 "task_mode": "evidence",
             }
         )
+        knowledge_scope = dict(result.get("knowledge_scope", {}) or {})
         reader_answer = dict(result.get("reader_answer", {}) or {})
         citations = list(reader_answer.get("citations", []) or [])
         verification = dict(result.get("citation_verification", {}) or {})
@@ -6026,6 +6284,8 @@ class ResearchAgentRuntime:
             "reader_answer": reader_answer,
             "citation_verification": verification,
         }
+        if knowledge_scope.get("active") and str(knowledge_scope.get("type", "")) != "zotero-tag":
+            message["knowledge_scope"] = knowledge_scope
         yield run_event(TEXT_MESSAGE_END, run_id=run_id, messageId=message_id)
         yield run_event(
             RUN_FINISHED,
@@ -6235,6 +6495,89 @@ class ResearchAgentRuntime:
             parser=str(payload.get("attachment_parser", "auto")),
         )
 
+    def _prepare_direct_audio(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Persist and transcribe local audio before the chat model is called.
+
+        The answer model remains the user's selected chat model.  Audio is a
+        separate capability: Qwen3-ASR turns the recording into text locally,
+        and that text is appended to the user's message.  This keeps every
+        existing text/vision provider compatible and prevents audio bytes from
+        being sent to a remote API by accident.
+        """
+
+        raw_audio = list(payload.get("audio", []) or [])
+        if not raw_audio:
+            return dict(payload), {}
+        attachments = persist_audio_attachments(self.workspace, raw_audio)
+        if not attachments:
+            return dict(payload), {}
+
+        settings = load_settings(self.workspace)
+        roles = dict(settings.get("model_roles", {}) or {})
+        reference = str(roles.get("audio", "") or "").strip()
+        local_models = list(settings.get("local_models", []) or [])
+        model_id = ""
+        if reference.startswith("local:"):
+            local_id = reference.removeprefix("local:")
+            selected = next((item for item in local_models if str(item.get("id", "")) == local_id), None)
+            if selected and str(selected.get("runtime", "")) == "local-huggingface":
+                candidate = str(selected.get("model_id", "") or "").strip()
+                if candidate and candidate != QWEN3_ASR_LEGACY_MODEL_ID and selected.get("runtime_compatible", True):
+                    model_id = candidate
+        if not model_id:
+            model_id = next(
+                (
+                    str(item.get("id", "")).strip()
+                    for item in installed_models()
+                    if bool(item.get("ready"))
+                    and str(item.get("kind", "")) == "audio"
+                    and item.get("runtime_compatible", True)
+                    and str(item.get("id", "")) != QWEN3_ASR_LEGACY_MODEL_ID
+                ),
+                "",
+            )
+        if not model_id:
+            legacy_ready = any(
+                bool(item.get("ready")) and str(item.get("id", "")) == QWEN3_ASR_LEGACY_MODEL_ID
+                for item in installed_models()
+            )
+            if legacy_ready:
+                raise ValueError(
+                    "检测到旧版 Qwen3-ASR-0.6B。它需要独立的 qwen-asr/Transformers 4.57 环境；"
+                    "请在设置 → 本地模型 → 模型市场下载 Qwen3-ASR-0.6B-hf。"
+                )
+            raise ValueError("尚未配置本地语音识别模型，请在设置 → 本地模型中下载 Qwen3-ASR-0.6B-hf")
+
+        language = str(payload.get("audio_language", "") or "").strip()
+        transcripts: list[dict[str, str]] = []
+        for attachment in attachments:
+            path, _content_type = audio_attachment_asset(self.workspace, str(attachment.get("id", "")))
+            text = transcribe_local_audio(model_id, path, language=language)
+            transcripts.append({"name": str(attachment.get("name", "音频")), "text": text})
+
+        messages = [dict(item) for item in list(payload.get("messages", []) or []) if isinstance(item, dict)]
+        user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if str(messages[index].get("role", "")).lower() == "user"),
+            -1,
+        )
+        if user_index < 0:
+            raise ValueError("语音消息缺少用户问题")
+        original = str(messages[user_index].get("content", "") or "").strip()
+        transcript_text = "\n\n".join(
+            f"[{item['name']}]\n{item['text']}" for item in transcripts if str(item.get("text", "")).strip()
+        ).strip()
+        if not transcript_text:
+            raise ValueError("语音识别没有得到可用文字，请重新录音或选择其他音频文件")
+        prefix = f"{original}\n\n" if original else "请根据下面的语音内容回答：\n\n"
+        messages[user_index]["content"] = f"{prefix}[本地语音转写]\n{transcript_text}"[:12_000]
+        prepared = dict(payload)
+        prepared["messages"] = messages
+        return prepared, {
+            "model_id": model_id,
+            "attachments": attachments,
+            "transcripts": transcripts,
+        }
+
     def _direct_chat_request(self, payload: dict[str, Any], *, attachment_context: str = "") -> _DirectChatRequest:
         raw_messages = list(payload.get("messages", []) or [])
         candidates: list[dict[str, Any]] = []
@@ -6283,17 +6626,79 @@ class ResearchAgentRuntime:
 
         provider_id = str(provider.get("id", ""))
         provider_kind = str(provider.get("kind", ""))
+        requested_provider_id = provider_id
+        requested_model_id = str(active.get("model_id", "")).strip()
+        model_id = requested_model_id
+        raw_images = list(payload.get("images", []) or [])
+        vision_route: dict[str, Any] = {}
+        if raw_images:
+            # Image input is a capability request, not a requirement that the
+            # user manually switch away from their preferred text model.  The
+            # selected vision endpoint is used only for this turn; subsequent
+            # turns keep the model the user chose in the composer.
+            try:
+                selected_vision = select_vision_route(
+                    self.workspace,
+                    settings,
+                    active_provider_id=requested_provider_id,
+                    active_model_id=requested_model_id,
+                )
+            except Exception:
+                selected_vision = None
+            if selected_vision is not None:
+                provider = dict(selected_vision["provider"])
+                provider_id = str(selected_vision["provider_id"])
+                provider_kind = str(selected_vision["provider_kind"])
+                model_id = str(selected_vision["model_id"])
+                vision_route = {
+                    "mode": str(selected_vision.get("mode", "local")),
+                    "provider_id": provider_id,
+                    "provider_name": str(selected_vision.get("provider_name", provider_id)),
+                    "model_id": model_id,
+                    "requested_provider_id": requested_provider_id,
+                    "requested_model_id": requested_model_id,
+                }
+            else:
+                # No visual endpoint is available.  Keep a usable text route
+                # when one exists and let the OCR fallback turn the image into
+                # explicit text instead of failing before the model request.
+                try:
+                    text_route = select_text_route(
+                        self.workspace,
+                        settings,
+                        active_provider_id=requested_provider_id,
+                        active_model_id=requested_model_id,
+                    )
+                except Exception:
+                    text_route = None
+                if text_route is not None:
+                    provider = dict(text_route["provider"])
+                    provider_id = str(text_route["provider_id"])
+                    provider_kind = str(text_route["provider_kind"])
+                    model_id = str(text_route["model_id"])
+                vision_route = {
+                    "mode": "ocr-fallback",
+                    "requested_provider_id": requested_provider_id,
+                    "requested_model_id": requested_model_id,
+                    "text_provider_id": provider_id,
+                    "text_model_id": model_id,
+                }
         managed = str(provider.get("auth_mode", "")) == "managed"
         if managed:
             api_key = "scansci-managed-gateway"
-        elif provider_kind == "local":
+        elif provider_kind == "local" or str(provider.get("auth_mode", "")) == "local":
             api_key = str(provider.get("api_key", "")) or "local"
         else:
             api_key = get_provider_api_key(self.workspace, provider_id)
         if not api_key:
             raise ValueError("当前对话模型尚未配置 API Key")
 
-        model_id = str(active.get("model_id", "")).strip()
+        if provider_id.startswith("local-runtime-") and str(provider.get("logo", "")) == "ollama":
+            status = ollama_status(str(provider.get("base_url", "")))
+            if not status.get("reachable"):
+                raise ValueError("Ollama 尚未运行，请先在设置 → 本地模型中启动 Ollama")
+            if not status.get("model_ready") and vision_route.get("mode") != "ocr-fallback":
+                raise ValueError("MiniCPM-V 4.6 尚未安装，请先在设置 → 本地模型 → 模型市场下载")
         responses_enabled = bool(provider.get("responses_enabled", False))
         requested_api_surface = str(
             payload.get("api_surface", provider.get("api_surface", "chat_completions"))
@@ -6357,18 +6762,29 @@ class ResearchAgentRuntime:
             provider_kind = "openai-compatible"
             provider = dict(provider)
             provider["base_url"] = ensure_local_transformers_runtime(model_id)
-        raw_images = list(payload.get("images", []) or [])
         if raw_images:
-            model_record = next(
-                (item for item in provider.get("models", []) if str(item.get("id", "")) == model_id),
-                {},
-            )
-            if "vision" not in set(model_record.get("capabilities", []) or []):
-                raise ValueError("当前模型不支持图片，请选择带有视觉能力的模型")
             attachments = persist_image_attachments(self.workspace, raw_images)
             blocks = vision_image_blocks(self.workspace, attachments)
             text = str(messages[-1].get("content", ""))
-            if provider_kind in {"anthropic-compatible", "anthropic"}:
+            if vision_route.get("mode") == "ocr-fallback":
+                ocr = ocr_image_blocks(blocks)
+                ocr_text = str(ocr.get("text", "")).strip()
+                vision_route.update(
+                    {
+                        "ocr_backend": str(ocr.get("backend", "unavailable")),
+                        "ocr_available": bool(ocr.get("available")),
+                        "ocr_message": str(ocr.get("message", ""))[:500],
+                    }
+                )
+                if ocr_text:
+                    image_context = f"[本地 OCR 图片文字]\n{ocr_text[:12_000]}"
+                else:
+                    image_context = (
+                        "[图片处理提示]\n当前没有可用的视觉模型，且本机 OCR 未提取到文字。"
+                        "请明确告诉用户无法可靠读取图片内容，不要猜测图像中的事实。"
+                    )
+                messages[-1]["content"] = f"{text}\n\n{image_context}".strip()
+            elif provider_kind in {"anthropic-compatible", "anthropic"}:
                 content: list[dict[str, Any]] = [{"type": "text", "text": text}]
                 content.extend(
                     {
@@ -6417,7 +6833,9 @@ class ResearchAgentRuntime:
                 for value in list(payload.get("notebook_ids", []) or [])
                 if str(value).strip()
             ][:12],
+            knowledge_scope=dict(payload.get("knowledge_scope", {}) or {}),
             manifest=manifest,
+            vision_route=vision_route,
         )
 
     @staticmethod
@@ -7937,6 +8355,95 @@ class ResearchAgentRuntime:
             return isolated
         return self.evidence_db
 
+    @staticmethod
+    def _scope_for_notebook(payload: dict[str, Any], notebook: dict[str, Any]) -> dict[str, Any]:
+        """Pick the knowledge scope for one notebook from the request payload.
+
+        The browser sends the full per-notebook list as ``knowledge_scopes``
+        alongside the active scope as ``knowledge_scope``.  Prefer the entry
+        that names the notebook being queried so per-notebook scopes are not
+        silently dropped.
+        """
+
+        notebook_id = str(notebook.get("notebook_id", "")).strip()
+        for item in list(payload.get("knowledge_scopes", []) or []):
+            if isinstance(item, dict) and str(item.get("notebook_id", "")).strip() == notebook_id:
+                return dict(item)
+        return dict(payload.get("knowledge_scope", {}) or {})
+
+    def _knowledge_scope_resolution(
+        self,
+        notebook: dict[str, Any],
+        evidence_db: str | Path,
+        scope: dict[str, Any] | None,
+        question: str = "",
+    ) -> dict[str, Any]:
+        requested = dict(scope or {})
+        requested_type = str(requested.get("type", "")).strip()
+        if requested_type not in {"", "zotero-tag"}:
+            return {"active": False, "status": "inactive"}
+        requested_notebook_id = str(requested.get("notebook_id", "")).strip()
+        notebook_id = str(notebook.get("notebook_id", "")).strip()
+        if requested_notebook_id and requested_notebook_id != notebook_id:
+            return {"active": False, "status": "other-library"}
+        if requested_type == "zotero-tag":
+            return resolve_zotero_tag_scope(notebook, evidence_db, requested)
+        library_kind = str(dict(notebook.get("metadata", {}) or {}).get("library_kind", "")).strip().lower()
+        if library_kind == "zotero":
+            self._ensure_zotero_tag_index(notebook, evidence_db)
+            return {"active": False, "status": "automatic-ranking"}
+        return {"active": False, "status": "no-query" if not str(question or "").strip() else "not-zotero"}
+
+    def _ensure_zotero_tag_index(
+        self,
+        notebook: dict[str, Any],
+        evidence_db: str | Path,
+    ) -> None:
+        """Backfill tags for existing Zotero connections on first retrieval."""
+
+        zotero = dict(dict(notebook.get("metadata", {}) or {}).get("zotero", {}) or {})
+        items = [item for item in list(zotero.get("items", []) or []) if isinstance(item, dict)]
+        if not items:
+            return
+        signature = hashlib.sha1(
+            json.dumps(
+                [
+                    {
+                        "doi": str(item.get("doi", "") or ""),
+                        "title": str(item.get("title", "") or ""),
+                        "attachments": [
+                            str(dict(attachment).get("path", "") or "")
+                            for attachment in list(item.get("attachments", []) or [])
+                            if isinstance(attachment, dict)
+                        ],
+                        "tags": [str(tag.get("tag", "") if isinstance(tag, dict) else tag) for tag in list(item.get("tags", []) or [])],
+                    }
+                    for item in items
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cache_key = f"{Path(evidence_db).resolve()}|{signature}"
+        if cache_key in self._zotero_tag_sync_cache:
+            return
+        result = sync_zotero_document_tags(evidence_db, items)
+        if str(result.get("status", "")) in {"ready", "empty_catalogue"}:
+            self._zotero_tag_sync_cache.add(cache_key)
+
+    def _knowledge_filters_for_notebook(
+        self,
+        notebook: dict[str, Any],
+        evidence_db: str | Path,
+        scope: dict[str, Any] | None,
+        question: str = "",
+    ) -> dict[str, Any]:
+        resolution = self._knowledge_scope_resolution(notebook, evidence_db, scope, question)
+        if not bool(resolution.get("active")):
+            return {}
+        return {"doc_ids": list(resolution.get("doc_ids", []) or [])}
+
     def _knowledge_run_metadata(self, notebook: dict[str, Any]) -> dict[str, Any]:
         """Freeze selected knowledge identity for conversation continuation."""
 
@@ -8205,23 +8712,192 @@ class ResearchAgentRuntime:
                     target,
                     provider=str(vector_identity["provider"]),
                     dimensions=int(vector_identity["dimensions"]),
-                ).get("ready")
+                    ).get("ready")
             )
-        stack_kind = (
+        settings = load_settings(self.workspace)
+        roles = dict(settings.get("model_roles", {}) or {})
+        installed_evidence_models = [
+            item
+            for item in installed_models()
+            if bool(item.get("ready"))
+            and item.get("runtime_compatible", True) is not False
+            and str(item.get("kind", "")).casefold() in {"embedding", "reranking"}
+        ]
+
+        def auto_local_model(role: str) -> str:
+            """Pick a verified local evidence model without exposing model plumbing.
+
+            The built-in evidence entry is a fallback marker, not a request to
+            permanently use hashing or lexical ranking.  If a compatible model
+            has been downloaded, let the Agent upgrade to it automatically;
+            otherwise the normal built-in fallback remains available.
+
+            When a library already contains a ready sqlite-vec cache for a
+            compatible model, prefer that model even when a newer one is
+            installed.  Picking a model whose cache must be built from scratch
+            (or migrated) leaves the dense retrieval route dead for the
+            library that the user is about to query.
+            """
+
+            candidates = [
+                item
+                for item in installed_evidence_models
+                if str(item.get("kind", "")).casefold() == role.casefold()
+            ]
+            # Pre-load the vector cache status for this library once.  A
+            # legacy library may have had its cache built with a different
+            # model version; that ready cache still serves dense retrieval
+            # today and outranks a fresh-but-empty cache.
+            try:
+                vector_status = (
+                    vector_cache_status(str(target), provider="", dimensions=0)
+                    if target.is_file()
+                    else None
+                )
+            except Exception:
+                vector_status = None
+            cached_providers: dict[str, int] = {}
+            if isinstance(vector_status, dict):
+                for entry in list(vector_status.get("providers", []) or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    key = str(entry.get("provider", "")).strip()
+                    count = int(entry.get("cached_vectors", 0) or 0)
+                    if key and count > 0:
+                        cached_providers[key] = max(cached_providers.get(key, 0), count)
+
+            def _has_ready_cache(model_id: str) -> bool:
+                """Return True when this model has cached vectors ready to serve."""
+                stripped = str(model_id or "").strip()
+                if not stripped or not cached_providers:
+                    return False
+                # A sentence-transformers model may be registered as
+                # "sentence-transformers:org/model-name" in the cache.
+                return (
+                    stripped in cached_providers
+                    or f"sentence-transformers:{stripped}" in cached_providers
+                )
+
+            candidates.sort(
+                key=lambda item: (
+                    0 if _has_ready_cache(str(item.get("id", ""))) else 1,
+                    0 if "qwen3" in str(item.get("id", "")).casefold() else 1,
+                    int(item.get("size_bytes", 0) or 0),
+                    str(item.get("id", "")).casefold(),
+                )
+            )
+            return str(candidates[0].get("id", "")).strip() if candidates else "__builtin__"
+
+        def configured_local_model(role: str) -> str:
+            reference = str(roles.get(role, "") or "").strip()
+            if reference in {"", "auto", "local:auto", "local:builtin-evidence"} and role in {"embedding", "reranking"}:
+                return auto_local_model(role)
+            if reference.startswith("local:"):
+                local_id = reference.removeprefix("local:")
+                local = next(
+                    (item for item in settings.get("local_models", []) if str(item.get("id", "")) == local_id),
+                    None,
+                )
+                if not local or not local.get("enabled", False):
+                    return ""
+                if str(local.get("runtime", "")) == "builtin":
+                    return "__builtin__"
+                if local.get("runtime_compatible") is False:
+                    return ""
+                return str(local.get("model_id", "") or "").strip()
+            if reference.startswith("provider:"):
+                provider_id, separator, model_id = reference.removeprefix("provider:").partition(":")
+                provider = next(
+                    (item for item in settings.get("providers", []) if str(item.get("id", "")) == provider_id),
+                    None,
+                )
+                if separator and provider and str(provider.get("kind", "")) == "local":
+                    return model_id.strip()
+            return ""
+
+        def configured_remote_reranker() -> tuple[str, Any | None]:
+            """Build the supported cloud reranker selected in Default abilities.
+
+            Keep this allow-list explicit: provider model IDs are not enough to
+            infer compatible APIs.  SiliconFlow's native ``/rerank`` contract
+            is supported here; other cloud rerankers continue to use the local
+            fallback until their protocol is implemented separately.
+            """
+
+            reference = str(roles.get("reranking", "") or "").strip()
+            if not reference.startswith("provider:"):
+                return "", None
+            provider_id, separator, model_id = reference.removeprefix("provider:").partition(":")
+            if not separator or provider_id != "siliconflow" or not model_id.strip():
+                return "", None
+            provider = next(
+                (item for item in settings.get("providers", []) if str(item.get("id", "")) == provider_id),
+                None,
+            )
+            if provider is None or not provider.get("enabled", True):
+                return "", None
+            model = next(
+                (
+                    item
+                    for item in provider.get("models", [])
+                    if str(item.get("id", "")) == model_id.strip()
+                ),
+                None,
+            )
+            capabilities = {
+                str(capability).casefold()
+                for capability in list((model or {}).get("capabilities", []) or [])
+            }
+            if model is None or "reranking" not in capabilities:
+                return "", None
+            api_key = get_provider_api_key(self.workspace, provider_id)
+            if not api_key:
+                return "", None
+            try:
+                reranker = build_reranker(
+                    "siliconflow",
+                    base_url=str(provider.get("base_url", "")).strip(),
+                    api_key=api_key,
+                    model_name=model_id.strip(),
+                )
+            except Exception:
+                return "", None
+            return model_id.strip(), reranker
+
+        selected_embedding_model = configured_local_model("embedding")
+        selected_reranker_model = configured_local_model("reranking")
+        remote_reranker_model, remote_reranker = configured_remote_reranker()
+        reranking_reference = str(roles.get("reranking", "") or "").strip()
+        if remote_reranker is not None:
+            selected_reranker_model = remote_reranker_model
+        elif reranking_reference.startswith("provider:"):
+            # If a remote key is missing or the provider is unavailable, use
+            # the best verified local model instead of disabling reranking.
+            selected_reranker_model = auto_local_model("reranking")
+        remote_reranker_selected = remote_reranker is not None and not embedding_only
+        use_fast_path = not target.is_file() or (
+            not embedding_only
+            and target.stat().st_size < _NEURAL_LIBRARY_MIN_BYTES
+            and not neural_cache_ready
+            and not remote_reranker_selected
+        )
+        stack_base = (
             "fast"
-            if not target.is_file()
-            or (
-                not embedding_only
-                and target.stat().st_size < _NEURAL_LIBRARY_MIN_BYTES
-                and not neural_cache_ready
-            )
+            if use_fast_path
             else "neural:embedding"
             if embedding_only
             else f"neural:{requested_profile}"
         )
+        reranker_selector = str(
+            getattr(remote_reranker, "cache_key", "")
+            or selected_reranker_model
+            or "auto"
+        )
+        selector_key = f"{selected_embedding_model or 'auto'}|{reranker_selector}"
+        stack_kind = f"{stack_base}:{selector_key}"
         with self._model_lock:
             if stack_kind not in self._local_evidence_models:
-                if stack_kind == "fast":
+                if stack_base == "fast":
                     self._local_evidence_models[stack_kind] = LocalEvidenceStack(
                         embedding_provider=HashingEmbeddingProvider(),
                         reranker=LexicalReranker(),
@@ -8245,7 +8921,7 @@ class ResearchAgentRuntime:
                         (
                             stack
                             for key, stack in self._local_evidence_models.items()
-                            if key.startswith("neural:")
+                            if key.startswith("neural:") and key.endswith(f":{selector_key}")
                         ),
                         None,
                     )
@@ -8260,6 +8936,9 @@ class ResearchAgentRuntime:
                                 existing_reranker = stage
                                 break
                     self._local_evidence_models[stack_kind] = build_local_evidence_stack(
+                        embedding_model=selected_embedding_model,
+                        reranker_model=selected_reranker_model,
+                        precision_reranker_model=selected_reranker_model,
                         quality_profile=requested_profile,
                         load_reranker=not embedding_only,
                         embedding_provider_override=(
@@ -8267,7 +8946,11 @@ class ResearchAgentRuntime:
                             if existing_neural is not None
                             else None
                         ),
-                        reranker_override=existing_reranker,
+                        reranker_override=(
+                            remote_reranker
+                            if remote_reranker is not None
+                            else existing_reranker
+                        ),
                     )
         return self._local_evidence_models[stack_kind]
 

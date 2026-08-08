@@ -166,6 +166,45 @@ def test_local_runtime_install_api_starts_background_job_and_exposes_progress(
     assert _payload(progress) == started
 
 
+def test_local_runtime_channels_and_manual_install_apis_expose_the_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    report = {
+        "checked_at": 123,
+        "available": True,
+        "preferred_url": "https://example.test/runtime.json",
+        "channels": [
+            {"label": "首选清单", "valid": False, "reachable": False, "version": "", "error": "timeout"},
+            {"label": "备用清单 1", "valid": True, "reachable": True, "version": "1.0.0", "error": ""},
+        ],
+        "manual_fallback": {"available": True, "release_url": "https://example.test/release"},
+    }
+    monkeypatch.setattr(app.local_runtime, "check_manifest_channels", lambda: dict(report))
+    selected: list[list[str]] = []
+    started = {"job_id": "local-runtime", "state": "queued", "source": "manual"}
+
+    def start_local_install(paths: list[str]) -> dict[str, object]:
+        selected.append(list(paths))
+        return dict(started)
+
+    monkeypatch.setattr(app.local_runtime, "start_local_install", start_local_install)
+
+    channels = app.dispatch("GET", "/api/local-runtime/channels")
+    accepted = app.dispatch(
+        "POST",
+        "/api/local-runtime/install-local",
+        json.dumps({"paths": ["C:/Downloads/runtime.zip", "C:/Downloads/local-transformers.json"]}).encode("utf-8"),
+    )
+
+    assert channels.status == 200
+    assert _payload(channels) == report
+    assert accepted.status == 202
+    assert _payload(accepted) == started
+    assert selected == [["C:/Downloads/runtime.zip", "C:/Downloads/local-transformers.json"]]
+
+
 @pytest.mark.parametrize("action", ["pause", "resume", "retry", "cancel"])
 def test_local_runtime_install_control_api_delegates_to_component(
     tmp_path: Path,
@@ -204,8 +243,43 @@ def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_pa
     assert 'data-action="open-download-center"' in script
     assert "预计" in script
     assert "下载任务" in script
+    assert 'if (action === "open-local-runtime-setup")' in script
+    assert 'openSettings("local-models");' in script
+    assert 'data-action="choose-local-runtime-files"' in script
+    assert 'data-action="check-local-runtime-channels"' in script
+    assert ".local-runtime-recovery" in styles
     assert ".download-activity" in styles
     assert ".download-task-section" in styles
+
+
+def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "LOCAL_MODEL_CATEGORY_GROUPS" in script
+    assert "local-model-recommendation" in script
+    assert "需要时，再下载模型" in script
+    assert "打开知识库" in script
+    assert 'onboarding-open-models' in script
+    assert 'onboarding-open-knowledge' in script
+    assert 'data-settings-panel="defaults"' in page
+    assert 'data-settings-panel="document-processing"' not in page
+    assert "defaultCapabilitiesForm" in script
+    assert "默认助手模型" in script
+    assert "hydrateSettingsSelects" in script
+    assert "settings-select-menu" in script
+    assert "resourceInstallGuideGroup" in script
+    assert "resource-install-grid" in script
+    assert "local-installed-panel" in script
+    assert "default-tools-disclosure" in script
+    assert ".local-recommendation-grid" in styles
+    assert ".resource-install-grid" in styles
+    assert ".local-installed-panel" in styles
+    assert ".settings-content select" in styles
+    assert ".settings-select-menu" in styles
+    assert ".guide-onboarding-card" in styles
 
 
 def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path):
@@ -356,6 +430,16 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
 
     assert "function conversationMessageMarkup" in script
+    assert "function modelIdentitySnapshot" in script
+    assert "model: message.model" in script
+    assert "/api/chat/history?limit=200" in script
+    assert "function persistDirectConversation" in script
+    assert "function openDirectConversation" in script
+    assert 'data-action="open-direct-conversation"' in script
+    assert "function directFailureMarkup" in script
+    assert "function streamChatWithRecovery" in script
+    assert 'data-action="retry-direct-message"' in script
+    assert "composerSubmissionInFlight" in script
     assert "function formatMessageTime" in script
     assert "function messageUsageMarkup" in script
     assert "function messageFooterMarkup" in script
@@ -454,6 +538,10 @@ def test_review_entry_uses_grounded_workflow_with_source_scope_and_notes(tmp_pat
     assert "source_doc_ids: sourceDocIds" in script
     assert 'note_type: "literature_review"' in script
     assert "save-review-note" in script
+    assert "选择保存位置" in script
+    assert "choose-review-save-folder" in script
+    assert "reviewSaveNewFolderInput" in script
+    assert "new_folder_name" in script
 
 
 def test_academic_search_and_evidence_qa_are_first_class_home_tools(tmp_path: Path):
@@ -775,9 +863,33 @@ def test_extension_inner_pages_keep_only_the_requested_compact_content(tmp_path:
     assert 'class="extension-panel-summary"' in script
     assert "内置办公与 LaTeX 插件由 Pi 直接调用" in script
     assert 'class="market-status-row"' in script
-    assert "已连接 skills.sh" in script
+    assert "市场已连接" in script
+    assert "已连接 skills.sh" not in script
     assert ".extension-panel-summary" in styles
     assert ".market-status-row" in styles
+
+
+def test_user_facing_cards_hide_internal_delivery_metadata(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "最新版链路" not in script
+    assert "兼容链路" not in script
+    assert "EasySlides 原生" not in script
+    assert "EasySlides project" not in script
+    assert "EasySlides template" not in script
+    assert "项目路径" not in script
+    assert "已尝试" not in script
+    assert "下载数" not in script
+    assert "随 ScanSci v" not in script
+    assert "mcp-version-state" not in styles
+    assert "slide-template-renderer" not in styles
+    assert "选择模板即可用于本次演示" in script
+    assert "文件会保存到本机" in script
+    assert "模板库暂不可用，请稍后重试" in script
+    assert "演示模板" in page
 
 
 def test_extensions_download_strategy_and_library_preview_match_desktop_navigation(tmp_path: Path):
@@ -799,10 +911,26 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert 'id="knowledgeScopeDialog"' in page
     assert 'data-action="refresh-knowledge-scope-counts"' in page
     assert "function renderKnowledgeScopeSurfaces" in script
+    assert 'data-action="choose-library-folder" data-notebook-id="${escapeHtml(notebook.notebook_id)}"' in script
+    assert "data-auto-select-knowledge" not in script
+    assert "function knowledgeLocalBindingSummary" in script
+    assert "function knowledgeLocalBindingKinds" in script
+    assert "metadata.imported_from_folder" in script
+    assert "文件与文件夹已连接" in script
+    assert "const taskEntries = downloadTaskEntries().slice(0, 6);" not in script
+    assert "模型下载只有一个入口" in script
+    assert 'data-action="open-local-models"' in script
+    assert "选择个人知识库后，可在右侧直接链接文件或文件夹。" in script
     assert '["academic", "deep-research"].includes(state.researchWorkflow)' in script
     assert 'workflowType === "academic_search" || workflowType === "deep_research"' in script
     assert "联网学术来源" in page
     assert "function refreshKnowledgeScopeCounts" in script
+    assert "function toggleKnowledgeScopeDraft" in script
+    assert "function applyKnowledgeScopeSelection" in script
+    assert "function syncKnowledgeScopeDialogSelection" in script
+    assert '"toggle-knowledge-scope-draft"' in script
+    assert 'data-action="apply-knowledge-scope"' in page
+    assert "knowledgeScopeDraftIds" in script
     assert "const count = Number(notebook.counts?.sources || 0);" in script
     assert "已更新可检索资料数量" in script
     assert "function activeKnowledgeScopePayload" in script
@@ -889,13 +1017,14 @@ def test_webapp_local_zotero_endpoint_runs_the_connector(tmp_path: Path, monkeyp
     app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     calls: list[dict[str, object]] = []
 
-    def fake_connect(workspace, *, notebook_id, evidence_db, index_attachments=True):
+    def fake_connect(workspace, *, notebook_id, evidence_db, index_attachments=True, data_dir=None):
         calls.append(
             {
                 "workspace": str(workspace),
                 "notebook_id": notebook_id,
                 "evidence_db": str(evidence_db),
                 "index_attachments": index_attachments,
+                "data_dir": data_dir,
             }
         )
         return {
@@ -912,7 +1041,12 @@ def test_webapp_local_zotero_endpoint_runs_the_connector(tmp_path: Path, monkeyp
         lambda payload: {"job_id": "import-zotero", "state": "queued", **payload},
     )
 
-    response = app.dispatch("POST", "/api/library/zotero/local", b"{}")
+    configured_data_dir = str(tmp_path / "Zotero")
+    response = app.dispatch(
+        "POST",
+        "/api/library/zotero/local",
+        json.dumps({"data_dir": configured_data_dir}).encode("utf-8"),
+    )
     payload = _payload(response)
 
     assert response.status == 202
@@ -922,7 +1056,54 @@ def test_webapp_local_zotero_endpoint_runs_the_connector(tmp_path: Path, monkeyp
     assert calls[0]["notebook_id"] == payload["notebook"]["notebook_id"]
     assert calls[0]["evidence_db"] == str(tmp_path / "evidence.sqlite")
     assert calls[0]["index_attachments"] is False
+    assert calls[0]["data_dir"] == configured_data_dir
     assert payload["import_job"]["library_kind"] == "zotero"
+    assert payload["import_job"]["data_dir"] == configured_data_dir
+
+
+def test_webapp_local_zotero_failure_keeps_the_created_notebook_for_recovery_ui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+
+    def fail_connect(*_args, **_kwargs):
+        raise RuntimeError("无法读取 Zotero 数据目录")
+
+    monkeypatch.setattr("scansci_html.webapp.connect_local_zotero", fail_connect)
+    response = app.dispatch(
+        "POST",
+        "/api/library/zotero/local",
+        json.dumps({"data_dir": str(tmp_path / "Not-Zotero")}).encode("utf-8"),
+    )
+    payload = _payload(response)
+
+    assert response.status == 502
+    assert payload["error"]["message"] == "无法读取 Zotero 数据目录"
+    assert payload["notebook"]["metadata"]["library_kind"] == "zotero"
+    assert payload["workspace"]["notebooks"]
+
+
+def test_webapp_zotero_status_endpoint_accepts_the_manual_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    calls: list[dict[str, object]] = []
+
+    def fake_status(*, data_dir=None, timeout=1.5):
+        calls.append({"data_dir": data_dir, "timeout": timeout})
+        return {"installed": False, "database_readable": False, "api_running": False, "read_mode": "unavailable"}
+
+    monkeypatch.setattr("scansci_html.webapp.zotero_status", fake_status)
+    manual_path = str(tmp_path / "Not-Zotero")
+    response = app.dispatch(
+        "POST",
+        "/api/library/zotero/status",
+        json.dumps({"data_dir": manual_path}).encode("utf-8"),
+    )
+    payload = _payload(response)
+
+    assert response.status == 200
+    assert payload["zotero"]["read_mode"] == "unavailable"
+    assert calls == [{"data_dir": manual_path, "timeout": 0.8}]
 
 
 def test_webapp_starts_academic_search_without_a_knowledge_library(tmp_path: Path, monkeypatch):
@@ -1112,6 +1293,19 @@ def test_model_settings_render_masked_secret_placeholder_and_eye_control(tmp_pat
     assert "/api-key/reveal" in script
     assert "input.type === \"text\"" in script
     assert ".cherry-secret-toggle" in styles
+
+
+def test_model_service_provider_toggle_is_inline_without_redundant_status_text():
+    root = Path(__file__).parents[1] / "src" / "scansci_html" / "web"
+    web_script = (root / "app.js").read_text(encoding="utf-8")
+    styles = (root / "styles.css").read_text(encoding="utf-8")
+
+    provider_row = web_script.split("const providerRow =", 1)[1].split("const providerItems", 1)[0]
+    assert "cherry-provider-health" not in provider_row
+    assert provider_row.count("cherry-provider-status") == 1
+    assert ".cherry-provider-item { display: grid; grid-template-columns: 13px minmax(0, 1fr) auto;" in styles
+    assert ".cherry-provider-status { grid-column: 3; grid-row: 1;" in styles
+    assert ".cherry-provider-health" not in styles
 
 
 def test_conditional_exact_doi_request_keeps_document_and_acquisition_tools():
@@ -1334,6 +1528,33 @@ def test_notebook_webapp_allows_direct_chat_without_a_library(tmp_path: Path, mo
     assert response["message"] == {"role": "assistant", "content": "Reply: 你是什么模型？"}
 
 
+def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    payload = {
+        "conversation_id": "direct-history-1",
+        "title": "海岛、两栖动物有什么方向",
+        "session_id": "session-1",
+        "messages": [
+            {"role": "user", "content": "海岛、两栖动物有什么方向", "images": [{"name": "brief.png", "data_url": "data:image/png;base64,secret"}]},
+            {
+                "role": "assistant",
+                "content": "可以从岛屿生物地理学和两栖动物多样性切入。",
+                "model": {"provider_id": "deepseek", "provider_name": "DeepSeek", "model_id": "deepseek-v4-flash", "model_name": "DeepSeek V4 Flash"},
+            },
+        ],
+    }
+
+    saved = _payload(app.dispatch("POST", "/api/chat/history", json.dumps(payload).encode("utf-8")))
+    listed = _payload(app.dispatch("GET", "/api/chat/history?limit=20"))
+    reopened = _payload(app.dispatch("GET", "/api/chat/history/direct-history-1"))
+
+    assert saved["conversation_id"] == "direct-history-1"
+    assert listed["conversations"][0]["title"] == "海岛、两栖动物有什么方向"
+    assert reopened["messages"][0]["images"] == [{"name": "brief.png"}]
+    assert "data_url" not in json.dumps(reopened, ensure_ascii=False)
+    assert reopened["messages"][1]["model"]["model_name"] == "DeepSeek V4 Flash"
+
+
 def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     def fake_stream(_self, _payload):
         yield {"type": "delta", "content": "Hel"}
@@ -1391,6 +1612,60 @@ def test_direct_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeyp
     assert events[-1]["result"]["message"]["content"] == "你好"
     assert events[-1]["result"]["message"]["usage"]["total_tokens"] == 4
     assert events[-1]["result"]["message"]["trace"] == []
+
+
+def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "vision-provider", "model_id": "vision-model"},
+            "providers": [{
+                "id": "vision-provider",
+                "name": "Vision provider",
+                "kind": "openai-compatible",
+                "base_url": "https://vision.example/v1",
+                "models": [{
+                    "id": "vision-model",
+                    "name": "Vision model",
+                    "capabilities": ["vision", "tool"],
+                }],
+            }],
+        },
+    )
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    observed: dict[str, object] = {}
+
+    def direct_model_stream(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        yield {"type": "delta", "content": "图中有一条曲线。"}
+        yield {"type": "done", "usage": {"total_tokens": 8}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    events = list(runtime.chat_stream({
+        "chat_mode": "knowledge",
+        "messages": [{"role": "user", "content": "解读这个图的内容"}],
+        "images": [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    assert result["message"]["content"] == "图中有一条曲线。"
+    assert result["agent_runtime"]["harness"] == "direct-provider"
+    assert result["agent_runtime"]["task_mode"] == "general"
+    assert result["agent_runtime"]["vision_route"]["model_id"] == "vision-model"
+    assert isinstance(observed["messages"][-1]["content"], list)
 
 
 def test_direct_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
@@ -1460,6 +1735,20 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     assert "directEvidenceAnswerMarkup" in script
     assert "data-direct-evidence-answer" in script
     assert "bindCitationInteractions({ reader_answer: message.reader_answer }, scope)" in script
+
+
+def test_task_delivery_reuses_artifact_citations_for_plain_answer_text(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    # The artifact summary and task follow-up are plain text views of the same
+    # verified answer. They must reuse the artifact citation package instead
+    # of leaving copied [1] markers as inert text.
+    assert "function citationTextMarkup(value, citations = [])" in script
+    assert "function citationRecordsForRun(run = {})" in script
+    assert "citationTextMarkup(content, citations)" in script
+    assert "const taskConversation = taskConversationMarkup(run);" in script
+    assert "bindRunCitations(run);" in script
 
 
 def test_direct_knowledge_catalog_counts_documents_not_evidence_hits(
@@ -2768,6 +3057,28 @@ def test_notebook_webapp_installs_local_skills_and_exposes_extension_catalog(tmp
     assert Path(installed["installed"][0]["path"]).is_dir()
 
 
+def test_disabled_builtin_skill_is_preserved_in_extension_surface(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    settings = _payload(app.dispatch("GET", "/api/settings"))
+    target = next(item for item in settings["skills"] if item["id"] == "literature-search")
+    target["enabled"] = False
+
+    saved = _payload(
+        app.dispatch(
+            "POST",
+            "/api/settings",
+            json.dumps({"settings": settings}).encode("utf-8"),
+        )
+    )
+    listed = _payload(app.dispatch("GET", "/api/skills"))
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert next(item for item in saved["skills"] if item["id"] == "literature-search")["enabled"] is False
+    assert next(item for item in listed["skills"] if item["id"] == "literature-search")["enabled"] is False
+    assert "const skills = mergedExtensionSkills();" in script
+    assert "const records = detail.kind === \"skills\" ? mergedExtensionSkills()" in script
+
+
 def test_skill_install_ui_requires_a_visible_security_report_before_confirmation(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     html = app.dispatch("GET", "/").body.decode("utf-8")
@@ -2780,11 +3091,27 @@ def test_skill_install_ui_requires_a_visible_security_report_before_confirmation
     assert 'request("/api/skills/scan"' in script
     assert 'request("/api/skills/install"' in script
     assert 'request("/api/skills/scan/cancel"' in script
+    assert 'request("/api/extension-updates"' in script
+    assert 'request("/api/skills/update/scan"' in script
+    assert 'request("/api/skills/update"' in script
     assert "SAFE: { label:" in script
     assert "REVIEW: { label:" in script
     assert "BLOCKED: { label:" in script
     assert ".skill-security-dialog" in styles
     assert ".skill-security-verdict.is-blocked" in styles
+
+
+def test_extension_update_surface_reports_bundled_plugins_and_mcp_updates(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    updates = _payload(app.dispatch("GET", "/api/extension-updates"))
+    assert updates["skills"]["available_count"] == 0
+    assert updates["mcp"]["available_count"] == 0
+    assert any(item["id"] == "zotero" and item["state"] == "bundled" for item in updates["plugins"])
+
+    response = app.dispatch("GET", "/api/mcp/marketplace")
+    marketplace = _payload(response)
+    assert "updates" in marketplace
+    assert 'data-action="check-extension-updates"' in app.dispatch("GET", "/").body.decode("utf-8")
 
 
 def test_skill_install_api_rejects_unscanned_and_blocked_packages(tmp_path: Path):
@@ -2874,6 +3201,17 @@ def test_notebook_webapp_exposes_presets_capabilities_and_ppt_outline(tmp_path: 
     assert outline["title"] == "免疫治疗证据汇报"
     assert outline["evidence_linked"] is True
     assert outline["slides"][-1]["title"] == "参考文献"
+
+
+def test_notebook_webapp_exposes_credential_free_model_health_snapshot(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+
+    health = _payload(app.dispatch("GET", "/api/model-health"))
+
+    assert health["checked_at"]
+    assert health["providers"]["scansci-managed"]["status"] == "configured"
+    assert health["models"]["scansci-managed::glm-4.7-flash"]["status"] == "configured"
+    assert "api_key" not in json.dumps(health)
 
 
 def test_notebook_webapp_fetches_models_through_a_redacted_provider_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3046,6 +3384,52 @@ def test_notebook_webapp_writes_notes_audits_and_serves_source_anchors(tmp_path:
     assert refreshed["counts"]["notes"] == 1
     assert refreshed["counts"]["citation_audits"] == 1
     assert workspace.exists()
+
+
+def test_notebook_webapp_saves_note_markdown_to_selected_or_new_folder(tmp_path: Path):
+    app, workspace, _evidence = _build_app(tmp_path)
+    parent = tmp_path / "saved-notes"
+    parent.mkdir()
+    notebook_id = "immunotherapy"
+
+    response = _payload(
+        app.dispatch(
+            "POST",
+            f"/api/notebooks/{notebook_id}/notes",
+            json.dumps(
+                {
+                    "title": "Evidence review: folder destination",
+                    "body": "# Findings\n\nSaved beside the workspace note.",
+                    "note_type": "literature_review",
+                    "folder_path": str(parent),
+                    "new_folder_name": "2026 review",
+                }
+            ).encode("utf-8"),
+        )
+    )
+
+    destination = parent / "2026 review"
+    markdown_files = list(destination.glob("*.md"))
+    assert response["destination"]["folder_path"] == str(destination.resolve())
+    assert len(markdown_files) == 1
+    assert markdown_files[0].read_text(encoding="utf-8") == "# Findings\n\nSaved beside the workspace note.\n"
+    assert response["note"]["note_type"] == "literature_review"
+    assert response["notebook"]["notes"][0]["source_path"] == str(markdown_files[0].resolve())
+    assert workspace.exists()
+
+    rejected = app.dispatch(
+        "POST",
+        f"/api/notebooks/{notebook_id}/notes",
+        json.dumps(
+            {
+                "title": "Unsafe folder",
+                "body": "should not be written",
+                "folder_path": str(parent),
+                "new_folder_name": "..\\escape",
+            }
+        ).encode("utf-8"),
+    )
+    assert rejected.status == 400
 
 
 def test_deep_research_task_reader_serves_only_task_scoped_fulltext(tmp_path: Path):
@@ -3234,6 +3618,28 @@ def test_model_download_is_refused_before_a_lightweight_build_has_a_runtime(tmp_
         assert payload["next_action"] == "configure_local_runtime"
 
 
+def test_unexpected_local_model_download_error_returns_json_instead_of_closing_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        app.model_installs,
+        "start",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("cache is not writable")),
+    )
+
+    response = app.dispatch(
+        "POST",
+        "/api/local-models/download",
+        b'{"id":"Qwen/Qwen3-ASR-0.6B-hf"}',
+    )
+
+    assert response.status == 500
+    assert _payload(response)["error"]["code"] == "internal_error"
+    assert "cache is not writable" in _payload(response)["error"]["message"]
+
+
 def test_library_binding_never_starts_a_model_download_implicitly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app, _workspace, _evidence = _build_app(tmp_path)
     monkeypatch.setattr(
@@ -3336,6 +3742,95 @@ def test_folder_binding_is_persisted_before_background_indexing_finishes(tmp_pat
         status = _payload(app.dispatch("GET", f"/api/library/import-jobs/{job_id}"))
 
     assert status["state"] == "completed"
+
+
+def test_selected_personal_library_appends_folder_binding_without_new_card(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    first = tmp_path / "first-personal-folder"
+    second = tmp_path / "second-personal-folder"
+    first.mkdir()
+    second.mkdir()
+    started_payloads: list[dict[str, object]] = []
+
+    def fake_runner(payload, _report):
+        started_payloads.append(dict(payload))
+        return {"ok": True, "notebook": app._notebook(str(payload["notebook_id"]))}
+
+    app.library_imports._runner = fake_runner
+    first_payload = _payload(
+        app.dispatch(
+            "POST",
+            "/api/library/bind-folder",
+            json.dumps({"path": str(first), "library_kind": "folder"}).encode("utf-8"),
+        )
+    )
+    notebook_id = str(first_payload["notebook"]["notebook_id"])
+    second_payload = _payload(
+        app.dispatch(
+            "POST",
+            "/api/library/bind-folder",
+            json.dumps(
+                {"notebook_id": notebook_id, "path": str(second), "library_kind": "folder"}
+            ).encode("utf-8"),
+        )
+    )
+
+    deadline = time.time() + 2
+    while time.time() < deadline and len(started_payloads) < 2:
+        time.sleep(0.01)
+
+    notebook = second_payload["notebook"]
+    bindings = notebook["metadata"]["local_bindings"]
+    assert len(started_payloads) == 2
+    assert started_payloads[0]["merge_existing"] is False
+    assert started_payloads[1]["merge_existing"] is True
+    assert notebook["root_path"] == str(first.resolve())
+    assert [item["source_path"] for item in bindings] == [str(first.resolve()), str(second.resolve())]
+    assert len([item for item in second_payload["workspace"]["notebooks"] if item["notebook_id"] == notebook_id]) == 1
+
+
+def test_selected_personal_library_appends_file_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(
+        app,
+        "_ensure_retrieval_models",
+        lambda _notebook_id: {"job_id": "retrieval-core", "state": "idle", "progress": 0.0},
+    )
+    created = _payload(
+        app.dispatch(
+            "POST",
+            "/api/library",
+            json.dumps({"title": "Personal sources"}).encode("utf-8"),
+        )
+    )
+    notebook_id = str(created["notebook"]["notebook_id"])
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("The first linked file remains searchable in the personal knowledge base.", encoding="utf-8")
+    second.write_text("The second linked file is appended without removing the first file.", encoding="utf-8")
+
+    _payload(
+        app.dispatch(
+            "POST",
+            "/api/library/files",
+            json.dumps({"notebook_id": notebook_id, "paths": [str(first)]}).encode("utf-8"),
+        )
+    )
+    result = _payload(
+        app.dispatch(
+            "POST",
+            "/api/library/files",
+            json.dumps({"notebook_id": notebook_id, "paths": [str(second)]}).encode("utf-8"),
+        )
+    )
+
+    notebook = result["notebook"]
+    assert notebook["counts"]["sources"] == 2
+    assert [item["source_path"] for item in notebook["metadata"]["local_bindings"]] == [
+        str(first.resolve()),
+        str(second.resolve()),
+    ]
+    assert notebook["root_path"] == str(first.parent.resolve())
 
 
 def test_library_import_job_rejects_unsupported_sources(tmp_path: Path):
@@ -3534,3 +4029,44 @@ def test_evidence_index_progress_identifies_the_target_knowledge_base():
     assert "原文件与原文证据无需重新导入" in web_script
     assert '"notebook_title": str(notebook.get("title") or "当前知识库")' in runtime
     assert "正在为「{notebook.get('title') or '当前知识库'}」优化语义检索：" in runtime
+
+
+def test_default_capability_settings_keep_content_inside_cards_and_reset_scroll():
+    root = Path(__file__).parents[1] / "src" / "scansci_html" / "web"
+    web_script = (root / "app.js").read_text(encoding="utf-8")
+    styles = (root / "styles.css").read_text(encoding="utf-8")
+
+    assert web_script.count("settingsContent.scrollTop = 0") >= 2
+    assert 'behavior: "instant"' not in web_script
+    assert ".default-capabilities-grid { display: grid; min-width: 0;" in styles
+    assert ".default-capability-panel .default-capability-row { grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr);" in styles
+    assert ".default-capability-panel:first-child .default-capability-row { grid-template-columns: minmax(0, .55fr) minmax(0, 1fr);" in styles
+    assert ".default-capability-row > .settings-select { min-width: 0; }" in styles
+    assert "@media (max-width: 1100px)" in styles
+
+
+def test_app_update_notice_lives_in_titlebar_and_starts_install_from_notice_button():
+    root = Path(__file__).parents[1] / "src" / "scansci_html" / "web"
+    page = (root / "index.html").read_text(encoding="utf-8")
+    web_script = (root / "app.js").read_text(encoding="utf-8")
+    styles = (root / "styles.css").read_text(encoding="utf-8")
+
+    update_position = page.index('id="appUpdate"')
+    titlebar_end = page.index('class="desktop-titlebar-drag-space')
+    canvas_start = page.index('<section class="app-canvas">')
+    assert update_position < titlebar_end < canvas_start
+    assert 'trigger.dataset.action = "install-app-update"' in web_script
+    assert ".app-update:not(.is-card-closed):hover .app-update-card" in styles
+    assert ".app-update:not(.is-card-closed):focus-within .app-update-card" in styles
+    assert ".app-update { position: relative;" in styles
+
+
+def test_app_update_close_button_overrides_hover_and_focus_reveal():
+    root = Path(__file__).parents[1] / "src" / "scansci_html" / "web"
+    web_script = (root / "app.js").read_text(encoding="utf-8")
+    styles = (root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'else if (action === "close-app-update") toggleAppUpdateCard(false);' in web_script
+    assert "Do not remove is-card-closed here" in web_script
+    assert ".app-update:not(.is-card-closed):hover .app-update-card" in styles
+    assert ".app-update:not(.is-card-closed):focus-within .app-update-card" in styles

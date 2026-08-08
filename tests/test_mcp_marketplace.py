@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
 
+from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.mcp_marketplace import (
     OFFICIAL_REGISTRY_URL,
     install_marketplace_server,
     marketplace_cache_path,
     marketplace_catalog,
+    marketplace_updates,
     sync_official_registry,
+    update_marketplace_server,
 )
 
 
@@ -87,3 +90,36 @@ def test_sync_official_registry_caches_and_classifies_public_records(tmp_path: P
     assert "life" in item["disciplines"]
     assert item["updated_at"] == "2026-07-19T00:00:00Z"
     assert marketplace_cache_path(workspace).is_file()
+
+
+def test_marketplace_update_compares_versions_and_preserves_user_permissions(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    workspace.touch()
+    catalog = marketplace_catalog(workspace)
+    pubmed = next(item for item in catalog["items"] if item["id"] == "io.github.cyanheads/pubmed-mcp-server")
+    installed = install_marketplace_server(workspace, pubmed["id"])
+    settings = load_settings(workspace)
+    server = settings["mcp_servers"][0]
+    server["enabled"] = False
+    server["allow_write"] = True
+    save_settings(workspace, settings)
+
+    newer = dict(pubmed)
+    newer.update({"version": "3.0.0", "command": "uvx", "args": "pubmed-mcp-server@3.0.0"})
+    marketplace_cache_path(workspace).write_text(
+        json.dumps({"schema_version": 1, "synced_at": "2026-08-07T00:00:00Z", "items": [newer]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    comparison = marketplace_updates(workspace)
+    update = next(item for item in comparison["updates"] if item["id"] == installed["record"]["id"])
+    assert update["available"] is True
+    assert update["latest_version"] == "3.0.0"
+
+    result = update_marketplace_server(workspace, installed["record"]["id"])
+    assert result["updated"] is True
+    assert result["record"]["version"] == "3.0.0"
+    assert result["record"]["command"] == "uvx"
+    assert result["record"]["enabled"] is False
+    assert result["record"]["allow_write"] is True
+    assert marketplace_updates(workspace)["updates"][0]["state"] == "current"

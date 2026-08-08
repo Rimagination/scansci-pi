@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -15,29 +16,44 @@ from .vector_index import cached_embedding_candidates, query_cached_embedding_ca
 
 
 STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "in",
-    "is",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "to",
-    "was",
-    "were",
-    "what",
-    "which",
-    "with",
+    # English
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "in", "is", "of", "on", "or", "that", "the", "to", "was", "were",
+    "what", "which", "with",
+
+    # Chinese stopwords — boilerplate that carries no topical signal.
+    # Without them a query like "光伏组件衰减率通常受到哪些因素影响？"
+    # and an unrelated psychology paper both contain "通常/因素",
+    # making the psychology paper rank first.
+    # General verbs / function words
+    "是", "有", "会", "可以", "能够", "需要", "使用", "进行", "包括",
+    "存在", "产生", "提供", "使得", "成为", "作为", "认为", "表示", "发现",
+    # Conjunctions / prepositions
+    "和", "与", "以及", "或", "且", "但", "而", "然而",
+    "在", "对", "从", "到", "用", "让", "被", "把", "将", "向", "由", "以",
+    "于", "关于", "对于", "根据", "经过", "除了",
+    # Adverbs / degree
+    "都", "也", "只", "就", "还", "更", "最", "很", "较", "太",
+    "已经", "正在", "将要", "可能", "应该",
+    # Question words
+    "什么", "怎样", "为什么", "如何", "哪些", "哪", "谁", "怎么",
+    # Demonstratives / particles
+    "这", "那", "这些", "那些", "这个", "那个", "其", "此", "该",
+    "的", "了", "吗", "呢", "吧", "着", "过", "得", "所", "者", "之",
+    # High-frequency boilerplate (Chinese academic prose)
+    "因素", "通常", "受到", "一般", "方面", "问题", "作用", "关系",
+    "过程", "机制", "特征", "特点", "基础", "方法", "结果", "表现",
+    "论文", "文献", "研究", "本文", "作者", "提出", "利用", "影响",
+    # English academic boilerplate
+    "paper", "study", "research", "result", "method", "approach",
+    "introduction", "conclusion", "discussion", "background",
+    "related", "work", "section", "figure", "table", "et", "al",
+    "propose", "proposed", "show", "shows", "shown", "also", "thus",
+    "therefore", "however", "moreover", "furthermore", "both", "each",
+    "using", "used", "based", "due", "well", "may", "one", "two",
+    "whether", "not", "still", "yet", "often", "many",
+    "much", "such", "various", "different", "between", "among",
+    "within", "these", "those", "their", "its",
 }
 
 
@@ -243,12 +259,41 @@ def search_evidence_store(
         candidate["dense_score"] = max(float(candidate.get("dense_score", 0.0)), dense_score)
         candidate.setdefault("routes", set()).add("dense")
 
+    # Legacy span-first stores have no document-card layer to carry tags into
+    # recall.  Seed one representative span per tag-matched document so a tag
+    # can introduce a document even when the exact label is absent from its
+    # full text.  The final reranker still sees all ordinary FTS/dense signals.
+    tags_by_doc = _load_document_tags(db, {str(row.get("doc_id", "")) for row in rows.values()})
+    tag_seed_rows: dict[str, tuple[dict[str, Any], float]] = {}
+    for row in rows.values():
+        doc_id = str(row.get("doc_id", ""))
+        tags = tags_by_doc.get(doc_id, [])
+        tag_score = _tag_match_score(tags, query_terms)
+        if tag_score <= 0.0 or doc_id in tag_seed_rows:
+            continue
+        tag_seed_rows[doc_id] = (row, tag_score)
+    for row, tag_score in tag_seed_rows.values():
+        evidence_id = str(row.get("evidence_id", ""))
+        if not evidence_id:
+            continue
+        candidate = candidates.setdefault(evidence_id, dict(row))
+        candidate["tags"] = list(tags_by_doc.get(str(row.get("doc_id", "")), []))
+        candidate["tag_score"] = max(float(candidate.get("tag_score", 0.0) or 0.0), tag_score)
+        candidate.setdefault("routes", set()).add("tag")
+
     normalized_candidates = []
     for candidate in candidates.values():
-        routes = candidate.get("routes", set())
-        candidate["routes"] = sorted(routes)
+        routes = {str(route) for route in candidate.get("routes", []) or []}
         candidate.setdefault("fts_score", 0.0)
         candidate.setdefault("dense_score", 0.0)
+        candidate.setdefault("tags", list(tags_by_doc.get(str(candidate.get("doc_id", "")), [])))
+        candidate["tag_score"] = max(
+            float(candidate.get("tag_score", 0.0) or 0.0),
+            _tag_match_score(candidate.get("tags", []), query_terms),
+        )
+        if candidate["tag_score"] > 0.0:
+            routes.add("tag")
+        candidate["routes"] = sorted(routes)
         document_recall = document_recall_by_id.get(str(candidate.get("doc_id", "")))
         if document_recall:
             candidate["paper_recall_rank"] = document_recall.get("rank")
@@ -384,6 +429,8 @@ def _search_evidence_store_from_document_cards(
         if score > 0.0:
             document_scores[doc_id] = max(document_scores.get(doc_id, 0.0), score)
             document_routes[doc_id].add("document-card")
+            if float(card.get("tag_score", 0.0) or 0.0) > 0.0:
+                document_routes[doc_id].add("tag")
             if float(card.get("card_dense_score", 0.0) or 0.0) > 1e-6:
                 document_routes[doc_id].add("document-card-dense")
     for evidence_id, doc_id, sparse_score in sparse_seed:
@@ -487,6 +534,13 @@ def _search_evidence_store_from_document_cards(
             continue
         candidate = dict(row)
         routes: set[str] = set()
+        recalled_document = document_recall_by_id.get(doc_id)
+        if recalled_document is not None:
+            candidate["tags"] = list(recalled_document.get("tags", []) or [])
+            candidate["tag_score"] = float(recalled_document.get("tag_score", 0.0) or 0.0)
+        else:
+            candidate["tags"] = []
+            candidate["tag_score"] = 0.0
         if evidence_id in sparse_scores:
             candidate["fts_score"] = float(sparse_scores[evidence_id])
             routes.add("fts")
@@ -500,8 +554,9 @@ def _search_evidence_store_from_document_cards(
             candidate["dense_score"] = 0.0
         if not routes:
             routes.add("document-card-anchor")
+        if float(candidate.get("tag_score", 0.0) or 0.0) > 0.0:
+            routes.add("tag")
         candidate["routes"] = sorted(routes)
-        recalled_document = document_recall_by_id.get(doc_id)
         if recalled_document is not None:
             candidate["document_card_rank"] = recalled_document.get("rank")
             candidate["document_card_score"] = recalled_document.get("score")
@@ -609,6 +664,21 @@ def recall_relevant_documents(
             }
         )
     ranked.sort(key=lambda document: (-float(document["score"]), str(document.get("doc_id", ""))))
+    # Drop documents that have zero lexical overlap with the question and only
+    # a weak dense signal.  A hashing embedding (128-dim hash) can produce
+    # small cosine noise (~0.16) that is not evidence of topical relevance.
+    # Real neural embeddings will reliably push relevant documents above this
+    # floor.
+    _RANK_NOISE_DENSE_THRESHOLD = 0.3
+    ranked = [
+        item
+        for item in ranked
+        if (
+            item["lexical_score"] > 0.0
+            or item["matched_terms"]
+            or item["dense_score"] >= _RANK_NOISE_DENSE_THRESHOLD
+        )
+    ]
     selected = ranked[: max(0, int(limit))]
     for rank, document in enumerate(selected, start=1):
         document["rank"] = rank
@@ -649,6 +719,8 @@ def _has_ready_document_cards(db_path: Path) -> bool:
 
 def _load_document_cards(db_path: Path, *, filters: dict[str, Any]) -> list[dict[str, Any]]:
     doc_ids = _string_set(filters.get("doc_ids"))
+    if "doc_ids" in filters and not doc_ids:
+        return []
     year_min = _int_or_none(filters.get("year_min"))
     try:
         with sqlite3.connect(db_path) as connection:
@@ -674,6 +746,7 @@ def _load_document_cards(db_path: Path, *, filters: dict[str, Any]) -> list[dict
     except sqlite3.Error:
         return []
     cards: list[dict[str, Any]] = []
+    tags_by_doc = _load_document_tags(db_path, [str(row["doc_id"]) for row in rows])
     for row in rows:
         card = dict(row)
         doc_id = str(card.get("doc_id", "")).strip()
@@ -687,6 +760,8 @@ def _load_document_cards(db_path: Path, *, filters: dict[str, Any]) -> list[dict
                 continue
         card["keywords"] = _json_string_list(card.pop("keywords_json", "[]"))
         card["anchor_evidence_ids"] = _json_string_list(card.pop("anchor_evidence_ids_json", "[]"))
+        card["tags"] = list(tags_by_doc.get(doc_id, []))
+        card["tag_text"] = " ".join(card["tags"])
         card["profile_text"] = " ".join(
             value
             for value in (
@@ -696,8 +771,98 @@ def _load_document_cards(db_path: Path, *, filters: dict[str, Any]) -> list[dict
             )
             if value
         )
+        # Tags influence the compact semantic route, while their exact-match
+        # contribution is scored separately below as a deliberately small
+        # lexical boost.
+        card["semantic_profile_text"] = " ".join(
+            value for value in (card["profile_text"], card["tag_text"]) if value
+        )
         cards.append(card)
     return cards
+
+
+def _load_document_tags(
+    db_path: Path,
+    doc_ids: list[str] | set[str] | None = None,
+) -> dict[str, list[str]]:
+    """Load optional Zotero tags without making retrieval depend on Zotero."""
+
+    normalized_ids = sorted({str(value).strip() for value in (doc_ids or []) if str(value).strip()})
+    clauses = ""
+    parameters: list[Any] = []
+    if doc_ids is not None:
+        if not normalized_ids:
+            return {}
+        clauses = f" where doc_id in ({', '.join('?' for _ in normalized_ids)})"
+        parameters.extend(normalized_ids)
+    try:
+        with sqlite3.connect(db_path) as connection:
+            rows = connection.execute(
+                f"""
+                select doc_id, tag
+                from document_tags
+                {clauses}
+                order by doc_id, normalized_tag, tag
+                """,
+                parameters,
+            ).fetchall()
+    except sqlite3.Error:
+        # Existing evidence stores may predate the sidecar.  Their ordinary
+        # FTS/vector retrieval remains fully valid.
+        return {}
+    tags_by_doc: dict[str, list[str]] = {}
+    for doc_id, tag in rows:
+        clean = str(tag or "").strip()
+        if clean and clean not in tags_by_doc.setdefault(str(doc_id), []):
+            tags_by_doc[str(doc_id)].append(clean)
+    return tags_by_doc
+
+
+def _document_card_embedding_digest(card: dict[str, Any]) -> str:
+    """Invalidate a compact card vector when its Zotero tag profile changes."""
+
+    source_digest = str(card.get("source_digest", "") or "")
+    tags = [str(tag).strip() for tag in list(card.get("tags", []) or []) if str(tag).strip()]
+    if not tags:
+        return source_digest
+    payload = "\n".join([source_digest, *sorted({tag.casefold() for tag in tags})])
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=20).hexdigest()
+
+
+def _tag_match_score(tags: Any, query_terms: list[str]) -> float:
+    """Return a bounded soft score for exact/partial tag overlap.
+
+    This is intentionally much smaller than a hard filter.  A tag can lift a
+    relevant document into the candidate set, but it cannot suppress documents
+    whose evidence text or embedding matches the question better.
+    """
+
+    clean_tags = [str(tag or "").strip() for tag in list(tags or []) if str(tag or "").strip()]
+    if not clean_tags or not query_terms:
+        return 0.0
+    query_set = set(query_terms)
+    compact_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", " ".join(query_terms).casefold())
+    score = 0.0
+    for tag in clean_tags:
+        tag_terms = set(_tokens(tag))
+        overlap = len(tag_terms & query_set)
+        if overlap:
+            score += min(1.2, overlap / max(1, len(tag_terms)) * 1.2)
+        compact_tag = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", tag.casefold())
+        if compact_tag and compact_tag in compact_query:
+            score += 0.8
+    return min(3.0, score)
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = str(value or "").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
 
 
 def _json_string_list(value: Any) -> list[str]:
@@ -727,6 +892,8 @@ def _rank_document_cards(
     for card in cards:
         profile_text = str(card.get("profile_text", ""))
         title = str(card.get("title", ""))
+        tag_text = str(card.get("tag_text", ""))
+        tag_score = _tag_match_score(card.get("tags", []), query_terms)
         lexical_score = _document_lexical_score(
             {"profile_text": profile_text, "title": title},
             query_terms,
@@ -736,8 +903,17 @@ def _rank_document_cards(
         # Lexical matches are useful for exact terminology; the compact card
         # vector supplies semantic recall without opening every source span.
         ranked_card["card_dense_score"] = round(dense_score, 6)
-        ranked_card["score"] = round(float(lexical_score) + max(0.0, dense_score) * 1.25, 6)
-        ranked_card["matched_terms"] = _matched_terms_in_text(profile_text, query_terms)
+        ranked_card["tag_score"] = round(tag_score, 6)
+        ranked_card["score"] = round(
+            float(lexical_score) + max(0.0, dense_score) * 1.25 + tag_score * 0.85,
+            6,
+        )
+        ranked_card["matched_terms"] = _unique_strings(
+            [
+                *_matched_terms_in_text(profile_text, query_terms),
+                *_matched_terms_in_text(tag_text, query_terms),
+            ]
+        )
         ranked.append(ranked_card)
     ranked.sort(key=lambda card: (-float(card.get("score", 0.0)), str(card.get("doc_id", ""))))
     return ranked
@@ -769,7 +945,7 @@ def _document_card_dense_scores(
     if len(query_vector) != dimensions:
         return {}
     expected = {
-        str(card.get("doc_id", "")): str(card.get("source_digest", ""))
+        str(card.get("doc_id", "")): _document_card_embedding_digest(card)
         for card in cards
         if str(card.get("doc_id", "")) and str(card.get("source_digest", ""))
     }
@@ -805,7 +981,9 @@ def _document_card_dense_scores(
     # foreground model job.
     if pending and len(pending) <= 2_000:
         try:
-            vectors = provider.embed_texts([str(card.get("profile_text", "")) for card in pending])
+            vectors = provider.embed_texts(
+                [str(card.get("semantic_profile_text", card.get("profile_text", ""))) for card in pending]
+            )
             writes: list[tuple[str, str, int, str, str]] = []
             for card, vector in zip(pending, vectors):
                 values = [float(value) for value in vector]
@@ -1070,6 +1248,8 @@ def _filter_evidence_spans(
     year_min = _int_or_none(filters.get("year_min"))
     section_kinds = _string_set(filters.get("section_kinds"))
     doc_ids = _string_set(filters.get("doc_ids"))
+    if "doc_ids" in filters and not doc_ids:
+        return {}
     filtered = rows
     if doc_ids:
         filtered = {

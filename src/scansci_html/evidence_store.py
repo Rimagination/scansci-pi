@@ -50,7 +50,7 @@ SPAN_COLUMNS = (
     "source_locator",
 )
 EVIDENCE_SCHEMA_NAME = "evidence_store"
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 
 
 def _evidence_migrations() -> tuple[Migration, ...]:
@@ -58,6 +58,7 @@ def _evidence_migrations() -> tuple[Migration, ...]:
         Migration(1, "evidence store baseline registry", lambda _connection: None),
         Migration(2, "stable document content identity", _apply_evidence_identity_migration),
         Migration(3, "stable document aliases and index versions", _apply_evidence_catalog_migration),
+        Migration(4, "zotero document tag index", _apply_zotero_document_tags_migration),
     )
 
 
@@ -1047,6 +1048,33 @@ def _apply_evidence_catalog_migration(connection: sqlite3.Connection) -> None:
             )
 
 
+def _apply_zotero_document_tags_migration(connection: sqlite3.Connection) -> None:
+    """Create the optional tag sidecar used by the hybrid retriever.
+
+    Tags are external Zotero metadata, not part of parsed source content.  They
+    therefore live in their own small table and can be refreshed without
+    rebuilding evidence spans or embeddings.
+    """
+
+    connection.execute(
+        """
+        create table if not exists document_tags (
+            doc_id text not null,
+            tag text not null,
+            normalized_tag text not null,
+            source text not null default 'zotero',
+            primary key (doc_id, normalized_tag, source)
+        )
+        """
+    )
+    connection.execute(
+        "create index if not exists idx_document_tags_normalized on document_tags(normalized_tag)"
+    )
+    connection.execute(
+        "create index if not exists idx_document_tags_doc on document_tags(doc_id)"
+    )
+
+
 def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -1126,6 +1154,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    _apply_zotero_document_tags_migration(connection)
     connection.execute(
         """
         create table if not exists document_index_revisions (
@@ -1225,6 +1254,7 @@ def _clear_index(connection: sqlite3.Connection) -> None:
     connection.execute("delete from knowledge_graph_edges")
     connection.execute("delete from knowledge_graph_nodes")
     connection.execute("delete from document_cards")
+    connection.execute("delete from document_tags")
     connection.execute("delete from document_index_revisions")
     connection.execute("delete from evidence_spans_fts")
     connection.execute("delete from evidence_spans")
@@ -1558,6 +1588,7 @@ def _delete_document_index_rows(connection: sqlite3.Connection, doc_id: str) -> 
     connection.execute("delete from evidence_spans where doc_id = ?", (doc_id,))
     connection.execute("delete from document_sections where doc_id = ?", (doc_id,))
     connection.execute("delete from document_cards where doc_id = ?", (doc_id,))
+    connection.execute("delete from document_tags where doc_id = ?", (doc_id,))
     connection.execute("delete from document_index_revisions where doc_id = ?", (doc_id,))
     connection.execute("delete from source_documents where doc_id = ?", (doc_id,))
 

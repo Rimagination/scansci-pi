@@ -13,6 +13,7 @@ from importlib.util import find_spec
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import subprocess
@@ -21,7 +22,7 @@ import tempfile
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
@@ -31,8 +32,12 @@ from .local_runtime_contract import COMPONENT_ID, COMPONENT_VERSION, EXECUTABLE_
 
 
 RUNTIME_MANIFEST_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_URL"
+RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
+DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json"
+DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0"
+_RUNTIME_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 8.0)
 
 
 class LocalRuntimeInstallPaused(RuntimeError):
@@ -41,6 +46,10 @@ class LocalRuntimeInstallPaused(RuntimeError):
 
 class LocalRuntimeInstallCancelled(RuntimeError):
     """Raised when the user cancels the optional runtime installation."""
+
+
+class _RetryableRuntimeDownloadError(RuntimeError):
+    """A runtime download failed transiently and may safely resume."""
 
 
 class LocalRuntimeComponent:
@@ -52,20 +61,51 @@ class LocalRuntimeComponent:
         root: str | Path | None = None,
         manifest_url: str | None = None,
         fallback_manifest_url: str | None = None,
+        component_id: str = COMPONENT_ID,
+        executable_name: str = EXECUTABLE_NAME,
+        component_version: str = COMPONENT_VERSION,
+        default_manifest_url: str = DEFAULT_RUNTIME_MANIFEST_URL,
+        default_release_url: str = DEFAULT_RUNTIME_RELEASE_URL,
+        manifest_env: str = RUNTIME_MANIFEST_ENV,
+        fallbacks_env: str = RUNTIME_MANIFEST_FALLBACKS_ENV,
+        embedded_profiles: frozenset[str] = frozenset({"full"}),
+        source_dependency_modules: tuple[str, ...] = ("torch", "transformers", "sentence_transformers"),
     ) -> None:
+        self.component_id = str(component_id or COMPONENT_ID)
+        self.executable_name = str(executable_name or EXECUTABLE_NAME)
+        self.component_version = str(component_version or COMPONENT_VERSION)
+        self.default_manifest_url = str(default_manifest_url or DEFAULT_RUNTIME_MANIFEST_URL)
+        self.default_release_url = str(default_release_url or DEFAULT_RUNTIME_RELEASE_URL)
+        self._embedded_profiles = frozenset(embedded_profiles or ())
+        self._source_dependency_modules = tuple(source_dependency_modules or ())
         local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        self.root = Path(root or Path(local_app_data) / "ScanSci" / "runtimes" / COMPONENT_ID).resolve()
+        self.root = Path(root or Path(local_app_data) / "ScanSci" / "runtimes" / self.component_id).resolve()
         build = current_build_info()
-        configured = (
-            manifest_url
-            if manifest_url is not None
-            else os.getenv(RUNTIME_MANIFEST_ENV)
-            or build.get("runtime_manifest_url")
-            or fallback_manifest_url
-            or os.getenv(UPDATE_MANIFEST_ENV)
-            or ""
+        packaged_core_fallback = (
+            self.default_manifest_url
+            if bool(build.get("frozen")) and str(build.get("package_profile", "")) == "core"
+            else ""
         )
-        self.manifest_url = str(configured).strip()
+        if manifest_url is not None:
+            # An explicit empty value is an intentional opt-out used by source
+            # builds and tests.  Do not silently resurrect a release URL in
+            # that case.
+            configured_urls = [manifest_url]
+        else:
+            configured_urls = [
+                os.getenv(manifest_env),
+                build.get("runtime_manifest_url"),
+                packaged_core_fallback,
+                fallback_manifest_url,
+                os.getenv(UPDATE_MANIFEST_ENV),
+            ]
+            configured_urls.extend(
+                value
+                for value in re.split(r"[;\r\n]+", os.getenv(fallbacks_env, ""))
+                if value.strip()
+            )
+        self.manifest_urls = self._unique_urls(configured_urls)
+        self.manifest_url = self.manifest_urls[0] if self.manifest_urls else ""
         self._install_lock = threading.RLock()
         self._install_job: dict[str, Any] = {
             "job_id": "local-runtime",
@@ -85,6 +125,12 @@ class LocalRuntimeComponent:
         self._install_control = ""
         self._download_sample: tuple[int, float, float] | None = None
         self._last_install_persist_at = 0.0
+        self._process: subprocess.Popen[Any] | None = None
+        self._process_model_id = ""
+        self._process_base_url = ""
+        self._last_manifest_source = ""
+        self._last_manifest_failures: list[dict[str, str]] = []
+        self._manual_install_paths: tuple[str, ...] = ()
         self._load_install_job()
 
     @property
@@ -112,14 +158,120 @@ class LocalRuntimeComponent:
             return None
         return candidate if candidate.is_file() else None
 
+    def ensure_process(self, model_id: str) -> str:
+        """Start the installed runtime sidecar and return its local ``/v1`` URL.
+
+        The core desktop package intentionally does not import PyTorch or
+        Transformers.  A downloaded component therefore has to be used as a
+        real loopback service, rather than merely being shown as installed.
+        The child watches the parent PID and exits when ScanSci closes.
+        """
+
+        wanted = str(model_id or "").strip()
+        if not wanted:
+            raise ValueError("本地运行组件缺少模型 ID")
+        executable = self.executable()
+        if executable is None:
+            raise RuntimeError("本地运行组件尚未安装，请先在设置 → 资源配置中安装")
+        with self._install_lock:
+            base_url = self._component_base_url()
+            health_model = self._health_model(base_url)
+            if health_model == wanted:
+                self._process_model_id = wanted
+                self._process_base_url = base_url
+                return base_url
+            if health_model and health_model != wanted:
+                if self._process is not None and self._process.poll() is None:
+                    self._stop_process_locked()
+                else:
+                    raise RuntimeError(
+                        f"本地运行组件正在服务 {health_model}，请等待当前本地模型请求完成后再切换。"
+                    )
+            if self._process is not None and self._process.poll() is None:
+                if self._process_model_id == wanted and self._health_model(base_url) == wanted:
+                    return base_url
+                self._stop_process_locked()
+            command = [
+                str(executable),
+                "--model-id",
+                wanted,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self._component_port()),
+                "--parent-pid",
+                str(os.getpid()),
+            ]
+            creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                self._process = subprocess.Popen(
+                    command,
+                    cwd=str(executable.parent),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+            except OSError as error:
+                raise RuntimeError(f"无法启动本地运行组件：{error}") from error
+            deadline = time.monotonic() + 45.0
+            while time.monotonic() < deadline:
+                if self._process.poll() is not None:
+                    code = self._process.returncode
+                    self._process = None
+                    raise RuntimeError(f"本地运行组件启动失败（退出码 {code}）")
+                if self._health_model(base_url) == wanted:
+                    self._process_model_id = wanted
+                    self._process_base_url = base_url
+                    return base_url
+                time.sleep(0.25)
+            self._stop_process_locked()
+            raise RuntimeError("本地运行组件启动超时，请重试或打开资源配置查看组件状态")
+
+    def _component_port(self) -> int:
+        try:
+            value = int(os.getenv("SCANSCI_LOCAL_RUNTIME_PORT", "17863"))
+        except ValueError:
+            value = 17863
+        return value if 1024 <= value <= 65535 else 17863
+
+    def _component_base_url(self) -> str:
+        return f"http://127.0.0.1:{self._component_port()}/v1"
+
+    @staticmethod
+    def _health_model(base_url: str) -> str:
+        try:
+            root = base_url[:-3] if base_url.endswith("/v1") else base_url.rstrip("/")
+            with urlopen(f"{root}/health", timeout=1.5) as response:  # noqa: S310 - loopback only
+                payload = json.loads(response.read(256_000).decode("utf-8"))
+            return str(payload.get("model", "")).strip() if isinstance(payload, dict) else ""
+        except (OSError, ValueError, json.JSONDecodeError):
+            return ""
+
+    def _stop_process_locked(self) -> None:
+        process = self._process
+        self._process = None
+        self._process_model_id = ""
+        self._process_base_url = ""
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
     def status(self) -> dict[str, Any]:
         executable = self.executable()
         build = current_build_info()
         source_runtime = not bool(build.get("frozen"))
-        embedded_runtime = bool(build.get("frozen")) and build.get("package_profile") == "full"
-        source_dependencies_ready = source_runtime and all(
+        embedded_runtime = bool(build.get("frozen")) and str(build.get("package_profile", "")) in self._embedded_profiles
+        source_dependencies_ready = source_runtime and bool(self._source_dependency_modules) and all(
             find_spec(module) is not None
-            for module in ("torch", "transformers", "sentence_transformers")
+            for module in self._source_dependency_modules
         )
         installed = executable is not None
         version = ""
@@ -131,13 +283,20 @@ class LocalRuntimeComponent:
                 version = "external"
         mode = "component" if installed else "embedded" if embedded_runtime else "source" if source_dependencies_ready else "missing"
         return {
-            "id": COMPONENT_ID,
-            "version": version or (COMPONENT_VERSION if source_runtime or embedded_runtime else ""),
+            "id": self.component_id,
+            "version": version or (self.component_version if source_runtime or embedded_runtime else ""),
             "installed": bool(installed or source_dependencies_ready or embedded_runtime),
             "mode": mode,
             "executable": str(executable or ""),
-            "install_available": bool(self.manifest_url),
-            "manifest_configured": bool(self.manifest_url),
+            "install_available": bool(self.manifest_urls),
+            "manifest_configured": bool(self.manifest_urls),
+            "manifest_url": self.manifest_url,
+            "manifest_urls": list(self.manifest_urls),
+            "manifest_channel_count": len(self.manifest_urls),
+            "manifest_release_url": self.default_release_url,
+            "manual_install_available": True,
+            "last_manifest_source": self._last_manifest_source,
+            "last_manifest_failures": list(self._last_manifest_failures),
             "root": str(self.root),
             "install_job": self.install_status(),
         }
@@ -155,6 +314,24 @@ class LocalRuntimeComponent:
         with self._install_lock:
             if self._install_thread is not None and self._install_thread.is_alive():
                 return dict(self._install_job)
+            if not self.manifest_urls:
+                now = int(time.time())
+                self._install_job = {
+                    "job_id": "local-runtime",
+                    "state": "failed",
+                    "phase": "unavailable",
+                    "progress": 0.0,
+                    "message": "自动下载清单不可用，可选择本地组件安装",
+                    "error": "本地 AI 组件尚未安装；自动下载清单不可用。请从官方发布页下载 ZIP 后选择“从本地文件安装”。",
+                    "current_file": "",
+                    "completed_bytes": 0,
+                    "total_bytes": 0,
+                    "speed_bytes_per_second": 0.0,
+                    "eta_seconds": None,
+                    "updated_at": now,
+                }
+                self._persist_install_job(force=True)
+                return dict(self._install_job)
             self._install_job = {
                 "job_id": "local-runtime",
                 "state": "queued",
@@ -169,7 +346,9 @@ class LocalRuntimeComponent:
                 "total_bytes": 0,
                 "speed_bytes_per_second": 0.0,
                 "eta_seconds": None,
+                "source": "automatic",
             }
+            self._manual_install_paths = ()
             self._download_sample = None
             self._install_control = ""
             self._persist_install_job(force=True)
@@ -177,6 +356,47 @@ class LocalRuntimeComponent:
                 target=self._install_in_background,
                 daemon=True,
                 name="scansci-local-runtime-install",
+            )
+            self._install_thread.start()
+            return dict(self._install_job)
+
+    def start_local_install(self, paths: list[str] | tuple[str, ...]) -> dict[str, Any]:
+        """Install a runtime selected from local files in the native dialog.
+
+        The user may select a single ZIP, or the ZIP parts plus the matching
+        ``local-transformers.json`` manifest from the official release.  The
+        same hash, size, ZIP path and diagnostic checks used by automatic
+        downloads are applied before activation.
+        """
+
+        normalized = self._normalize_manual_paths(paths)
+        with self._install_lock:
+            if self._install_thread is not None and self._install_thread.is_alive():
+                return dict(self._install_job)
+            self._manual_install_paths = tuple(str(path) for path in normalized)
+            self._install_job = {
+                "job_id": "local-runtime",
+                "state": "queued",
+                "phase": "preparing",
+                "progress": 0.0,
+                "message": "准备校验本地运行组件",
+                "error": "",
+                "started_at": time.time(),
+                "updated_at": int(time.time()),
+                "current_file": "",
+                "completed_bytes": 0,
+                "total_bytes": 0,
+                "speed_bytes_per_second": 0.0,
+                "eta_seconds": None,
+                "source": "manual",
+            }
+            self._download_sample = None
+            self._install_control = ""
+            self._persist_install_job(force=True)
+            self._install_thread = threading.Thread(
+                target=self._install_in_background,
+                daemon=True,
+                name="scansci-local-runtime-manual-install",
             )
             self._install_thread.start()
             return dict(self._install_job)
@@ -240,7 +460,11 @@ class LocalRuntimeComponent:
                 return self.install_status()
             if state not in {"paused", "interrupted", "failed", "cancelled", "queued", "installing"}:
                 raise ValueError(f"本地运行组件当前状态不支持{action}：{state}")
-        return self.start_install()
+            manual = str(self._install_job.get("source", "automatic")) == "manual"
+            paths = self._manual_install_paths
+            if manual and not paths:
+                raise ValueError("手动安装任务需要重新选择本地组件文件")
+        return self.start_local_install(paths) if manual else self.start_install()
 
     def _check_install_control(self) -> None:
         with self._install_lock:
@@ -252,7 +476,10 @@ class LocalRuntimeComponent:
 
     def _install_in_background(self) -> None:
         try:
-            result = self.install(progress_callback=self._update_install_progress)
+            if self._manual_install_paths:
+                result = self.install_local(self._manual_install_paths, progress_callback=self._update_install_progress)
+            else:
+                result = self.install(progress_callback=self._update_install_progress)
             self._check_install_control()
             with self._install_lock:
                 self._install_job.update(
@@ -267,6 +494,7 @@ class LocalRuntimeComponent:
                         "updated_at": int(time.time()),
                         "speed_bytes_per_second": 0.0,
                         "eta_seconds": 0,
+                        "source": str(self._install_job.get("source", "automatic")),
                     }
                 )
                 self._persist_install_job(force=True)
@@ -284,6 +512,7 @@ class LocalRuntimeComponent:
                         "error": str(exc),
                         "finished_at": time.time(),
                         "updated_at": int(time.time()),
+                        "source": str(self._install_job.get("source", "automatic")),
                     }
                 )
                 self._persist_install_job(force=True)
@@ -402,17 +631,50 @@ class LocalRuntimeComponent:
     def install(self, progress_callback=None) -> dict[str, Any]:
         """Download, verify, and atomically activate one runtime version."""
 
-        if not self.manifest_url:
+        if not self.manifest_urls:
             raise RuntimeError("当前发行渠道没有配置本地 AI 组件下载清单。")
         with self._process_install_lock():
             return self._install_component(progress_callback=progress_callback)
 
+    def install_local(self, paths: list[str] | tuple[str, ...], progress_callback=None) -> dict[str, Any]:
+        """Install a verified runtime package selected from local disk."""
+
+        normalized = self._normalize_manual_paths(paths)
+        with self._process_install_lock():
+            component, package = self._manual_component_package(normalized)
+            return self._install_component_package(
+                component,
+                package,
+                progress_callback=progress_callback,
+                manifest_source="manual",
+            )
+
     def _install_component(self, progress_callback=None) -> dict[str, Any]:
-        self._emit_progress(progress_callback, "manifest", 0.02, "读取官方组件清单")
-        manifest = self._read_json(self.manifest_url)
-        component = self._component_record(manifest)
-        version = str(component.get("version", "")).strip()
+        self._emit_progress(progress_callback, "manifest", 0.02, "读取官方组件清单（自动切换下载通道）")
+        manifest, component, source, failures = self._read_component_manifest()
+        self._last_manifest_source = source
+        self._last_manifest_failures = failures
         package = component.get("windows", {})
+        if not isinstance(package, dict):
+            raise RuntimeError("本地 AI 组件清单缺少 Windows 包")
+        return self._install_component_package(
+            component,
+            dict(package),
+            progress_callback=progress_callback,
+            manifest_source=source,
+            manifest_failures=failures,
+        )
+
+    def _install_component_package(
+        self,
+        component: dict[str, Any],
+        package: dict[str, Any],
+        *,
+        progress_callback=None,
+        manifest_source: str = "",
+        manifest_failures: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        version = str(component.get("version", "")).strip()
         if not version or not isinstance(package, dict):
             raise RuntimeError("本地 AI 组件清单缺少版本或 Windows 包。")
         expected = str(package.get("sha256", "")).strip().lower()
@@ -422,7 +684,7 @@ class LocalRuntimeComponent:
         self.root.mkdir(parents=True, exist_ok=True)
         downloads = self.root / "downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        archive = downloads / f"{COMPONENT_ID}-{version}.zip"
+        archive = downloads / f"{self.component_id}-{version}.zip"
         if not archive.is_file() or self._sha256(archive) != expected:
             archive.unlink(missing_ok=True)
             self._acquire_package(package, archive, expected, progress_callback=progress_callback)
@@ -432,13 +694,13 @@ class LocalRuntimeComponent:
         versions = self.root / "versions"
         versions.mkdir(parents=True, exist_ok=True)
         target = versions / self._safe_segment(version)
-        if not (target / EXECUTABLE_NAME).is_file():
+        if not (target / self.executable_name).is_file():
             self._emit_progress(progress_callback, "extract", 0.86, "解压本地运行能力")
             staging = Path(tempfile.mkdtemp(prefix="install-", dir=self.root)).resolve()
             try:
                 matches = self._extract_verified(archive, staging)
                 if len(matches) != 1:
-                    raise RuntimeError(f"本地 AI 组件包必须只包含一个 {EXECUTABLE_NAME}。")
+                    raise RuntimeError(f"本地 AI 组件包必须只包含一个 {self.executable_name}。")
                 payload = matches[0].parent
                 if target.exists():
                     invalid = versions / f"{target.name}.invalid-{uuid4().hex[:8]}"
@@ -449,11 +711,11 @@ class LocalRuntimeComponent:
 
         diagnostics = package.get("diagnostics")
         self._emit_progress(progress_callback, "diagnostics", 0.95, "验证运行依赖")
-        diagnostic_result = self._run_diagnostics(target / EXECUTABLE_NAME, diagnostics)
+        diagnostic_result = self._run_diagnostics(target / self.executable_name, diagnostics)
         active_payload = {
-            "id": COMPONENT_ID,
+            "id": self.component_id,
             "version": version,
-            "executable": str((target / EXECUTABLE_NAME).relative_to(self.root)),
+            "executable": str((target / self.executable_name).relative_to(self.root)),
             "sha256": expected,
             "diagnostics": diagnostic_result,
         }
@@ -461,7 +723,179 @@ class LocalRuntimeComponent:
         temporary.write_text(json.dumps(active_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.active_path)
         self._emit_progress(progress_callback, "ready", 1.0, "ScanSci 本地运行能力已就绪")
-        return {**self.status(), "installed": True}
+        result = {**self.status(), "installed": True, "source": manifest_source or "manual"}
+        if manifest_failures:
+            result["manifest_failures"] = list(manifest_failures)
+        return result
+
+    def check_manifest_channels(self) -> dict[str, Any]:
+        """Probe configured manifest channels only when the user asks to."""
+
+        checked_at = int(time.time())
+        channels: list[dict[str, Any]] = []
+        for index, url in enumerate(self.manifest_urls):
+            record: dict[str, Any] = {
+                "url": url,
+                "label": self._manifest_channel_label(url, index),
+                "reachable": False,
+                "valid": False,
+                "version": "",
+                "error": "",
+            }
+            try:
+                manifest = self._read_json(url)
+                component = self._component_record(manifest)
+                record.update(
+                    {
+                        "reachable": True,
+                        "valid": True,
+                        "version": str(component.get("version", "")).strip(),
+                    }
+                )
+            except Exception as error:
+                record["error"] = str(error)[:500]
+            channels.append(record)
+        available = next((item for item in channels if item["valid"]), None)
+        return {
+            "checked_at": checked_at,
+            "channels": channels,
+            "available": bool(available),
+            "preferred_url": str(available.get("url", "")) if available else "",
+            "manual_fallback": {
+                "available": True,
+                "release_url": self.default_release_url,
+                "accepted_files": [".zip", ".json", ".zip.part001 … .zip.part999"],
+            },
+        }
+
+    @staticmethod
+    def _unique_urls(values: list[object]) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            url = str(value or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    def _manifest_channel_label(self, url: str, index: int) -> str:
+        if url == self.default_manifest_url:
+            return "官方固定清单"
+        if "stable.json" in url:
+            return "应用更新清单备用"
+        return "首选清单" if index == 0 else f"备用清单 {index}"
+
+    def _read_component_manifest(self) -> tuple[dict[str, Any], dict[str, Any], str, list[dict[str, str]]]:
+        failures: list[dict[str, str]] = []
+        for index, url in enumerate(self.manifest_urls):
+            try:
+                manifest = self._read_json(url)
+                component = self._component_record(manifest)
+                return manifest, component, url, failures
+            except Exception as error:
+                failures.append(
+                    {
+                        "url": url,
+                        "label": self._manifest_channel_label(url, index),
+                        "error": str(error)[:500],
+                    }
+                )
+        detail = "；".join(f"{item['label']}：{item['error']}" for item in failures)
+        if not failures:
+            raise RuntimeError("当前发行渠道没有配置本地 AI 组件下载清单。")
+        raise RuntimeError(f"本地 AI 组件清单的所有自动通道均不可用。{detail}")
+
+    @classmethod
+    def _normalize_manual_paths(cls, paths: list[str] | tuple[str, ...]) -> list[Path]:
+        if isinstance(paths, (str, bytes)) or not isinstance(paths, (list, tuple)):
+            raise ValueError("请选择本地运行组件 ZIP，以及可选的 JSON 清单或分片文件。")
+        normalized: list[Path] = []
+        seen: set[str] = set()
+        for raw in paths:
+            candidate = Path(str(raw or "")).expanduser()
+            if not str(candidate).strip():
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError as error:
+                raise ValueError(f"找不到本地文件：{candidate}") from error
+            if not resolved.is_file():
+                raise ValueError(f"本地运行组件必须是文件：{resolved}")
+            key = str(resolved).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(resolved)
+        if not normalized:
+            raise ValueError("请至少选择一个本地运行组件文件。")
+        if len(normalized) > 128:
+            raise ValueError("一次选择的本地组件文件过多。")
+        return normalized
+
+    def _manual_component_package(self, paths: list[Path]) -> tuple[dict[str, Any], dict[str, Any]]:
+        manifest_path = next((path for path in paths if path.suffix.casefold() == ".json"), None)
+        archive_path = next((path for path in paths if path.suffix.casefold() == ".zip"), None)
+        if manifest_path is None and archive_path is None:
+            raise ValueError("没有找到 ZIP 组件包。请从官方发布页下载 ZIP，或同时选择 ZIP 分片。")
+
+        if manifest_path is not None:
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("所选本地组件清单不是有效的 UTF-8 JSON 文件。") from error
+            if not isinstance(payload, dict):
+                raise ValueError("本地组件清单必须是 JSON 对象。")
+            component = self._component_record(payload)
+            package = component.get("windows", {})
+            if not isinstance(package, dict):
+                raise ValueError("本地组件清单缺少 Windows 包。")
+            package = dict(package)
+            parts = package.get("parts")
+            if isinstance(parts, list) and parts:
+                selected = {path.name.casefold(): path for path in paths if path != manifest_path}
+                local_parts: list[dict[str, Any]] = []
+                missing: list[str] = []
+                for record in parts:
+                    if not isinstance(record, dict):
+                        raise ValueError("本地组件分片清单格式无效。")
+                    raw_url = str(record.get("url", "")).strip()
+                    name = Path(unquote(urlparse(raw_url).path)).name.casefold()
+                    match = selected.get(name)
+                    if match is None:
+                        match = next((path for key, path in selected.items() if name and (name in key or key in name)), None)
+                    if match is None:
+                        missing.append(name or "未命名分片")
+                    else:
+                        local_parts.append({**record, "url": match.as_uri()})
+                if missing:
+                    raise ValueError(f"本地组件还缺少分片：{', '.join(missing[:8])}")
+                package["parts"] = local_parts
+            else:
+                if archive_path is None:
+                    raise ValueError("所选清单对应单个 ZIP 包；请同时选择该 ZIP 文件。")
+                package["url"] = archive_path.as_uri()
+            return dict(component), package
+
+        # A ZIP without a manifest is still accepted as a deliberate local
+        # fallback, but its hash is calculated locally and the archive must
+        # pass the same structural and diagnostic checks before activation.
+        assert archive_path is not None
+        digest = self._sha256(archive_path)
+        return {
+            "id": self.component_id,
+            "version": f"manual-{int(archive_path.stat().st_mtime)}",
+            "windows": {
+                "url": archive_path.as_uri(),
+                "size": archive_path.stat().st_size,
+                "sha256": digest,
+            },
+        }, {
+            "url": archive_path.as_uri(),
+            "size": archive_path.stat().st_size,
+            "sha256": digest,
+        }
 
     def _acquire_package(
         self,
@@ -493,16 +927,26 @@ class LocalRuntimeComponent:
                     or self._sha256(destination) != checksum
                 ):
                     destination.unlink(missing_ok=True)
-                    self._download(
-                        url,
-                        destination,
-                        progress_callback=lambda received, _total, before=completed_bytes: self._emit_download_progress(
-                            progress_callback,
-                            before + received,
-                            total_bytes,
-                            current_file=destination.name,
-                        ),
-                    )
+                    for attempt in range(2):
+                        try:
+                            self._download(
+                                url,
+                                destination,
+                                expected_size=size,
+                                progress_callback=lambda received, _total, before=completed_bytes: self._emit_download_progress(
+                                    progress_callback,
+                                    before + received,
+                                    total_bytes,
+                                    current_file=destination.name,
+                                ),
+                            )
+                        except RuntimeError as error:
+                            raise RuntimeError(f"本地 AI 组件第 {index} 个分片校验失败：{error}") from error
+                        if destination.stat().st_size == size and self._sha256(destination) == checksum:
+                            break
+                        destination.unlink(missing_ok=True)
+                        if attempt == 1:
+                            raise RuntimeError(f"本地 AI 组件第 {index} 个分片校验失败，已重试后取消安装。")
                 if destination.stat().st_size != size or self._sha256(destination) != checksum:
                     destination.unlink(missing_ok=True)
                     raise RuntimeError(f"本地 AI 组件第 {index} 个分片校验失败，已取消安装。")
@@ -521,16 +965,25 @@ class LocalRuntimeComponent:
             if not url:
                 raise RuntimeError("本地 AI 组件清单缺少有效的下载地址。")
             expected_size = int(package.get("size", 0) or 0)
-            self._download(
-                url,
-                archive,
-                progress_callback=lambda received, total: self._emit_download_progress(
-                    progress_callback,
-                    received,
-                    expected_size or total,
-                    current_file=archive.name,
-                ),
-            )
+            for attempt in range(2):
+                self._download(
+                    url,
+                    archive,
+                    expected_size=expected_size or None,
+                    progress_callback=lambda received, total: self._emit_download_progress(
+                        progress_callback,
+                        received,
+                        expected_size or total,
+                        current_file=archive.name,
+                    ),
+                )
+                size_ok = not expected_size or archive.stat().st_size == expected_size
+                hash_ok = self._sha256(archive) == expected
+                if size_ok and hash_ok:
+                    break
+                archive.unlink(missing_ok=True)
+                if attempt == 1:
+                    raise RuntimeError("本地 AI 组件校验失败，已重试后取消安装。")
 
         self._emit_progress(progress_callback, "verify", 0.82, "校验组件完整性")
         expected_size = int(package.get("size", 0) or 0)
@@ -573,14 +1026,13 @@ class LocalRuntimeComponent:
             raise RuntimeError(f"本地 AI 组件自检失败。{detail}".rstrip())
         return result
 
-    @staticmethod
-    def _component_record(manifest: dict[str, Any]) -> dict[str, Any]:
-        if str(manifest.get("id", "")) == COMPONENT_ID:
+    def _component_record(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        if str(manifest.get("id", "")) == self.component_id:
             return manifest
         components = manifest.get("components", {})
-        if isinstance(components, dict) and isinstance(components.get(COMPONENT_ID), dict):
-            return dict(components[COMPONENT_ID])
-        raise RuntimeError(f"发行清单中没有 {COMPONENT_ID} 组件。")
+        if isinstance(components, dict) and isinstance(components.get(self.component_id), dict):
+            return dict(components[self.component_id])
+        raise RuntimeError(f"发行清单中没有 {self.component_id} 组件。")
 
     @staticmethod
     def _validate_url(url: str) -> None:
@@ -601,35 +1053,91 @@ class LocalRuntimeComponent:
         return result
 
     @classmethod
-    def _download(cls, url: str, destination: Path, progress_callback=None) -> None:
+    def _download(
+        cls,
+        url: str,
+        destination: Path,
+        progress_callback=None,
+        *,
+        expected_size: int | None = None,
+    ) -> None:
+        """Download a runtime archive with bounded retries and safe resume.
+
+        A connection can disappear after hundreds of megabytes. The partial
+        file is retained, but it is only promoted after the advertised size is
+        complete. If a server ignores ``Range``, the partial is replaced
+        instead of being accidentally concatenated with a second full response.
+        """
+
         cls._validate_url(url)
         temporary = Path(f"{destination}.download")
-        resumed = temporary.stat().st_size if temporary.is_file() else 0
-        headers = {"User-Agent": "ScanSci local runtime"}
-        if resumed:
-            headers["Range"] = f"bytes={resumed}-"
-        req = Request(url, headers=headers)
-        with urlopen(req, timeout=300) as response:  # noqa: S310
-            content_range = str(response.headers.get("Content-Range", ""))
-            accepted_range = resumed > 0 and content_range.lower().startswith(f"bytes {resumed}-")
-            if resumed and not accepted_range:
-                resumed = 0
-            remaining = int(response.headers.get("Content-Length", 0) or 0)
-            total = resumed + remaining if remaining else 0
-            received = resumed
-            mode = "ab" if accepted_range else "wb"
-            output = temporary.open(mode)
+        last_error: Exception | None = None
+        for delay in _RUNTIME_RETRY_DELAYS_SECONDS:
+            if delay:
+                time.sleep(delay)
             try:
-                if progress_callback is not None:
-                    progress_callback(received, total)
-                while chunk := response.read(1024 * 1024):
-                    output.write(chunk)
-                    received += len(chunk)
+                resumed = temporary.stat().st_size if temporary.is_file() else 0
+                if expected_size and resumed == expected_size:
                     if progress_callback is not None:
-                        progress_callback(received, total)
-            finally:
-                output.close()
-        temporary.replace(destination)
+                        progress_callback(expected_size, expected_size)
+                    temporary.replace(destination)
+                    return
+                if expected_size and resumed > expected_size:
+                    temporary.unlink(missing_ok=True)
+                    resumed = 0
+                headers = {"User-Agent": "ScanSci local runtime"}
+                if resumed:
+                    headers["Range"] = f"bytes={resumed}-"
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=300) as response:  # noqa: S310 - scheme validated above
+                    content_range = str(response.headers.get("Content-Range", "") or "")
+                    accepted_range = resumed > 0 and content_range.lower().startswith(f"bytes {resumed}-")
+                    if resumed and not accepted_range:
+                        resumed = 0
+                    content_type = str(response.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+                    if urlparse(url).scheme.lower() in {"http", "https"} and content_type in {
+                        "text/html",
+                        "application/json",
+                        "application/xml",
+                        "text/plain",
+                    }:
+                        raise RuntimeError(
+                            f"组件下载源返回了 {content_type or '文本'} 错误页，而不是运行组件归档。"
+                        )
+                    remaining = int(response.headers.get("Content-Length", 0) or 0)
+                    total = resumed + remaining if remaining else 0
+                    if "/" in content_range:
+                        advertised_total = content_range.rsplit("/", 1)[-1].strip()
+                        if advertised_total.isdigit():
+                            total = int(advertised_total)
+                    if expected_size and total and total != expected_size and urlparse(url).scheme.lower() in {"http", "https"}:
+                        raise _RetryableRuntimeDownloadError(
+                            f"组件响应大小异常：清单为 {expected_size} 字节，服务器报告 {total} 字节。"
+                        )
+                    if expected_size:
+                        total = expected_size
+                    received = resumed
+                    mode = "ab" if accepted_range else "wb"
+                    with temporary.open(mode) as output:
+                        if progress_callback is not None:
+                            progress_callback(received, total)
+                        while chunk := response.read(1024 * 1024):
+                            output.write(chunk)
+                            received += len(chunk)
+                            if progress_callback is not None:
+                                progress_callback(received, total)
+                if expected_size and received != expected_size:
+                    detail = f"组件下载未完成：预期 {expected_size} 字节，当前只有 {received} 字节。"
+                    if urlparse(url).scheme.lower() in {"http", "https"}:
+                        raise _RetryableRuntimeDownloadError(detail)
+                    raise RuntimeError(detail)
+                temporary.replace(destination)
+                return
+            except (OSError, TimeoutError, _RetryableRuntimeDownloadError) as error:
+                last_error = error
+                continue
+        detail = str(last_error or "未知网络错误").strip()
+        raise RuntimeError(f"本地 AI 组件下载失败；已自动重试并保留断点：{detail}") from last_error
 
     @staticmethod
     def _is_sha256(value: str) -> bool:
@@ -672,8 +1180,7 @@ class LocalRuntimeComponent:
             },
         )
 
-    @classmethod
-    def _extract_verified(cls, archive_path: Path, destination: Path) -> list[Path]:
+    def _extract_verified(self, archive_path: Path, destination: Path) -> list[Path]:
         executable_paths: list[Path] = []
         try:
             with ZipFile(archive_path) as archive:
@@ -688,12 +1195,12 @@ class LocalRuntimeComponent:
                         raise RuntimeError("本地 AI 组件包不能包含符号链接。")
                     target = destination.joinpath(*name.parts)
                     if info.is_dir():
-                        os.makedirs(cls._extended_windows_path(target), exist_ok=True)
+                        os.makedirs(self._extended_windows_path(target), exist_ok=True)
                         continue
-                    os.makedirs(cls._extended_windows_path(target.parent), exist_ok=True)
-                    with archive.open(info, "r") as source, open(cls._extended_windows_path(target), "wb") as output:
+                    os.makedirs(self._extended_windows_path(target.parent), exist_ok=True)
+                    with archive.open(info, "r") as source, open(self._extended_windows_path(target), "wb") as output:
                         shutil.copyfileobj(source, output, length=1024 * 1024)
-                    if name.name == EXECUTABLE_NAME:
+                    if name.name == self.executable_name:
                         executable_paths.append(target)
         except BadZipFile as exc:
             raise RuntimeError("本地 AI 组件包不是有效的 ZIP 文件。") from exc
@@ -772,3 +1279,15 @@ class LocalRuntimeComponent:
     def _safe_segment(value: str) -> str:
         clean = "".join(ch for ch in value if ch.isalnum() or ch in ".-_").strip(".-")
         return clean or uuid4().hex
+
+
+_DEFAULT_RUNTIME_COMPONENT: LocalRuntimeComponent | None = None
+
+
+def default_local_runtime_component() -> LocalRuntimeComponent:
+    """Return the process-wide component manager used by chat and audio."""
+
+    global _DEFAULT_RUNTIME_COMPONENT
+    if _DEFAULT_RUNTIME_COMPONENT is None:
+        _DEFAULT_RUNTIME_COMPONENT = LocalRuntimeComponent()
+    return _DEFAULT_RUNTIME_COMPONENT

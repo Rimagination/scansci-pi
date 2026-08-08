@@ -27,6 +27,7 @@ from .workspace import (
     sync_sources_from_evidence_store,
     update_notebook_metadata,
 )
+from .zotero_scope import sync_zotero_document_tags
 
 
 _MAX_LIBRARY_DOCUMENTS = 2_000
@@ -65,6 +66,21 @@ def _report_import_progress(
         # Progress is informative only. A stale browser must never prevent the
         # source documents from being indexed.
         return
+
+
+def _refresh_zotero_tag_index(
+    evidence_db: str | Path,
+    zotero_items: Iterable[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Sync Zotero tags without invalidating parsed evidence or vectors."""
+
+    tag_index = sync_zotero_document_tags(evidence_db, zotero_items)
+    if tag_index.get("status") == "ready":
+        try:
+            tag_index["library_overview"] = build_library_overview(evidence_db)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            tag_index["overview_error"] = f"{type(error).__name__}: {error}"[:300]
+    return tag_index
 
 
 def _quality_snapshot(quality: dict[str, Any]) -> dict[str, Any]:
@@ -140,6 +156,8 @@ def import_library_folder(
     folder_path: str | Path,
     library_kind: str = "folder",
     progress: ImportProgress | None = None,
+    merge_existing: bool = False,
+    root_path_override: str | Path | None = None,
 ) -> dict[str, Any]:
     """Index a selected folder and switch the notebook only after validation."""
 
@@ -148,6 +166,47 @@ def import_library_folder(
     normalized_kind = _library_kind(library_kind)
     html_files = [] if normalized_kind == "obsidian" else _candidate_files(folder, _HTML_SUFFIXES)
     markdown_files = _candidate_files(folder, _MARKDOWN_SUFFIXES)
+    if merge_existing:
+        # A personal knowledge base is a container for multiple linked
+        # locations.  Importing the new location directly would make the
+        # incremental indexer prune documents from the previous location.
+        # Route the addition through the managed-file importer so the old
+        # sources are copied into the next generation before the new folder
+        # is indexed.
+        merge_files = (
+            markdown_files
+            if normalized_kind == "obsidian"
+            else _candidate_files(folder, _LIBRARY_IMPORTABLE_SUFFIXES)
+        )
+        if not merge_files:
+            pdf_count = sum(1 for path in folder.rglob("*.pdf") if path.is_file())
+            if pdf_count:
+                raise ValueError(
+                    "所选文件夹只有 PDF。请先用 scansci-html 转换为 HTML，或通过“添加论文文件”导入已转换文献。"
+                )
+            raise ValueError("所选文件夹没有可索引的 HTML 或 Markdown 文献")
+        existing_summary = load_workspace_summary(workspace, notebook_id=notebook_id)
+        existing_notebooks = list(existing_summary.get("notebooks", []) or [])
+        existing_root = str(dict(existing_notebooks[0]).get("root_path", "") or "") if existing_notebooks else ""
+        display_root = root_path_override or existing_root or folder
+        result = import_library_files(
+            workspace,
+            evidence_db,
+            notebook_id=notebook_id,
+            file_paths=merge_files,
+            progress=progress,
+            root_path=display_root,
+        )
+        update_notebook_metadata(
+            workspace,
+            notebook_id=notebook_id,
+            metadata={"imported_from_folder": str(folder), "library_kind": normalized_kind},
+        )
+        result["workspace"] = load_workspace_summary(workspace)
+        result["notebook"] = load_workspace_summary(workspace, notebook_id=notebook_id)["notebooks"][0]
+        result["linked_folder"] = str(folder)
+        result["merged_existing"] = True
+        return result
     candidates = html_files or markdown_files
     importable_files = (
         markdown_files
@@ -172,6 +231,7 @@ def import_library_folder(
             notebook_id=notebook_id,
             file_paths=importable_files,
             progress=progress,
+            root_path=root_path_override or folder,
         )
         update_notebook_metadata(
             workspace,
@@ -179,7 +239,7 @@ def import_library_folder(
             metadata={"imported_from_folder": str(folder), "library_kind": _library_kind(library_kind)},
         )
         result["workspace"] = load_workspace_summary(workspace)
-        result["notebook"] = result["workspace"]["notebooks"][0]
+        result["notebook"] = load_workspace_summary(workspace, notebook_id=notebook_id)["notebooks"][0]
         return result
     if not candidates:
         pdf_count = sum(1 for path in folder.rglob("*.pdf") if path.is_file())
@@ -276,13 +336,14 @@ def import_library_folder(
     finally:
         _cleanup_temporary_database(temporary_db)
 
+    effective_root = Path(root_path_override).expanduser().resolve() if root_path_override else folder
     set_notebook_root_path(
         workspace,
         notebook_id=notebook_id,
-        root_path=folder,
+        root_path=effective_root,
         metadata={
             "library_kind": normalized_kind,
-            "library_root": str(folder),
+            "library_root": str(effective_root),
             "evidence_quality": _quality_snapshot(dict(indexed.get("quality", {}) or {})),
             "vector_cache_migration": {
                 "migrated_vectors": int(cache_migration.get("migrated_vectors", 0) or 0),
@@ -333,6 +394,8 @@ def import_library_files(
     file_paths: Iterable[str | Path],
     progress: ImportProgress | None = None,
     replace_existing: bool = False,
+    source_metadata: dict[str, dict[str, Any]] | None = None,
+    root_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Index local source documents while leaving the originals in place.
 
@@ -355,6 +418,13 @@ def import_library_files(
     current_summary = load_workspace_summary(workspace_path, notebook_id=notebook_id)
     current_notebooks = list(current_summary.get("notebooks", []) or [])
     current_kind = str(dict(current_notebooks[0]).get("metadata", {}).get("library_kind", "files")) if current_notebooks else "files"
+    display_root = Path(root_path).expanduser().resolve() if root_path else None
+    if display_root is None and current_notebooks:
+        current_root = str(dict(current_notebooks[0]).get("root_path", "") or "").strip()
+        if current_root:
+            display_root = Path(current_root).expanduser().resolve()
+    if display_root is None:
+        display_root = supported[0].parent
     managed = (
         workspace_path.parent
         / ".scansci-library"
@@ -412,14 +482,19 @@ def import_library_files(
         try:
             stem = _safe_folder_name(original.stem)
             target = _unique_path(managed, stem, ".md")
+            supplied_metadata = dict((source_metadata or {}).get(str(original.resolve()), {}) or {})
             metadata = {
-                "title": original.stem,
+                "title": str(supplied_metadata.get("title") or original.stem),
                 "source_file": original.name,
                 "source_url": str(original),
                 "source_suffix": original.suffix.lower(),
                 "parser": str(source.get("parser", "")),
                 "source_storage": "external-reference",
             }
+            for key in ("doi", "date"):
+                value = str(supplied_metadata.get(key, "") or "").strip()
+                if value:
+                    metadata[key] = value
             target.write_text(_markdown_document(metadata, text), encoding="utf-8")
             extracted_sources.append(
                 {
@@ -451,6 +526,7 @@ def import_library_files(
         notebook_id=notebook_id,
         folder_path=managed,
         library_kind=current_kind,
+        root_path_override=display_root,
     )
     result["added_files"] = added
     result["skipped_files"] = failures
@@ -545,6 +621,7 @@ def index_zotero_attachments(
 
     target_db = notebook_evidence_db(evidence_db, notebook_id)
     paths: list[Path] = []
+    source_metadata: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
     for item in list(zotero_state.get("items", []) or []):
         if not isinstance(item, dict):
@@ -556,6 +633,14 @@ def index_zotero_attachments(
             if not path.is_file() or path.suffix.lower() != ".pdf":
                 continue
             resolved = str(path.resolve())
+            source_metadata.setdefault(
+                resolved,
+                {
+                    "title": str(item.get("title", "") or "").strip(),
+                    "doi": str(item.get("doi", "") or "").strip(),
+                    "date": str(item.get("date", "") or "").strip(),
+                },
+            )
             if resolved not in seen:
                 seen.add(resolved)
                 paths.append(Path(resolved))
@@ -573,12 +658,14 @@ def index_zotero_attachments(
         and target_db.stat().st_size >= _MIN_EVIDENCE_DB_BYTES
         and indexed_documents >= expected_documents
     ):
+        tag_index = _refresh_zotero_tag_index(target_db, zotero_state.get("items", []))
         return {
             "status": "ready",
             "db_path": str(target_db),
             "reused": True,
             "requested": expected_documents,
             "indexed_documents": indexed_documents,
+            "tag_index": tag_index,
         }
     _report_import_progress(
         progress,
@@ -593,6 +680,7 @@ def index_zotero_attachments(
             notebook_id=notebook_id,
             file_paths=paths[:expected_documents],
             replace_existing=True,
+            source_metadata=source_metadata,
             progress=lambda event: _report_import_progress(
                 progress,
                 phase=str(event.get("phase", "正在读取 Zotero 全文")),
@@ -607,41 +695,57 @@ def index_zotero_attachments(
             "db_path": str(target_db),
             "requested": len(paths),
         }
+    indexed_db = Path(str(result.get("db_path", target_db)))
+    tag_index = _refresh_zotero_tag_index(indexed_db, zotero_state.get("items", []))
     return {
         "status": "indexed",
-        "db_path": str(result.get("db_path", target_db)),
+        "db_path": str(indexed_db),
         "requested": len(paths),
         "indexed_documents": int(dict(result.get("indexed", {}) or {}).get("documents", 0) or 0),
         "skipped": len(list(result.get("skipped_files", []) or [])),
+        "tag_index": tag_index,
     }
 
 
-def discover_local_zotero() -> dict[str, str]:
-    """Find the active Zotero data directory without starting or modifying Zotero."""
+def discover_local_zotero(preferred_data_dir: str | Path | None = None) -> dict[str, str]:
+    """Find a Zotero data directory without starting or modifying Zotero.
+
+    A user-selected directory is authoritative.  This is important for the
+    manual recovery flow: an invalid selection must not silently fall back to
+    another profile and make the UI report a connection to the wrong library.
+    """
 
     candidates: list[Path] = []
-    configured = str(os.environ.get("ZOTERO_DATA_DIR", "")).strip()
-    if configured:
-        candidates.append(Path(configured).expanduser())
+    preferred = str(preferred_data_dir or "").strip()
+    if preferred:
+        candidates.append(Path(preferred).expanduser())
+    else:
+        configured = str(os.environ.get("ZOTERO_DATA_DIR", "")).strip()
+        if configured:
+            candidates.append(Path(configured).expanduser())
 
-    home = Path.home()
-    candidates.extend([home / "Zotero", home / "Documents" / "Zotero"])
-    appdata = Path(str(os.environ.get("APPDATA", home / "AppData" / "Roaming")))
-    profile_root = appdata / "Zotero" / "Zotero" / "Profiles"
-    for prefs_path in sorted(profile_root.glob("*/prefs.js")) if profile_root.is_dir() else []:
-        try:
-            text = prefs_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        match = re.search(r'user_pref\("extensions\.zotero\.dataDir",\s*("(?:[^"\\]|\\.)*")\s*\);', text)
-        if not match:
-            continue
-        try:
-            value = str(json.loads(match.group(1))).strip()
-        except (ValueError, TypeError):
-            continue
-        if value:
-            candidates.append(Path(value).expanduser())
+        home = Path.home()
+        appdata = Path(str(os.environ.get("APPDATA", home / "AppData" / "Roaming")))
+        profile_root = appdata / "Zotero" / "Zotero" / "Profiles"
+        # Zotero's profile preference is authoritative when it exists.  A
+        # stale ``%USERPROFILE%\\Zotero`` folder can otherwise win first and
+        # make ScanSci connect to an empty or obsolete library.
+        for prefs_path in sorted(profile_root.glob("*/prefs.js")) if profile_root.is_dir() else []:
+            try:
+                text = prefs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            match = re.search(r'user_pref\("extensions\.zotero\.dataDir",\s*("(?:[^"\\]|\\.)*")\s*\);', text)
+            if not match:
+                continue
+            try:
+                value = str(json.loads(match.group(1))).strip()
+            except (ValueError, TypeError):
+                continue
+            if value:
+                candidates.append(Path(value).expanduser())
+
+        candidates.extend([home / "Zotero", home / "Documents" / "Zotero"])
 
     checked: list[str] = []
     for candidate in candidates:
@@ -664,10 +768,14 @@ def discover_local_zotero() -> dict[str, str]:
     raise FileNotFoundError("未在本机发现 Zotero 数据目录")
 
 
-def _read_local_zotero_database(*, limit: int) -> dict[str, Any]:
+def _read_local_zotero_database(
+    *,
+    limit: int,
+    data_dir: str | Path | None = None,
+) -> dict[str, Any]:
     """Read Zotero metadata and attachment links through a read-only SQLite connection."""
 
-    discovered = discover_local_zotero()
+    discovered = discover_local_zotero(data_dir)
     data_dir = Path(discovered["data_dir"])
     database_path = Path(discovered["database_path"])
     # Zotero keeps a write transaction open while it refreshes its local API.
@@ -738,6 +846,7 @@ def _read_local_zotero_database(*, limit: int) -> dict[str, Any]:
         fields_by_item: dict[int, dict[str, str]] = {item_id: {} for item_id in item_ids}
         creators_by_item: dict[int, list[str]] = {item_id: [] for item_id in item_ids}
         collections_by_item: dict[int, list[str]] = {item_id: [] for item_id in item_ids}
+        tags_by_item: dict[int, list[str]] = {item_id: [] for item_id in item_ids}
         attachments_by_item: dict[int, list[dict[str, Any]]] = {item_id: [] for item_id in item_ids}
         if item_ids:
             for row in connection.execute(
@@ -776,6 +885,24 @@ def _read_local_zotero_database(*, limit: int) -> dict[str, Any]:
                 key = str(row["key"] or "")
                 if key:
                     collections_by_item[int(row["itemID"])].append(key)
+            # ``tags``/``itemTags`` are present in current Zotero databases,
+            # but older or minimal test profiles may not have them yet.
+            try:
+                for row in connection.execute(
+                    f"""
+                    SELECT it.itemID, t.name
+                    FROM itemTags it
+                    JOIN tags t ON t.tagID = it.tagID
+                    WHERE it.itemID IN ({placeholders})
+                    ORDER BY it.itemID, lower(t.name), t.tagID
+                    """,
+                    item_ids,
+                ):
+                    tag = str(row["name"] or "").strip()
+                    if tag and tag not in tags_by_item[int(row["itemID"])]:
+                        tags_by_item[int(row["itemID"])].append(tag)
+            except sqlite3.Error:
+                pass
             for row in connection.execute(
                 f"""
                 SELECT ia.parentItemID, ia.path, ia.linkMode, attachment.key AS attachmentKey
@@ -832,6 +959,7 @@ def _read_local_zotero_database(*, limit: int) -> dict[str, Any]:
                     "creators": creators_by_item[item_id],
                     "url": str(fields.get("url", "")),
                     "collections": collections_by_item[item_id],
+                    "tags": tags_by_item[item_id],
                     "attachments": attachments,
                     "pdf_path": str(attachments[0]["path"]) if attachments else "",
                 }
@@ -873,6 +1001,7 @@ def connect_local_zotero(
     limit: int = 10_000,
     evidence_db: str | Path | None = None,
     index_attachments: bool = True,
+    data_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Read bibliographic metadata from Zotero 7's loopback API.
 
@@ -881,12 +1010,16 @@ def connect_local_zotero(
     """
 
     database_error: Exception | None = None
+    configured_data_dir = str(data_dir or "").strip()
     if client is None:
         try:
-            zotero_state = _read_local_zotero_database(limit=limit)
+            zotero_state = _read_local_zotero_database(limit=limit, data_dir=data_dir)
         except (OSError, sqlite3.Error, ValueError) as error:
             database_error = error
         else:
+            if configured_data_dir:
+                zotero_state["auto_discovered"] = False
+                zotero_state["configured_data_dir"] = str(zotero_state["data_dir"])
             set_notebook_root_path(
                 workspace,
                 notebook_id=notebook_id,
@@ -997,6 +1130,11 @@ def connect_local_zotero(
             )
             if name:
                 creators.append(name)
+        tags: list[str] = []
+        for raw_tag in list(data.get("tags", []) or []):
+            tag = str(raw_tag.get("tag", "") if isinstance(raw_tag, dict) else raw_tag).strip()
+            if tag and tag not in tags:
+                tags.append(tag)
         key = str(raw.get("key", data.get("key", "")))
         title = str(data.get("title", "")).strip() or str(data.get("shortTitle", "")).strip()
         if not title:
@@ -1012,6 +1150,7 @@ def connect_local_zotero(
                 "creators": creators,
                 "url": str(data.get("url", "")),
                 "collections": [str(key) for key in list(data.get("collections", []) or []) if key],
+                "tags": tags,
             }
         )
 
@@ -1055,6 +1194,8 @@ def connect_local_zotero(
         "items": items,
         "sample_titles": [item["title"] for item in items[:18]],
     }
+    if configured_data_dir:
+        zotero_state["configured_data_dir"] = configured_data_dir
     if evidence_db is not None and index_attachments:
         zotero_state["evidence_index"] = index_zotero_attachments(
             workspace,

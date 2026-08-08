@@ -21,6 +21,7 @@ DEFAULT_LOCAL_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_LOCAL_EMBEDDING_DIMENSIONS = 1024
 DEFAULT_LOCAL_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_PRECISION_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+BUILTIN_MODEL_MARKER = "__builtin__"
 
 
 @dataclass(frozen=True)
@@ -72,8 +73,13 @@ def build_local_evidence_stack(
         or os.getenv("SCANSCI_PRECISION_RERANKER_MODEL", "").strip()
         or DEFAULT_PRECISION_RERANKER_MODEL
     )
+    embedding_builtin = str(resolved_embedding).casefold() in {"builtin", "local:builtin-evidence", BUILTIN_MODEL_MARKER}
+    reranker_builtin = str(resolved_reranker).casefold() in {"builtin", "local:builtin-evidence", BUILTIN_MODEL_MARKER}
     errors: list[str] = []
-    if embedding_provider_override is not None:
+    if embedding_builtin:
+        embedding_provider = HashingEmbeddingProvider()
+        embedding_identity = "local-hash-v1"
+    elif embedding_provider_override is not None:
         embedding_provider = embedding_provider_override
         embedding_identity = str(
             getattr(embedding_provider, "cache_key", "")
@@ -100,10 +106,10 @@ def build_local_evidence_stack(
             embedding_identity = "local-hash-v1"
             errors.append(f"embedding {type(error).__name__}: {error}"[:500])
 
-    if not load_reranker:
+    if not load_reranker or reranker_builtin:
         reranker = LexicalReranker()
         reranker_identity = "local-lexical-v1"
-        effective_profile = "embedding-only"
+        effective_profile = "embedding-only" if not reranker_builtin else "fast"
     else:
         try:
             selected_reranker_model = (
@@ -138,7 +144,10 @@ def build_local_evidence_stack(
                     (neural_reranker, None),
                 ]
             )
-            reranker_identity = f"{provider_name}:{selected_reranker_model}"
+            reranker_identity = str(
+                getattr(neural_reranker, "cache_key", "")
+                or f"{provider_name}:{selected_reranker_model}"
+            )
             effective_profile = requested_profile
         except Exception as error:  # optional local-model boundary
             reranker = LexicalReranker()
@@ -179,6 +188,7 @@ def build_local_evidence_stack(
             "precision_max_length": max(256, int(precision_max_length)),
             "local_neural_embedding": embedding_identity.startswith("sentence-transformers:"),
             "local_neural_reranker": reranker_identity.startswith(("cross-encoder:", "qwen3:")),
+            "remote_reranker_active": reranker_identity.startswith("siliconflow:"),
             "qwen_embedding_active": (
                 embedding_identity.startswith("sentence-transformers:")
                 and resolved_embedding.casefold().startswith("qwen/")

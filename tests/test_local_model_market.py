@@ -9,10 +9,20 @@ from scansci_html import research_tools
 
 def test_model_root_uses_per_user_local_app_data(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("SCANSCI_MODEL_ROOT", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
 
     assert local_model_market.model_root() == tmp_path / "ScanSci" / "models"
     assert local_model_market.hub_cache_root() == tmp_path / "ScanSci" / "models" / "HuggingFace" / "hub"
+
+
+def test_hub_cache_root_uses_configured_huggingface_cache(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("SCANSCI_MODEL_ROOT", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "huggingface"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+    assert local_model_market.hub_cache_root() == tmp_path / "huggingface" / "hub"
 
 
 def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch):
@@ -33,6 +43,7 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "path": str(snapshot),
             "size_bytes": (snapshot / "config.json").stat().st_size + len(b"weights"),
             "ready": True,
+            "kind": "chat",
             "architecture": "Qwen2ForCausalLM",
             "model_type": "qwen2",
             "format": "transformers",
@@ -52,6 +63,73 @@ def test_market_catalog_marks_cached_model_without_network(tmp_path: Path, monke
     assert catalog["source"] == "curated"
     assert row["installed"] is True
     assert row["ready"] is True
+
+
+def test_market_catalog_keeps_native_asr_visible_when_searching(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    monkeypatch.setattr(local_model_market, "_remote_catalog", lambda _query, _limit: [])
+
+    catalog = local_model_market.market_catalog("ASR")
+
+    assert any(item["id"] == local_model_market.QWEN3_ASR_NATIVE_MODEL_ID for item in catalog["items"])
+
+
+def test_minicpm_vision_models_are_curated_for_local_download(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    monkeypatch.setattr(local_model_market, "_remote_catalog", lambda _query, _limit: [])
+
+    catalog = local_model_market.market_catalog("MiniCPM-V")
+    rows = {item["id"]: item for item in catalog["items"]}
+
+    assert rows["openbmb/MiniCPM-V-4.6-BNB"]["kind"] == "vision"
+    assert rows["openbmb/MiniCPM-V-4.6-BNB"]["runtime"] == "local-huggingface"
+    assert rows["openbmb/MiniCPM-V-4.6-GPTQ"]["kind"] == "vision"
+
+
+def test_installed_minicpm_snapshot_is_vision(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    snapshot = tmp_path / "HuggingFace" / "hub" / "models--openbmb--MiniCPM-V-4.6-BNB" / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "minicpmv4_6",
+                "architectures": ["MiniCPMV4_6ForConditionalGeneration"],
+                "vision_config": {"model_type": "siglip"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    row = next(item for item in local_model_market.installed_models() if item["id"] == "openbmb/MiniCPM-V-4.6-BNB")
+
+    assert row["ready"] is True
+    assert row["kind"] == "vision"
+    assert row["architecture"] == "MiniCPMV4_6ForConditionalGeneration"
+
+
+def test_installed_vision_snapshot_is_exposed_with_vision_capability(monkeypatch):
+    monkeypatch.setattr(
+        app_settings,
+        "installed_models",
+        lambda: [
+            {
+                "id": "openbmb/MiniCPM-V-4.6-BNB",
+                "name": "MiniCPM-V 4.6（BNB 4-bit）",
+                "ready": True,
+                "format": "transformers",
+                "architecture": "MiniCPMV4_6ForConditionalGeneration",
+                "model_type": "minicpmv4_6",
+                "kind": "vision",
+            }
+        ],
+    )
+
+    settings = app_settings._normalize_settings({})
+    provider = next(item for item in settings["providers"] if item["id"] == "local-huggingface")
+
+    assert provider["models"][0]["capabilities"] == ["reasoning", "coding", "vision"]
 
 
 def test_complete_chat_snapshot_is_exposed_as_local_provider(monkeypatch):

@@ -10,6 +10,7 @@ import pytest
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.library_manager import (
     connect_local_zotero,
+    discover_local_zotero,
     import_library_files,
     import_library_folder,
     index_zotero_attachments,
@@ -38,6 +39,33 @@ def _workspace(tmp_path: Path) -> tuple[Path, Path]:
     initialize_notebook(workspace, notebook_id="research", title="Research", root_path=old_library)
     sync_sources_from_evidence_store(workspace, evidence, notebook_id="research")
     return workspace, evidence
+
+
+def test_discover_local_zotero_prefers_profile_data_dir_over_stale_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    appdata = tmp_path / "appdata"
+    stale_default = home / "Zotero"
+    configured = tmp_path / "configured-zotero"
+    for data_dir in (stale_default, configured):
+        data_dir.mkdir(parents=True)
+        (data_dir / "zotero.sqlite").touch()
+    prefs_path = appdata / "Zotero" / "Zotero" / "Profiles" / "profile" / "prefs.js"
+    prefs_path.parent.mkdir(parents=True)
+    prefs_path.write_text(
+        f'user_pref("extensions.zotero.dataDir", {json.dumps(str(configured))});\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("ZOTERO_DATA_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+
+    result = discover_local_zotero()
+
+    assert result["data_dir"] == str(configured.resolve())
 
 
 class _StableEmbeddingProvider:
@@ -75,6 +103,34 @@ def test_import_library_folder_replaces_sources_and_persists_root(tmp_path: Path
     assert notebook["root_path"] == str(selected.resolve())
     assert notebook["counts"]["sources"] == 2
     assert {source["title"] for source in notebook["sources"]} == {"Paper one", "Paper two"}
+
+
+def test_import_library_folder_merge_existing_keeps_previous_linked_sources(tmp_path: Path):
+    workspace, evidence = _workspace(tmp_path)
+    first = tmp_path / "first-linked-folder"
+    second = tmp_path / "second-linked-folder"
+    first.mkdir()
+    second.mkdir()
+    _paper(first / "one.html", "First linked paper", "The first linked folder contains the original searchable result.")
+    _paper(second / "two.html", "Second linked paper", "The second linked folder adds another searchable result.")
+
+    initial = import_library_folder(workspace, evidence, notebook_id="research", folder_path=first)
+    merged = import_library_folder(
+        workspace,
+        evidence,
+        notebook_id="research",
+        folder_path=second,
+        merge_existing=True,
+    )
+
+    assert initial["notebook"]["counts"]["sources"] == 1
+    assert merged["merged_existing"] is True
+    assert merged["notebook"]["root_path"] == str(first.resolve())
+    assert merged["notebook"]["counts"]["sources"] == 2
+    assert {source["title"] for source in merged["notebook"]["sources"]} == {
+        "First linked paper",
+        "Second linked paper",
+    }
 
 
 def test_import_library_folder_ignores_dependency_trees_and_prunes_removed_documents(tmp_path: Path):
@@ -453,6 +509,8 @@ def test_connect_local_zotero_auto_discovers_read_only_database_and_pdf_links(
         CREATE TABLE itemCreators (itemID INTEGER, creatorID INTEGER, orderIndex INTEGER);
         CREATE TABLE collections (collectionID INTEGER PRIMARY KEY, collectionName TEXT, parentCollectionID INTEGER, key TEXT);
         CREATE TABLE collectionItems (collectionID INTEGER, itemID INTEGER, orderIndex INTEGER);
+        CREATE TABLE tags (tagID INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE itemTags (itemID INTEGER, tagID INTEGER);
         CREATE TABLE itemAttachments (itemID INTEGER, parentItemID INTEGER, linkMode INTEGER, contentType TEXT, path TEXT);
         INSERT INTO itemTypes VALUES (1, 'journalArticle'), (2, 'attachment');
         INSERT INTO items VALUES (1, 1, '2026-07-23', 'ITEM0001'), (2, 2, '2026-07-23', 'PDFKEY01');
@@ -464,6 +522,8 @@ def test_connect_local_zotero_auto_discovers_read_only_database_and_pdf_links(
         INSERT INTO itemCreators VALUES (1, 1, 0);
         INSERT INTO collections VALUES (1, '博士论文', NULL, 'COLL001');
         INSERT INTO collectionItems VALUES (1, 1, 0);
+        INSERT INTO tags VALUES (1, '接口'), (2, 'priority');
+        INSERT INTO itemTags VALUES (1, 1), (1, 2);
         INSERT INTO itemAttachments VALUES (2, 1, 1, 'application/pdf', 'storage:evidence-linked.pdf');
         """
     )
@@ -484,6 +544,7 @@ def test_connect_local_zotero_auto_discovers_read_only_database_and_pdf_links(
     assert zotero["items"][0]["title"] == "Evidence-linked interfaces"
     assert zotero["items"][0]["creators"] == ["Ada Li"]
     assert zotero["items"][0]["collections"] == ["COLL001"]
+    assert zotero["items"][0]["tags"] == ["priority", "接口"]
     assert zotero["items"][0]["pdf_path"] == str(pdf_path.resolve())
     assert zotero["items"][0]["attachments"][0]["exists"] is True
     assert result["notebook"]["metadata"]["zotero"]["database_path"] == str(database.resolve())
@@ -558,7 +619,7 @@ def test_zotero_attachment_index_does_not_treat_a_partial_evidence_db_as_complet
     target_db.write_bytes(b"x" * 1_000_000)
     calls: list[tuple[list[Path], bool]] = []
 
-    def fake_import(_workspace, _evidence, *, notebook_id, file_paths, progress, replace_existing):
+    def fake_import(_workspace, _evidence, *, notebook_id, file_paths, progress, replace_existing, source_metadata=None):
         calls.append((list(file_paths), replace_existing))
         progress({"phase": "提取原文内容", "progress": 1.0, "detail": "完成"})
         return {"db_path": str(target_db), "indexed": {"documents": 2}, "skipped_files": []}

@@ -98,6 +98,59 @@ def test_runtime_component_installs_from_verified_parts(tmp_path: Path, monkeypa
     assert component.ensure_installed().read_bytes() == b"runtime-binary"
 
 
+def test_runtime_component_manual_zip_fallback_installs_without_a_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    manifest = _component_manifest(tmp_path)
+    archive = tmp_path / "runtime.zip"
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+
+    result = component.install_local([str(archive)])
+
+    assert result["installed"] is True
+    assert result["source"] == "manual"
+    assert component.ensure_installed().read_bytes() == b"runtime-binary"
+    assert manifest.is_file()
+
+
+def test_runtime_component_switches_to_a_healthy_manifest_fallback_and_reports_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "missing.json"
+    healthy = _component_manifest(tmp_path)
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {
+            "frozen": True,
+            "package_profile": "core-without-embedded-fallback",
+            "runtime_manifest_url": missing.as_uri(),
+        },
+    )
+    component = LocalRuntimeComponent(
+        root=tmp_path / "installed",
+        fallback_manifest_url=healthy.as_uri(),
+    )
+
+    result = component.install()
+    report = component.check_manifest_channels()
+
+    assert result["installed"] is True
+    assert result["source"] == healthy.as_uri()
+    assert result["manifest_failures"][0]["url"] == missing.as_uri()
+    assert report["available"] is True
+    assert report["preferred_url"] == healthy.as_uri()
+    assert report["channels"][0]["valid"] is False
+    assert report["channels"][1]["valid"] is True
+
+
 def test_runtime_component_extracts_deep_windows_paths_without_zip_extractall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -283,6 +336,59 @@ def test_runtime_component_download_resumes_an_existing_partial_file(
     assert not partial.exists()
 
 
+def test_runtime_component_retries_a_connection_drop_and_resumes_the_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "runtime.zip"
+    calls: list[str | None] = []
+
+    class _Response:
+        def __init__(self, payload: bytes, headers: dict[str, str], *, fail_after: bool = False) -> None:
+            self._payload = payload
+            self.headers = headers
+            self._fail_after = fail_after
+            self._read = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._read:
+                if self._fail_after:
+                    raise OSError("connection reset")
+                return b""
+            self._read = True
+            return self._payload
+
+    def _urlopen(request, timeout=0):
+        calls.append(request.get_header("Range"))
+        assert timeout == 300
+        if len(calls) == 1:
+            return _Response(b"abcd", {"Content-Length": "10"}, fail_after=True)
+        assert calls[-1] == "bytes=4-"
+        return _Response(
+            b"efghij",
+            {"Content-Range": "bytes 4-9/10", "Content-Length": "6"},
+        )
+
+    monkeypatch.setattr(local_runtime_component, "urlopen", _urlopen)
+    monkeypatch.setattr(local_runtime_component, "_RUNTIME_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+
+    LocalRuntimeComponent._download(
+        "https://downloads.example.test/runtime.zip",
+        destination,
+        expected_size=10,
+    )
+
+    assert calls == [None, "bytes=4-"]
+    assert destination.read_bytes() == b"abcdefghij"
+    assert not Path(f"{destination}.download").exists()
+
+
 def test_runtime_component_restores_interrupted_install_with_download_details(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -347,6 +453,22 @@ def test_core_runtime_requires_a_release_component_manifest(tmp_path: Path, monk
 
     with pytest.raises(RuntimeError, match="下载清单"):
         component.ensure_installed()
+
+
+def test_packaged_core_uses_public_runtime_manifest_fallback_when_build_info_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core", "runtime_manifest_url": ""},
+    )
+
+    component = LocalRuntimeComponent(root=tmp_path)
+
+    assert component.manifest_url == local_runtime_component.DEFAULT_RUNTIME_MANIFEST_URL
+    assert component.status()["install_available"] is True
 
 
 def test_core_runtime_never_installs_from_a_manifest_while_only_checking_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

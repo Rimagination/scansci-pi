@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .local_model_market import installed_models
+from .local_model_market import QWEN3_ASR_LEGACY_MODEL_ID, QWEN3_ASR_NATIVE_MODEL_ID, installed_models
 
 from .builtin_skills import default_skill_records
 from .artifact_plugins import default_plugin_records, enrich_builtin_plugins
@@ -29,6 +29,10 @@ _MANAGED_GATEWAY_BASE_URL = "https://scansci-glm-gateway.932196440.workers.dev/v
 _MANAGED_PROVIDER_ID = "scansci-managed"
 _MANAGED_PROVIDER_NAME = "ScanSci"
 _DEFAULT_CHAT_MODEL_ID = "glm-4.7-flash"
+_DEEPSEEK_PROVIDER_ID = "deepseek"
+_DEEPSEEK_FLASH_MODEL_ID = "deepseek-v4-flash"
+_DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro"
+_DEEPSEEK_LEGACY_MODEL_IDS = frozenset({"deepseek-chat", "deepseek-reasoner"})
 
 
 def _provider_preset(
@@ -101,18 +105,12 @@ def _model_preset(
 # catalog, never a list of bundled or shared credentials.
 _MANAGED_MODEL_PRESETS = [
     _model_preset("glm-4.7-flash", "GLM-4.7 Flash", group="GLM", context_window="200K", capabilities=["reasoning", "tool", "coding"]),
-    # The gateway can route this standby model, but its current scientific
-    # writing probe is below ScanSci's release contract.  Keep the route
-    # visible to operations and probe it, without silently serving it as a
-    # replacement for the primary model.
-    _model_preset(
-        "Qwen/Qwen2.5-7B-Instruct",
-        "Qwen2.5 7B Instruct（待质量验证）",
-        group="Qwen",
-        context_window="32K",
-        capabilities=["reasoning", "tool", "coding"],
-        readiness="standby",
-    ),
+]
+
+
+_DEEPSEEK_MODEL_PRESETS = [
+    _model_preset(_DEEPSEEK_FLASH_MODEL_ID, "DeepSeek V4 Flash", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset(_DEEPSEEK_PRO_MODEL_ID, "DeepSeek V4 Pro", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
 ]
 
 
@@ -123,12 +121,7 @@ def managed_model_ids() -> tuple[str, ...]:
 
 
 def managed_probe_model_ids() -> tuple[str, ...]:
-    """Return production routes that must pass the release health probe.
-
-    A route marked ``standby`` remains visible for operator evaluation, but it
-    must not turn an otherwise healthy release into a failed build before it
-    has passed ScanSci's scientific-writing acceptance contract.
-    """
+    """Return the managed routes that must pass the release health probe."""
 
     return tuple(
         str(model["id"])
@@ -170,7 +163,7 @@ _PROVIDER_PRESETS: list[dict[str, Any]] = [
     _provider_preset("vertex-ai", "Google Vertex AI", category="国际模型", summary="Vertex AI 通常需要网关或企业项目凭据；请粘贴其兼容 API 地址。", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("text-embedding-005", "Text Embedding", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("openrouter", "OpenRouter", category="模型聚合", base_url="https://openrouter.ai/api/v1", models=[_model_preset("openai/gpt-5.2", "OpenAI GPT-5.2", group="OpenAI", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Google", capabilities=["reasoning", "vision", "tool"]), _model_preset("deepseek/deepseek-r1", "DeepSeek R1", group="DeepSeek", capabilities=["reasoning", "coding"])]),
     _provider_preset("nvidia", "NVIDIA NIM", category="国际模型", base_url="https://integrate.api.nvidia.com/v1", models=[_model_preset("meta/llama-3.3-70b-instruct", "Llama 3.3 70B Instruct", group="Meta", capabilities=["reasoning", "tool", "coding"]), _model_preset("nvidia/llama-3.2-nv-embedqa-1b-v2", "NV-EmbedQA", group="Embeddings", capabilities=["embedding"])]),
-    _provider_preset("deepseek", "DeepSeek", category="国内直连", base_url="https://api.deepseek.com", models=[_model_preset("deepseek-chat", "DeepSeek Chat", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]), _model_preset("deepseek-reasoner", "DeepSeek Reasoner", group="DeepSeek", capabilities=["reasoning", "coding"])]),
+    _provider_preset(_DEEPSEEK_PROVIDER_ID, "DeepSeek", category="国内直连", base_url="https://api.deepseek.com", models=_DEEPSEEK_MODEL_PRESETS),
     _provider_preset("dashscope", "阿里云百炼", category="国内直连", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", models=[_model_preset("qwen-plus", "Qwen Plus", group="Qwen", capabilities=["reasoning", "tool", "coding"]), _model_preset("qwen-vl-plus", "Qwen VL Plus", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("text-embedding-v3", "Text Embedding V3", group="Embeddings", capabilities=["embedding"]), _model_preset("gte-rerank-v2", "GTE Rerank V2", group="Rerankers", capabilities=["reranking"])]),
     _provider_preset("zai", "Z.ai", category="国内直连", base_url="https://api.z.ai/api/paas/v4", models=[_model_preset("glm-4.7", "GLM-4.7", group="GLM", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4.6v", "GLM-4.6V", group="GLM", capabilities=["reasoning", "vision"]), _model_preset("embedding-3", "Embedding-3", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("zhipu", "智谱开放平台", category="国内直连", base_url="https://open.bigmodel.cn/api/paas/v4", models=[_model_preset("glm-4.7-flash", "GLM-4.7 Flash（免费）", group="GLM", context_window="200K", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4-plus", "GLM-4 Plus", group="GLM", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4v-plus", "GLM-4V Plus", group="GLM", capabilities=["reasoning", "vision"]), _model_preset("embedding-3", "Embedding-3", group="Embeddings", capabilities=["embedding"])]),
@@ -208,6 +201,24 @@ _LOCAL_MODEL_PRESETS: list[dict[str, Any]] = [
         "base_url": "http://127.0.0.1:11434/v1",
         "model_id": "",
         "enabled": False,
+    },
+    {
+        "id": "ollama-minicpm-v4.6",
+        "name": "Ollama · MiniCPM-V 4.6（视觉）",
+        "runtime": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model_id": "minicpm-v4.6",
+        "capabilities": ["vision"],
+        "enabled": True,
+    },
+    {
+        "id": "qwen3-asr-0.6b",
+        "name": "Qwen3 ASR 0.6B（语音识别）",
+        "runtime": "local-huggingface",
+        "base_url": "",
+        "model_id": QWEN3_ASR_NATIVE_MODEL_ID,
+        "capabilities": ["audio"],
+        "enabled": True,
     },
     {
         "id": "lm-studio",
@@ -272,9 +283,10 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "reasoning": "provider:scansci-managed:glm-4.7-flash",
         "writing": "provider:scansci-managed:glm-4.7-flash",
         "retrieval": "local:builtin-evidence",
-        "embedding": "local:builtin-evidence",
-        "reranking": "local:builtin-evidence",
+        "embedding": "auto",
+        "reranking": "auto",
         "vision": "",
+        "audio": "",
         "slides": "provider:scansci-managed:glm-4.7-flash",
     },
     "document_processing": {
@@ -302,6 +314,7 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "locale": "zh-CN",
         "theme": "system",
         "accent": "jade",
+        "font_scale": "medium",
     },
     "skills": default_skill_records(),
     "mcp_servers": [],
@@ -321,23 +334,100 @@ def local_model_presets() -> list[dict[str, Any]]:
     return deepcopy(_LOCAL_MODEL_PRESETS)
 
 
+def ensure_local_model_preset(workspace: str | Path, preset_id: str) -> dict[str, Any]:
+    """Persist one approved local-model preset after an explicit install.
+
+    Model downloads are deliberately separate from settings: a user can browse
+    the catalog without changing routing.  Once a download has completed, the
+    installer calls this helper so the new capability becomes visible and can
+    be selected without asking the user to copy an endpoint or model id.
+    """
+
+    wanted = str(preset_id or "").strip()
+    preset = next((item for item in _LOCAL_MODEL_PRESETS if str(item.get("id", "")) == wanted), None)
+    if preset is None:
+        raise SettingsError("未知的本地模型预设")
+    settings = _normalize_settings(_read_raw_settings(workspace))
+    rows = list(settings.get("local_models", []) or [])
+    existing = next((item for item in rows if str(item.get("id", "")) == wanted), None)
+    if existing is None:
+        rows.append(deepcopy(preset))
+    else:
+        # Keep a user's custom endpoint/name, but make the installed model
+        # routable again if a previous setup left the preset disabled.
+        existing["model_id"] = str(preset.get("model_id", "") or existing.get("model_id", ""))
+        existing["runtime"] = str(preset.get("runtime", existing.get("runtime", "")))
+        existing["base_url"] = str(existing.get("base_url") or preset.get("base_url", ""))
+        existing["capabilities"] = list(preset.get("capabilities", existing.get("capabilities", [])) or [])
+        existing["enabled"] = True
+    settings["local_models"] = rows
+    if wanted == "qwen3-asr-0.6b" and not str(settings.get("model_roles", {}).get("audio", "")):
+        settings.setdefault("model_roles", {})["audio"] = f"local:{wanted}"
+    return save_settings(workspace, settings)
+
+
 def settings_path(workspace: str | Path) -> Path:
     """Return the per-workspace config file path without creating it."""
 
     return Path(workspace).resolve().parent / _CONFIG_NAME
 
 
+def _quarantine_settings_file(path: Path) -> Path | None:
+    """Move an unreadable settings file aside without deleting user data.
+
+    A partially written or legacy non-UTF-8 settings file must not prevent the
+    desktop from starting.  Keeping the original as a timestamped sidecar
+    gives support and the user a recovery point while allowing the normalized
+    defaults to load immediately.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        stamp = str(path.stat().st_mtime_ns)
+    except OSError:
+        stamp = "unknown"
+    candidate = path.with_name(f"{path.name}.corrupt-{stamp}")
+    suffix = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+        suffix += 1
+    try:
+        os.replace(path, candidate)
+    except OSError:
+        return None
+    return candidate
+
+
+def _read_raw_settings_file(workspace: str | Path) -> dict[str, Any]:
+    """Read the public settings file, recovering safely from bad snapshots."""
+
+    path = settings_path(workspace)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        _quarantine_settings_file(path)
+        return {}
+    if not isinstance(payload, dict):
+        _quarantine_settings_file(path)
+        return {}
+    return payload
+
+
 def load_settings(workspace: str | Path) -> dict[str, Any]:
     """Load a safe public configuration and redact all provider credentials."""
 
     path = settings_path(workspace)
-    raw: object = {}
-    if path.is_file():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SettingsError(f"无法读取本地设置：{exc}") from exc
-    normalized = _normalize_settings(raw)
+    raw = _read_raw_settings_file(workspace)
+    try:
+        normalized = _normalize_settings(raw)
+    except SettingsError:
+        # A valid JSON object from an older release can still be structurally
+        # unusable after a migration. Preserve it and start from defaults.
+        _quarantine_settings_file(path)
+        normalized = _normalize_settings({})
     return _with_secret_status(normalized, workspace)
 
 
@@ -501,13 +591,7 @@ def notion_api_token_configured(workspace: str | Path) -> bool:
 
 
 def _read_raw_settings(workspace: str | Path) -> object:
-    path = settings_path(workspace)
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SettingsError(f"无法读取本地设置：{exc}") from exc
+    return _read_raw_settings_file(workspace)
 
 
 def _normalize_settings(payload: object) -> dict[str, Any]:
@@ -516,10 +600,14 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise SettingsError("设置必须是一个对象")
     defaults = deepcopy(_DEFAULT_SETTINGS)
-    providers = _with_local_huggingface_provider(
-        _with_common_provider_catalog(_normalize_providers(payload.get("providers", defaults["providers"])))
-    )
     local_models = _normalize_local_models(payload.get("local_models", defaults["local_models"]))
+    local_models = _with_discovered_local_models(local_models)
+    providers = _with_local_runtime_providers(
+        _with_local_huggingface_provider(
+            _with_common_provider_catalog(_normalize_providers(payload.get("providers", defaults["providers"])))
+        ),
+        local_models,
+    )
     document_processing = _normalize_document_processing(payload.get("document_processing", defaults["document_processing"]))
     onboarding = _normalize_onboarding(payload.get("onboarding", defaults["onboarding"]))
     appearance = _normalize_appearance(payload.get("appearance", defaults["appearance"]))
@@ -541,10 +629,27 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     if provider["id"] == _MANAGED_PROVIDER_ID and model_id not in _managed_production_model_ids():
         model_id = _DEFAULT_CHAT_MODEL_ID
     model_roles = _normalize_model_roles(payload.get("model_roles", defaults["model_roles"]))
+    if not model_roles.get("audio"):
+        audio_model = next(
+            (
+                item
+                for item in local_models
+                if item.get("runtime") == "local-huggingface"
+                and item.get("enabled")
+                and "audio" in set(item.get("capabilities", []) or [])
+                and item.get("runtime_compatible", True)
+            ),
+            None,
+        )
+        if audio_model:
+            model_roles["audio"] = f"local:{audio_model['id']}"
     for role, reference in list(model_roles.items()):
         prefix = f"provider:{_MANAGED_PROVIDER_ID}:"
         if reference.startswith(prefix) and reference.removeprefix(prefix) not in _managed_production_model_ids():
             model_roles[role] = f"{prefix}{_DEFAULT_CHAT_MODEL_ID}"
+        deepseek_prefix = f"provider:{_DEEPSEEK_PROVIDER_ID}:"
+        if reference.startswith(deepseek_prefix) and reference.removeprefix(deepseek_prefix) in _DEEPSEEK_LEGACY_MODEL_IDS:
+            model_roles[role] = f"{deepseek_prefix}{_DEEPSEEK_FLASH_MODEL_ID}"
     return {
         "schema_version": 2,
         "active_model": {"provider_id": provider["id"], "model_id": model_id},
@@ -569,7 +674,7 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
             continue
         identifier = _unique_id(_safe_id(item.get("id"), fallback=f"local-model-{index + 1}"), used)
         runtime = _text(item.get("runtime"), fallback="openai-compatible", limit=40).lower()
-        if runtime not in {"builtin", "ollama", "lm-studio", "llama.cpp", "openai-compatible"}:
+        if runtime not in {"builtin", "ollama", "lm-studio", "llama.cpp", "openai-compatible", "local-huggingface"}:
             runtime = "openai-compatible"
         if identifier == "builtin-evidence" and runtime == "builtin":
             name = "离线基础检索（非模型）"
@@ -577,6 +682,16 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
         else:
             name = _text(item.get("name"), fallback=identifier, limit=100)
             model_id = _text(item.get("model_id"), limit=160)
+        capabilities = _normalize_capabilities(item.get("capabilities"), fallback=model_id or identifier)
+        runtime_compatible = bool(item.get("runtime_compatible", True))
+        # A legacy ASR snapshot can still be present in the Hugging Face cache,
+        # but the current in-process loader cannot execute it.  Keep it visible
+        # in the installed-model diagnostics; do not expose it as a selectable
+        # default or a runnable connection.
+        if runtime == "local-huggingface" and model_id == QWEN3_ASR_LEGACY_MODEL_ID:
+            continue
+        if runtime == "local-huggingface" and "audio" in capabilities and not runtime_compatible:
+            continue
         rows.append(
             {
                 "id": identifier,
@@ -585,13 +700,116 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
                 "base_url": _text(item.get("base_url"), limit=500),
                 "model_id": model_id,
                 "enabled": bool(item.get("enabled", True)),
+                "capabilities": capabilities,
+                # Runtime diagnostics are facts discovered by the installer;
+                # preserving them lets the UI explain an incompatible model
+                # instead of presenting a misleading download/select action.
+                "runtime_compatible": runtime_compatible,
+                "runtime_backend": _text(item.get("runtime_backend"), limit=80),
+                "runtime_message": _text(item.get("runtime_message"), limit=500),
             }
         )
     return rows or deepcopy(_DEFAULT_SETTINGS["local_models"])
 
 
+def _with_discovered_local_models(local_models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose downloaded local models that can be selected by capability.
+
+    Chat and vision snapshots are exposed by the local Hugging Face provider;
+    embedding and reranking models are used by the evidence stack directly,
+    so they need a small role-routable record of their own.  Audio keeps the
+    same treatment because it is executed by the native ASR loader.
+    """
+
+    rows = [dict(item) for item in local_models]
+    known = {str(item.get("model_id", "")) for item in rows}
+    for item in installed_models():
+        model_id = str(item.get("id", "")).strip()
+        kind = str(item.get("kind", "")).strip().lower()
+        # Keep compatibility with older discovery records that predate the
+        # explicit ``kind`` field.  Qwen3-ASR is the only audio snapshot we
+        # currently execute in-process.
+        if not kind and ("asr" in model_id.casefold() or "whisper" in model_id.casefold()):
+            kind = "audio"
+        if not item.get("ready") or kind not in {"audio", "embedding", "reranking"}:
+            continue
+        if kind == "audio" and item.get("runtime_compatible") is False:
+            continue
+        if not model_id or model_id in known:
+            continue
+        identifier = _safe_id(f"{kind}-{model_id}", fallback=f"local-{kind}")
+        if any(str(row.get("id", "")) == identifier for row in rows):
+            continue
+        rows.append(
+            {
+                "id": identifier,
+                "name": (
+                    "Qwen3 ASR 0.6B（语音识别）"
+                    if model_id == QWEN3_ASR_NATIVE_MODEL_ID
+                    else str(item.get("name") or model_id)
+                ),
+                "runtime": "local-huggingface",
+                "base_url": "",
+                "model_id": model_id,
+                "enabled": True,
+                "capabilities": [kind],
+                "runtime_compatible": bool(item.get("runtime_compatible", True)),
+                "runtime_backend": str(item.get("runtime_backend", "unsupported")),
+                "runtime_message": str(item.get("runtime_message", "")),
+            }
+        )
+        known.add(model_id)
+    return rows
+
+
+def _with_local_runtime_providers(providers: list[dict[str, Any]], local_models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn configured Ollama/loopback entries into selectable model providers."""
+
+    rows = [
+        item
+        for item in providers
+        if not str(item.get("id", "")).startswith("local-runtime-")
+    ]
+    for local in local_models:
+        runtime = str(local.get("runtime", "")).strip().lower()
+        model_id = str(local.get("model_id", "")).strip()
+        base_url = str(local.get("base_url", "")).strip()
+        if runtime in {"builtin", "local-huggingface"} or not local.get("enabled") or not model_id or not base_url:
+            continue
+        provider_id = f"local-runtime-{_safe_id(local.get('id'), fallback='model')}"
+        capabilities = _normalize_capabilities(local.get("capabilities"), fallback=model_id)
+        rows.append(
+            {
+                "id": provider_id,
+                "name": f"本地 · {local.get('name') or model_id}",
+                "kind": "openai-compatible",
+                "base_url": base_url,
+                "api_surface": "chat_completions",
+                "responses_enabled": False,
+                "enabled": True,
+                "logo": "ollama" if runtime == "ollama" else "local",
+                "category": "本地模型",
+                "summary": "通过本机运行时提供，不会上传本地文件。",
+                "auth_mode": "local",
+                "model_listing": False,
+                "local_model_id": str(local.get("id", "")),
+                "runtime": runtime,
+                "models": [
+                    {
+                        "id": model_id,
+                        "name": str(local.get("name") or model_id),
+                        "group": f"本地 {runtime}",
+                        "context_window": "本机",
+                        "capabilities": capabilities,
+                    }
+                ],
+            }
+        )
+    return rows
+
+
 def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Expose complete, text-generating HF snapshots as a selectable local provider.
+    """Expose complete HF snapshots as selectable local text/vision models.
 
     This row is derived from the local cache each time settings are normalized.
     It intentionally contains no token, endpoint configuration or duplicated
@@ -615,13 +833,27 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
             and not any(word in marker for word in ("embedding", "reranker", "asr", "whisper", "reward"))
         )
 
+    def capabilities_for(item: dict[str, Any]) -> list[str]:
+        capabilities = ["reasoning", "coding"]
+        marker = " ".join(
+            [
+                str(item.get("id", "")),
+                str(item.get("model_type", "")),
+                str(item.get("kind", "")),
+            ]
+        ).casefold()
+        architecture = str(item.get("architecture", "")).casefold()
+        if str(item.get("kind", "")).casefold() == "vision" or "minicpmv" in marker or "vision" in marker or "image" in architecture:
+            capabilities.append("vision")
+        return capabilities
+
     models = [
         {
             "id": str(item["id"]),
             "name": str(item.get("name") or item["id"]),
             "group": "本地 Hugging Face",
             "context_window": "本机",
-            "capabilities": ["reasoning", "coding"],
+            "capabilities": capabilities_for(item),
         }
         for item in installed_models()
         if is_chat_model(item)
@@ -672,10 +904,12 @@ def _normalize_appearance(value: object) -> dict[str, str]:
     locale = _text(source.get("locale"), fallback="zh-CN", limit=16)
     theme = _text(source.get("theme"), fallback="system", limit=16).lower()
     accent = _text(source.get("accent"), fallback="jade", limit=16).lower()
+    font_scale = _text(source.get("font_scale"), fallback="medium", limit=16).lower()
     return {
         "locale": locale if locale in {"zh-CN", "en"} else "zh-CN",
         "theme": theme if theme in {"system", "light", "dark"} else "system",
         "accent": accent if accent in {"jade", "ocean", "plum", "amber"} else "jade",
+        "font_scale": font_scale if font_scale in {"small", "medium", "large"} else "medium",
     }
 
 
@@ -810,7 +1044,24 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
                 for model in refreshed["models"]
                 if str(model.get("id", ""))
             }
-            canonical_ids = {str(model.get("id", "")) for model in preset["models"]}
+            refreshed["models"] = [
+                {
+                    **existing_models.get(str(model["id"]), {}),
+                    **deepcopy(model),
+                }
+                for model in preset["models"]
+            ]
+        elif row.get("id") == _DEEPSEEK_PROVIDER_ID:
+            # DeepSeek's old Chat/Reasoner aliases are no longer offered by
+            # the product. Replace those presets during normalization so an
+            # existing workspace gets the same two exact choices as a fresh
+            # install, while preserving any model the user added manually.
+            existing_models = {
+                str(model.get("id", "")): model
+                for model in refreshed["models"]
+                if str(model.get("id", ""))
+            }
+            preset_ids = {str(model["id"]) for model in preset["models"]}
             refreshed["models"] = [
                 {
                     **existing_models.get(str(model["id"]), {}),
@@ -820,7 +1071,8 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
             ] + [
                 model
                 for model in refreshed["models"]
-                if str(model.get("id", "")) not in canonical_ids
+                if str(model.get("id", "")) not in _DEEPSEEK_LEGACY_MODEL_IDS
+                and str(model.get("id", "")) not in preset_ids
             ]
         rows[index] = refreshed
     known_ids = {str(provider.get("id", "")) for provider in rows}
@@ -922,6 +1174,22 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
             row["source_type"] = _text(item.get("source_type"), limit=32)
             row["source"] = _text(item.get("source"), limit=1_000)
             row["installed_at"] = _text(item.get("installed_at"), limit=48)
+            row["updated_at"] = _text(item.get("updated_at"), limit=48)
+            security_scan = item.get("security_scan")
+            if isinstance(security_scan, dict):
+                row["security_scan"] = {
+                    "version": _text(security_scan.get("version"), limit=80),
+                    "verdict": _text(security_scan.get("verdict"), limit=16).upper(),
+                    "scanned_at": _text(security_scan.get("scanned_at"), limit=48),
+                    "fingerprint": _text(security_scan.get("fingerprint"), limit=100),
+                    "package_count": max(0, int(security_scan.get("package_count", 0) or 0)),
+                    "file_count": max(0, int(security_scan.get("file_count", 0) or 0)),
+                    "byte_count": max(0, int(security_scan.get("byte_count", 0) or 0)),
+                    "counts": dict(security_scan.get("counts", {}) or {}) if isinstance(security_scan.get("counts"), dict) else {},
+                    "scanners": list(security_scan.get("scanners", []) or [])[:32],
+                    "findings": list(security_scan.get("findings", []) or [])[:80],
+                    "recommendation": _text(security_scan.get("recommendation"), limit=500),
+                }
         elif kind == "mcp":
             row["command"] = _text(item.get("command"), limit=500)
             row["args"] = _text(item.get("args"), limit=1_000)
@@ -937,6 +1205,7 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
                 row["transport"] = "stdio"
             row["endpoint"] = _text(item.get("endpoint"), limit=500)
             row["version"] = _text(item.get("version"), limit=80)
+            row["updated_at"] = _text(item.get("updated_at"), limit=48)
             connector_kind = _text(item.get("connector_kind"), limit=32).lower()
             row["connector_kind"] = connector_kind if connector_kind in {"", "zotero", "obsidian", "general"} else "general"
             # Read-only is the product default.  A saved MCP cannot expose
@@ -957,6 +1226,8 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
             row["skills"] = list(dict.fromkeys(_text(value, limit=80) for value in skills if _text(value, limit=80)))[:12]
             tool_names = item.get("tool_names") if isinstance(item.get("tool_names"), list) else []
             row["tool_names"] = list(dict.fromkeys(_text(value, limit=80) for value in tool_names if _text(value, limit=80)))[:12]
+            row["update_mode"] = _text(item.get("update_mode"), fallback="manual", limit=24)
+            row["version"] = _text(item.get("version"), limit=40)
         rows.append(row)
     if rows or kind not in {"skill"}:
         return rows

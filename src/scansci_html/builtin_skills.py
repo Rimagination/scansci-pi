@@ -92,6 +92,16 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
     },
 ]
 
+BUILTIN_SKILLS.append({
+    "id": "agent-reach",
+    "name": "agent-reach",
+    "description": "Routes public web, RSS, GitHub, Bilibili, and V2EX reads/searches through built-in backends.",
+    "path": "builtin:agent-reach",
+    "enabled": True,
+    "source_type": "builtin",
+    "source": "Panniantong/Agent-Reach / MIT / ScanSci adaptation",
+})
+
 
 # Research-oriented Skill contracts adapted for the ScanSci runtime.  The
 # upstream packages are intentionally not copied wholesale: ScanSci keeps the
@@ -286,6 +296,7 @@ def third_party_notices() -> dict[str, str]:
         "Rimagination/good-question": _RIMAGINATION_MIT_NOTICE,
         "Rimagination/good-story": _RIMAGINATION_MIT_NOTICE,
         "eze-is/web-access": "MIT License. Source: https://github.com/eze-is/web-access",
+        "Panniantong/Agent-Reach": "MIT License. ScanSci ships a read-only native adaptation of the routing and channel ideas. Source: https://github.com/Panniantong/Agent-Reach",
         "K-Dense-AI/scientific-agent-skills": "MIT License. Source: https://github.com/K-Dense-AI/scientific-agent-skills",
         "Yuan1z0825/nature-skills": "Apache-2.0 License. Source: https://github.com/Yuan1z0825/nature-skills",
         "OpenAI Zotero plugin": "MIT License. Source: https://github.com/openai/plugins/tree/main/plugins/zotero",

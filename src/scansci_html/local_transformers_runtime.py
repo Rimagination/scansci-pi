@@ -11,12 +11,14 @@ import gc
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from importlib.util import find_spec
 from pathlib import Path
 import threading
 import time
 from typing import Any, Iterator
 
 from .local_model_market import installed_models
+from .local_runtime_component import default_local_runtime_component
 from .local_model_inference import (
     LoadedLocalModel,
     generate_local_chat_stream,
@@ -197,4 +199,14 @@ _RUNTIME = LocalTransformersRuntime()
 def ensure_local_transformers_runtime(model_id: str) -> str:
     """Return a ready loopback OpenAI-compatible base URL for an installed model."""
 
+    # Core releases exclude the heavy inference stack.  In that case the
+    # versioned component is not merely a download artifact: launch it as the
+    # loopback runtime so the same model-selection contract works in released
+    # lightweight builds and in source/full builds.
+    try:
+        has_in_process_runtime = find_spec("torch") is not None and find_spec("transformers") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        has_in_process_runtime = False
+    if not has_in_process_runtime:
+        return default_local_runtime_component().ensure_process(model_id)
     return _RUNTIME.ensure(model_id)

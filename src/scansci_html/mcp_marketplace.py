@@ -14,6 +14,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -202,7 +203,7 @@ def marketplace_catalog(workspace: str | Path) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("id"):
             items_by_id[str(item["id"])] = item
     items = sorted(items_by_id.values(), key=lambda item: (-int(item.get("rank", 0)), str(item.get("title", "")).casefold()))
-    return {
+    result = {
         "items": items,
         "disciplines": list(DISCIPLINES),
         "source": {
@@ -214,6 +215,8 @@ def marketplace_catalog(workspace: str | Path) -> dict[str, Any]:
         "synced_at": str(cache.get("synced_at", "")),
         "cached_count": len(cache.get("items", [])),
     }
+    result["updates"] = _marketplace_update_records(workspace, items)
+    return result
 
 
 def sync_official_registry(workspace: str | Path, *, timeout: float = 7.0) -> dict[str, Any]:
@@ -287,6 +290,145 @@ def install_marketplace_server(workspace: str | Path, identifier: str) -> dict[s
     servers.append(record)
     settings["mcp_servers"] = servers
     return {"settings": save_settings(workspace, settings), "record": record, "created": True}
+
+
+def marketplace_updates(workspace: str | Path) -> dict[str, Any]:
+    """Return version comparisons for MCP servers installed from the catalog."""
+
+    catalog = marketplace_catalog(workspace)
+    updates = list(catalog.get("updates", []) or [])
+    return {
+        "checked_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "updates": updates,
+        "available_count": sum(1 for item in updates if item.get("available")),
+    }
+
+
+def update_marketplace_server(workspace: str | Path, identifier: str) -> dict[str, Any]:
+    """Apply the latest catalog configuration without starting the MCP process."""
+
+    requested = str(identifier or "").strip()
+    if not requested:
+        raise ValueError("缺少 MCP 服务器标识。")
+    settings = load_settings(workspace)
+    servers = list(settings.get("mcp_servers", []) or [])
+    index = next(
+        (
+            position
+            for position, server in enumerate(servers)
+            if str(server.get("id", "")) == requested or str(server.get("catalog_id", "")) == requested
+        ),
+        None,
+    )
+    if index is None:
+        raise ValueError("找不到要更新的 MCP 服务器。")
+    server = dict(servers[index])
+    catalog_id = str(server.get("catalog_id", "") or "")
+    item = next((row for row in marketplace_catalog(workspace)["items"] if str(row.get("id", "")) == catalog_id), None)
+    if item is None:
+        raise ValueError("这个 MCP 服务器没有对应的官方目录记录，请手动维护。")
+    current_version = str(server.get("version", "") or "").strip()
+    latest_version = str(item.get("version", "") or "").strip()
+    if not _is_newer_version(latest_version, current_version):
+        return {"settings": settings, "record": server, "updated": False, "update": _update_record(server, item)}
+
+    # Keep user-owned switches and connector permissions.  Only registry-owned
+    # connection metadata is replaced, and the process is never launched here.
+    replacement = {
+        **server,
+        "name": item.get("title", server.get("name", "")),
+        "description": item.get("description", server.get("description", "")),
+        "command": item.get("command", server.get("command", "")),
+        "args": item.get("args", server.get("args", "")),
+        "transport": item.get("transport", server.get("transport", "stdio")),
+        "endpoint": item.get("endpoint", server.get("endpoint", "")),
+        "source": item.get("source", server.get("source", "Official MCP Registry")),
+        "source_url": item.get("source_url", server.get("source_url", OFFICIAL_REGISTRY_HOME)),
+        "discipline": (item.get("disciplines") or [server.get("discipline", "general")])[0],
+        "tags": item.get("tags", server.get("tags", [])),
+        "version": latest_version,
+        "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    servers[index] = replacement
+    settings["mcp_servers"] = servers
+    saved = save_settings(workspace, settings)
+    record = next((row for row in saved.get("mcp_servers", []) if str(row.get("id", "")) == str(replacement.get("id", ""))), replacement)
+    return {
+        "settings": saved,
+        "record": record,
+        "updated": True,
+        "update": _update_record(record, item),
+    }
+
+
+def _marketplace_update_records(workspace: str | Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    settings = load_settings(workspace)
+    catalogue = {str(item.get("id", "")): item for item in items if isinstance(item, dict) and item.get("id")}
+    updates: list[dict[str, Any]] = []
+    for server in list(settings.get("mcp_servers", []) or []):
+        catalog_id = str(server.get("catalog_id", "") or "")
+        if not catalog_id:
+            continue
+        item = catalogue.get(catalog_id)
+        if item is None:
+            updates.append({
+                "id": str(server.get("id", "")),
+                "catalog_id": catalog_id,
+                "state": "unavailable",
+                "available": False,
+                "message": "官方目录暂未找到此服务器",
+            })
+            continue
+        updates.append(_update_record(server, item))
+    return updates
+
+
+def _update_record(server: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    current = str(server.get("version", "") or "").strip()
+    latest = str(item.get("version", "") or "").strip()
+    if not current or not latest:
+        state = "unknown"
+        available = False
+        message = "版本信息不完整，请手动核对"
+    else:
+        try:
+            available = _is_newer_version(latest, current)
+            state = "available" if available else "current"
+            message = "发现可更新版本" if available else "当前已是最新版本"
+        except ValueError:
+            state = "unknown"
+            available = False
+            message = "版本格式无法比较，请手动核对"
+    return {
+        "id": str(server.get("id", "")),
+        "catalog_id": str(server.get("catalog_id", "")),
+        "name": str(server.get("name", "") or item.get("title", "")),
+        "current_version": current,
+        "latest_version": latest,
+        "state": state,
+        "available": available,
+        "message": message,
+        "source_url": item.get("source_url", OFFICIAL_REGISTRY_HOME),
+        "updated_at": item.get("updated_at", ""),
+    }
+
+
+def _is_newer_version(latest: str, current: str) -> bool:
+    if not latest or not current:
+        return False
+    return _version_key(latest) > _version_key(current)
+
+
+def _version_key(value: str) -> tuple[tuple[int, ...], int, str]:
+    clean = str(value).strip().lstrip("vV")
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:[-+]?([0-9A-Za-z.-]+))?", clean)
+    if not match:
+        raise ValueError(f"无效版本号：{value}")
+    parts = [int(part) for part in match.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    prerelease = match.group(2) or ""
+    return tuple(parts), 1 if not prerelease else 0, prerelease
 
 
 def _read_cache(workspace: str | Path) -> dict[str, Any]:

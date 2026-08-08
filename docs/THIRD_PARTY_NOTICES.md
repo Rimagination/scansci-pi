@@ -27,3 +27,11 @@ Packaged desktop builds may include the official Tectonic executable release
 available.
 
 Release source: https://github.com/tectonic-typesetting/tectonic/releases/tag/tectonic%400.16.9
+
+## Agent Reach
+
+ScanSci includes a read-only native adaptation of Agent-Reach's channel
+routing and capability-layer ideas. The independent upstream project is
+licensed under the MIT License.
+
+Source: https://github.com/Panniantong/Agent-Reach

@@ -13,7 +13,10 @@ dependencies = [
   "keyring>=25.0",
   "litellm>=1.80,<2",
   "lxml>=5.0",
-  "markitdown[all]>=0.1.3,<0.2",
+  # Document conversion uses only the docx/pptx/pdf converters.  The "all"
+  # extra would also pull the audio-transcription stack (speech_recognition,
+  # pocketsphinx, pydub) and youtube/xlsx/azure converters into the bundle.
+  "markitdown[docx,pptx,pdf]>=0.1.3,<0.2",
   "opentelemetry-api>=1.39,<2",
   "opentelemetry-sdk>=1.39,<2",
   "playwright>=1.40",

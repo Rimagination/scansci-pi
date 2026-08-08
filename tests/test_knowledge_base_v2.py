@@ -293,7 +293,9 @@ def test_old_evidence_schema_fixture_migrates_without_losing_layer_counts(tmp_pa
         }
         revision_columns = [row[1] for row in connection.execute("pragma table_info(document_index_revisions)")]
 
-    assert schema_version == 3
+    # The fixture predates the zotero document tag index migration; the
+    # additive v4 migration must run without losing any recorded counts.
+    assert schema_version == 4
     assert counts["source_documents"] == 1
     assert counts["document_cards"] == 1
     assert counts["evidence_spans"] == 1

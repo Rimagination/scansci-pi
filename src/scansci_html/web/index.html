@@ -28,6 +28,38 @@
             <span data-ui-icon="arrow-right"></span>
           </button>
         </div>
+        <div class="app-update" id="appUpdate" data-app-update data-state="checking" hidden>
+          <button type="button" class="app-update-status" data-action="toggle-app-update" aria-haspopup="dialog" aria-expanded="false" aria-controls="appUpdateCard">
+            <span data-ui-icon="refresh"></span>
+            <span id="appUpdateLabel">检查更新</span>
+            <i aria-hidden="true"></i>
+          </button>
+          <section class="app-update-card" id="appUpdateCard" role="dialog" aria-modal="false" aria-labelledby="appUpdateTitle" hidden>
+            <header class="app-update-head">
+              <div class="app-update-brand"><img src="/scansci-mark.png" alt="" /><div><span id="appUpdateKicker">稳定版</span><h2 id="appUpdateTitle">ScanSci</h2></div></div>
+              <div class="app-update-head-actions">
+                <button type="button" data-action="check-app-update" aria-label="重新检查更新" title="重新检查更新">
+                  <span data-ui-icon="refresh"></span>
+                </button>
+                <button type="button" data-action="close-app-update" aria-label="关闭更新卡片">×</button>
+              </div>
+            </header>
+            <div class="app-update-body">
+              <p class="app-update-summary" id="appUpdateSummary">正在检查 ScanSci 更新。</p>
+              <div class="app-update-versions" aria-label="版本信息">
+                <div><span>当前版本</span><strong id="appUpdateCurrentVersion">—</strong></div>
+                <span data-ui-icon="arrow-right"></span>
+                <div><span>最新版本</span><strong id="appUpdateLatestVersion">—</strong></div>
+              </div>
+              <div class="app-update-progress" id="appUpdateProgress" hidden><i></i><span>正在下载并校验更新包</span></div>
+              <div class="app-update-notes" id="appUpdateNotes"></div>
+            </div>
+            <footer class="app-update-footer">
+              <span id="appUpdateCheckedAt"></span>
+              <div><button type="button" class="secondary-button" data-action="close-app-update">稍后</button><button type="button" class="primary-button" id="appUpdatePrimary" data-action="check-app-update">检查更新</button></div>
+            </footer>
+          </section>
+        </div>
         <div class="desktop-titlebar-drag-space pywebview-drag-region" data-titlebar-drag></div>
         <div class="desktop-window-actions" aria-label="窗口控制">
           <button type="button" data-action="minimize-window" aria-label="最小化窗口"><span data-ui-icon="minus"></span></button>
@@ -88,38 +120,6 @@
       <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-label="调整侧边栏宽度" aria-orientation="vertical" aria-valuemin="260" aria-valuemax="520" aria-valuenow="352" tabindex="0"></div>
 
       <section class="app-canvas">
-        <div class="app-update" id="appUpdate" data-app-update data-state="checking" hidden>
-          <button type="button" class="app-update-status" data-action="toggle-app-update" aria-haspopup="dialog" aria-expanded="false" aria-controls="appUpdateCard">
-            <span data-ui-icon="refresh"></span>
-            <span id="appUpdateLabel">检查更新</span>
-            <i aria-hidden="true"></i>
-          </button>
-          <section class="app-update-card" id="appUpdateCard" role="dialog" aria-modal="false" aria-labelledby="appUpdateTitle" hidden>
-            <header class="app-update-head">
-              <div class="app-update-brand"><img src="/scansci-mark.png" alt="" /><div><span id="appUpdateKicker">稳定版</span><h2 id="appUpdateTitle">ScanSci</h2></div></div>
-              <div class="app-update-head-actions">
-                <button type="button" data-action="check-app-update" aria-label="重新检查更新" title="重新检查更新">
-                  <span data-ui-icon="refresh"></span>
-                </button>
-                <button type="button" data-action="close-app-update" aria-label="关闭更新卡片">×</button>
-              </div>
-            </header>
-            <div class="app-update-body">
-              <p class="app-update-summary" id="appUpdateSummary">正在检查 ScanSci 更新。</p>
-              <div class="app-update-versions" aria-label="版本信息">
-                <div><span>当前版本</span><strong id="appUpdateCurrentVersion">—</strong></div>
-                <span data-ui-icon="arrow-right"></span>
-                <div><span>最新版本</span><strong id="appUpdateLatestVersion">—</strong></div>
-              </div>
-              <div class="app-update-progress" id="appUpdateProgress" hidden><i></i><span>正在下载并校验更新包</span></div>
-              <div class="app-update-notes" id="appUpdateNotes"></div>
-            </div>
-            <footer class="app-update-footer">
-              <span id="appUpdateCheckedAt"></span>
-              <div><button type="button" class="secondary-button" data-action="close-app-update">稍后</button><button type="button" class="primary-button" id="appUpdatePrimary" data-action="check-app-update">检查更新</button></div>
-            </footer>
-          </section>
-        </div>
         <section class="app-view home-view is-active" data-view="home" aria-label="Start a research task">
           <div class="home-landing">
             <div class="landing-mark" aria-hidden="true"><img src="/scansci-mark.png" alt="" /></div>
@@ -131,6 +131,7 @@
               <div class="composer-source-strip" id="homeSourceAttachments" aria-live="polite" hidden></div>
               <div class="paper-list-attachment" id="homePaperBatchAttachment" aria-live="polite" hidden></div>
               <div class="composer-image-strip" id="homeImageAttachments" aria-live="polite" hidden></div>
+              <div class="composer-audio-strip" id="homeAudioAttachments" aria-live="polite" hidden></div>
               <div class="composer-skill-strip" id="homeSkillTokens" aria-label="已选择的 Skill" aria-live="polite" hidden></div>
               <textarea id="homeQuestionInput" rows="3" placeholder="向 ScanSci 提问，@ 资料，/ 工具，$ 技能"></textarea>
               <div class="prompt-tools">
@@ -140,6 +141,8 @@
                     <div class="attachment-popover" role="menu" aria-label="添加资料">
                       <button type="button" data-action="choose-composer-source" data-composer-key="home" role="menuitem"><span data-ui-icon="file-plus"></span><span>添加文件</span></button>
                       <button type="button" data-action="choose-composer-image" data-composer-key="home" role="menuitem"><span data-ui-icon="image"></span><span>添加图片</span></button>
+                      <button type="button" data-action="choose-composer-audio" data-composer-key="home" role="menuitem"><span data-ui-icon="file-audio"></span><span>添加语音</span></button>
+                      <button type="button" data-action="toggle-composer-recording" data-composer-key="home" role="menuitem"><span data-ui-icon="audio"></span><span>录制语音</span></button>
                       <button type="button" data-action="choose-presentation-sources" data-composer-key="home" role="menuitem"><span data-ui-icon="presentation"></span><span>添加演示材料</span></button>
                     </div>
                   </div>
@@ -148,6 +151,7 @@
                 <div class="prompt-send"><div class="context-usage-control" data-context-usage><button type="button" class="context-usage-trigger" data-action="toggle-context-usage" aria-haspopup="dialog" aria-expanded="false" aria-controls="homeContextUsageMenu" aria-label="查看上下文容量" title="查看上下文容量"><span class="context-usage-ring" data-context-ring role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-usage-ring-track" cx="10" cy="10" r="7.5"></circle><circle class="context-usage-ring-progress" cx="10" cy="10" r="7.5" pathLength="100"></circle></svg><span data-context-percent>—</span></span></button><div class="context-usage-popover" id="homeContextUsageMenu" role="dialog" aria-label="上下文容量统计"></div></div><div class="composer-model composer-settings" data-composer-model><button type="button" class="composer-model-trigger" data-action="toggle-composer-model" aria-haspopup="dialog" aria-expanded="false" aria-controls="homeModelMenu"><span data-ui-icon="globe" data-icon-class="composer-model-network-icon" aria-hidden="true"></span><span id="homeModelLabel">选择模型</span><span data-ui-icon="chevron-down" data-icon-class="composer-model-chevron"></span></button><div class="composer-model-popover" id="homeModelMenu" role="dialog" aria-label="模型、联网与思考设置"></div></div><button type="submit" class="send-button" aria-label="发送问题"><span data-ui-icon="send"></span></button></div>
               </div>
               <input class="composer-image-input" id="homeImageFileInput" data-composer-image-file="home" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple />
+              <input class="composer-audio-input" id="homeAudioFileInput" data-composer-audio-file="home" type="file" accept="audio/wav,audio/mpeg,audio/mp4,audio/flac,audio/ogg,audio/aac,audio/webm,.wav,.mp3,.m4a,.flac,.ogg,.aac,.webm" multiple />
               <input class="composer-source-input" id="homeSourceFileInput" data-composer-source-file="home" type="file" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.json,.xml,.html,.htm,.md,.markdown,.txt,.rtf,.epub,.zip,.png,.jpg,.jpeg,.webp,.gif,.wav,.mp3,.m4a,.flac" multiple />
               <input class="composer-source-input" id="homePaperBatchFile" type="file" accept=".txt,.bib,.csv,text/plain" data-action="pick-home-batch-file" />
             </form>
@@ -193,6 +197,7 @@
                 <div class="composer-knowledge-strip" id="chatKnowledgeScope" aria-live="polite" hidden></div>
                 <div class="composer-source-strip" id="chatSourceAttachments" aria-live="polite" hidden></div>
                 <div class="composer-image-strip" id="chatImageAttachments" aria-live="polite" hidden></div>
+                <div class="composer-audio-strip" id="chatAudioAttachments" aria-live="polite" hidden></div>
                 <div class="composer-skill-strip" id="chatSkillTokens" aria-label="已选择的 Skill" aria-live="polite" hidden></div>
                 <textarea id="chatQuestionInput" rows="2" placeholder="继续追问或提出新的研究问题"></textarea>
                 <div class="chat-composer-tools">
@@ -202,6 +207,8 @@
                       <div class="attachment-popover" role="menu" aria-label="添加资料">
                         <button type="button" data-action="choose-composer-source" data-composer-key="chat" role="menuitem"><span data-ui-icon="file-plus"></span><span>添加文件</span></button>
                         <button type="button" data-action="choose-composer-image" data-composer-key="chat" role="menuitem"><span data-ui-icon="image"></span><span>添加图片</span></button>
+                        <button type="button" data-action="choose-composer-audio" data-composer-key="chat" role="menuitem"><span data-ui-icon="file-audio"></span><span>添加语音</span></button>
+                        <button type="button" data-action="toggle-composer-recording" data-composer-key="chat" role="menuitem"><span data-ui-icon="audio"></span><span>录制语音</span></button>
                         <button type="button" data-action="choose-presentation-sources" data-composer-key="chat" role="menuitem"><span data-ui-icon="presentation"></span><span>添加演示材料</span></button>
                       </div>
                     </div>
@@ -210,6 +217,7 @@
                   <div class="composer-right"><div class="context-usage-control" data-context-usage><button type="button" class="context-usage-trigger" data-action="toggle-context-usage" aria-haspopup="dialog" aria-expanded="false" aria-controls="chatContextUsageMenu" aria-label="查看上下文容量" title="查看上下文容量"><span class="context-usage-ring" data-context-ring role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-usage-ring-track" cx="10" cy="10" r="7.5"></circle><circle class="context-usage-ring-progress" cx="10" cy="10" r="7.5" pathLength="100"></circle></svg><span data-context-percent>—</span></span></button><div class="context-usage-popover" id="chatContextUsageMenu" role="dialog" aria-label="上下文容量统计"></div></div><div class="composer-model composer-settings" data-composer-model><button type="button" class="composer-model-trigger" data-action="toggle-composer-model" aria-haspopup="dialog" aria-expanded="false" aria-controls="chatModelMenu"><span data-ui-icon="globe" data-icon-class="composer-model-network-icon" aria-hidden="true"></span><span id="chatModelLabel">选择模型</span><span data-ui-icon="chevron-down" data-icon-class="composer-model-chevron"></span></button><div class="composer-model-popover" id="chatModelMenu" role="dialog" aria-label="模型、联网与思考设置"></div></div><button type="submit" class="send-button" aria-label="发送问题"><span data-ui-icon="send"></span></button></div>
                 </div>
                 <input class="composer-image-input" id="chatImageFileInput" data-composer-image-file="chat" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple />
+                <input class="composer-audio-input" id="chatAudioFileInput" data-composer-audio-file="chat" type="file" accept="audio/wav,audio/mpeg,audio/mp4,audio/flac,audio/ogg,audio/aac,audio/webm,.wav,.mp3,.m4a,.flac,.ogg,.aac,.webm" multiple />
                 <input class="composer-source-input" id="chatSourceFileInput" data-composer-source-file="chat" type="file" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.json,.xml,.html,.htm,.md,.markdown,.txt,.rtf,.epub,.zip,.png,.jpg,.jpeg,.webp,.gif,.wav,.mp3,.m4a,.flac" multiple />
               </form>
               <div class="slide-template-dock chat-slide-template-dock" data-slide-template-dock data-composer-key="chat" hidden>
@@ -245,7 +253,7 @@
           <header class="extensions-header">
             <button type="button" class="back-button" data-action="new-task" aria-label="返回工作区">←</button>
             <div><p class="overline">ScanSci Extension Hub</p><h1>插件和技能</h1></div>
-            <button type="button" class="extensions-refresh" data-action="refresh-marketplace">↻ 刷新市场</button>
+            <button type="button" class="extensions-refresh" data-action="check-extension-updates">↻ 检查更新</button>
           </header>
           <main class="extensions-content" id="extensionsContent" aria-live="polite"></main>
         </section>
@@ -256,13 +264,15 @@
 
         <section class="app-view settings-view" data-view="settings" aria-label="Settings">
           <aside class="settings-sidebar">
-            <button type="button" class="back-workspace" data-action="new-task"><span aria-hidden="true">←</span><span data-i18n="backToWorkspace">返回工作区</span></button>
+            <header class="settings-sidebar-header">
+              <strong data-i18n="settingsTitle">设置</strong>
+              <button type="button" class="settings-sidebar-close" data-action="new-task" aria-label="关闭设置"><span aria-hidden="true">×</span></button>
+            </header>
             <nav aria-label="Settings navigation">
               <button type="button" class="settings-nav is-active" data-settings-panel="general"><span data-ui-icon="settings"></span><span class="settings-nav-label" data-i18n="general">常规</span></button>
-              <button type="button" class="settings-nav" data-settings-panel="resources"><span data-ui-icon="download"></span><span class="settings-nav-label" data-i18n="resources">资源配置</span></button>
+              <button type="button" class="settings-nav" data-settings-panel="defaults"><span data-ui-icon="sliders"></span><span class="settings-nav-label" data-i18n="defaultCapabilities">默认能力</span></button>
               <button type="button" class="settings-nav" data-settings-panel="models"><span data-ui-icon="brain"></span><span class="settings-nav-label" data-i18n="modelServices">模型服务</span></button>
               <button type="button" class="settings-nav" data-settings-panel="local-models"><span data-ui-icon="layout"></span><span class="settings-nav-label" data-i18n="localModels">本地模型</span></button>
-              <button type="button" class="settings-nav" data-settings-panel="document-processing"><span data-ui-icon="file-plus"></span><span class="settings-nav-label" data-i18n="documentProcessing">文档处理</span></button>
             </nav>
             <div class="settings-sidebar-bottom">
               <button type="button" class="settings-nav settings-nav-about" data-settings-panel="about"><span data-ui-icon="info"></span><span class="settings-nav-label" data-i18n="about">关于搜索科学</span></button>
@@ -281,14 +291,14 @@
     <dialog class="slide-template-dialog" id="slideTemplateDialog" aria-labelledby="slideTemplateTitle">
       <div class="slide-template-browser">
         <header class="slide-template-header">
-          <div><span>EasySlides</span><h2 id="slideTemplateTitle">选择模板</h2></div>
+          <div><span>演示模板</span><h2 id="slideTemplateTitle">选择模板</h2></div>
           <button type="button" data-action="close-slide-templates" aria-label="关闭模板库">×</button>
         </header>
         <div class="slide-template-body">
           <aside class="slide-template-catalog">
             <label class="slide-template-search"><span data-ui-icon="search"></span><input id="slideTemplateSearch" type="search" placeholder="搜索模板" autocomplete="off" /></label>
             <div class="slide-template-count" id="slideTemplateCount"></div>
-            <div class="slide-template-list" id="slideTemplateList" role="listbox" aria-label="EasySlides 模板"></div>
+            <div class="slide-template-list" id="slideTemplateList" role="listbox" aria-label="演示模板"></div>
           </aside>
           <section class="slide-template-preview" id="slideTemplatePreview" aria-live="polite"></section>
         </div>
@@ -337,7 +347,7 @@
       <section class="skill-security-shell">
         <header class="skill-security-header">
           <span class="skill-security-mark"><span data-ui-icon="shield-check"></span></span>
-          <div><span>SKILL SECURITY GATE</span><h2 id="skillSecurityTitle">安装前安全检查</h2><p>扫描的是隔离快照；确认后只会安装这份已经检查的内容。</p></div>
+          <div><span>SKILL SECURITY GATE</span><h2 id="skillSecurityTitle">安装前安全检查</h2><p id="skillSecurityDescription">扫描的是隔离快照；确认后只会安装这份已经检查的内容。</p></div>
           <button type="button" data-action="close-skill-security" aria-label="关闭安全检查"><span data-ui-icon="x"></span></button>
         </header>
         <div class="skill-security-content" id="skillSecurityContent" aria-live="polite"></div>
@@ -351,7 +361,7 @@
       <section class="knowledge-scope-shell">
         <header><div><h2 id="knowledgeScopeTitle">选择知识库</h2><p>可同时引用多个本地知识库</p></div><div class="knowledge-scope-dialog-actions"><button type="button" class="knowledge-scope-refresh" id="knowledgeScopeRefresh" data-action="refresh-knowledge-scope-counts" aria-label="刷新可检索资料数量" title="刷新可检索资料数量"><span data-ui-icon="refresh"></span></button><button type="button" data-action="close-knowledge-scope" aria-label="关闭"><span data-ui-icon="x"></span></button></div></header>
         <div class="knowledge-scope-content" id="knowledgeScopeContent" aria-live="polite"></div>
-        <footer><span><i></i>仅建立本地链接与索引，不上传原文件</span><button type="button" class="secondary-button" data-action="close-knowledge-scope">完成</button></footer>
+        <footer><span id="knowledgeScopeDraftStatus"><i></i><b data-knowledge-scope-status-text>仅建立本地链接与索引，不上传原文件</b></span><button type="button" class="primary-button" data-action="apply-knowledge-scope">完成</button></footer>
       </section>
     </dialog>
     <dialog class="pdf-viewer-dialog" id="pdfViewerDialog" aria-labelledby="pdfViewerTitle">

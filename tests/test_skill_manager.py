@@ -3,15 +3,19 @@ import zipfile
 
 import pytest
 
+from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.builtin_skills import builtin_skill_asset_path, default_skill_records
 from scansci_html.skill_manager import (
     SkillInstallError,
     cancel_skill_scan,
+    check_skill_updates,
     install_skill,
     installed_skills,
     marketplace_skills,
     scan_skill_source,
+    scan_skill_update,
     skill_library_path,
+    update_skill,
 )
 
 
@@ -208,3 +212,78 @@ def test_marketplace_listing_uses_fallback_when_remote_catalog_is_unavailable(mo
 def test_remote_skill_acquisition_requires_https(tmp_path: Path, source: str):
     with pytest.raises(SkillInstallError, match="HTTPS"):
         scan_skill_source(tmp_path / "workspace.sqlite", {"source_type": "git", "source": source})
+
+
+def test_git_skill_update_scans_replaces_in_place_and_keeps_record_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "workspace.sqlite"
+    source = tmp_path / "initial-skill"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: Tracked Skill\n---\nold\n", encoding="utf-8")
+    _scan_and_install(workspace, source_type="local", source=str(source))
+
+    settings = load_settings(workspace)
+    record = next(item for item in settings["skills"] if item["name"] == "Tracked Skill")
+    record["source_type"] = "git"
+    record["source"] = "https://github.com/example/tracked-skill.git"
+    save_settings(workspace, settings)
+
+    remote = tmp_path / "remote-checkout"
+    remote.mkdir()
+    (remote / "SKILL.md").write_text("---\nname: Tracked Skill\ndescription: New description\n---\nnew\n", encoding="utf-8")
+    temporary = tmp_path / "fake-download"
+    temporary.mkdir()
+    monkeypatch.setattr("scansci_html.skill_manager._clone_git_source", lambda _source: (temporary, remote))
+
+    checked = check_skill_updates(workspace)
+    status = next(item for item in checked["skills"] if item["id"] == record["id"])
+    assert status["available"] is True
+
+    scanned = scan_skill_update(workspace, {"record_id": record["id"]})
+    updated = update_skill(workspace, {"scan_id": scanned["scan_id"], "decision": "update"})
+
+    installed = next(item for item in updated["skills"] if item["id"] == record["id"])
+    assert installed["id"] == record["id"]
+    assert installed["description"] == "New description"
+    assert len([item for item in updated["skills"] if item["source_type"] == "git"]) == 1
+    assert (Path(installed["path"]) / "SKILL.md").read_text(encoding="utf-8").endswith("new\n")
+    assert Path(updated["backup_path"]).is_dir()
+
+
+def test_skill_update_restores_old_package_when_settings_save_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = tmp_path / "workspace.sqlite"
+    source = tmp_path / "rollback-skill"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: Rollback Skill\n---\nold\n", encoding="utf-8")
+    _scan_and_install(workspace, source_type="local", source=str(source))
+    settings = load_settings(workspace)
+    record = next(item for item in settings["skills"] if item["name"] == "Rollback Skill")
+    record["source_type"] = "git"
+    record["source"] = "https://github.com/example/rollback-skill.git"
+    save_settings(workspace, settings)
+
+    remote = tmp_path / "remote-rollback"
+    remote.mkdir()
+    (remote / "SKILL.md").write_text("---\nname: Rollback Skill\n---\nnew\n", encoding="utf-8")
+    temporary = tmp_path / "fake-download-rollback"
+    temporary.mkdir()
+    monkeypatch.setattr("scansci_html.skill_manager._clone_git_source", lambda _source: (temporary, remote))
+    scanned = scan_skill_update(workspace, {"record_id": record["id"]})
+
+    import scansci_html.skill_manager as manager
+
+    real_save = manager.save_settings
+    calls = 0
+
+    def fail_once(workspace_arg, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated settings lock")
+        return real_save(workspace_arg, payload)
+
+    monkeypatch.setattr(manager, "save_settings", fail_once)
+    with pytest.raises(SkillInstallError, match="自动回滚"):
+        update_skill(workspace, {"scan_id": scanned["scan_id"], "decision": "update"})
+
+    installed_path = Path(next(item for item in load_settings(workspace)["skills"] if item["id"] == record["id"])["path"])
+    assert (installed_path / "SKILL.md").read_text(encoding="utf-8").endswith("old\n")

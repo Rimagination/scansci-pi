@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from .academic_search import search_academic_papers
 from .academic_planning import plan_academic_search
+from .agent_reach import run_agent_reach
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
 from .checkpoints import CheckpointError, CheckpointStore
@@ -44,7 +45,9 @@ from .research_tools import (
     verify_doi_metadata,
 )
 from .retrieval import search_evidence_store
+from .runtime_components import default_node_component
 from .web_search import search_public_web
+from .web_access import browser_access_read, browser_access_status
 from .workspace import initialize_notebook, load_workspace_summary
 from .zotero_integration import (
     search_zotero_library,
@@ -53,6 +56,10 @@ from .zotero_integration import (
     zotero_formatted_citations,
     zotero_fulltext,
     zotero_status,
+)
+from .zotero_scope import (
+    filter_zotero_result,
+    resolve_zotero_tag_scope,
 )
 from .obsidian_integration import obsidian_backlinks, obsidian_status, read_obsidian_note, search_obsidian_vault
 from .prefix_diagnostics import build_prefix_shape
@@ -890,6 +897,7 @@ class PiAgentClient:
         root_evidence_db: str | Path | None = None,
         additional_evidence_dbs: list[str | Path] | None = None,
         notebook_ids: list[str] | None = None,
+        knowledge_scope: dict[str, Any] | None = None,
         embedding_provider: Any | None = None,
         reranker: Any | None = None,
         active_run_id: str = "",
@@ -906,6 +914,8 @@ class PiAgentClient:
             *(Path(path).resolve() for path in (additional_evidence_dbs or [])),
         ]))
         self.notebook_ids = list(dict.fromkeys(str(value).strip() for value in (notebook_ids or []) if str(value).strip()))
+        self.knowledge_scope = dict(knowledge_scope or {})
+        self._knowledge_scope_cache: dict[str, dict[str, Any]] = {}
         self.embedding_provider = embedding_provider
         self.reranker = reranker
         self.active_run_id = str(active_run_id or "").strip()
@@ -929,7 +939,12 @@ class PiAgentClient:
     def runtime_paths() -> tuple[Path, Path]:
         if getattr(sys, "frozen", False):
             bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve()
+            # A user-installed Node component takes precedence over the
+            # bundled copy, so slim builds without an embedded Node still run
+            # the Pi sidecar after one confirmed component install.
+            managed_node = default_node_component().executable()
             node_candidates = [
+                *( [managed_node] if managed_node is not None else [] ),
                 bundle_root / "pi_runtime" / "node.exe",
                 Path(sys.executable).parent / "pi_runtime" / "node.exe",
             ]
@@ -2621,6 +2636,7 @@ class PiAgentClient:
                     max_followup_queries=1,
                     embedding_provider=self.embedding_provider,
                     reranker=self.reranker,
+                    filters=self._knowledge_filters(evidence_db, question),
                 )
                 compact = _compact_verified_answer_for_model(payload)
                 compact["library_index"] = library_index
@@ -2635,7 +2651,10 @@ class PiAgentClient:
         if not results:
             detail = failures[0]["error"] if failures else "No selected evidence store could be queried"
             raise RuntimeError(detail)
+        scope_summary = self._knowledge_scope_summary(question)
         if len(results) == 1 and not failures:
+            if scope_summary is not None:
+                results[0]["knowledge_scope"] = scope_summary
             return results[0]
 
         citations: list[dict[str, Any]] = []
@@ -2695,6 +2714,7 @@ class PiAgentClient:
             },
             "libraries": results,
             "failures": failures,
+            **({"knowledge_scope": scope_summary} if scope_summary is not None else {}),
         }
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2728,6 +2748,22 @@ class PiAgentClient:
         if name == "inspect_available_tools":
             snapshot = capability_snapshot(workspace=self.workspace, evidence_db=self.evidence_db)
             snapshot["pi_high_level_tools"] = [
+                {
+                    "id": "agent_reach",
+                    "status": "ready",
+                    "description": "Read and search public internet channels through built-in zero-install Agent Reach routes.",
+                },
+                {
+                    "id": "browser_access",
+                    # A probe is a side-effect-free localhost health check; do
+                    # not advertise a ready tool that would fail on first use.
+                    "status": (
+                        "ready"
+                        if browser_access_status(timeout=1.5).get("ready")
+                        else "requires-setup"
+                    ),
+                    "description": "Read rendered public pages through the bundled web-access CDP bridge when public readers are insufficient.",
+                },
                 {
                     "id": "download_and_index",
                     "status": "ready" if self.notebook_ids else "needs-selected-library",
@@ -2779,17 +2815,19 @@ class PiAgentClient:
             search_evidence = name == "search_local_evidence" and (
                 not selected_notebooks or any(list(notebook.get("sources", []) or []) for notebook in selected_notebooks)
             )
+            query_text = str(arguments.get("query", ""))
             if search_evidence:
                 for library_index, evidence_db in enumerate(self.evidence_dbs):
                     if not evidence_db.is_file():
                         continue
                     library_hits = search_evidence_store(
                         evidence_db,
-                        str(arguments.get("query", "")),
+                        query_text,
                         limit=limit,
                         context_mode="sentence",
                         embedding_provider=self.embedding_provider,
                         reranker=self.reranker,
+                        filters=self._knowledge_filters(evidence_db, query_text),
                     )
                     for hit in library_hits:
                         hits.append({**hit, "library_index": library_index})
@@ -2798,12 +2836,16 @@ class PiAgentClient:
             zotero_results = []
             if zotero_enabled and (name in {"kb_search", "zotero_search"} or zotero_notebooks):
                 collection_key = str(arguments.get("collection_key", ""))
+                zotero_scope = self._knowledge_scope_summary(query_text) or self.knowledge_scope
                 zotero_results.append(
-                    search_zotero_library(
-                        str(arguments.get("query", "")),
-                        limit=limit,
-                        collection_key=collection_key,
-                        include_fulltext=bool(arguments.get("include_fulltext", True)),
+                    filter_zotero_result(
+                        search_zotero_library(
+                            query_text,
+                            limit=limit,
+                            collection_key=collection_key,
+                            include_fulltext=bool(arguments.get("include_fulltext", True)),
+                        ),
+                        zotero_scope,
                     )
                 )
             payload = {
@@ -2816,6 +2858,9 @@ class PiAgentClient:
                 ],
                 "zotero": zotero_results,
             }
+            scope_summary = self._knowledge_scope_summary(query_text)
+            if scope_summary is not None:
+                payload["knowledge_scope"] = scope_summary
             if not payload["count"] and not zotero_results:
                 self._require_evidence_store()
             return payload
@@ -2922,6 +2967,26 @@ class PiAgentClient:
                 str(arguments.get("query", "")),
                 limit=_bounded_limit(arguments.get("result_limit"), default=8),
             )
+        if name == "agent_reach":
+            return run_agent_reach(
+                str(arguments.get("operation", "")),
+                target=str(arguments.get("target", "")),
+                query=str(arguments.get("query", "")),
+                channel=str(arguments.get("channel", "auto")),
+                limit=_bounded_limit(arguments.get("limit"), default=8),
+                timeout=min(60.0, max(3.0, float(arguments.get("timeout_seconds", 30) or 30))),
+            )
+        if name == "browser_access":
+            operation = str(arguments.get("operation", "")).strip().lower()
+            timeout = min(60.0, max(5.0, float(arguments.get("timeout_seconds", 30) or 30)))
+            if operation == "status":
+                return browser_access_status(timeout=min(3.0, timeout))
+            if operation == "read":
+                return browser_access_read(
+                    str(arguments.get("target", "")),
+                    timeout=timeout,
+                )
+            raise ValueError("browser_access operation must be status or read")
         if name == "search_journal":
             return search_journals(
                 str(arguments.get("query", "")),
@@ -2967,6 +3032,83 @@ class PiAgentClient:
             summary = load_workspace_summary(self.workspace, notebook_id=notebook_id)
             selected.extend(dict(notebook) for notebook in list(summary.get("notebooks", []) or []))
         return selected
+
+    def _knowledge_scope_resolution(
+        self,
+        evidence_db: str | Path,
+        question: str = "",
+    ) -> dict[str, Any]:
+        """Resolve explicit or automatic tag scope for one selected index."""
+
+        requested = dict(self.knowledge_scope or {})
+        requested_type = str(requested.get("type", "")).strip()
+        if requested_type not in {"", "zotero-tag"}:
+            return {"active": False, "status": "inactive"}
+        database = Path(evidence_db).resolve()
+        cache_question = "" if requested_type == "zotero-tag" else str(question or "").strip().casefold()
+        cache_key = f"{database}|{cache_question}"
+        if cache_key in self._knowledge_scope_cache:
+            return dict(self._knowledge_scope_cache[cache_key])
+        selected = self._selected_notebooks()
+        requested_id = str(requested.get("notebook_id", "")).strip()
+        notebook = next(
+            (
+                item
+                for item in selected
+                if requested_id and str(item.get("notebook_id", "")).strip() == requested_id
+            ),
+            None,
+        )
+        if notebook is None:
+            notebook = next(
+                (
+                    item
+                    for item in selected
+                    if str(dict(item.get("metadata", {}) or {}).get("library_kind", "")).strip().lower() == "zotero"
+                ),
+                None,
+            )
+        if notebook is None:
+            return {"active": False, "status": "unavailable"}
+        notebook_databases = {
+            str(Path(str(dict(source).get("evidence_db_path", ""))).resolve())
+            for source in list(notebook.get("sources", []) or [])
+            if str(dict(source).get("evidence_db_path", "")).strip()
+        }
+        if notebook_databases and str(database) not in notebook_databases:
+            result = {"active": False, "status": "other-library"}
+            self._knowledge_scope_cache[cache_key] = result
+            return dict(result)
+        if not notebook_databases and len(self.evidence_dbs) > 1 and database != self.evidence_dbs[0].resolve():
+            result = {"active": False, "status": "other-library"}
+            self._knowledge_scope_cache[cache_key] = result
+            return dict(result)
+        library_kind = str(dict(notebook.get("metadata", {}) or {}).get("library_kind", "")).strip().lower()
+        if requested_type == "zotero-tag":
+            # Keep the old explicit scope format readable for old callers, but
+            # the UI no longer creates it. Normal Zotero retrieval uses the
+            # tag sidecar as a soft hybrid-ranking signal instead of a filter.
+            result = resolve_zotero_tag_scope(notebook, database, requested)
+        elif library_kind == "zotero":
+            result = {"active": False, "status": "automatic-ranking"}
+        else:
+            result = {"active": False, "status": "no-query" if not str(question or "").strip() else "not-zotero"}
+        result["notebook_id"] = str(notebook.get("notebook_id", ""))
+        self._knowledge_scope_cache[cache_key] = dict(result)
+        return dict(result)
+
+    def _knowledge_filters(self, evidence_db: str | Path, question: str = "") -> dict[str, Any]:
+        resolution = self._knowledge_scope_resolution(evidence_db, question)
+        if not bool(resolution.get("active")):
+            return {}
+        return {"doc_ids": list(resolution.get("doc_ids", []) or [])}
+
+    def _knowledge_scope_summary(self, question: str = "") -> dict[str, Any] | None:
+        for evidence_db in self.evidence_dbs:
+            resolution = self._knowledge_scope_resolution(evidence_db, question)
+            if resolution.get("type") == "zotero-tag" and resolution.get("status") == "applied":
+                return resolution
+        return None
 
     def _selected_obsidian_vaults(self) -> list[str]:
         vaults: list[str] = []

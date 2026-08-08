@@ -1486,6 +1486,34 @@ function tools(
       }),
     ),
     bridgeTool(
+      "agent_reach",
+      "Agent Reach internet router",
+      "Read or search public internet channels through ScanSci's built-in zero-install Agent Reach adaptation. Use for public URLs, RSS, GitHub, Bilibili, V2EX, and public-web discovery. If the page needs login state, browser rendering, or interaction, use browser_access instead.",
+      Type.Object({
+        operation: Type.Union([Type.Literal("status"), Type.Literal("read"), Type.Literal("search")]),
+        target: Type.Optional(Type.String({ maxLength: 2_000 })),
+        query: Type.Optional(Type.String({ maxLength: 1_000 })),
+        channel: Type.Optional(Type.Union([
+          Type.Literal("auto"), Type.Literal("web"), Type.Literal("rss"), Type.Literal("github"),
+          Type.Literal("youtube"), Type.Literal("bilibili"), Type.Literal("v2ex"), Type.Literal("xueqiu"),
+          Type.Literal("twitter"), Type.Literal("reddit"), Type.Literal("xiaohongshu"), Type.Literal("facebook"),
+          Type.Literal("instagram"), Type.Literal("linkedin"),
+        ])),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 12 })),
+        timeout_seconds: Type.Optional(Type.Number({ minimum: 3, maximum: 60 })),
+      }),
+    ),
+    bridgeTool(
+      "browser_access",
+      "Rendered browser access",
+      "Read one public URL through the bundled web-access CDP bridge and the user's Chrome session. Use only for login-aware, dynamically rendered, anti-bot, or interaction-dependent pages. Read-only: no arbitrary JavaScript, clicks, form submission, uploads, or writes.",
+      Type.Object({
+        operation: Type.Union([Type.Literal("status"), Type.Literal("read")]),
+        target: Type.Optional(Type.String({ maxLength: 2_000 })),
+        timeout_seconds: Type.Optional(Type.Number({ minimum: 5, maximum: 60 })),
+      }),
+    ),
+    bridgeTool(
       "search_journal",
       "Search journals",
       "Look up journal metadata, indicators, and warning flags.",
@@ -1603,13 +1631,13 @@ function tools(
   const enabledAvailable = available.filter((tool) => !blocked.has(tool.name));
   const namesByMode: Record<string, Set<string>> = {
     knowledge: new Set(["inspect_workspace", "inspect_available_tools", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
-    research: new Set(["inspect_workspace", "inspect_available_tools", "search_web", "discover_papers", "download_and_index", "summarize_documents", "check_task_completion", "verify_doi", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
+    research: new Set(["inspect_workspace", "inspect_available_tools", "search_web", "agent_reach", "browser_access", "discover_papers", "download_and_index", "summarize_documents", "check_task_completion", "verify_doi", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
     "workspace-status": new Set(["inspect_workspace"]),
     "zotero-status": new Set(["zotero_status"]),
     "zotero-search": new Set(["zotero_search"]),
     "task-documents": new Set(["read_task_documents", "summarize_documents", "check_task_completion", "self_assess"]),
-    "web-auto": new Set(["search_web", "discover_papers", "verify_doi", "self_assess"]),
-    web: new Set(["search_web", "self_assess"]),
+    "web-auto": new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
+    web: new Set(["search_web", "agent_reach", "browser_access", "self_assess"]),
     // The verified-answer endpoint has one mandatory terminal action. Keeping
     // only this composite tool prevents small/text-only models from spending
     // their bounded generation window on an intermediate search and stopping.
@@ -1750,9 +1778,9 @@ function systemPrompt(request: RunStart): string {
       : hasMode("task-documents")
         ? "For a summary or comparison, call summarize_documents; for a focused quotation or simple read, call read_task_documents. Synthesize across every returned document map, state failed or truncated files briefly, and do not ask the user to upload files that ScanSci already registered."
         : hasMode("web")
-    ? "Web search is explicitly ON. You MUST call search_web before answering. Cite the returned URLs for externally sourced claims. Do not describe setup steps, promise future work, or ask the user to wait: execute the available tool now and return the completed result."
+    ? "Web access is explicitly ON. You MUST call one permitted web tool before answering. Route ordinary public search to search_web; route public direct URLs, RSS, GitHub, Bilibili, V2EX, or channel status to agent_reach; route pages requiring login state, browser rendering, anti-bot handling, or interaction to browser_access. Do not call both public readers for the same URL unless the first result is insufficient. Cite returned URLs for externally sourced claims. If browser_access returns a risk_notice, include it when relevant."
     : hasMode("web-auto")
-      ? "Web search is AUTO. Call search_web when the answer depends on current or general public-web information; call discover_papers for not-yet-imported scholarly literature. Cite returned URLs/DOIs and distinguish discovery snippets or abstracts from verified full text."
+      ? "Web search is AUTO. Call one permitted web tool when the answer depends on current or general public-web information. Use search_web for discovery, agent_reach for public direct URLs and structured channels, and browser_access only when login state, rendering, anti-bot handling, or interaction is required. Call discover_papers for not-yet-imported scholarly literature. Do not duplicate the same URL across public readers. Cite returned URLs/DOIs and distinguish discovery snippets or abstracts from verified full text."
       : hasMode("knowledge") && !hasMode("research")
         ? "Use only the selected knowledge library. For a ScanSci-indexed library, call search_local_evidence or build_verified_answer and synthesize the returned full-text excerpts. For a linked Zotero or Obsidian library, use only the matching permitted connector tools. Do not call research-run document tools, switch to an unselected library, or treat title-only metadata as full-text evidence."
       : hasMode("verified-answer") || hasMode("research") || hasMode("benchmark")
@@ -1777,7 +1805,7 @@ function requiredToolGroups(taskMode: string, requestText = ""): Set<string>[] {
   if (parts.has("zotero-status")) groups.push(new Set(["zotero_status"]));
   if (parts.has("workspace-status")) groups.push(new Set(["inspect_workspace"]));
   if (parts.has("zotero-search")) groups.push(new Set(["zotero_search"]));
-  if (parts.has("web")) groups.push(new Set(["search_web", "discover_papers"]));
+  if (parts.has("web")) groups.push(new Set(["search_web", "agent_reach", "browser_access", "discover_papers"]));
   if (parts.has("task-documents")) groups.push(new Set(["read_task_documents", "summarize_documents"]));
   const explicitKnowledge = /(?:knowledge\s*base|zotero|obsidian|知识库|本地库|文献库|资料库|向量库)|(?:这些|这批|已连接|已链接|当前).{0,12}(?:文献|论文|资料|知识库)|(?:linked|local|selected|current).{0,18}(?:library|documents?|papers?)/i.test(normalizedText);
   if (parts.has("knowledge") && explicitKnowledge) {
