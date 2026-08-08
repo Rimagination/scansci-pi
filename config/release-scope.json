@@ -1,36 +1,39 @@
 {
   "schema_version": 1,
-  "p0_objective": "更新桌面应用图标，修复 Windows 窗口最大化时的显示问题（最大化铺满工作区且任务栏仍可见、四角直角无 DWM 圆角、边框无杂色条；还原窗口保持圆角），并把当前未提交功能集重新打包为可验收的发布候选。",
+  "p0_objective": "发布 v0.3.0：Agent Reach 互联网路由、MinerU 云端 PDF 解析、GPU/CUDA 引导、向量索引加速、OCR 引擎扩展（Tesseract / Windows OCR / Paddle / DeepSeek OCR）、文献综述模板词过滤、证据检索去噪（STOPWORDS + F4 门禁）、桌面窗口窄屏适配（min 800px）、打包瘦身与组件化（Node/Tectonic 托管运行时）、应用图标更新及窗口最大化 DWM 修复。",
   "acceptance": [
     {
       "id": "app-icon",
-      "requirement": "打包产物（EXE、安装包、桌面快捷方式）使用新版应用图标，Windows 资源管理器中正常显示且不出现默认白图标。"
+      "requirement": "打包产物（EXE、安装包、桌面快捷方式）使用新版应用图标，Windows 资源管理器中正常显示。"
     },
     {
       "id": "maximized-window",
-      "requirement": "窗口最大化时铺满显示器工作区（任务栏仍可见），四角为直角、无 DWM 圆角，边框无杂色条。"
+      "requirement": "窗口最大化时铺满显示器工作区（任务栏仍可见），四角直角无 DWM 圆角，边框无杂色条。"
     },
     {
       "id": "restored-window",
-      "requirement": "从最大化还原后，窗口恢复为当前的圆角样式，标题栏与内容区域显示正常。"
+      "requirement": "从最大化还原后窗口恢复圆角样式，标题栏与内容区域显示正常。"
+    },
+    {
+      "id": "narrow-window",
+      "requirement": "窗口宽度 ≥800px 时界面可用，侧栏在窄屏下自动折叠。"
     },
     {
       "id": "edge-resize",
-      "requirement": "无边框窗口的边缘与四角仍可通过鼠标拖拽调整大小，最大化/还原与拖拽行为不冲突。"
+      "requirement": "无边框窗口边缘与四角可通过鼠标拖拽调整大小。"
     },
     {
       "id": "standard-package",
-      "requirement": "ScanSci core 包继续保持轻量，不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"
+      "requirement": "安装包不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"
     },
     {
       "id": "package-identity",
-      "requirement": "应用版本、安装器版本、更新清单、build_id、package_profile 与 SHA256 必须指向同一唯一构建。"
+      "requirement": "应用版本、安装器版本、build_id、package_profile 与 SHA256 指向同一唯一构建。"
     }
   ],
   "non_goals": [
-    "本轮不新增聊天、知识库、PPT、模型市场或论文获取产品功能。",
-    "不把可选本地模型或推理依赖打进 ScanSci core 安装包。",
-    "不购买或要求代码签名证书。",
-    "不修改发布渠道分级与既有门禁步骤顺序。"
+    "本轮不购买或要求代码签名证书。",
+    "不把可选本地模型或推理依赖打进 core 安装包。",
+    "不修改发布渠道分级与门禁步骤顺序。"
   ]
 }

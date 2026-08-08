@@ -442,11 +442,11 @@ def test_answer_question_repairs_an_llm_answer_that_fails_strict_citation_verifi
                 "title": "Photovoltaic field study",
                 "section": "Results",
                 "section_kind": "results",
-                "text": "Photovoltaic arrays increased shaded soil moisture during summer.",
+                "text": "Photovoltaic arrays increased shaded soil moisture during summer. 光伏阵列增加了夏季遮荫土壤水分。",
                 "html_path": "paper.evidence.html",
                 "html_anchor": "doc1-s0001",
                 "score": 3.0,
-                "matched_terms": ["photovoltaic", "soil", "moisture"],
+                "matched_terms": ["photovoltaic", "soil", "moisture", "光伏", "土壤"],
             }
         ]
 
@@ -486,7 +486,7 @@ def test_answer_question_repairs_an_llm_answer_that_fails_strict_citation_verifi
                 quote_id="q0001",
                 question="光伏阵列对土壤水分有什么影响？",
                 evidence_ids=["doc1.s0001"],
-                exact_quote="Photovoltaic arrays increased shaded soil moisture during summer.",
+                exact_quote="Photovoltaic arrays increased shaded soil moisture during summer. 光伏阵列增加了夏季遮荫土壤水分。",
                 role="result",
                 claim_hint="Photovoltaic arrays increased shaded soil moisture.",
                 confidence=0.95,

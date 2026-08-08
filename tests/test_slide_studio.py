@@ -232,7 +232,8 @@ def test_presentation_ui_uses_stable_rendering_and_native_save_bridge():
     assert "const isTaskConversation = inputId === \"chatQuestionInput\"" in app_js
     assert "const isTaskFollowUp = isTaskConversation" in app_js
     assert "renderAssistantContent(message.content)" in app_js
-    assert '<a href=\"$2\" target=\"_blank\" rel=\"noopener noreferrer\">$1</a>' in app_js
+    assert "function siteLinkMarkup" in app_js
+    assert "function linkifyExternalUrls" in app_js
     assert 'input.dispatchEvent(new Event("input", { bubbles: true }));' in app_js
     assert 'mode === "knowledge" && !selectedKnowledge.length && !isTaskFollowUp' in app_js
     # Public academic/deep research no longer requires a selected local

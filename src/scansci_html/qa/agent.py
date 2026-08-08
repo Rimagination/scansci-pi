@@ -481,11 +481,14 @@ def _apply_topical_relevance_gate(
     domain_terms = [t for t in domain_terms if all('\u4e00' <= c <= '\u9fff' for c in t) or len(t) >= 4]
     # Stopwords cover individual glyphs, but char-level bigrams/trigrams
     # like "因素影" (from "因素"+"影") slip through when they share
-    # characters with a stopword.  Filter any domain term that contains
-    # a multi-character stopword as a substring.
+    # characters with a stopword.  Filter CJK domain terms that contain
+    # a multi-character stopword as a substring.  Latin terms are not
+    # subject to this filter — short stopwords like "on", "at", "be" are
+    # frequent substrings of legitimate English content words.
     domain_terms = [
         t for t in domain_terms
-        if not any(len(sw) >= 2 and sw in t for sw in STOPWORDS)
+        if not all('\u4e00' <= c <= '\u9fff' for c in t)
+        or not any(len(sw) >= 2 and sw in t for sw in STOPWORDS)
     ]
     # Review-template terms like "foundations", "architecture", "methods"
     # are boilerplate that the writing model appends to section queries
