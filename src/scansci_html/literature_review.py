@@ -105,7 +105,10 @@ def retrieve_review_evidence(
 
     for raw_section in list(plan["sections"]):
         section = dict(raw_section)
-        section["queries"] = _balanced_review_queries(topic, section)
+        section["queries"] = [
+            _clean_review_query(query)
+            for query in _balanced_review_queries(topic, section)
+        ]
         section_citations: list[str] = []
         query_traces: list[dict[str, Any]] = []
         for query in list(section["queries"])[:_MAX_QUERIES_PER_SECTION]:
@@ -978,6 +981,44 @@ def _balanced_review_queries(question: str, planned: dict[str, Any]) -> list[str
             "BERT GLUE SQuAD fine-tuning GPT-3 zero-shot one-shot few-shot in-context learning",
         ]
     return [str(item) for item in list(planned.get("queries", []) or []) if str(item).strip()]
+
+
+# Review structure boilerplate that a model may append as pseudo-English
+# "translation" of generic section headers.  These terms do not represent
+# topical content and must be removed before the query enters retrieval.
+_REVIEW_TEMPLATE_TERMS = {
+    "foundations", "architecture", "mechanism", "mechanisms",
+    "methods", "method", "training", "objectives", "objective",
+    "pretraining", "pre-training", "pre", "training",
+    "results", "experiments", "experiment", "performance",
+    "comparison", "comparisons", "compare",
+    "adaptation", "adaptations", "adapt", "fine-tuning", "fine", "tuning",
+    "transfer", "in-context", "in", "context", "learning",
+    "limitations", "limitation", "weaknesses", "weakness",
+    "open", "questions", "discussion", "discussions", "conclusion", "conclusions",
+    "future", "work", "works", "related", "background", "introduction",
+    "evaluation", "evaluations", "evaluate", "benchmark", "benchmarks",
+    "framework", "frameworks", "survey", "surveys", "overview",
+    "systematic", "review", "reviews", "analysis", "analyses",
+    "application", "applications", "implication", "implications",
+    "chapter", "chapters", "section", "sections", "part", "parts",
+    "approach", "approaches", "model", "models",
+    "methodology", "methodologies", "meta-analysis", "meta",
+}
+
+
+def _clean_review_query(query: str) -> str:
+    """Remove generic review-template terms from a section query.
+
+    A writing model may output ``"光伏组件衰减率综述 foundations architecture"``
+    where the English suffix is a generic section header, not a topical
+    search term.  Drop those words so the retrieval sees only the real
+    subject matter.
+    """
+
+    words = str(query or "").split()
+    cleaned = [word for word in words if word.casefold() not in _REVIEW_TEMPLATE_TERMS]
+    return " ".join(cleaned) if cleaned else str(query).strip()
 
 
 def _is_transformer_bert_gpt3_comparison(question: str) -> bool:

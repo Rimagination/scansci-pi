@@ -487,6 +487,24 @@ def _apply_topical_relevance_gate(
         t for t in domain_terms
         if not any(len(sw) >= 2 and sw in t for sw in STOPWORDS)
     ]
+    # Review-template terms like "foundations", "architecture", "methods"
+    # are boilerplate that the writing model appends to section queries
+    # regardless of the actual topic.  Treat them as stopwords.
+    _REVIEW_BOILERPLATE = frozenset({
+        "foundations", "architecture", "mechanism", "mechanisms",
+        "methods", "method", "training", "objectives", "objective",
+        "pretraining", "pre-training", "results", "experiments",
+        "performance", "comparison", "comparisons",
+        "adaptation", "adaptations", "fine-tuning", "transfer",
+        "limitations", "limitation", "weaknesses", "weakness",
+        "discussion", "discussions", "conclusion", "conclusions",
+        "background", "introduction", "evaluation", "evaluations",
+        "benchmark", "benchmarks", "framework", "frameworks",
+        "survey", "surveys", "overview", "systematic", "review",
+        "analysis", "analyses", "application", "applications",
+        "approach", "approaches", "methodology", "methodologies",
+    })
+    domain_terms = [t for t in domain_terms if t.casefold() not in _REVIEW_BOILERPLATE]
     if not domain_terms:
         return adequacy
     combined_text = " ".join(
