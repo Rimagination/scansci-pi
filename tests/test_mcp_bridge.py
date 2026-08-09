@@ -11,6 +11,9 @@ from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.pi_agent import PiAgentClient
 
 
+_TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
+
+
 def _probe(
     tmp_path: Path,
     *,
@@ -222,6 +225,7 @@ def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: 
             thinking_level="off",
             task_mode="general",
             task_contract={
+                **_TASK_CONTRACT_V2,
                 "allowed_tools": [],
                 "allowed_mcp_servers": ["fixture"],
                 "risk_level": "high",

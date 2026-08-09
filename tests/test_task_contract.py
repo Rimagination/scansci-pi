@@ -32,8 +32,9 @@ def test_task_contract_reads_legacy_v1_and_writes_only_v2() -> None:
 
 
 def test_task_contract_preserves_missing_versus_explicit_empty_tool_lease() -> None:
-    omitted = TaskContract.from_payload({"goal": "omitted"}).to_dict()
-    explicit = TaskContract.from_payload({"goal": "empty", "allowed_tools": []}).to_dict()
+    version = {"schema_version": TASK_CONTRACT_SCHEMA, "version": 2}
+    omitted = TaskContract.from_payload({**version, "goal": "omitted"}).to_dict()
+    explicit = TaskContract.from_payload({**version, "goal": "empty", "allowed_tools": []}).to_dict()
 
     assert "allowed_tools" not in omitted
     assert explicit["allowed_tools"] == []
@@ -48,6 +49,77 @@ def test_v2_contract_fixture_round_trips_without_expanding_initial_tools() -> No
     assert round_tripped["schema_version"] == TASK_CONTRACT_SCHEMA
     assert round_tripped["allowed_tools"] == ["inspect_workspace", "kb_search"]
     assert round_tripped["initial_tools"] == ["inspect_workspace"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"schema_version": "scansci.task-contract.v999"},
+        {"schema_version": "scansci.task-contract.v999", "version": 999},
+        {"version": 999},
+        {"version": "999"},
+        {"schema_version": "scansci.task-contract.v1", "version": 2},
+        {"schema_version": "scansci.task-contract.v2", "version": "1"},
+        {"schema_version": "scansci.task-contract.v2", "version": {"major": 2}},
+    ],
+)
+def test_unknown_conflicting_or_malformed_contract_versions_drop_authority(
+    payload: dict[str, object],
+) -> None:
+    migrated = TaskContract.from_payload({
+        **payload,
+        "goal": "malformed authority",
+        "allowed_tools": ["download_and_index"],
+        "initial_tools": ["download_and_index"],
+        "allowed_mcp_servers": ["writer"],
+        "allow_external_write": True,
+        "requires_plan": False,
+        "risk_level": "high",
+    }).to_dict()
+
+    assert migrated["schema_version"] == TASK_CONTRACT_SCHEMA
+    assert migrated["source_contract_valid"] is False
+    assert "allowed_tools" not in migrated
+    assert "initial_tools" not in migrated
+    assert "allowed_mcp_servers" not in migrated
+    assert "allow_external_write" not in migrated
+    assert "requires_plan" not in migrated
+    assert "risk_level" not in migrated
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "version"),
+    [
+        ("scansci.task-contract.v1", 1),
+        ("scansci.task-contract.v1", "1"),
+        ("scansci.task-contract.v2", 2),
+        ("scansci.task-contract.v2", "2"),
+    ],
+)
+def test_matching_v1_v2_schema_and_integer_or_string_version_preserve_lease(
+    schema_version: str,
+    version: int | str,
+) -> None:
+    migrated = TaskContract.from_payload({
+        "schema_version": schema_version,
+        "version": version,
+        "allowed_tools": ["inspect_workspace"],
+    }).to_dict()
+
+    assert migrated["allowed_tools"] == ["inspect_workspace"]
+    assert migrated["source_contract_valid"] is True
+
+
+@pytest.mark.parametrize("version", [1, "1", 2, "2"])
+def test_integer_only_legacy_versions_remain_readable(version: int | str) -> None:
+    migrated = TaskContract.from_payload({
+        "version": version,
+        "allowed_tools": ["inspect_workspace"],
+    }).to_dict()
+
+    assert migrated["allowed_tools"] == ["inspect_workspace"]
+    assert migrated["source_contract_valid"] is True
 
 
 def test_tool_authorization_denies_missing_empty_spoofed_and_over_budget_calls() -> None:

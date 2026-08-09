@@ -1770,6 +1770,8 @@ class PiAgentClient:
                 raise RuntimeError(str(event.get("error", "Pi compaction failed")))
             if event.get("type") == "session.compact_completed":
                 result = dict(event.get("result", {}) or {})
+                if isinstance(event.get("base_prompt"), dict):
+                    result["_base_prompt"] = dict(event["base_prompt"])
                 if isinstance(event.get("stats"), dict):
                     result["_session_stats"] = dict(event["stats"])
                 return result

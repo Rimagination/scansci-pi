@@ -24,6 +24,9 @@ from scansci_html.research_runs import ResearchRunStore, StageSpec
 from scansci_html.workspace import initialize_notebook
 
 
+_TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
+
+
 def test_disabling_zotero_plugin_removes_native_zotero_tools_from_pi(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace.sqlite"
     settings = load_settings(workspace)
@@ -1232,6 +1235,86 @@ def test_pi_sidecar_rejects_incompatible_protocol_before_starting_a_run() -> Non
     assert response["failure"]["protocol"] == 3
 
 
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        {},
+        {"schema_version": "scansci.task-contract.v999"},
+        {"schema_version": "scansci.task-contract.v999", "version": 999},
+        {"version": 999},
+        {"schema_version": "scansci.task-contract.v1", "version": 2},
+        {"schema_version": "scansci.task-contract.v2", "version": {"major": 2}},
+    ],
+)
+def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
+    tmp_path: Path,
+    invalid_contract: dict[str, object],
+) -> None:
+    _OpenAIStreamHandler.request_payload = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    node, sidecar = PiAgentClient.runtime_paths()
+    environment = PiAgentClient._node_environment()
+    environment["SCANSCIPI_PROVIDER_KEY"] = "fixture-key"
+    process = subprocess.Popen(
+        [str(node), str(sidecar)],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps({
+            "type": "run.start",
+            "pi_protocol_version": 4,
+            "required_features": ["task_contract_v2"],
+            "request_id": "invalid-contract-version",
+            "session_id": "invalid-contract-version",
+            "cwd": str(tmp_path),
+            "agent_dir": str(tmp_path / ".agent"),
+            "provider_kind": "openai-compatible",
+            "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+            "model_id": "fixture-model",
+            "thinking_level": "off",
+            "system_prompt": "",
+            "prompt": "Answer without tools.",
+            "task_mode": "knowledge",
+            "task_contract": {
+                **invalid_contract,
+                "allowed_tools": ["inspect_workspace"],
+                "initial_tools": ["inspect_workspace"],
+                "risk_level": "read_only",
+            },
+            "mcp_servers": [],
+            "disabled_tools": [],
+        }) + "\n")
+        process.stdin.flush()
+        while True:
+            event = json.loads(process.stdout.readline())
+            if event.get("type") in {"run.completed", "run.failed"}:
+                break
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert event["type"] == "run.completed"
+    advertised = {
+        str(dict(tool.get("function", {}) or {}).get("name", ""))
+        for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
+        if isinstance(tool, dict)
+    }
+    assert advertised <= {"ask_user", "submit_plan"}
+
+
 def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch) -> None:
     client = PiAgentClient(
         workspace=tmp_path / "workspace.sqlite",
@@ -1255,6 +1338,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
             messages=[{"role": "user", "content": "search my library"}],
             task_mode="knowledge",
             task_contract={
+                **_TASK_CONTRACT_V2,
                 "contract_id": "contract-test",
                 "risk_level": "read_only",
                 "allowed_tools": ["kb_search"],
@@ -1338,7 +1422,11 @@ def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) ->
             messages=[{"role": "user", "content": "Do not use tools."}],
             thinking_level="off",
             task_mode="knowledge",
-            task_contract={"allowed_tools": [], "risk_level": "read_only"},
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "risk_level": "read_only",
+            },
             timeout_seconds=30,
             session_id="empty-lease-session",
         ))
@@ -1836,6 +1924,7 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
                 thinking_level="off",
                 task_mode="knowledge",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-tool-loop",
                     "autonomy": "read_only",
                     "risk_level": "read_only",
@@ -1904,6 +1993,7 @@ def test_plan_approval_defaults_to_deny_without_explicit_approve(tmp_path: Path)
                 thinking_level="off",
                 task_mode="general",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "allowed_tools": ["download_and_index"],
                     "risk_level": "reversible",
                     "requires_plan": True,
@@ -2007,6 +2097,7 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
                 thinking_level="off",
                 task_mode="web",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-web-budget",
                     "autonomy": "direct",
                     "risk_level": "read_only",
@@ -2054,6 +2145,7 @@ def test_pi_extends_soft_model_token_lease_instead_of_failing_sound_answer(tmp_p
                 thinking_level="off",
                 task_mode="general",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-progressive-model-budget",
                     "allowed_tools": [],
                     "initial_tool_budget": 3,
@@ -2156,6 +2248,7 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
     thread.start()
     client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     common_contract = {
+        **_TASK_CONTRACT_V2,
         "autonomy": "direct",
         "risk_level": "none",
         "allowed_tools": [],
@@ -2208,6 +2301,83 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
     )
     assert "Task contract turn-two: goal=second question." in second_system
     assert "Task contract turn-one: goal=first question." not in second_system
+
+
+@pytest.mark.parametrize("grant_first", [True, False])
+def test_pi_reused_session_applies_current_mcp_lease_in_both_directions(
+    tmp_path: Path,
+    grant_first: bool,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}"',
+        "allow_write": False,
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    base_contract = {
+        "schema_version": "scansci.task-contract.v2",
+        "version": 2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "risk_level": "read_only",
+        "initial_tool_budget": 2,
+        "max_tool_budget": 4,
+    }
+    try:
+        for turn, granted in enumerate((grant_first, not grant_first), start=1):
+            events = list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": f"turn {turn}"}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    **base_contract,
+                    "contract_id": f"mcp-turn-{turn}",
+                    "goal": f"turn {turn}",
+                    "allowed_mcp_servers": ["fixture"] if granted else [],
+                },
+                timeout_seconds=30,
+                session_id=f"mcp-lease-{'grant' if grant_first else 'revoke'}-first",
+            ))
+            assert events[-1]["type"] == "done"
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert len(_OpenAIPersistentHandler.request_payloads) == 2
+    tool_names_by_turn = []
+    for payload in _OpenAIPersistentHandler.request_payloads:
+        tool_names_by_turn.append({
+            str(dict(tool.get("function", {}) or {}).get("name", ""))
+            for tool in list(payload.get("tools", []) or [])
+            if isinstance(tool, dict)
+        })
+    mcp_names = {"mcp__fixture__search", "mcp__fixture__call"}
+    if grant_first:
+        assert mcp_names <= tool_names_by_turn[0]
+        assert mcp_names.isdisjoint(tool_names_by_turn[1])
+    else:
+        assert mcp_names.isdisjoint(tool_names_by_turn[0])
+        assert mcp_names <= tool_names_by_turn[1]
 
 
 def test_pi_cancel_aborts_active_sdk_run_without_killing_client(tmp_path: Path) -> None:
@@ -2342,7 +2512,7 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
             "api_key": "fixture-key",
             "model_id": "fixture-model",
             "thinking_level": "off",
-            "task_mode": "knowledge",
+            "task_mode": "general",
             "timeout_seconds": 30,
             "session_id": "compact-session",
         }
@@ -2351,6 +2521,15 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
             events = list(
                 client.stream_chat(
                     messages=[{"role": "user", "content": f"turn {turn}: alpha beta gamma " + ("context " * 5000)}],
+                    task_contract={
+                        "schema_version": "scansci.task-contract.v2",
+                        "version": 2,
+                        "contract_id": f"compact-turn-{turn}",
+                        "goal": f"turn {turn}: alpha beta gamma",
+                        "allowed_tools": [],
+                        "initial_tools": [],
+                        "risk_level": "read_only",
+                    },
                     **common,
                 )
             )
@@ -2365,3 +2544,6 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
     assert result["summary"]
     records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
     assert any(record.get("type") == "compaction" for record in records)
+    assert result["_base_prompt"]["contract_id"] == "compact-turn-3"
+    assert result["_base_prompt"]["request_id"]
+    assert len(result["_base_prompt"]["sha256"]) == 64

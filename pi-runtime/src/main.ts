@@ -60,6 +60,7 @@ interface McpToolPolicy {
 }
 
 interface NormalizedTaskContract {
+  contractValid: boolean;
   schemaVersion: string;
   contractId: string;
   goal: string;
@@ -652,24 +653,70 @@ function boundedInteger(value: unknown, fallback: number, minimum: number, maxim
   return Math.min(maximum, Math.max(minimum, Math.trunc(parsed)));
 }
 
+function taskContractVersion(raw: JsonRecord): { valid: boolean; schemaVersion: string } {
+  const schemaVersions = new Map<string, number>([
+    ["scansci.task-contract.v1", 1],
+    ["scansci.task-contract.v2", 2],
+  ]);
+  const schemaPresent = Object.prototype.hasOwnProperty.call(raw, "schema_version");
+  const versionPresent = Object.prototype.hasOwnProperty.call(raw, "version");
+  if (Object.prototype.hasOwnProperty.call(raw, "source_contract_valid") && raw.source_contract_valid !== true) {
+    return { valid: false, schemaVersion: "scansci.task-contract.v2" };
+  }
+  if (!schemaPresent && !versionPresent) {
+    return { valid: false, schemaVersion: "scansci.task-contract.v2" };
+  }
+
+  let schemaVersion: number | undefined;
+  if (schemaPresent) {
+    if (typeof raw.schema_version !== "string" || !schemaVersions.has(raw.schema_version)) {
+      return { valid: false, schemaVersion: "scansci.task-contract.v2" };
+    }
+    schemaVersion = schemaVersions.get(raw.schema_version);
+  }
+
+  let declaredVersion: number | undefined;
+  if (versionPresent) {
+    if (typeof raw.version === "number" && Number.isInteger(raw.version) && [1, 2].includes(raw.version)) {
+      declaredVersion = raw.version;
+    } else if (typeof raw.version === "string" && ["1", "2"].includes(raw.version)) {
+      declaredVersion = Number(raw.version);
+    } else {
+      return { valid: false, schemaVersion: "scansci.task-contract.v2" };
+    }
+  }
+
+  if (schemaVersion !== undefined && declaredVersion !== undefined && schemaVersion !== declaredVersion) {
+    return { valid: false, schemaVersion: "scansci.task-contract.v2" };
+  }
+  const resolved = schemaVersion ?? declaredVersion ?? 1;
+  return { valid: true, schemaVersion: `scansci.task-contract.v${resolved}` };
+}
+
 function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
   const raw = request.task_contract && typeof request.task_contract === "object"
     ? request.task_contract
     : {};
+  const version = taskContractVersion(raw);
+  const authority = version.valid ? raw : {};
   const fallbackBudget = toolCallBudget(String(request.task_mode || "general"));
-  const initialToolBudget = boundedInteger(raw.initial_tool_budget, fallbackBudget, 1, 24);
+  const initialToolBudget = boundedInteger(authority.initial_tool_budget, fallbackBudget, 1, 24);
   const maxToolBudget = boundedInteger(
-    raw.max_tool_budget,
+    authority.max_tool_budget,
     Math.max(initialToolBudget, fallbackBudget),
     initialToolBudget,
     32,
   );
   const modeParts = new Set(String(request.task_mode || "general").split("+").filter(Boolean));
-  const fallbackRisk = [...modeParts].some((part) => ["research", "slides"].includes(part))
-    ? "reversible"
-    : "read_only";
-  const requiredGroups = Array.isArray(raw.required_tool_groups)
-    ? raw.required_tool_groups
+  const fallbackRisk = version.valid
+    ? [...modeParts].some((part) => ["research", "slides"].includes(part))
+      ? "reversible"
+      : "read_only"
+    : "none";
+  const requiredGroups = !version.valid
+    ? []
+    : Array.isArray(authority.required_tool_groups)
+    ? authority.required_tool_groups
       .filter((group) => Array.isArray(group))
       .map((group) => new Set((group as unknown[]).map(String).filter(Boolean)))
       .filter((group) => group.size > 0)
@@ -678,62 +725,65 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
       finalUserRequestText(request.prompt || ""),
     );
   const tokenLease = boundedInteger(
-    raw.model_token_budget,
+    authority.model_token_budget,
     modelTokenBudget(String(request.task_mode || "general")),
     16_000,
     768_000,
   );
   const maxTokenLease = boundedInteger(
-    raw.max_model_token_budget,
+    authority.max_model_token_budget,
     maxModelTokenBudget(String(request.task_mode || "general")),
     tokenLease,
     1_000_000,
   );
   return {
-    schemaVersion: String(raw.schema_version || (Number(raw.version) === 2 ? "scansci.task-contract.v2" : "scansci.task-contract.v1")),
-    contractId: String(raw.contract_id || `legacy-${request.request_id}`),
+    contractValid: version.valid,
+    schemaVersion: version.schemaVersion,
+    contractId: String((version.valid ? raw.contract_id : "") || `${version.valid ? "legacy" : "invalid"}-${request.request_id}`),
     goal: String(raw.goal || finalUserRequestText(request.prompt || "")).slice(0, 1200),
     outputFormat: String(raw.output_format || "text").slice(0, 120),
     pausePolicy: String(raw.pause_policy || "pause only when a missing user choice changes the result").slice(0, 300),
     requiredEvidence: Array.isArray(raw.required_evidence)
       ? raw.required_evidence.map(String).filter(Boolean).slice(0, 12)
       : [],
-    autonomy: String(raw.autonomy || fallbackRisk),
-    riskLevel: String(raw.risk_level || fallbackRisk),
-    requiresPlan: raw.requires_plan === true,
+    autonomy: String(authority.autonomy || (version.valid ? fallbackRisk : "direct")),
+    riskLevel: String(authority.risk_level || fallbackRisk),
+    requiresPlan: authority.requires_plan === true,
     allowedTools: new Set(
-      Array.isArray(raw.allowed_tools)
-        ? raw.allowed_tools.map(String).filter(Boolean)
+      Array.isArray(authority.allowed_tools)
+        ? authority.allowed_tools.map(String).filter(Boolean)
         : [],
     ),
     initialTools: new Set(
-      Array.isArray(raw.initial_tools)
-        ? raw.initial_tools.map(String).filter((name) => (
-          Boolean(name) && Array.isArray(raw.allowed_tools) && raw.allowed_tools.map(String).includes(String(name))
+      Array.isArray(authority.initial_tools)
+        ? authority.initial_tools.map(String).filter((name) => (
+          Boolean(name) && Array.isArray(authority.allowed_tools) && authority.allowed_tools.map(String).includes(String(name))
         ))
-        : Array.isArray(raw.allowed_tools)
-          ? raw.allowed_tools.map(String).filter(Boolean)
+        : Array.isArray(authority.allowed_tools)
+          ? authority.allowed_tools.map(String).filter(Boolean)
           : [],
     ),
-    hasToolLease: Object.prototype.hasOwnProperty.call(raw, "allowed_tools") && Array.isArray(raw.allowed_tools),
+    hasToolLease: version.valid
+      && Object.prototype.hasOwnProperty.call(authority, "allowed_tools")
+      && Array.isArray(authority.allowed_tools),
     allowedMcpServers: new Set(
-      Array.isArray(raw.allowed_mcp_servers)
-        ? raw.allowed_mcp_servers.map(String).filter(Boolean)
+      Array.isArray(authority.allowed_mcp_servers)
+        ? authority.allowed_mcp_servers.map(String).filter(Boolean)
         : [],
     ),
-    hasMcpLease: Array.isArray(raw.allowed_mcp_servers),
+    hasMcpLease: version.valid && Array.isArray(authority.allowed_mcp_servers),
     requiredToolGroups: requiredGroups,
     successCriteria: Array.isArray(raw.success_criteria)
       ? raw.success_criteria.map(String).filter(Boolean).slice(0, 12)
       : [],
     initialToolBudget,
     maxToolBudget,
-    recoveryBudget: boundedInteger(raw.recovery_budget, 2, 1, 4),
+    recoveryBudget: boundedInteger(authority.recovery_budget, 2, 1, 4),
     modelTokenBudget: tokenLease,
     maxModelTokenBudget: maxTokenLease,
-    allowExternalWrite: raw.allow_external_write === true,
-    taskProfile: raw.task_profile && typeof raw.task_profile === "object"
-      ? raw.task_profile as JsonRecord
+    allowExternalWrite: authority.allow_external_write === true,
+    taskProfile: authority.task_profile && typeof authority.task_profile === "object"
+      ? authority.task_profile as JsonRecord
       : {},
   };
 }
@@ -782,6 +832,9 @@ function toolFingerprint(name: string, args: JsonRecord): string {
 function assertCapabilityLease(activeRun: ActiveRun, name: string, mcpPolicy?: McpToolPolicy): void {
   const risk = toolRisk(name, mcpPolicy);
   const contract = activeRun.taskContract;
+  if (!contract.contractValid) {
+    throw new Error("Capability lease denied because the task contract version is invalid.");
+  }
   if (!String(name).startsWith("mcp__") && (!contract.hasToolLease || !contract.allowedTools.has(name))) {
     throw new Error(`Capability lease denied tool ${name}; it is outside the current task contract.`);
   }
@@ -1991,12 +2044,16 @@ function taskContractSessionSignature(request: RunStart): JsonRecord {
   if (!request.task_contract) return {};
   const contract = normalizeTaskContract(request);
   return {
+    contractValid: contract.contractValid,
+    schemaVersion: contract.schemaVersion,
     autonomy: contract.autonomy,
     riskLevel: contract.riskLevel,
     requiresPlan: contract.requiresPlan,
     hasToolLease: contract.hasToolLease,
     allowedTools: [...contract.allowedTools].sort(),
     initialTools: [...contract.initialTools].sort(),
+    hasMcpLease: contract.hasMcpLease,
+    allowedMcpServers: [...contract.allowedMcpServers].sort(),
     requiredToolGroups: contract.requiredToolGroups
       .map((group) => [...group].sort())
       .sort((left, right) => left.join("|").localeCompare(right.join("|"))),
@@ -2007,6 +2064,16 @@ function taskContractSessionSignature(request: RunStart): JsonRecord {
     maxModelTokenBudget: contract.maxModelTokenBudget,
     allowExternalWrite: contract.allowExternalWrite,
   };
+}
+
+function mcpServerSessionSignature(request: RunStart): JsonRecord[] {
+  return (Array.isArray(request.mcp_servers) ? request.mcp_servers : []).map((server) => ({
+    serverId: String(server.id || server.name || ""),
+    // Keep credentials out of the signature while still rebuilding the Pi
+    // session for every configuration change that can alter the MCP schema,
+    // transport, effect policy, or definition labels.
+    configurationHash: stableHash(server),
+  }));
 }
 
 function sessionSignature(request: RunStart): string {
@@ -2025,7 +2092,7 @@ function sessionSignature(request: RunStart): string {
     // for every user message; only a real permission/budget change should
     // force a new Pi session and discard accumulated context.
     taskContractSessionSignature(request),
-    request.mcp_servers || [],
+    mcpServerSessionSignature(request),
     request.disabled_tools || [],
   ]);
 }
@@ -2077,7 +2144,7 @@ async function createSession(
   const loader = new DefaultResourceLoader({
     cwd: request.cwd,
     agentDir: request.agent_dir,
-    systemPromptOverride: () => systemPrompt(request),
+    systemPromptOverride: () => systemPrompt(requestRef.current),
     appendSystemPromptOverride: () => [],
     extensionFactories: [{
       name: "scansci-provider-request-guard",
@@ -2638,9 +2705,24 @@ async function compactSession(message: JsonRecord): Promise<void> {
     return;
   }
   try {
+    const currentRequest = state.requestRef.current;
+    const currentContract = normalizeTaskContract(currentRequest);
+    const baseSystemPrompt = systemPrompt(currentRequest);
+    const basePrompt = {
+      request_id: currentRequest.request_id,
+      contract_id: currentContract.contractId,
+      sha256: createHash("sha256").update(baseSystemPrompt).digest("hex"),
+    };
     const cleanup = pruneStaleToolResults(state);
     const result = await state.session.compact(String(message.instructions || "") || undefined);
-    emit({ type: "session.compact_completed", command_id: commandId, session_id: sessionId, result, stats: { ...sessionStats(state), contextCleanup: cleanup } });
+    emit({
+      type: "session.compact_completed",
+      command_id: commandId,
+      session_id: sessionId,
+      result,
+      base_prompt: basePrompt,
+      stats: { ...sessionStats(state), contextCleanup: cleanup },
+    });
   } catch (error) {
     emit({ type: "session.compact_failed", command_id: commandId, session_id: sessionId, error: errorText(error) });
   }
