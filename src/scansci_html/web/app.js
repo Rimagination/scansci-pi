@@ -61,6 +61,10 @@ const state = {
   activeStreamRunId: "",
   toolProgress: null,
   reviewDocument: null,
+  // Research documents are prepared alongside the task conversation, but
+  // opening a historical task must never hide the request that created it.
+  // The reader becomes full-page only after an explicit user action.
+  reviewDocumentOpen: false,
   reviewSaveDialog: {
     open: false,
     folderPath: "",
@@ -1270,6 +1274,16 @@ function safeEvidenceSourceUrl(value) {
   }
 }
 
+function citationPublicSourceUrl(record = {}) {
+  const supplied = safeEvidenceSourceUrl(record.original_url || record.source_url || record.url || "");
+  if (supplied) return supplied;
+  const doi = String(record.doi || "")
+    .trim()
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+    .replace(/^doi:\s*/i, "");
+  return doi && !/\s/.test(doi) ? safeEvidenceSourceUrl(`https://doi.org/${encodeURI(doi)}`) : "";
+}
+
 function sourceTitle(record = {}) {
   return String(record.paper || record.title || record.doc_id || "未命名来源");
 }
@@ -1302,7 +1316,12 @@ function showCitationPreview(citation, marker) {
   clearCitationPreviewTimer();
   const quote = compact(citation.exact_quote || "当前引用未保存原文摘录。", 460);
   const meta = evidenceMeta(citation);
-  preview.innerHTML = `<div class="citation-preview-kicker">证据 ${escapeHtml(citation.citation_id || "")}</div><h3>${escapeHtml(sourceTitle(citation))}</h3>${meta ? `<p class="citation-preview-meta">${escapeHtml(meta)}</p>` : ""}<blockquote>${escapeHtml(quote)}</blockquote><p class="citation-preview-hint">点击脚标可在本应用中查看全文与高亮原文。</p>`;
+  const hint = safeReaderUrl(citation)
+    ? "点击脚标可在本应用中查看全文与高亮原文。"
+    : citationPublicSourceUrl(citation)
+      ? "点击脚标可展开证据，并跳转公开原文。"
+      : "点击脚标可展开本次任务保存的证据摘录。";
+  preview.innerHTML = `<div class="citation-preview-kicker">证据 ${escapeHtml(citation.citation_id || "")}</div><h3>${escapeHtml(sourceTitle(citation))}</h3>${meta ? `<p class="citation-preview-meta">${escapeHtml(meta)}</p>` : ""}<blockquote>${escapeHtml(quote)}</blockquote><p class="citation-preview-hint">${escapeHtml(hint)}</p>`;
   preview.classList.add("is-visible");
   preview.setAttribute("aria-hidden", "false");
   const rect = marker.getBoundingClientRect();
@@ -1349,7 +1368,7 @@ function showEvidenceReader(citation, options = {}) {
 }
 
 function closeEvidenceReader() {
-  const returnPanel = state.evidenceReturnPanel === "review" && state.reviewDocument
+  const returnPanel = state.evidenceReturnPanel === "review" && state.reviewDocument && state.reviewDocumentOpen
     ? "review"
     : state.evidenceReturnPanel === "none" ? "none" : "sources";
   state.activeEvidence = null;
@@ -1570,7 +1589,7 @@ function renderReviewSaveDialog() {
         <div class="confirm-dialog-copy">
           <p class="confirm-dialog-eyebrow">保存研究笔记</p>
           <h2 id="reviewSaveDialogTitle">选择保存位置</h2>
-          <p class="confirm-dialog-subject">${escapeHtml(state.reviewDocument?.title || "证据综述")}</p>
+          <p class="confirm-dialog-subject">${escapeHtml(state.reviewDocument?.title || "研究稿件")}</p>
           <p class="confirm-dialog-message">会保存一份 Markdown 文件，同时登记到当前知识库，方便后续检索和查看。</p>
           <div class="review-save-location">
             <div class="review-save-location-copy"><span>目标文件夹</span><strong title="${escapeHtml(location)}">${escapeHtml(location)}</strong></div>
@@ -1597,7 +1616,7 @@ function renderReviewSaveDialog() {
 
 function openReviewSaveDialog() {
   if (!state.reviewDocument?.markdown) {
-    toast("当前没有可保存的证据综述稿件。", true);
+    toast("当前没有可保存的研究稿件。", true);
     return;
   }
   if (!state.notebook?.notebook_id) {
@@ -1693,7 +1712,7 @@ async function commitReviewAsNote() {
   const notebookId = state.notebook.notebook_id;
   try {
     const payload = {
-      title: state.reviewDocument.title || "证据综述",
+      title: state.reviewDocument.title || "研究稿件",
       body: state.reviewDocument.markdown,
       note_type: "literature_review",
     };
@@ -4149,6 +4168,8 @@ function openMcpMarketplace() {
 function startTask() {
   state.activeTaskId = "";
   state.directConversationId = "";
+  state.reviewDocument = null;
+  state.reviewDocumentOpen = false;
   state.sessionId = null;
   state.sessionTokens = 0;
   state.contextUsagePercent = 0;
@@ -4902,6 +4923,9 @@ async function askQuestion(event, inputId) {
   const isReviewWorkflow = inputId === "reviewQuestionInput";
   const selectedKnowledge = selectedKnowledgeNotebooks();
   const searchableKnowledgeSelected = selectedKnowledge.some((notebook) => Number(notebook.counts?.sources || 0) > 0);
+  const writingArtifactRoute = !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length
+    ? academicWritingArtifactRoute(mode, question, { searchableKnowledgeSelected })
+    : null;
   let routedTask = null;
   // General input stays general by default.  For an explicit, multi-step
   // product request the host may offer a durable route; the server repeats
@@ -4918,7 +4942,7 @@ async function askQuestion(event, inputId) {
       console.warn("Freeform task preview unavailable", error);
     }
   }
-  const isDirectConversation = !isReviewWorkflow && !routedTask && (mode === "general" || mode === "writing");
+  const isDirectConversation = !isReviewWorkflow && !routedTask && !writingArtifactRoute && (mode === "general" || mode === "writing");
   const directChatMode = isDirectConversation && searchableKnowledgeSelected ? "knowledge" : mode;
   const isStandaloneSlides = mode === "slides" && sourceFiles.length > 0;
   if (mode === "knowledge" && !selectedKnowledge.length && !isTaskFollowUp) {
@@ -4968,10 +4992,17 @@ async function askQuestion(event, inputId) {
     return;
   }
 
+  const plannedWorkflowType = String(
+    routedTask?.workflow_type
+      || writingArtifactRoute?.workflowType
+      || (isReviewWorkflow ? "literature_review" : mode === "deep-research" ? "deep_research" : ""),
+  );
+  const plannedResearchDocument = ["literature_review", "deep_research"].includes(plannedWorkflowType);
   button.disabled = true;
   let streamingMessage = null;
   byId("conversationTitle").textContent = compact(question, 80);
-  applyContextPanelPreset(directChatMode === "knowledge" ? "knowledge" : mode === "deep-research" ? "review" : "none");
+  if (!isTaskFollowUp) state.reviewDocumentOpen = false;
+  applyContextPanelPreset(directChatMode === "knowledge" ? "knowledge" : "none");
   setView("conversation");
   if (isTaskFollowUp) {
     renderPendingTaskFollowUp(activeRun, question, selectedSkills);
@@ -4980,7 +5011,9 @@ async function askQuestion(event, inputId) {
     byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
     followLatestConversationMessage();
   }
-  if (mode === "deep-research" || (mode === "knowledge" && state.evidenceOutputMode === "review")) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
+  if (plannedResearchDocument || (mode === "knowledge" && state.evidenceOutputMode === "review")) {
+    renderReviewDocument({ title: question, workflow_type: plannedWorkflowType, input: { question, document_kind: writingArtifactRoute?.workflowInput?.document_kind || "" }, status: "planning", progress: 0 }, null);
+  }
   try {
     if (isTaskFollowUp) {
       // Clear the composer before waiting for the task endpoint.  Follow-up
@@ -5132,7 +5165,7 @@ async function askQuestion(event, inputId) {
           workflowType: "auto",
           workflowInput: { question, task_origin: "freeform", skills: selectedSkillIds },
         }
-      : composerRun(mode, question, images, sourceFiles);
+      : writingArtifactRoute || composerRun(mode, question, images, sourceFiles);
     if (selectedSkillIds.length) workflowInput.skills = selectedSkillIds;
     if (isReviewWorkflow) Object.assign(workflowInput, reviewWorkflowPreferences());
     const run = await createResearchRun(workflowType, workflowInput);
@@ -5675,6 +5708,53 @@ function resolveResearchComposerMode(text) {
   const query = String(text || "");
   if (/(深度|系统综述|研究进展|证据分歧|争议|开放问题|全面调研|deep research)/i.test(query)) return "deep-research";
   return "academic";
+}
+
+function academicWritingIsEditingOnly(text = "") {
+  const request = String(text || "").trim();
+  if (!request) return false;
+  const asksForSources = /(联网|检索|调研|综述|文献|证据|引用|参考文献|来源|研究进展|研究现状|争议|开放问题|doi)/i.test(request);
+  const editingTask = /(润色|改写|翻译|校对|纠错|降重|续写|压缩|精简|调整语气|修改语法|优化表达)/i.test(request);
+  return editingTask && !asksForSources;
+}
+
+function academicWritingArtifactRoute(mode, text, { searchableKnowledgeSelected = false } = {}) {
+  if (mode !== "writing") return null;
+  const documentMetadata = {
+    document_kind: "academic_writing",
+    task_origin: "academic_writing",
+    writing_brief: {
+      audience: "researcher",
+      tone: "academic",
+      length: "long",
+      focus: "形成可追溯的学术稿件；实质性论断必须绑定可预览、可回到原始来源的引用",
+    },
+  };
+  // “强制联网” is authoritative. Deep Research intentionally uses only
+  // task-acquired public sources, so the document can say exactly where each
+  // citation came from instead of silently mixing it with a personal library.
+  if (state.webSearchMode === "on") {
+    return {
+      workflowType: "deep_research",
+      workflowInput: { question: text, limit: 36, max_search_rounds: 2, max_fulltext: 4, ...documentMetadata },
+    };
+  }
+  if (searchableKnowledgeSelected) {
+    return {
+      workflowType: "literature_review",
+      workflowInput: { question: text, ...documentMetadata },
+    };
+  }
+  // In automatic mode, ordinary academic composition is source-backed by
+  // default. Pure editing remains a low-latency direct conversation, and
+  // “不联网” always keeps the request with the selected writing model.
+  if (state.webSearchMode === "auto" && !academicWritingIsEditingOnly(text)) {
+    return {
+      workflowType: "deep_research",
+      workflowInput: { question: text, limit: 36, max_search_rounds: 2, max_fulltext: 4, ...documentMetadata },
+    };
+  }
+  return null;
 }
 
 function composerRun(mode, text, images = [], sourceFiles = []) {
@@ -7287,7 +7367,7 @@ function renderRun(run) {
   state.lastRunRenderKey = renderKey;
   const answerArea = byId("answerArea");
   const scrollSnapshot = conversationScrollSnapshot();
-  byId("conversationTitle").textContent = ["literature_review", "deep_research"].includes(run.workflow_type) ? (run.workflow_type === "deep_research" ? "深度研究" : "证据综述") : compact(runDisplayTitle(run), 80);
+  byId("conversationTitle").textContent = ["literature_review", "deep_research"].includes(run.workflow_type) ? researchDocumentPresentation(run).conversationTitle : compact(runDisplayTitle(run), 80);
   const percent = Math.round((run.progress || 0) * 100);
   const evidenceIndex = run.workflow_type === "evidence_index" ? evidenceIndexContext(run) : null;
   const stageCalls = new Map((run.tool_calls || []).map((call) => [call.stage_id, call]));
@@ -7358,7 +7438,7 @@ function renderRun(run) {
   if (["literature_review", "deep_research"].includes(run.workflow_type)) {
     const reviewModel = artifact?.payload ? buildReviewDocumentModel(run, artifact) : null;
     state.reviewDocument = reviewModel;
-    applyContextPanelPreset(contextPanelPresetForRun(run));
+    applyContextPanelPreset(state.reviewDocumentOpen ? "review" : "none");
     renderReviewDocument(run, artifact, reviewModel);
     byId("answerArea").innerHTML = reviewTaskMarkup(run, reviewModel, { percent, stages, actions });
     if (run.status === "completed" && scrollSnapshot.top === 0) {
@@ -7371,6 +7451,7 @@ function renderRun(run) {
     return;
   }
   state.reviewDocument = null;
+  state.reviewDocumentOpen = false;
   // The primary artifact owns the canvas. Only workflows whose normal use
   // depends on sources receive a persistent context panel; citations can
   // still open the evidence reader temporarily from every artifact.
@@ -7573,7 +7654,35 @@ function reviewDisplayTitle(run, supplied = {}) {
     .replace(/^(?:撰写|写|生成|整理)(?:一篇|一份)?(?:中文)?(?:文献)?综述[：:]?\s*/, "")
     .replace(/(?:有哪些|有什么)?(?:可用)?证据[？?]?$/, "")
     .replace(/^[\s，,：:。；;？?"'“”]+|[\s，,：:。；;？?"'“”]+$/g, "");
-  return topic ? `${topic.slice(0, 52)}：证据综述` : "文献证据综述";
+  const documentKind = String(run?.input?.document_kind || "");
+  const suffix = documentKind === "academic_writing"
+    ? "学术稿件"
+    : run?.workflow_type === "deep_research" ? "研究报告" : "证据综述";
+  return topic ? `${topic.slice(0, 52)}：${suffix}` : documentKind === "academic_writing" ? "学术写作稿件" : run?.workflow_type === "deep_research" ? "深度研究报告" : "文献证据综述";
+}
+
+function researchDocumentPresentation(run = {}, model = {}) {
+  const workflowType = String(run?.workflow_type || model?.workflowType || "literature_review");
+  const documentKind = String(run?.input?.document_kind || model?.documentKind || "");
+  const academicWriting = documentKind === "academic_writing";
+  const deepResearch = workflowType === "deep_research";
+  const evidenceLevel = String(model?.evidenceLevel || "");
+  const originLabel = deepResearch
+    ? evidenceLevel === "task_acquired_fulltext" || evidenceLevel === "fulltext"
+      ? "本次联网调查取得的全文"
+      : evidenceLevel === "external_source_abstracts"
+        ? "公开学术摘要"
+        : "联网学术来源"
+    : "所选知识库原文";
+  return {
+    conversationTitle: academicWriting ? "学术写作" : deepResearch ? "深度研究" : "证据综述",
+    toolbarTitle: academicWriting ? (deepResearch ? "联网学术写作" : "学术写作稿件") : deepResearch ? "深度研究报告" : "证据综述稿件",
+    kicker: academicWriting ? "学术写作" : deepResearch ? "深度研究" : "证据综述",
+    agentLabel: academicWriting ? "ScanSci 学术写作智能体" : deepResearch ? "ScanSci 深度研究智能体" : "ScanSci 写作智能体",
+    requestLabel: academicWriting ? "本次写作请求" : "本次研究请求",
+    openLabel: academicWriting || deepResearch ? "打开报告" : "打开稿件",
+    originLabel,
+  };
 }
 
 function evidenceIndexContext(run) {
@@ -7663,6 +7772,10 @@ function buildReviewDocumentModel(run, artifact) {
   const title = reviewDisplayTitle(run, supplied);
   const model = {
     title,
+    workflowType: String(run?.workflow_type || "literature_review"),
+    documentKind: String(run?.input?.document_kind || ""),
+    requestText: runUserPromptText(run),
+    writingBrief: run?.input?.writing_brief && typeof run.input.writing_brief === "object" ? { ...run.input.writing_brief } : {},
     abstract,
     sections,
     scope,
@@ -7676,6 +7789,7 @@ function buildReviewDocumentModel(run, artifact) {
     citationCount: Number(reader.citation_count || citations.length || 0),
     evidenceNotice,
     evidenceLevel,
+    sourceScope: payload.source_scope && typeof payload.source_scope === "object" ? { ...payload.source_scope } : {},
     researchTrace,
     verified,
     insufficientEvidence,
@@ -7704,6 +7818,7 @@ function reviewDocumentMarkdown(model) {
   const lines = [
     `# ${model.title}`,
     "",
+    ...(model.requestText ? ["> 原始请求", ">", ...String(model.requestText).split("\n").map((line) => `> ${line}`), ""] : []),
     "## 摘要",
     "",
     citedText(model.abstract),
@@ -7732,19 +7847,45 @@ function reviewDocumentMarkdown(model) {
   }
   lines.push("", "## 证据边界", "");
   if (model.limitations.length) model.limitations.forEach((item) => lines.push(`- ${item}`));
-  else lines.push("- 本综述仅综合当前项目资料库中的可核验证据，未覆盖的研究方向不代表不存在相关工作。");
+  else if (model.workflowType === "deep_research") lines.push("- 本稿件仅综合本次联网研究任务取得的可追溯来源；未检索到的研究不代表不存在。");
+  else lines.push("- 本稿件仅综合当前项目资料库中的可核验证据；未覆盖的研究方向不代表不存在相关工作。");
   lines.push("", "## 参考文献", "");
-  model.citations.forEach((citation, index) => lines.push(`${citation.citation_id || index + 1}. ${citation.paper}${citation.doi ? ` — ${citation.doi}` : ""}`));
+  model.citations.forEach((citation, index) => {
+    const sourceUrl = citationPublicSourceUrl(citation);
+    const source = sourceUrl ? ` — ${sourceUrl}` : citation.doi ? ` — https://doi.org/${citation.doi}` : "";
+    lines.push(`${citation.citation_id || index + 1}. ${citation.paper}${source}`);
+  });
   return lines.join("\n").trim();
 }
 
 function reviewCitationButtons(ids = []) {
-  return ids.map((id) => `<button type="button" class="review-inline-citation" data-action="open-review-citation" data-citation-id="${escapeHtml(id)}" aria-label="查看证据 ${escapeHtml(id)}">${escapeHtml(id)}</button>`).join("");
+  return ids.map((id) => `<button type="button" class="review-inline-citation" data-action="open-review-citation" data-citation-id="${escapeHtml(id)}" aria-label="预览证据 ${escapeHtml(id)}" aria-haspopup="dialog" title="预览证据 ${escapeHtml(id)}">${escapeHtml(id)}</button>`).join("");
 }
 
 function reviewCitedTextMarkup(item) {
   const sentences = item?.sentences?.length ? item.sentences : [item || {}];
   return sentences.map((sentence) => `${escapeHtml(sentence.text || "")}${reviewCitationButtons(sentence.citation_ids || [])}`).join(" ");
+}
+
+function bindReviewCitationInteractions(model, scope = byId("reviewDocumentPanel")) {
+  if (!scope || !model) return;
+  const citations = new Map((model.citations || []).map((citation) => [String(citation.citation_id), citation]));
+  scope.querySelectorAll('[data-action="open-review-citation"]').forEach((marker) => {
+    const citation = citations.get(String(marker.dataset.citationId || ""));
+    if (!citation) return;
+    marker.addEventListener("pointerenter", () => showCitationPreview(citation, marker));
+    marker.addEventListener("pointerleave", deferCitationPreviewHide);
+    marker.addEventListener("focus", () => showCitationPreview(citation, marker));
+    marker.addEventListener("blur", deferCitationPreviewHide);
+    marker.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") hideCitationPreview();
+    });
+  });
+  const preview = byId("citationPreview");
+  if (preview) {
+    preview.onpointerenter = clearCitationPreviewTimer;
+    preview.onpointerleave = deferCitationPreviewHide;
+  }
 }
 
 function reviewDocumentProgressMarkup(run) {
@@ -7775,6 +7916,7 @@ function reviewDocumentProgressMarkup(run) {
 }
 
 function reviewTaskMarkup(run, model, { percent, stages, actions }) {
+  const presentation = researchDocumentPresentation(run, model || {});
   const outline = model?.outline || [
     { id: "review-abstract", title: "摘要" },
     { id: "review-synthesis", title: "主题证据综合" },
@@ -7785,7 +7927,7 @@ function reviewTaskMarkup(run, model, { percent, stages, actions }) {
   const completed = (run.stages || []).filter((stage) => stage.status === "completed").length;
   const total = (run.stages || []).length;
   const summary = run.status === "completed" ? "全部步骤已完成" : runStatusLabel(run);
-  const failure = run.status === "failed" ? `<div class="review-workflow-error"><strong>证据综述没有生成</strong><p>${escapeHtml(runFailureSummary(run))}</p><button type="button" data-action="open-settings" data-settings-panel="models">配置写作模型</button></div>` : "";
+  const failure = run.status === "failed" ? `<div class="review-workflow-error"><strong>${escapeHtml(presentation.toolbarTitle)}没有生成</strong><p>${escapeHtml(runFailureSummary(run))}</p><button type="button" data-action="open-settings" data-settings-panel="models">配置写作模型</button></div>` : "";
   const userMessage = conversationMessageMarkup({
     role: "user",
     content: runUserPromptText(run),
@@ -7793,20 +7935,33 @@ function reviewTaskMarkup(run, model, { percent, stages, actions }) {
     createdAt: run.created_at,
     classes: "review-conversation-message",
   });
-  return `<article class="review-task-shell">${userMessage}<div class="review-agent-head"><div class="review-agent-identity"><img src="/scansci-mark.png" alt="" /><span>ScanSci 写作智能体</span></div><span class="review-agent-meta">${percent}% · ${escapeHtml(runStatusLabel(run))}</span></div>${failure}<section class="review-outline-card"><span>Review outline</span><h2>${escapeHtml(model?.title || runDisplayTitle(run))}</h2><ol class="review-outline-list">${outlineMarkup}</ol><div class="review-run-actions">${actions}<button type="button" class="review-open-document" data-action="open-review-document" ${model ? "" : "disabled"}>打开稿件</button></div></section><details class="review-steps"><summary>${escapeHtml(summary)}<span>${completed}/${total}</span></summary><ol class="run-stage-list">${stages}</ol></details>${runCompletionMessageMarkup(run)}${taskConversationMarkup(run)}</article>`;
+  return `<article class="review-task-shell">${userMessage}<div class="review-agent-head"><div class="review-agent-identity"><img src="/scansci-mark.png" alt="" /><span>${escapeHtml(presentation.agentLabel)}</span></div><span class="review-agent-meta">${percent}% · ${escapeHtml(runStatusLabel(run))}</span></div>${failure}<section class="review-outline-card"><span>Research outline</span><h2>${escapeHtml(model?.title || runDisplayTitle(run))}</h2><ol class="review-outline-list">${outlineMarkup}</ol><div class="review-run-actions">${actions}<button type="button" class="review-open-document" data-action="open-review-document">${escapeHtml(model ? presentation.openLabel : "查看研究进度")}</button></div></section><details class="review-steps"><summary>${escapeHtml(summary)}<span>${completed}/${total}</span></summary><ol class="run-stage-list">${stages}</ol></details>${runCompletionMessageMarkup(run)}${taskConversationMarkup(run)}</article>`;
+}
+
+function reviewRequestContextMarkup(run, model, presentation) {
+  const request = String(model?.requestText || runUserPromptText(run) || "").trim();
+  if (!request) return "";
+  const steps = (run.stages || [])
+    .map((stage) => String(stage.title || "").trim())
+    .filter(Boolean);
+  const stepMarkup = steps.length
+    ? `<ol>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>`
+    : "<p>检索来源、抽取证据、生成正文并核验引用。</p>";
+  return `<details class="review-request-context"><summary><span>${escapeHtml(presentation.requestLabel)}</span><strong>${escapeHtml(compact(request, 92))}</strong><em>查看原始请求与生成方式</em>${uiIcon("chevron-down")}</summary><div class="review-request-context-body"><section><span>原始请求（实际提交内容）</span><p>${escapeHtml(request)}</p><button type="button" data-action="return-review-conversation">返回完整对话</button></section><section><span>本页如何形成</span>${stepMarkup}<p class="review-request-origin">引用证据来自：${escapeHtml(presentation.originLabel)}。正文与引用锚点分开生成，并在交付前校验对应关系。</p></section></div></details>`;
 }
 
 function renderReviewDocument(run, artifact, model = null) {
   const target = byId("reviewDocumentPanel");
   if (!target) return;
   const ready = Boolean(model);
+  const presentation = researchDocumentPresentation(run, model || {});
   const percent = Math.max(0, Math.min(100, Math.round(Number(run.progress || 0) * 100)));
   const currentStage = (run.stages || []).find((stage) => stage.status === "running")
     || (run.stages || []).find((stage) => stage.key === run.current_stage);
-  const title = ready ? "证据综述稿件" : compact(runDisplayTitle(run) || "正在生成证据综述", 72);
+  const title = ready ? presentation.toolbarTitle : compact(runDisplayTitle(run) || `正在生成${presentation.toolbarTitle}`, 72);
   const summary = ready ? (model.legacy ? "旧版任务 · 仅包含证据摘录，请重新生成" : model.insufficientEvidence ? `证据不足 · ${model.discoveryLeads.length} 条检索线索` : `${model.documentCount} 篇来源 · ${model.citationCount} 个证据锚点${model.verified ? " · 引用已核验" : ""}`) : `${percent}% · ${currentStage?.title || runStatusLabel(run)}`;
   const tabButtons = `<nav class="review-document-tabs" aria-label="稿件视图"><button type="button" class="is-active" data-action="review-document-tab" data-review-tab="preview" ${ready ? "" : "disabled"}>预览</button><button type="button" data-action="review-document-tab" data-review-tab="source" ${ready ? "" : "disabled"}>Markdown</button></nav>`;
-  const toolbar = `<header class="review-panel-toolbar"><div class="review-document-identity"><span class="review-file-icon">${uiIcon("file-plus")}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></div></div><div class="review-toolbar-cluster">${tabButtons}<div class="review-toolbar-actions"><button type="button" class="review-save-note" data-action="save-review-note" ${ready ? "" : "disabled"}>保存为笔记</button><button type="button" class="review-icon-button" data-action="copy-review-document" aria-label="复制稿件" title="复制稿件" ${ready ? "" : "disabled"}>${uiIcon("copy")}</button><button type="button" class="review-icon-button" data-action="refresh-review-document" aria-label="刷新稿件" title="刷新稿件">${uiIcon("refresh")}</button><button type="button" class="review-icon-button" data-action="download-review-document" aria-label="下载 Markdown" title="下载 Markdown" ${ready ? "" : "disabled"}>${uiIcon("download")}</button><button type="button" class="review-icon-button" data-action="close-review-document" aria-label="关闭稿件" title="关闭稿件">${uiIcon("x")}</button></div></div></header>`;
+  const toolbar = `<header class="review-panel-toolbar"><div class="review-toolbar-leading"><button type="button" class="review-back-conversation" data-action="return-review-conversation">${uiIcon("arrow-left")}<span>返回对话</span></button><div class="review-document-identity"><span class="review-file-icon">${uiIcon("file-plus")}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></div></div></div><div class="review-toolbar-cluster">${tabButtons}<div class="review-toolbar-actions"><button type="button" class="review-save-note" data-action="save-review-note" ${ready ? "" : "disabled"}>保存为笔记</button><button type="button" class="review-icon-button" data-action="copy-review-document" aria-label="复制稿件" title="复制稿件" ${ready ? "" : "disabled"}>${uiIcon("copy")}</button><button type="button" class="review-icon-button" data-action="refresh-review-document" aria-label="刷新稿件" title="刷新稿件">${uiIcon("refresh")}</button><button type="button" class="review-icon-button" data-action="download-review-document" aria-label="下载 Markdown" title="下载 Markdown" ${ready ? "" : "disabled"}>${uiIcon("download")}</button></div></div></header>`;
   if (!ready) {
     const failed = run.status === "failed";
     const body = failed
@@ -7820,13 +7975,19 @@ function renderReviewDocument(run, artifact, model = null) {
   const controversies = model.controversies.length ? `<section id="review-controversies"><h2>证据分歧与争议</h2><div class="review-finding-list">${model.controversies.map((item, index) => `<article><span>${String(index + 1).padStart(2, "0")}</span><p>${reviewCitedTextMarkup(item)}</p></article>`).join("")}</div></section>` : "";
   const openQuestions = model.openQuestions.length ? `<section id="review-open-questions"><h2>开放问题</h2><div class="review-question-grid">${model.openQuestions.map((item, index) => `<article><span>Q${index + 1}</span><h3>${reviewCitedTextMarkup(item)}</h3>${item.basis ? `<p>${escapeHtml(item.basis)}</p>` : ""}</article>`).join("")}</div></section>` : "";
   const discovery = model.discoveryLeads.length ? `<section id="review-discovery"><h2>检索候选</h2><p class="review-discovery-notice">这些记录来自多源学术搜索；只有标记“已获取全文”的论文才可能进入上方句级证据链。</p><ol class="review-reference-list">${model.discoveryLeads.map((item) => `<li><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml([item.year, item.venue, item.doi].filter(Boolean).join(" · "))}</span><br /><small>${escapeHtml(item.sources.join(" + "))}${item.acquired ? " · 已获取全文" : " · 发现线索"}</small></li>`).join("")}</ol></section>` : "";
-  const limitations = model.limitations.length ? model.limitations.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : "<p>本综述仅综合当前项目资料库中的可核验证据；未覆盖的研究方向不代表不存在相关工作。</p>";
-  const references = model.citations.length ? model.citations.map((citation) => `<li><strong>${escapeHtml(citation.paper)}</strong><span>${escapeHtml([citation.section, citation.doi].filter(Boolean).join(" · "))}</span><br /><button type="button" data-action="open-review-citation" data-citation-id="${escapeHtml(citation.citation_id)}">查看证据与原文锚点</button></li>`).join("") : "<li>当前稿件没有可回跳引用。</li>";
+  const defaultLimitation = run.workflow_type === "deep_research"
+    ? "本报告只使用本次联网研究任务取得且可追溯的学术来源；未检索到的研究不代表不存在。"
+    : "本稿件仅综合当前知识库中的可核验证据；未覆盖的研究方向不代表不存在相关工作。";
+  const limitations = model.limitations.length ? model.limitations.map((item) => `<p>${escapeHtml(item)}</p>`).join("") : `<p>${escapeHtml(defaultLimitation)}</p>`;
+  const references = model.citations.length ? model.citations.map((citation) => `<li><strong>${escapeHtml(citation.paper)}</strong><span>${escapeHtml([citation.section, citation.doi].filter(Boolean).join(" · "))}</span><br /><button type="button" data-action="open-review-citation" data-citation-id="${escapeHtml(citation.citation_id)}">预览证据与来源</button></li>`).join("") : "<li>当前稿件没有可回跳引用。</li>";
   const legacyNotice = model.legacy ? `<div class="review-legacy-notice"><strong>这不是完整综述</strong><p>该任务由旧版流程生成，只包含检索摘录。请回到写作模式重新生成，新的流程会完成章节检索、跨论文比较、争议分析和开放问题。</p></div>` : "";
-  const evidenceNotice = model.evidenceNotice ? `<div class="review-evidence-notice"><strong>${model.evidenceLevel === "fulltext" ? "全文证据链" : "证据范围"}</strong><p>${escapeHtml(model.evidenceNotice)}</p></div>` : "";
-  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">证据综述 <span>${model.legacy ? "旧版摘录" : model.insufficientEvidence ? "证据不足" : model.verified ? "引用已核验" : "待人工复核"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${model.insufficientEvidence ? "证据不足，未生成科学结论" : model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${legacyNotice}${evidenceNotice}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${reviewCitedTextMarkup(model.abstract)}</p></section>${sections}${comparison}${controversies}${openQuestions}${discovery}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
+  const fulltextEvidence = ["fulltext", "task_acquired_fulltext"].includes(model.evidenceLevel);
+  const evidenceNotice = model.evidenceNotice ? `<div class="review-evidence-notice"><strong>${fulltextEvidence ? "全文证据链" : "证据范围"}</strong><p>${escapeHtml(model.evidenceNotice)}</p></div>` : "";
+  const requestContext = reviewRequestContextMarkup(run, model, presentation);
+  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">${escapeHtml(presentation.kicker)} <span>${model.legacy ? "旧版摘录" : model.insufficientEvidence ? "证据不足" : model.verified ? "引用已核验" : "待人工复核"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${escapeHtml(presentation.originLabel)}</span><span>${model.insufficientEvidence ? "证据不足，未生成科学结论" : model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${requestContext}${legacyNotice}${evidenceNotice}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${reviewCitedTextMarkup(model.abstract)}</p></section>${sections}${comparison}${controversies}${openQuestions}${discovery}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
   const source = `<div class="review-document-view review-source-view" data-review-view="source"><pre><code>${escapeHtml(model.markdown)}</code></pre></div>`;
   target.innerHTML = `${toolbar}<div class="review-document-body">${preview}${source}<aside class="review-evidence-drawer" id="reviewEvidenceDrawer" aria-live="polite"></aside></div>`;
+  bindReviewCitationInteractions(model, target);
 }
 
 function researchIdeaCardMarkup(payload) {
@@ -8053,6 +8214,8 @@ async function openDirectConversation(conversationId, { record = true } = {}) {
   if (!id) return;
   const conversation = await request(`/api/chat/history/${encodeURIComponent(id)}`);
   state.activeTaskId = "";
+  state.reviewDocument = null;
+  state.reviewDocumentOpen = false;
   state.directConversationId = id;
   state.directMessages = Array.isArray(conversation.messages) ? conversation.messages : [];
   state.sessionId = conversation.session_id || null;
@@ -8087,6 +8250,7 @@ async function openTask(id, { record = true } = {}) {
     upsertRun(displayRun);
     state.activeTaskId = displayRun.run_id;
     state.directConversationId = "";
+    state.reviewDocumentOpen = false;
     window.localStorage.setItem("scansci.active.task", displayRun.run_id);
     window.localStorage.removeItem("scansci.active.direct");
     state.sessionId = `research-run-${displayRun.run_id}`;
@@ -8096,7 +8260,7 @@ async function openTask(id, { record = true } = {}) {
       const composer = byId("chatQuestionInput");
       if (composer) composer.placeholder = "通用模式可继续讨论；幻灯片模式可选择模板后重新制作";
     }
-    byId("conversationTitle").textContent = ["literature_review", "deep_research"].includes(run.workflow_type) ? (run.workflow_type === "deep_research" ? "深度研究" : "证据综述") : compact(runDisplayTitle(run), 80);
+    byId("conversationTitle").textContent = ["literature_review", "deep_research"].includes(run.workflow_type) ? researchDocumentPresentation(run).conversationTitle : compact(runDisplayTitle(run), 80);
     // A direct-chat render can leave the previous task's render key behind.
     // Invalidate it whenever a history item is opened so the fetched run,
     // including its durable message history, replaces the visible thread.
@@ -11284,10 +11448,11 @@ function showReviewCitation(citationId) {
   const citation = state.reviewDocument?.citations?.find((item) => String(item.citation_id) === String(citationId));
   const drawer = byId("reviewEvidenceDrawer");
   if (!citation || !drawer) return;
+  hideCitationPreview();
   const sourceMeta = [citation.section, citation.doi, citation.evidence_id].filter(Boolean).join(" · ");
   const readerButton = safeReaderUrl(citation) ? `<button type="button" data-action="open-review-evidence-reader" data-citation-id="${escapeHtml(citation.citation_id)}">在应用中定位原文</button>` : "";
-  const externalUrl = safeEvidenceSourceUrl(citation.original_url);
-  const externalButton = externalUrl ? `<a class="review-evidence-link" href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener noreferrer">打开公开来源 ${uiIcon("arrow-up-right")}</a>` : "";
+  const externalUrl = citationPublicSourceUrl(citation);
+  const externalButton = externalUrl ? `<a class="review-evidence-link" href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener noreferrer">打开原始来源 ${uiIcon("arrow-up-right")}</a>` : "";
   drawer.innerHTML = `<div class="review-evidence-head"><div><span>Evidence ${escapeHtml(citation.citation_id)}</span><strong>${escapeHtml(citation.paper)}</strong></div><button type="button" class="review-icon-button" data-action="close-review-evidence" aria-label="关闭证据">×</button></div><div class="review-evidence-body"><small>${escapeHtml(sourceMeta)}</small><blockquote>${escapeHtml(compact(citation.exact_quote || "当前引用没有保存原文摘录。", 900))}</blockquote>${readerButton}${externalButton}</div>`;
   hydrateIcons(drawer);
   drawer.classList.add("is-open");
@@ -11326,7 +11491,7 @@ async function copyConversationMessage(button) {
 async function copyReviewDocument() {
   if (!state.reviewDocument?.markdown) return;
   await copyTextToClipboard(state.reviewDocument.markdown);
-  toast("综述 Markdown 已复制");
+  toast("研究稿件 Markdown 已复制");
 }
 
 function downloadReviewDocument() {
@@ -11335,7 +11500,7 @@ function downloadReviewDocument() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `${state.reviewDocument.title.replace(/[\\/:*?"<>|]+/g, "-").slice(0, 64) || "ScanSci-综述"}.md`;
+  link.download = `${state.reviewDocument.title.replace(/[\\/:*?"<>|]+/g, "-").slice(0, 64) || "ScanSci-研究稿件"}.md`;
   link.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
@@ -11781,8 +11946,10 @@ document.addEventListener("click", (event) => {
   }
   else if (action === "review-document-tab") switchReviewDocumentTab(element.dataset.reviewTab || "preview");
   else if (action === "scroll-review-section") {
+    state.reviewDocumentOpen = true;
+    applyContextPanelPreset("review");
     switchReviewDocumentTab("preview");
-    byId(element.dataset.sectionId || "review-abstract")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.requestAnimationFrame(() => byId(element.dataset.sectionId || "review-abstract")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
   else if (action === "open-review-citation") showReviewCitation(element.dataset.citationId || "");
   else if (action === "close-review-evidence") byId("reviewEvidenceDrawer")?.classList.remove("is-open");
@@ -11825,8 +11992,15 @@ document.addEventListener("click", (event) => {
     element.textContent = focused ? "↙" : "↗";
     element.setAttribute("aria-label", focused ? "退出专注阅读" : "专注阅读");
   }
-  else if (action === "close-review-document") applyContextPanelPreset("evidence");
-  else if (action === "open-review-document") applyContextPanelPreset("review");
+  else if (["close-review-document", "return-review-conversation"].includes(action)) {
+    state.reviewDocumentOpen = false;
+    hideCitationPreview();
+    applyContextPanelPreset("none");
+  }
+  else if (action === "open-review-document") {
+    state.reviewDocumentOpen = true;
+    applyContextPanelPreset("review");
+  }
   else if (action === "toggle-evidence-panel-expand") toggleEvidencePanelExpanded();
   else if (action === "toggle-context-panel") toggleContextPanel();
   else if (action === "toggle-sidebar") toggleSidebar();

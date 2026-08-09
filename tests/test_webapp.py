@@ -419,19 +419,42 @@ def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public
     assert ".run-event-trace" in styles
 
 
-def test_review_document_ui_does_not_replay_the_user_instruction(tmp_path: Path):
+def test_research_document_ui_preserves_request_conversation_and_source_navigation(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    index = app.dispatch("GET", "/").body.decode("utf-8")
 
     assert "function reviewDisplayTitle" in script
     assert "Transformer、BERT 与 GPT-3：架构、训练与能力边界" in script
-    assert 'class="review-request"' not in script
-    assert 'if (model.scope) lines.push("", "> 研究范围"' not in script
-    assert 'const scope = model.scope ?' not in script
-    assert 'const title = ready ? "证据综述稿件"' in script
-    assert ".review-request" not in styles
+    assert "function researchDocumentPresentation" in script
+    assert "function reviewRequestContextMarkup" in script
+    assert 'class="review-request-context"' in script
+    assert 'data-action="return-review-conversation"' in script
+    assert "reviewDocumentOpen: false" in script
+    assert 'applyContextPanelPreset(state.reviewDocumentOpen ? "review" : "none")' in script
+    assert 'aria-label="研究稿件"' in index
+    assert "function citationPublicSourceUrl" in script
+    assert "function bindReviewCitationInteractions" in script
+    assert "打开原始来源" in script
+    assert ".review-request-context" in styles
+    assert '--editorial: "Iowan Old Style", "Noto Serif SC", "Songti SC", Georgia, serif;' in styles
     assert "font-size: clamp(23px, 1.7vw, 28px)" in styles
+
+
+def test_academic_writing_routes_source_backed_requests_to_research_documents(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert "function academicWritingArtifactRoute" in script
+    assert 'document_kind: "academic_writing"' in script
+    assert 'task_origin: "academic_writing"' in script
+    assert 'workflowType: "deep_research"' in script
+    assert 'workflowType: "literature_review"' in script
+    assert "!writingArtifactRoute" in script
+    assert 'evidenceLevel === "external_source_abstracts"' in script
+    assert '"公开学术摘要"' in script
+    assert '"所选知识库原文"' in script
 
 
 def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(tmp_path: Path):
@@ -2228,7 +2251,7 @@ def test_plain_greeting_uses_host_classified_compact_prompt(
     profile = result["agent_runtime"]["task_profile"]
     assert profile["route"] == "direct_chat"
     assert profile["cognitive_complexity"] == "low"
-    assert result["agent_runtime"]["task_contract"]["allowed_tools"] == []
+    assert result["agent_runtime"]["task_contract"]["allowed_tools"] == ["agent_reach", "browser_access", "discover_papers", "search_web", "self_assess", "verify_doi"]
     system = observed["messages"][0]["content"]
     assert system.startswith("You are ScanSci, a scientific assistant.")
     assert "HOST-OWNED TASK CONTRACT" not in system

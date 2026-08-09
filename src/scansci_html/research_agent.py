@@ -2786,9 +2786,11 @@ class ResearchAgentRuntime:
     @staticmethod
     def _pi_eligible(chat_request: _DirectChatRequest, payload: dict[str, Any]) -> bool:
         requested_harness = str(payload.get("agent_harness", "pi") or "pi").strip().lower()
+        # Local models are no longer blanket-blocked from Pi.  Many Ollama/
+        # LM Studio models support tool calling (Qwen, Llama 3, etc.), and
+        # the fallback at _complete_with_pi adequately handles failures.
         return (
             requested_harness not in {"legacy", "direct", "fixed-workflow"}
-            and chat_request.provider_kind != "local"
             and all(isinstance(item.get("content"), str) for item in chat_request.messages)
         )
 
@@ -3175,14 +3177,14 @@ class ResearchAgentRuntime:
         if (
             search_mode in {"on", "auto"}
             and not cls._local_only_intent(final_user_text)
-            and "research" not in parts
             and "web" not in parts
         ):
             web_part = "web" if search_mode == "on" else "web-auto"
-            # Merely leaving the global web toggle on must not override an
-            # explicit local-KB request.  A knowledge+web union is added only
-            # when the user also asks for public/current online information.
-            if not knowledge_intent or explicit_public_web:
+            # When the user has explicitly turned web search ON, honour that
+            # unconditionally — even when knowledge intent is present, the
+            # user likely wants both local and public results.  "auto" mode
+            # remains more conservative.
+            if search_mode == "on" or not knowledge_intent or explicit_public_web:
                 parts.append(web_part)
 
         if not parts:
@@ -7972,6 +7974,12 @@ class ResearchAgentRuntime:
 
         payload = dict(run.get("input", {}) or {})
         question = str(payload.get("question", "")).strip()
+        requested_writing_brief = dict(payload.get("writing_brief", {}) or {})
+        requested_focus = str(requested_writing_brief.get("focus", "")).strip()
+        fulltext_focus = (
+            "Prioritize claims supported by the acquired full text. "
+            "State evidence limits and disagreements explicitly."
+        )
         acquisition = self._stage_output(run, "acquire")
         task_evidence = dict(acquisition.get("task_evidence", {}) or {})
         evidence_db = Path(str(task_evidence.get("evidence_db", "") or ""))
@@ -7998,7 +8006,8 @@ class ResearchAgentRuntime:
                 reranker=local_evidence.reranker,
                 retrieval_runtime=local_evidence.metadata,
                 writing_brief={
-                    "focus": "Prioritize claims supported by the acquired full text. State evidence limits and disagreements explicitly."
+                    **requested_writing_brief,
+                    "focus": " ".join(part for part in (requested_focus, fulltext_focus) if part),
                 },
             )
         except Exception as error:
@@ -8037,6 +8046,9 @@ class ResearchAgentRuntime:
 
         payload = dict(run.get("input", {}) or {})
         question = str(payload.get("question", "")).strip()
+        requested_writing_brief = dict(payload.get("writing_brief", {}) or {})
+        requested_focus = str(requested_writing_brief.get("focus", "")).strip()
+        abstract_focus = "只可根据所给公开来源摘要作答；不能把题录信息或检索排序写成研究结论。"
         plan = self._stage_output(run, "plan")
         discovery = self._stage_output(run, "discover")
         evidence: list[dict[str, Any]] = []
@@ -8122,7 +8134,8 @@ class ResearchAgentRuntime:
                 "label": "本次任务收集的公开学术来源",
             },
             "writing_brief": {
-                "focus": "只可根据所给公开来源摘要作答；不能把题录信息或检索排序写成研究结论。",
+                **requested_writing_brief,
+                "focus": " ".join(part for part in (requested_focus, abstract_focus) if part),
             },
             "evidence_status": "external_source_abstracts",
             "evidence_notice": "本次深度研究使用公开学术来源摘要，不读取或写入任何个人知识库。",

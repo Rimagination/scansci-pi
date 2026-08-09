@@ -77,7 +77,7 @@ def test_plain_knowledge_chat_does_not_receive_research_run_tools() -> None:
     assert "check_task_completion" not in contract["allowed_tools"]
 
 
-def test_auto_web_toggle_does_not_grant_tools_to_an_ordinary_turn() -> None:
+def test_auto_web_toggle_grants_read_only_web_tools_to_ordinary_turn() -> None:
     contract = compile_task_contract(
         task_mode="web-auto",
         user_text="解释一下什么是向量",
@@ -85,7 +85,10 @@ def test_auto_web_toggle_does_not_grant_tools_to_an_ordinary_turn() -> None:
 
     assert contract["task_profile"]["route"] == "direct_chat"
     assert contract["autonomy"] == "direct"
-    assert contract["allowed_tools"] == []
+    # Web-auto mode now preserves read-only web tools so the model can
+    # decide whether to search — without tools, it would report "I cannot
+    # search" even when the user has the toggle set to "auto".
+    assert set(contract["allowed_tools"]) == {"agent_reach", "browser_access", "discover_papers", "search_web", "self_assess", "verify_doi"}
 
 
 def test_explicit_current_search_is_a_bounded_tool_turn() -> None:

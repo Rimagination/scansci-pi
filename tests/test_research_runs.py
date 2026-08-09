@@ -1009,6 +1009,10 @@ def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_p
             "workflow_type": "deep_research",
             "notebook_id": "should-not-be-used",
             "question": "How should scientific RAG be evaluated?",
+            "writing_brief": {
+                "audience": "researcher",
+                "focus": "Compare evaluation protocols and write a source-linked academic report.",
+            },
         }
     )
 
@@ -1045,6 +1049,9 @@ def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_p
     assert result["evidence"][0]["doc_id"].startswith("external:")
     assert result["evidence"][0]["original_url"] == "https://example.org/study-1"
     assert result["review_plan"]["sections"][0]["citation_ids"] == ["S1", "S2", "S3"]
+    assert result["writing_brief"]["audience"] == "researcher"
+    assert "Compare evaluation protocols" in result["writing_brief"]["focus"]
+    assert "只可根据所给公开来源摘要作答" in result["writing_brief"]["focus"]
 
 
 def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, monkeypatch):
@@ -1068,7 +1075,13 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
         min_sentence_length=20,
     )
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "library.sqlite")
-    run = {"run_id": "run-fulltext", "input": {"question": "How should scientific retrieval be audited?"}}
+    run = {
+        "run_id": "run-fulltext",
+        "input": {
+            "question": "How should scientific retrieval be audited?",
+            "writing_brief": {"tone": "academic", "focus": "Compare audit frameworks."},
+        },
+    }
     monkeypatch.setattr(
         runtime,
         "_stage_output",
@@ -1084,15 +1097,17 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
         ),
     )
     monkeypatch.setattr(runtime, "_writing_chat_client", lambda: "writing-client")
-    monkeypatch.setattr(
-        research_agent,
-        "retrieve_review_evidence",
-        lambda _db, _question, **_kwargs: {
+    captured: dict[str, object] = {}
+
+    def fake_retrieve_review_evidence(_db, _question, **kwargs):
+        captured.update(kwargs)
+        return {
             "phase": "retrieval",
             "evidence": [{"citation_id": "1"}, {"citation_id": "2"}, {"citation_id": "3"}],
             "retrieval_summary": {"document_count": 2, "evidence_count": 3},
-        },
-    )
+        }
+
+    monkeypatch.setattr(research_agent, "retrieve_review_evidence", fake_retrieve_review_evidence)
 
     result = runtime._task_fulltext_deep_research_evidence(run)
 
@@ -1101,6 +1116,9 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
     assert result["evidence_level"] == "fulltext"
     assert result["source_scope"]["kind"] == "task_acquired_fulltext"
     assert result["task_evidence"]["root"].startswith(str(tmp_path))
+    assert captured["writing_brief"]["tone"] == "academic"
+    assert "Compare audit frameworks." in captured["writing_brief"]["focus"]
+    assert "Prioritize claims supported by the acquired full text" in captured["writing_brief"]["focus"]
 
 
 def test_deep_research_auto_runs_past_planning_and_completes_honest_discovery_only_report(tmp_path: Path, monkeypatch):

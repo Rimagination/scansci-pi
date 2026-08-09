@@ -240,11 +240,11 @@ def _budgets(parts: set[str], *, risk_level: str) -> tuple[int, int, int]:
     if parts & {"research", "slides"}:
         initial, maximum = 6, 12
     elif parts & {"knowledge", "task-documents"}:
-        initial, maximum = 4, 8
+        initial, maximum = 5, 10
     elif parts & {"web", "web-auto"}:
-        initial, maximum = 3, 6
+        initial, maximum = 4, 8
     else:
-        initial, maximum = 2, 4
+        initial, maximum = 3, 6
     if risk_level == "high":
         maximum = min(maximum, initial + 2)
     return initial, maximum, 3 if maximum > initial else 2
@@ -256,7 +256,7 @@ def _model_token_budget(parts: set[str]) -> int:
     if parts & {"knowledge", "task-documents"}:
         return 32_000
     if parts & {"web", "web-auto"}:
-        return 24_000
+        return 32_000
     return 12_000
 
 
@@ -472,9 +472,15 @@ def compile_task_contract(
             if tool in set().union(*(_MODE_TOOLS.get(part, set()) for part in parts))
         )
     if task_profile.execution_complexity == "none":
-        # An AUTO toggle is not authority by itself.  A turn that the host
-        # classified as direct conversation receives no latent tool lease.
-        allowed.clear()
+        # A direct-conversation turn normally receives no tool lease.  However,
+        # when the user has explicitly enabled web search (toggle "on" or
+        # "auto"), the model must receive the read-only public web tools so it
+        # can honour that instruction.  Without tools, the model will report
+        # that it cannot search — frustrating the user who just enabled search.
+        if not (parts & {"web", "web-auto"}):
+            allowed.clear()
+        else:
+            allowed.intersection_update(_MODE_TOOLS.get("web-auto", set()))
 
     unavailable_tools: tuple[str, ...] = ()
     if available_tool_ids is not None:
