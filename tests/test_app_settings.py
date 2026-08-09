@@ -155,6 +155,51 @@ def test_saved_settings_keep_models_and_never_write_api_key(tmp_path: Path):
     assert persisted["mcp_servers"][0]["deferred"] is True
 
 
+def test_mcp_host_owned_tool_policies_round_trip_with_bounded_values(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    policies = [
+        {"name": "lookup_records", "effect": "read", "idempotent": True},
+        {"tool": "notes.put", "effect": "reversible", "idempotent": False},
+        {"name": "invalid", "effect": "execute", "idempotent": True},
+        {"name": "x" * 161, "effect": "read", "idempotent": True},
+        *({"name": f"bounded_{index}", "effect": "write"} for index in range(80)),
+    ]
+
+    saved = save_settings(workspace, {
+        "mcp_servers": [{
+            "id": "policy-fixture",
+            "name": "Policy fixture",
+            "command": "node fixture.mjs",
+            "tool_effects": {
+                "search/library": "read",
+                "notes.put": "reversible",
+                "accounts.delete": "high",
+                "invalid": "execute",
+                "y" * 161: "read",
+            },
+            "tool_policies": policies,
+        }],
+    })
+    loaded = load_settings(workspace)
+    persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+
+    expected_effects = {
+        "search/library": "read",
+        "notes.put": "reversible",
+        "accounts.delete": "high",
+    }
+    for payload in (saved, loaded, persisted):
+        server = payload["mcp_servers"][0]
+        assert server["tool_effects"] == expected_effects
+        assert server["tool_policies"][:2] == [
+            {"name": "lookup_records", "effect": "read", "idempotent": True},
+            {"name": "notes.put", "effect": "reversible", "idempotent": False},
+        ]
+        assert len(server["tool_policies"]) == 64
+        assert all(policy["effect"] in {"read", "reversible", "write", "high"} for policy in server["tool_policies"])
+        assert all(len(policy["name"]) <= 160 for policy in server["tool_policies"])
+
+
 def test_onboarding_settings_persist_for_later_resume(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
 

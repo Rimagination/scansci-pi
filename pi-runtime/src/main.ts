@@ -1002,6 +1002,24 @@ function normalizeMcpEffect(value: unknown): McpEffect {
   return "unknown";
 }
 
+function mcpNameEffect(value: unknown): McpEffect {
+  const tokens = String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const destructive = new Set([
+    "delete", "destroy", "drop", "erase", "purge", "remove", "revoke", "wipe",
+  ]);
+  if (tokens.some((token) => destructive.has(token))) return "destructive";
+  const write = new Set([
+    "add", "copy", "create", "edit", "email", "execute", "install", "insert",
+    "move", "patch", "post", "publish", "put", "rename", "run", "send", "set",
+    "submit", "trigger", "update", "upload", "write",
+  ]);
+  return tokens.some((token) => write.has(token)) ? "write" : "unknown";
+}
+
 function mcpToolPolicy(
   raw: JsonRecord,
   serverId: string,
@@ -1023,18 +1041,20 @@ function mcpToolPolicy(
     : raw.tool_policies && typeof raw.tool_policies === "object"
       ? ((raw.tool_policies as JsonRecord)[remoteName] as JsonRecord | undefined)
       : undefined;
-  let effect = normalizeMcpEffect(configuredPolicy?.effect || configuredEffects[remoteName]);
-  if (effect === "unknown") {
-    if (annotations.destructiveHint === true) effect = "destructive";
-    else if (annotations.readOnlyHint === true) effect = "read";
-    else if (annotations.readOnlyHint === false) effect = "write";
-  }
+  const configuredEffect = normalizeMcpEffect(configuredPolicy?.effect || configuredEffects[remoteName]);
+  let effect = configuredEffect === "unknown" ? mcpNameEffect(remoteName) : configuredEffect;
+  // MCP annotations are supplied by the remote server. They can make a
+  // host-owned classification more restrictive, but can never create read or
+  // idempotency authority on their own.
+  if (annotations.destructiveHint === true) effect = "destructive";
+  else if (annotations.readOnlyHint === false && effect !== "destructive") effect = "write";
+  const configuredIdempotent = configuredPolicy?.idempotent === true;
   return {
     serverId,
     serverAlias,
     remoteName,
     effect,
-    idempotent: configuredPolicy?.idempotent === true || effect === "read" || annotations.idempotentHint === true,
+    idempotent: configuredIdempotent && annotations.idempotentHint !== false,
     annotations: {
       readOnlyHint: annotations.readOnlyHint,
       destructiveHint: annotations.destructiveHint,
