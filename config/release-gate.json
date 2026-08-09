@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "ScanSci",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "scope_file": "config/release-scope.json",
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [
@@ -25,9 +25,13 @@
         "tests/test_archive_binary_component.py",
         "tests/test_prepare_runtime_release_manifest.py",
         "tests/test_local_runtime_component.py",
+        "tests/test_local_runtime_isolation.py",
         "tests/test_local_transformers_compat.py",
         "tests/test_package_desktop_release.py",
         "tests/test_runtime_identity.py",
+        "tests/test_verify_update_channel.py",
+        "tests/test_direct_chat_queue_ui.py",
+        "tests/test_dark_theme_css_contract.py",
         "tests/test_research_tools.py",
         "tests/test_research_runs.py",
         "-q"
@@ -172,7 +176,8 @@
     "profile": "core",
     "signature_required": false,
     "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
-    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
+    "update_package_url": "https://github.com/Rimagination/scansci-pi/releases/download/v{version}/ScanSci-{version}-windows-x64.zip",
+    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json",
     "node_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     "tectonic_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     "exclude_runtimes": true,

@@ -23,7 +23,7 @@ from .update_blockmap import (
 )
 
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.3.1"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
@@ -52,10 +52,18 @@ class AppUpdateService:
         self,
         *,
         manifest_url: str | None = None,
-        current_version: str = APP_VERSION,
+        current_version: str | None = None,
         updates_root: str | Path | None = None,
     ) -> None:
-        self.current_version = current_version
+        if current_version is None:
+            # build-info.json is written into every packaged candidate and is
+            # the runtime identity already exposed by /api/health.  Reading it
+            # here prevents the updater/About page from reporting a stale
+            # source constant when the packaged version has advanced.
+            from .build_info import current_build_info
+
+            current_version = str(current_build_info().get("version", "")).strip() or APP_VERSION
+        self.current_version = str(current_version).strip() or APP_VERSION
         configured_manifest = manifest_url if manifest_url is not None else os.getenv(UPDATE_MANIFEST_ENV, "")
         # A packaged desktop must always have an update channel. Older builds
         # did not persist this URL in build-info.json, so keep a compiled

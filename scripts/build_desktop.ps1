@@ -8,7 +8,7 @@ param(
     [string]$PackageProfile = "core",
     [string]$OutputDir = "",
     [string]$Name = "ScanSci",
-    [string]$Version = "0.2.3",
+    [string]$Version = "0.3.1",
     [string]$BuildId = "",
     # Populated only by scripts/release_gate.py. This binds an auditable
     # release candidate to the exact source fingerprint that passed its gate.
@@ -17,7 +17,7 @@ param(
     # Keep direct/manual builds aligned with the public release contract. An
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
-    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
+    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json",
     [string]$NodeComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     [string]$TectonicComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     # Slim channel: do not embed node.exe or tectonic.exe in the bundle.

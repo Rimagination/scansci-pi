@@ -10,7 +10,12 @@
   --faint: #b7b8be;
   --rule: #e4e4e7;
   --rule-strong: #d8d8dd;
+  --page-background: var(--surface);
+  --surface-elevated: var(--raised);
+  --control-background: var(--raised);
+  --control-background-hover: var(--soft);
   --accent: #1f7d4e;
+  --accent-solid: var(--accent);
   --accent-soft: #e8f5ec;
   --accent-ink: #1f5d48;
   --accent-ring: rgba(31, 125, 78, .18);
@@ -650,10 +655,10 @@ textarea::placeholder { color: #b6b7bd; }
 .conversation-layout.is-direct-conversation .context-panel-resizer, .conversation-layout.is-context-collapsed .context-panel-resizer, .conversation-layout.is-review-workbench .context-panel-resizer, .reference-panel.is-hidden ~ .context-panel-resizer { display: none; }
 .conversation-main { position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; }
 .answer-area { display: flex; min-height: 0; flex: 1; justify-content: center; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 38px clamp(28px, 8vw, 104px) 24px; }
-.conversation-jump-latest { position: absolute; z-index: 8; left: 50%; bottom: 132px; display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid #dedfe2; border-radius: 50%; color: #5d6066; background: rgba(255, 255, 255, .96); box-shadow: 0 8px 22px rgba(32, 34, 40, .12), 0 1px 3px rgba(32, 34, 40, .08); transform: translateX(-50%); transition: color .14s ease, background .14s ease, box-shadow .14s ease; backdrop-filter: blur(12px); }
-.conversation-jump-latest .ui-icon { --icon-size: 18px; stroke-width: 1.8; }
-.conversation-jump-latest:hover { color: #202226; background: #fff; box-shadow: 0 10px 25px rgba(32, 34, 40, .16), 0 2px 4px rgba(32, 34, 40, .08); }
-.conversation-jump-latest:focus-visible { outline: 2px solid rgba(57, 110, 82, .3); outline-offset: 2px; }
+.conversation-jump-latest { position: absolute; z-index: 40; left: 50%; bottom: 132px; display: grid; width: 36px; height: 36px; place-items: center; border: 1px solid var(--rule-strong); border-radius: 50%; color: var(--ink); background: color-mix(in srgb, var(--surface-elevated) 94%, transparent); box-shadow: 0 8px 22px rgba(32, 34, 40, .12), 0 1px 3px rgba(32, 34, 40, .08); transform: translateX(-50%); transition: color .14s ease, background .14s ease, box-shadow .14s ease; backdrop-filter: blur(12px); }
+.conversation-jump-latest .ui-icon { --icon-size: 19px; display: block; color: currentColor; stroke-width: 2; }
+.conversation-jump-latest:hover { color: var(--ink); background: var(--control-background-hover); box-shadow: 0 10px 25px rgba(32, 34, 40, .16), 0 2px 4px rgba(32, 34, 40, .08); }
+.conversation-jump-latest:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
 .conversation-jump-latest[hidden] { display: none; }
 .is-review-workbench .answer-area { justify-content: stretch; padding: 24px 22px 18px; }
 .is-review-workbench .chat-composer { width: calc(100% - 36px); margin-bottom: 16px; }
@@ -926,10 +931,12 @@ html[data-theme="dark"] .stream-retry-button:hover { border-color: #cf777a; colo
 .direct-live-stop .ui-icon { --icon-size: 12px; }
 .direct-live-queue { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start; padding-top: 7px; border-top: 1px solid color-mix(in srgb, var(--accent) 12%, #e2e5e3); }
 .direct-live-queue > span { padding-top: 4px; color: #77817c; font-size: 10px; white-space: nowrap; }
-.direct-live-queue ol { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; margin: 0; padding: 0; list-style: none; }
-.direct-live-queue li { display: inline-flex; max-width: min(100%, 260px); align-items: center; gap: 4px; padding: 3px 4px 3px 8px; border-radius: 7px; color: #53645b; background: rgba(255,255,255,.8); font-size: 10px; line-height: 17px; }
-.direct-live-queue li > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.direct-live-queue ol { display: flex; width: 100%; min-width: 0; flex-direction: column; flex-wrap: nowrap; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.direct-live-queue li { display: flex; width: 100%; max-width: none; align-items: center; gap: 4px; box-sizing: border-box; padding: 3px 4px 3px 8px; border-radius: 7px; color: #53645b; background: rgba(255,255,255,.8); font-size: 10px; line-height: 17px; }
+.direct-live-queue li > span { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.direct-live-queue li .direct-live-actions { flex: 0 0 auto; margin-left: auto; }
 .chat-composer .direct-live-queue li button { display: grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; padding: 0; border-radius: 5px; color: #929995; background: transparent; }
+.chat-composer .direct-live-queue li button[data-action="set-queued-direct-mode"] { display: inline-flex; width: auto; height: 24px; align-items: center; padding: 0 7px; }
 .direct-live-queue li button:hover { color: #8e4848; background: #fff0f0; }
 .direct-live-queue .ui-icon { --icon-size: 11px; }
 .stream-paused { margin: 8px 0 18px; color: #7e8581; font-size: 12px; line-height: 18px; }
@@ -4687,7 +4694,7 @@ html[data-accent] .provider-button.is-active .provider-logo { box-shadow: 0 0 0 
 html[data-accent] .cherry-provider-item.is-enabled .cherry-provider-status:hover,
 html[data-accent] .market-install:hover { color: var(--accent-contrast); background: var(--accent-strong); }
 
-html[data-accent] .extensions-view { background: radial-gradient(circle at 88% 6%, var(--accent-ring), transparent 23%), #fcfcfb; }
+html[data-accent] .extensions-view { background: radial-gradient(circle at 88% 6%, var(--accent-ring), transparent 23%), var(--page-background); }
 html[data-accent] .extension-tab.is-active { color: var(--accent-ink); }
 html[data-accent] .extension-tab.is-active small { color: var(--accent-ink); background: var(--accent-surface-strong); }
 html[data-accent] :is(.mcp-market-tab.is-active, .mcp-market-tab.is-active span, .mcp-sort-control button.is-active) { border-color: var(--accent); color: var(--accent-ink); }
@@ -5152,6 +5159,7 @@ html[data-theme="dark"] .default-tools-heading > em { color: #929d97; }
 .local-installed-panel > header p { margin: 5px 0 0; color: #828d87; font-size: 11px; line-height: 17px; }
 .local-installed-panel > header > b { padding-top: 3px; color: #3b7c5c; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .local-installed-panel > .quiet-model-list { border: 0; border-radius: 0; }
+.local-installed-model-list { max-height: 360px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .local-installed-panel .quiet-model-row { padding-right: 17px; padding-left: 17px; }
 .local-models-page--managed .local-model-fallback { margin-top: 14px; }
 
@@ -5289,6 +5297,12 @@ html[data-theme="dark"] .settings-content select { border-color: #4a534e; color:
 .settings-select-option .settings-select-accent-label { width: 100%; }
 .settings-select-option .settings-select-accent-value { font-size: 11px; }
 .document-select-row > .settings-select { width: min(360px, 48%); }
+.document-language-row > .settings-select { width: min(360px, 48%); }
+.settings-select-option.is-multiple { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-select-multi-summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-select-multi-check { display: grid; width: 17px; height: 17px; flex: 0 0 auto; place-items: center; border: 1px solid #d6ded9; border-radius: 5px; color: var(--accent-contrast); background: var(--surface); }
+.settings-select-multi-check .ui-icon { --icon-size: 12px; stroke-width: 2.2; }
+.settings-select-multi-check.is-selected { border-color: var(--accent); background: var(--accent); }
 .default-capability-panel,
 .default-capability-panel .default-capability-list,
 .default-capability-panel .default-capability-row { overflow: visible; }
@@ -5308,11 +5322,18 @@ html[data-theme="dark"] .settings-select-option.is-selected { color: #c5ebd0; ba
 html[data-theme="dark"] .settings-select-option:disabled { color: #77827b; }
 
 @media (max-width: 760px) {
-  .document-select-row > .settings-select { width: 100%; }
+  .document-select-row > .settings-select,
+  .document-language-row > .settings-select { width: 100%; }
   .settings-select-menu { max-height: 230px; }
 }
 
-html[data-theme="dark"] .extensions-view { background: #181c1d; }
+/* The model-services navigation item uses the same Lucide stroke box as its
+   label so the icon never sits on a different text baseline. */
+.settings-nav { align-items: center; }
+.settings-nav > .ui-icon { display: block; width: 19px; height: 19px; flex: 0 0 19px; margin: 0; }
+.settings-nav-label { display: inline-flex; min-height: 20px; align-items: center; line-height: 20px; }
+
+html[data-theme="dark"] .extensions-view { background: var(--page-background); }
 html[data-theme="dark"] .extensions-header { border-color: var(--rule); background: #1d2223; }
 html[data-theme="dark"] .extensions-header h1 { color: var(--ink); }
 html[data-theme="dark"] .extensions-refresh { border-color: #46504b; color: #b9c9bf; background: #252b2a; }
@@ -5341,8 +5362,8 @@ html[data-theme="dark"] .mcp-owned-record { border-color: #343d49; background: #
 html[data-theme="dark"] .mcp-owned-record h2 { color: #e1e7ef; }
 html[data-theme="dark"] .mcp-owned-record p { color: #a1aab6; }
 html[data-theme="dark"] .mcp-owned-record small { color: #8994a0; }
-html[data-theme="dark"] .mcp-owned-actions .mcp-update-button { border-color: #53659a; color: #c0ccff; background: #29314b; }
-html[data-theme="dark"] .mcp-owned-actions .mcp-update-button:hover { border-color: #8495e0; background: #4a5fc2; }
+html[data-theme="dark"] .mcp-owned-actions .mcp-update-button { border-color: var(--accent-border); color: var(--accent-ink); background: var(--accent-surface); }
+html[data-theme="dark"] .mcp-owned-actions .mcp-update-button:hover { border-color: var(--accent); color: var(--accent-contrast); background: var(--accent); }
 
 /* Knowledge-base retrieval settings preview.  The page keeps the user-facing
    decision small: current index first, recommended models second, advanced
@@ -8533,4 +8554,1249 @@ html[data-theme="dark"] .runtime-components-panel > header {
   .prompt-card button.composer-record-button.is-recording,
   .chat-composer button.composer-record-button.is-recording { width: 150px; }
   .composer-recording-wave { width: 57px; gap: 2px; }
+}
+
+/* Theme takeover bridge --------------------------------------------------
+   Some focused settings and onboarding components are intentionally defined
+   later than the shared accent contract above. Keep product-owned ready,
+   selected and primary states on the active accent even when those component
+   styles carry a legacy green fallback. Error, warning and third-party brand
+   states remain semantic and are not included here. */
+html[data-accent] .local-capability-section > header > span,
+html[data-accent] .runtime-components-panel > header > div > span,
+html[data-accent] .runtime-component-copy > span,
+html[data-accent] .local-model-category > header > div > span {
+  color: var(--accent-ink);
+}
+
+html[data-accent] .resource-setup-card.is-ready,
+html[data-accent] .local-model-recommendation.is-ready,
+html[data-accent] .runtime-component-card.is-ready {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+html[data-accent] .resource-setup-mark,
+html[data-accent] .knowledge-settings-model-icon:not(.is-reranking),
+html[data-accent] .knowledge-settings-help-mark,
+html[data-accent] .knowledge-settings-safety-card > span,
+html[data-accent] .local-model-principle > span,
+html[data-accent] .runtime-component-icon,
+html[data-accent] .guide-feature-icon,
+html[data-accent] .guide-destination:not(.is-library) .guide-destination-icon,
+html[data-accent] .resource-guide-cuda-icon {
+  color: var(--accent);
+  background: var(--accent-surface-strong);
+}
+
+html[data-accent] .resource-setup-copy > span,
+html[data-accent] .resource-setup-action > b,
+html[data-accent] .local-model-summary b,
+html[data-accent] .local-model-recommendation-status.is-ready,
+html[data-accent] .local-model-card-ready,
+html[data-accent] .runtime-component-ready,
+html[data-accent] .runtime-component-running,
+html[data-accent] .knowledge-settings-ready-text,
+html[data-accent] .knowledge-settings-index-state,
+html[data-accent] .knowledge-settings-current-models em,
+html[data-accent] .knowledge-settings-model-control small:not(.is-warning),
+html[data-accent] .knowledge-settings-link-button,
+html[data-accent] .knowledge-settings-metrics b,
+html[data-accent] .resource-guide-cuda-status,
+html[data-accent] .resource-guide-optional-banner > .ui-icon {
+  color: var(--accent-ink);
+}
+
+html[data-accent] .resource-setup-action > span,
+html[data-accent] .knowledge-settings-recommend-tag:not(.is-soft),
+html[data-accent] .knowledge-settings-notice:not(.is-warning),
+html[data-accent] .knowledge-settings-toggle.is-on,
+html[data-accent] .resource-guide-destination-tags b {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+html[data-accent] .resource-setup-action button,
+html[data-accent] .local-model-card-button:not(.is-secondary),
+html[data-accent] .knowledge-settings-save,
+html[data-accent] .runtime-component-primary,
+html[data-accent] .guide-destination-action,
+html[data-accent] .resource-guide-destination-action {
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  background: var(--accent);
+  box-shadow: 0 4px 10px var(--accent-shadow);
+}
+
+html[data-accent] .resource-setup-action button:hover:not(:disabled),
+html[data-accent] .local-model-card-button:not(.is-secondary):hover,
+html[data-accent] .knowledge-settings-save:hover,
+html[data-accent] .runtime-component-primary:hover,
+html[data-accent] .guide-destination-action:hover,
+html[data-accent] .resource-guide-destination-action:hover {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+}
+
+html[data-accent] .resource-setup-progress,
+html[data-accent] .local-model-primary-progress,
+html[data-accent] .runtime-component-progress {
+  background: color-mix(in srgb, var(--accent) 15%, var(--surface));
+}
+
+html[data-accent] .resource-setup-progress span,
+html[data-accent] .local-model-primary-progress span,
+html[data-accent] .runtime-component-progress > span,
+html[data-accent] .data-import-progress-track i,
+html[data-accent] .data-import-progress-track i.is-complete {
+  background: var(--accent);
+}
+
+html[data-accent] .runtime-components-panel > header,
+html[data-accent] .runtime-component-card.is-compact {
+  border-color: var(--accent-border);
+}
+
+html[data-accent] .runtime-component-secondary {
+  border-color: var(--accent-border);
+}
+
+html[data-accent] .runtime-component-secondary:hover,
+html[data-accent] .knowledge-settings-quiet-action:hover,
+html[data-accent] .knowledge-settings-link-button:hover,
+html[data-accent] .local-runtime-edit > summary {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+}
+
+html[data-accent] .knowledge-settings-notice:not(.is-warning) .ui-icon,
+html[data-accent] .knowledge-settings-help-card li::before {
+  color: var(--accent);
+  background: var(--accent-surface-strong);
+}
+
+html[data-accent] .knowledge-settings-toggle.is-on i {
+  background: var(--accent);
+}
+
+html[data-accent] .local-model-principle,
+html[data-accent] .resource-install-data-card,
+html[data-accent] .resource-guide-count {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+html[data-accent] .resource-install-data-card > span {
+  color: var(--accent);
+  background: var(--accent-surface-strong);
+}
+
+html[data-accent] .data-source-card.is-connected,
+html[data-accent] .data-import-progress.is-complete,
+html[data-accent] .resource-settings-status,
+html[data-accent] .resource-settings-boundary,
+html[data-accent] .local-note {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+html[data-accent] .data-source-card-icon,
+html[data-accent] .data-import-progress > span,
+html[data-accent] .resource-settings-status > span,
+html[data-accent] .resource-settings-row-icon,
+html[data-accent] .resource-settings-boundary > span {
+  color: var(--accent);
+  background: var(--accent-surface-strong);
+}
+
+html[data-accent] .data-source-card.is-connected i,
+html[data-accent] .data-source-card button,
+html[data-accent] .resource-settings-row-ready,
+html[data-accent] .resource-settings-heading > div > span,
+html[data-accent] .local-agent-route.is-active,
+html[data-accent] .local-runtime-channel-list b.is-ready {
+  color: var(--accent-ink);
+}
+
+html[data-accent] .app-update[data-state="available"] .app-update-status,
+html[data-accent] .app-update[data-state="available"] .app-update-summary,
+html[data-accent] .provider-state.is-ready,
+html[data-accent] .provider-status.is-connected,
+html[data-accent] .system-model-status.is-ready,
+html[data-accent] .extension-status.is-ready,
+html[data-accent] .run-status.running,
+html[data-accent] .run-status.planning,
+html[data-accent] .run-status.queued,
+html[data-accent] .run-status.verifying,
+html[data-accent] .run-status.completed {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+}
+
+html[data-accent] .app-update[data-state="available"] .app-update-status,
+html[data-accent] .run-status.running,
+html[data-accent] .run-status.planning,
+html[data-accent] .run-status.queued,
+html[data-accent] .run-status.verifying,
+html[data-accent] .run-status.completed {
+  background: var(--accent-surface);
+}
+
+html[data-accent] .run-progress i,
+html[data-accent] .retrieval-download-progress span,
+html[data-accent] .review-progress-track i,
+html[data-accent] .task-status.running::before,
+html[data-accent] .task-status.planning::before,
+html[data-accent] .task-status.queued::before,
+html[data-accent] .task-status.verifying::before,
+html[data-accent] .task-status.completed::before {
+  background: var(--accent);
+}
+
+html[data-accent] .resource-guide-step.is-current > span,
+html[data-accent] .resource-guide-step.is-complete > span {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+html[data-accent] .resource-guide-destination:not(.is-library),
+html[data-accent] .guide-destination:not(.is-library) {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+/* Dark-theme readability contract: conversation, history, and model controls. */
+html[data-theme="dark"] .answer-sentence {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .evidence-grounded-article .answer-sentence h1,
+html[data-theme="dark"] .direct-answer .answer-sentence h2,
+html[data-theme="dark"] .direct-answer .answer-sentence h3,
+html[data-theme="dark"] .direct-answer .answer-sentence h4,
+html[data-theme="dark"] .direct-answer .answer-sentence h5 {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .direct-answer .answer-sentence code {
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+html[data-theme="dark"] .direct-answer .answer-sentence pre code {
+  color: inherit;
+  background: transparent;
+}
+
+html[data-theme="dark"] .direct-answer .answer-sentence blockquote {
+  border-left-color: var(--rule-strong);
+  color: var(--muted);
+  background: var(--surface-elevated);
+}
+
+html[data-theme="dark"] .direct-answer .answer-sentence hr {
+  border-top-color: var(--rule);
+}
+
+html[data-theme="dark"] .assistant-table {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+html[data-theme="dark"] .assistant-table th,
+html[data-theme="dark"] .assistant-table td {
+  border-right-color: var(--rule);
+  border-bottom-color: var(--rule);
+}
+
+html[data-theme="dark"] .assistant-table th {
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+html[data-theme="dark"] .assistant-table tbody tr:hover td {
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] .history-collapse {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .history-collapse:hover {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .history-collapse-chevron,
+html[data-theme="dark"] .history-search-trigger,
+html[data-theme="dark"] .history-archive-trigger,
+html[data-theme="dark"] .task-more {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .history-search-trigger:hover,
+html[data-theme="dark"] .history-search-trigger[aria-expanded="true"],
+html[data-theme="dark"] .history-archive-trigger:hover,
+html[data-theme="dark"] .history-archive-trigger.is-active,
+html[data-theme="dark"] .task-more:hover,
+html[data-theme="dark"] .task-row.has-open-menu .task-more {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] .history-search {
+  border-color: var(--rule);
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+html[data-theme="dark"] .history-search input {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .history-search input::placeholder {
+  color: var(--faint);
+}
+
+html[data-theme="dark"] .task-item {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .task-item:hover,
+html[data-theme="dark"] .task-item.is-active {
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] .task-item time {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .task-menu {
+  border-color: var(--rule-strong);
+  background: var(--surface-elevated);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .28);
+}
+
+html[data-theme="dark"] .task-menu button {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .task-menu button:not(:disabled):hover {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] .task-menu button.is-danger {
+  color: #ef9b9b;
+}
+
+html[data-theme="dark"] .task-menu button.is-danger:not(:disabled):hover {
+  color: #ffb4b2;
+  background: #3b292b;
+}
+
+html[data-theme="dark"] .task-menu button:disabled,
+html[data-theme="dark"] .task-menu small,
+html[data-theme="dark"] .history-empty {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .composer-model-trigger {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+html[data-theme="dark"] .composer-model-network-icon {
+  color: var(--muted);
+}
+
+/* Semantic page and component colour contract ----------------------------
+   Page families below share the same tokens in both themes. Brand accents
+   and status/error variants remain in their narrower component rules. */
+.settings-view,
+.settings-content,
+.cherry-model-services,
+.mcp-view,
+.settings-content:has(.mcp-marketplace),
+.settings-content:has(.default-capabilities-page),
+.extensions-view {
+  color: var(--ink);
+  background: var(--page-background);
+}
+
+.settings-surface,
+.cherry-provider-panel,
+.settings-card,
+.settings-record,
+.record-form,
+.about-card,
+.library-root-toolbar,
+.library-source,
+.knowledge-import-card,
+.knowledge-collection,
+.mcp-market-card,
+.mcp-owned-record,
+.extension-record {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.settings-surface {
+  border-color: var(--rule);
+  background: var(--surface);
+}
+
+.settings-sidebar,
+.cherry-provider-catalog,
+.knowledge-shelf,
+.extension-tabs {
+  border-color: var(--rule);
+  background: var(--surface-elevated);
+}
+
+.settings-page-heading h1,
+.quiet-page-heading h1,
+.resource-install-heading h1,
+.resource-settings-heading h1,
+.settings-heading h1,
+.cherry-provider-name h1,
+.knowledge-library-hero h2,
+.knowledge-shelf header h3,
+.mcp-market-hero h1,
+.mcp-market-card h2,
+.mcp-owned-record h2,
+.extensions-header h1,
+.extension-panel-head h2,
+.extension-record h3 {
+  color: var(--ink);
+}
+
+.settings-page-heading p,
+.quiet-page-heading p,
+.resource-install-heading p,
+.resource-settings-heading p,
+.settings-heading p,
+.settings-row small,
+.settings-select-model-meta,
+.knowledge-library-hero p,
+.knowledge-import-card p,
+.knowledge-collection p,
+.knowledge-collection em,
+.mcp-market-hero-copy > p:not(.mcp-market-eyebrow),
+.mcp-market-card > p,
+.mcp-owned-record p,
+.mcp-owned-record small,
+.extension-panel-head p:last-child,
+.extension-panel-summary p,
+.extension-record p,
+.extension-record code {
+  color: var(--muted);
+}
+
+.settings-select-trigger,
+.settings-select-menu,
+.cherry-provider-search,
+.mcp-market-search,
+.mcp-market-select,
+.mcp-sync-button,
+.extensions-refresh,
+.local-role-tabs select,
+.local-model-market-search input,
+.extension-form input,
+.skill-install-fields input,
+.skill-install-fields select,
+.market-search input,
+.library-root-toolbar button,
+.knowledge-collection button,
+.knowledge-shelf header button {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.settings-select-trigger:hover,
+.cherry-provider-item:hover,
+.cherry-provider-item.is-active,
+.cherry-provider-item.is-selected,
+.mcp-sync-button:hover:not(:disabled),
+.extensions-refresh:hover,
+.library-root-toolbar button:hover,
+.knowledge-collection button:hover,
+.knowledge-shelf header button:hover {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.settings-select-model-name,
+.settings-select-accent-value,
+.cherry-provider-button,
+.cherry-provider-search input,
+.mcp-market-search input,
+.mcp-market-select select {
+  color: var(--ink);
+}
+
+.settings-select-menu,
+.settings-select-option,
+.cherry-provider-search input,
+.mcp-market-search input,
+.mcp-market-select select {
+  background-color: transparent;
+}
+
+.settings-select-menu {
+  background: var(--surface-elevated);
+}
+
+.cherry-model-services {
+  background: var(--page-background);
+}
+
+.cherry-provider-catalog {
+  background: var(--surface-elevated);
+}
+
+.cherry-provider-panel {
+  background: var(--surface);
+}
+
+/* Model service editor: all copy and controls inherit the shared theme
+   contract instead of the legacy Cherry Studio light-only palette. */
+.cherry-field,
+.cherry-field > span,
+.cherry-provider-name h1,
+.cherry-model-section-title h2,
+.cherry-model-group > header,
+.cherry-model-copy > button {
+  color: var(--ink);
+}
+
+.cherry-field > span i,
+.cherry-provider-search input::placeholder,
+.cherry-model-search,
+.cherry-model-search input::placeholder,
+.cherry-model-copy small,
+.cherry-field-hint,
+.cherry-endpoint-preview,
+.cherry-provider-empty,
+.cherry-provider-divider,
+.cherry-local-runtime-notice p,
+.cherry-text-button,
+.cherry-restore-default,
+.cherry-mini-gear,
+.cherry-icon-button,
+.cherry-model-more summary,
+.cherry-row-remove {
+  color: var(--muted);
+}
+
+.cherry-field input,
+.cherry-field select,
+.cherry-detect-button,
+.cherry-fetch-button,
+.cherry-plus-button,
+.cherry-add-provider {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.cherry-model-search {
+  border-color: var(--rule);
+}
+
+.cherry-model-search input {
+  color: var(--ink);
+}
+
+.cherry-field input::placeholder,
+.cherry-secret-control input::placeholder {
+  color: var(--muted);
+}
+
+.cherry-provider-header-divider,
+.cherry-model-section,
+.cherry-model-list,
+.cherry-model-group + .cherry-model-group,
+.cherry-model-row {
+  border-color: var(--rule);
+}
+
+.cherry-model-list,
+.cherry-model-row,
+.cherry-local-runtime-notice,
+.cherry-model-more .model-capabilities {
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.cherry-model-group > header {
+  background: var(--surface-elevated);
+}
+
+.cherry-model-section-title b,
+.cherry-model-row > .model-capabilities .model-capability-chip {
+  border-color: var(--rule);
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.cherry-model-row > .model-capabilities .model-capability-chip.is-active,
+.cherry-secret-field > span:first-child em {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.cherry-local-runtime-notice strong {
+  color: var(--ink);
+}
+
+.cherry-model-copy > button:hover,
+.cherry-local-runtime-notice button {
+  color: var(--accent-ink);
+}
+
+.cherry-detect-button:hover:not(:disabled),
+.cherry-fetch-button:hover:not(:disabled),
+.cherry-plus-button:hover,
+.cherry-add-provider:hover,
+.cherry-text-button:hover,
+.cherry-mini-gear:hover,
+.cherry-icon-button:hover,
+.cherry-model-more summary:hover,
+.cherry-secret-toggle:hover,
+.cherry-secret-toggle[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.cherry-restore-default:hover {
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.cherry-detect-button:disabled,
+.cherry-fetch-button:disabled {
+  color: var(--faint);
+  background: var(--control-background);
+}
+
+.mcp-marketplace {
+  color: var(--ink);
+}
+
+.mcp-market-hero {
+  border-color: var(--rule);
+  background: radial-gradient(circle at 82% 46%, var(--accent-ring), transparent 23%), var(--surface-elevated);
+}
+
+.mcp-market-tabs,
+.mcp-market-card footer {
+  border-color: var(--rule);
+}
+
+.mcp-market-tab,
+.mcp-market-card footer,
+.mcp-card-tags span,
+.mcp-market-loading,
+.mcp-market-empty,
+.mcp-market-note {
+  color: var(--muted);
+}
+
+.mcp-card-tags span,
+.mcp-sort-control,
+.mcp-market-loading,
+.mcp-market-empty,
+.mcp-market-note {
+  border-color: var(--rule);
+  background: var(--surface-elevated);
+}
+
+.mcp-market-tab span {
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.mcp-sort-control {
+  background: var(--surface-elevated);
+}
+
+.mcp-sort-control button {
+  color: var(--muted);
+}
+
+.mcp-sort-control button.is-active {
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.mcp-owned-record {
+  background: var(--surface);
+}
+
+/* MCP product chrome follows the selected application accent. Brand artwork
+   supplied by third-party servers is deliberately not part of these rules. */
+.mcp-market-eyebrow {
+  color: var(--accent-ink);
+}
+
+.mcp-market-orbit::before,
+.mcp-market-orbit::after {
+  border-color: var(--accent-border);
+}
+
+.mcp-market-orbit i {
+  background: radial-gradient(circle at 35% 28%, var(--accent-surface-strong), var(--accent) 55%, var(--accent-strong));
+  box-shadow: 0 8px 24px var(--accent-shadow);
+}
+
+.mcp-market-orbit b {
+  background: var(--accent);
+  box-shadow: 0 0 0 6px var(--accent-ring);
+}
+
+.mcp-market-orbit em {
+  background: var(--accent-muted);
+}
+
+.mcp-market-tab:hover,
+.mcp-sort-control button:hover {
+  color: var(--accent-ink);
+}
+
+.mcp-market-tab.is-active {
+  border-bottom-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.mcp-market-tab.is-active span,
+.mcp-sort-control button.is-active {
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.mcp-sort-control button.is-active {
+  box-shadow: 0 1px 4px var(--accent-shadow);
+}
+
+.mcp-market-search:focus-within,
+.mcp-manual-fields input:focus,
+.mcp-manual-fields select:focus,
+.mcp-create-basics input:focus,
+.mcp-create-basics select:focus,
+.mcp-create-basics textarea:focus,
+.mcp-create-connection input:focus,
+.mcp-create-connection select:focus {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.mcp-sync-button:hover:not(:disabled),
+.mcp-create-back:hover,
+.mcp-create-form footer button:hover {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.mcp-create-button,
+.mcp-manual-form footer button,
+.mcp-create-form footer .mcp-create-save {
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  background: var(--accent);
+  box-shadow: 0 4px 12px var(--accent-shadow);
+}
+
+.mcp-create-button:hover,
+.mcp-manual-form footer button:hover,
+.mcp-create-form footer .mcp-create-save:hover {
+  border-color: var(--accent-strong);
+  color: var(--accent-contrast);
+  background: var(--accent-strong);
+  box-shadow: 0 6px 16px var(--accent-shadow);
+}
+
+.mcp-market-card:hover,
+.mcp-owned-record:hover,
+.mcp-create-option:hover {
+  border-color: var(--accent-border);
+  box-shadow: 0 12px 25px var(--accent-shadow);
+}
+
+.mcp-card-icon,
+.mcp-card-tags .mcp-discipline-tag,
+.mcp-install-button,
+.mcp-install-button.is-added,
+.mcp-owned-icon,
+.mcp-owned-actions .mcp-update-button,
+.mcp-manual-trigger,
+.mcp-create-mark,
+.mcp-create-option-icon,
+.mcp-create-option-icon.is-remote {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.mcp-install-button:hover,
+.mcp-install-button.is-added:hover,
+.mcp-owned-actions .mcp-update-button:hover {
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  background: var(--accent);
+}
+
+.mcp-manual-trigger:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  background: var(--accent-surface-strong);
+}
+
+.mcp-market-loading .ui-icon,
+.mcp-market-empty > .ui-icon,
+.mcp-market-note .ui-icon,
+.mcp-create-connection p .ui-icon {
+  color: var(--accent);
+}
+
+/* MCP creation and manual-connection surfaces share the same light/dark
+   semantic layer; only their product accents vary with --accent. */
+.mcp-manual-form,
+.mcp-create-dialog {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.mcp-manual-form {
+  background: var(--surface-elevated);
+}
+
+.mcp-manual-form header strong,
+.mcp-create-dialog-top h1,
+.mcp-create-intro h2,
+.mcp-create-option,
+.mcp-create-option strong,
+.mcp-create-form > header h2 {
+  color: var(--ink);
+}
+
+.mcp-manual-form header span,
+.mcp-manual-fields label,
+.mcp-create-steps,
+.mcp-create-intro span,
+.mcp-create-option small,
+.mcp-create-option > i,
+.mcp-create-basics label,
+.mcp-create-connection label,
+.mcp-create-connection p,
+.mcp-create-review {
+  color: var(--muted);
+}
+
+.mcp-manual-form header button,
+.mcp-create-dialog-top > button,
+.mcp-create-back,
+.mcp-create-form footer button {
+  border-color: var(--rule-strong);
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.mcp-manual-form header button:hover,
+.mcp-create-dialog-top > button:hover {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.mcp-manual-fields input,
+.mcp-manual-fields select,
+.mcp-create-basics input,
+.mcp-create-basics select,
+.mcp-create-basics textarea,
+.mcp-create-connection input,
+.mcp-create-connection select {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.mcp-create-dialog-top,
+.mcp-create-steps {
+  border-color: var(--rule);
+  background: var(--surface-elevated);
+}
+
+.mcp-create-steps span {
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.mcp-create-dialog-top span,
+.mcp-create-steps .is-current,
+.mcp-create-intro p,
+.mcp-create-form > header > div span,
+.mcp-create-connection-label,
+.mcp-create-review > span {
+  color: var(--accent-ink);
+}
+
+.mcp-create-steps .is-current span {
+  color: var(--accent-contrast);
+  background: var(--accent);
+}
+
+.mcp-create-option,
+.mcp-create-basics,
+.mcp-create-connection {
+  border-color: var(--rule);
+  background: var(--surface-elevated);
+}
+
+.mcp-create-option:hover {
+  background: var(--accent-surface);
+}
+
+.mcp-create-connection {
+  background: linear-gradient(145deg, var(--accent-surface), var(--surface-elevated));
+}
+
+.mcp-create-review {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+.knowledge-library-hero > div:first-child > span,
+.knowledge-shelf header > div:first-child > span,
+.knowledge-collection small,
+.library-root-copy span,
+.library-source small {
+  color: var(--muted);
+}
+
+.knowledge-import-card,
+.knowledge-collection {
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.knowledge-import-card strong,
+.knowledge-collection h3,
+.knowledge-collection strong {
+  color: var(--ink);
+}
+
+.knowledge-collection.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+.knowledge-shelf {
+  background: var(--surface-elevated);
+}
+
+.knowledge-zotero-shelf {
+  background: color-mix(in srgb, var(--surface-elevated) 92%, #9c4b3e);
+}
+
+.knowledge-empty-shelf,
+.knowledge-shelf-remainder,
+.knowledge-shelf-placeholder,
+.library-path-dialog,
+.knowledge-scope-shell > header,
+.knowledge-scope-list,
+.knowledge-connector,
+.knowledge-source-list,
+.knowledge-source-select,
+.ima-library-layout,
+.ima-library-appbar,
+.knowledge-settings-index-card,
+.knowledge-settings-choice-card,
+.knowledge-settings-help-card,
+.knowledge-settings-safety-card,
+.knowledge-settings-model-card,
+.knowledge-settings-current-models article {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+/* Connected IMA library: layout/sidebar/main/inspector are the actual DOM
+   surfaces used after a knowledge source is connected. */
+.ima-library-layout {
+  background: var(--page-background);
+}
+
+.ima-library-appbar {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.ima-library-sources {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+.ima-library-main {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.ima-library-preview {
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+.ima-library-appbar-context,
+.ima-library-title h2,
+.ima-library-tree > header strong,
+.ima-folder summary,
+.ima-notion-page-trigger,
+.ima-source-entry,
+.ima-file-row,
+.ima-preview-card h3 {
+  color: var(--ink);
+}
+
+.ima-library-appbar-context > .ui-icon,
+.ima-library-sources > header,
+.ima-source-group > header,
+.ima-library-title span,
+.ima-library-tree > header span,
+.ima-folder summary small,
+.ima-source-entry.is-empty,
+.ima-file-row small,
+.ima-library-empty,
+.ima-preview-card > span,
+.ima-preview-card p,
+.ima-preview-card small,
+.ima-preview-empty,
+.ima-library-suggestions > span {
+  color: var(--muted);
+}
+
+.ima-library-appbar-search-field,
+.ima-library-toolbar label,
+.ima-preview-toggle,
+.ima-library-suggestions button {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.ima-library-appbar-search-field input,
+.ima-library-toolbar input {
+  color: var(--ink);
+}
+
+.ima-library-appbar-search-field input::placeholder,
+.ima-library-toolbar input::placeholder {
+  color: var(--muted);
+}
+
+.ima-library-appbar-search-field button:hover,
+.ima-library-appbar-search:hover,
+.ima-library-sources > header button:hover,
+.ima-source-entry:hover,
+.ima-file-row:hover,
+.ima-preview-toggle:hover,
+.ima-library-suggestions button:hover {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.ima-source-entry.is-active {
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.ima-file-row.is-active {
+  background: var(--control-background-hover);
+}
+
+.ima-preview-card {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.extensions-view {
+  background: var(--page-background);
+}
+
+.extensions-header,
+.extension-detail-card,
+.skill-security-dialog,
+.skill-security-provenance,
+.skill-security-scanners,
+.skill-security-findings,
+.skill-security-footer {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+.extensions-header {
+  background: var(--surface);
+}
+
+.extension-tabs {
+  background: var(--surface-elevated);
+}
+
+.extension-tab {
+  color: var(--muted);
+}
+
+.extension-tab small {
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.extension-tab:hover,
+.extension-tab.is-active {
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.extension-record {
+  background: var(--surface);
+}
+
+.extension-form,
+.extension-empty {
+  border-color: var(--rule);
+  color: var(--muted);
+  background: var(--surface-elevated);
+}
+
+.extension-form-copy strong,
+.extension-empty strong {
+  color: var(--ink);
+}
+
+.extension-form-copy span,
+.extension-form label,
+.extension-empty p {
+  color: var(--muted);
+}
+
+.extension-record-title span,
+.extension-record code,
+.local-capability-tags span,
+.panel-count {
+  border-color: var(--rule);
+  color: var(--muted);
+  background: var(--control-background-hover);
+}
+
+.extension-detail-card > p,
+.extension-detail-card dt,
+.extension-update-summary small {
+  color: var(--muted);
+}
+
+.extension-detail-card dd {
+  color: var(--ink);
+}
+
+html:not([data-theme="dark"]) :is(
+  .settings-view,
+  .settings-content,
+  .mcp-view,
+  .mcp-marketplace-content,
+  .extensions-view
+),
+html[data-theme="dark"] :is(
+  .settings-view,
+  .settings-content,
+  .mcp-view,
+  .mcp-marketplace-content,
+  .extensions-view
+) {
+  background: var(--page-background);
+}
+
+html[data-theme="dark"] :is(
+  .settings-select-trigger,
+  .composer-model-trigger
+) {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+html[data-theme="dark"] :is(
+  .settings-select-trigger:hover,
+  .composer-model-trigger:hover,
+  .composer-model.is-open .composer-model-trigger
+) {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] .composer-model-trigger:hover,
+html[data-theme="dark"] .composer-model.is-open .composer-model-trigger {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+html[data-theme="dark"] :is(
+  .cherry-model-services,
+  .cherry-provider-panel,
+  .settings-surface,
+  .mcp-market-card,
+  .mcp-owned-record,
+  .extension-record
+) {
+  color: var(--ink);
+  background: var(--surface);
+}
+
+html[data-theme="dark"] :is(
+  .cherry-provider-catalog,
+  .settings-select-menu,
+  .knowledge-shelf,
+  .extension-tabs,
+  .extension-detail-card
+) {
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-capability-panel,
+html[data-theme="dark"] .settings-surface:has(.default-capabilities-page) .default-tools-section .document-service-card {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+html[data-theme="dark"] :is(
+  .extensions-header h1,
+  .extension-record h3,
+  .mcp-market-card h2,
+  .mcp-owned-record h2
+) {
+  color: var(--ink);
+}
+
+html[data-theme="dark"] :is(
+  .extension-record p,
+  .extension-panel-summary p,
+  .mcp-market-card > p,
+  .mcp-owned-record p,
+  .mcp-owned-record small
+) {
+  color: var(--muted);
 }

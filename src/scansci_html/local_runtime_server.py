@@ -27,6 +27,81 @@ from .local_model_inference import (
 from .local_runtime_contract import COMPONENT_VERSION
 
 
+def _runtime_versions() -> dict[str, str]:
+    versions = {"python": sys.version.split()[0], "component": COMPONENT_VERSION}
+    for name in ("torch", "transformers", "safetensors", "bitsandbytes"):
+        module = sys.modules.get(name)
+        if module is not None:
+            versions[name] = str(getattr(module, "__version__", ""))
+    return versions
+
+
+def run_model_preflight(
+    record: dict[str, Any],
+    *,
+    load_model: Any | None = None,
+    generate_stream: Any | None = None,
+) -> dict[str, Any]:
+    """Really load a model and generate text inside the disposable worker."""
+
+    if load_model is None:
+        loaded = load_local_chat_model(Path(str(record["path"])).resolve(), str(record["id"]))
+    else:
+        loaded = load_model(record)
+    messages = [{"role": "user", "content": "只回答：好"}]
+    if generate_stream is None:
+        chunks = generate_local_chat_stream(loaded, messages, max_new_tokens=8)
+    else:
+        chunks = generate_stream(loaded, record, messages, max_new_tokens=8)
+    generated_text = "".join(str(chunk or "") for chunk in chunks).strip()
+    if not generated_text:
+        raise RuntimeError("模型完成加载，但最小生成没有生成任何文本。")
+    return {
+        "loaded_model": loaded,
+        "generated": True,
+        "generated_text": generated_text,
+        "runtime_versions": _runtime_versions(),
+    }
+
+
+def _requires_generation_probe(model_id: str) -> bool:
+    normalized = str(model_id or "").lower().replace("_", "").replace("-", "")
+    return "qwen3.5" in str(model_id or "").lower() or "qwen35" in normalized
+
+
+def _model_record(model_id: str) -> dict[str, Any]:
+    record = next((item for item in installed_models() if item.get("id") == model_id), None)
+    if not record or not (record.get("ready") or record.get("model_files_present")):
+        raise ValueError("本地模型权重尚未完整下载，暂时不能启动。")
+    return dict(record)
+
+
+def create_runtime_daemon(
+    *,
+    model_id: str,
+    host: str,
+    port: int,
+    state_dir: str | Path,
+    auto_start_worker: bool = True,
+):
+    """Create the stable public daemon; heavyweight imports stay in its worker."""
+
+    from .local_runtime_daemon import LocalRuntimeDaemon, ModelWorkerSupervisor
+
+    record = _model_record(model_id)
+    supervisor = ModelWorkerSupervisor(
+        model_record=record,
+        state_dir=state_dir,
+        auto_start=auto_start_worker,
+    )
+    return LocalRuntimeDaemon(
+        host=host,
+        port=port,
+        model_record=record,
+        supervisor=supervisor,
+    )
+
+
 class LocalRuntimeServer:
     """Host one selected Hugging Face chat model on a loopback-only port."""
 
@@ -44,14 +119,15 @@ class LocalRuntimeServer:
         self._device = "cpu"
         self._loaded: LoadedLocalModel | None = None
         self._asr = LocalASRRuntime()
+        self._probe_result: dict[str, Any] = {}
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}/v1"
 
-    def start(self, model_id: str) -> str:
-        record = next((item for item in installed_models() if item.get("id") == model_id), None)
-        if not record or not record.get("ready"):
+    def start(self, model_id: str, *, preflight: bool = False) -> str:
+        record = _model_record(model_id)
+        if not record or not (record.get("ready") or record.get("model_files_present")):
             raise ValueError("本地模型权重尚未完整下载，暂时不能启动。")
         if str(record.get("format")) != "transformers":
             raise ValueError("该模型是 GGUF 格式，请通过 llama.cpp 或 LM Studio 运行。")
@@ -59,6 +135,15 @@ class LocalRuntimeServer:
             raise ValueError(str(record.get("runtime_message", "当前语音模型格式不受支持。")))
         self._model_id = str(record["id"])
         self._model_path = Path(str(record["path"])).resolve()
+        if preflight:
+            probe = run_model_preflight(record)
+            loaded = probe.pop("loaded_model")
+            self._loaded = loaded
+            self._tokenizer = loaded.tokenizer
+            self._model = loaded.model
+            self._torch = loaded.torch
+            self._device = loaded.input_device
+            self._probe_result = probe
         self._server = ThreadingHTTPServer((self.host, self.port), self._handler())
         self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True, name="scansci-local-runtime")
@@ -84,7 +169,19 @@ class LocalRuntimeServer:
 
             def do_GET(self) -> None:  # noqa: N802
                 if self.path.rstrip("/") == "/health":
-                    self._json(HTTPStatus.OK, {"status": "ok", "component": "local-transformers", "version": COMPONENT_VERSION, "model": runtime._model_id, **local_runtime_status(runtime._loaded)})
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "status": "ok",
+                            "component": "local-transformers",
+                            "process_role": "model-worker",
+                            "version": COMPONENT_VERSION,
+                            "model": runtime._model_id,
+                            "probe": dict(runtime._probe_result),
+                            "runtime_versions": _runtime_versions(),
+                            **local_runtime_status(runtime._loaded),
+                        },
+                    )
                     return
                 if self.path.rstrip("/") == "/v1/models":
                     self._json(HTTPStatus.OK, {"object": "list", "data": [{"id": runtime._model_id, "object": "model"}]})
@@ -270,22 +367,74 @@ def _write_diagnostics(output: Path) -> int:
     return 0 if payload["ok"] else 1
 
 
+def _write_worker_failure(output: Path | None, *, model_id: str, error: Exception) -> None:
+    if output is None:
+        return
+    payload = {
+        "ok": False,
+        "error": {
+            "type": "local_runtime_error",
+            "code": "model_probe_failed",
+            "message": f"模型 {model_id} 的隔离加载或最小生成失败：{error}",
+            "model": model_id,
+            "phase": "load_or_generate",
+            "native_crash": False,
+            "retryable": False,
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(output)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the ScanSci local Transformers component.")
     parser.add_argument("--model-id")
+    parser.add_argument("--worker-model-id")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int)
     parser.add_argument("--parent-pid", type=int, default=0)
+    parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--worker-status-file", type=Path)
     parser.add_argument("--diagnose-output", type=Path)
     args = parser.parse_args(argv)
     if args.diagnose_output is not None:
         return _write_diagnostics(args.diagnose_output)
-    if not args.model_id or args.port is None:
-        parser.error("--model-id and --port are required unless --diagnose-output is used")
+    if not (args.model_id or args.worker_model_id) or args.port is None:
+        parser.error("--model-id (daemon) or --worker-model-id (worker), plus --port, are required")
     if args.host not in {"127.0.0.1", "localhost"}:
         raise SystemExit("The local runtime may only bind to loopback.")
-    runtime = LocalRuntimeServer(host=args.host, port=args.port)
-    runtime.start(args.model_id)
+    if args.worker_model_id:
+        os.environ.update(
+            {
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_DATASETS_OFFLINE": "1",
+                "HF_HUB_DISABLE_TELEMETRY": "1",
+                "SCANSCI_LOCAL_MODEL_WORKER": "1",
+            }
+        )
+        runtime: Any = LocalRuntimeServer(host=args.host, port=args.port)
+        try:
+            runtime.start(
+                args.worker_model_id,
+                preflight=_requires_generation_probe(args.worker_model_id),
+            )
+        except Exception as error:
+            _write_worker_failure(args.worker_status_file, model_id=args.worker_model_id, error=error)
+            return 20
+    else:
+        from .local_runtime_compatibility import default_compatibility_path
+
+        state_dir = (args.state_dir or default_compatibility_path().parent).expanduser().resolve()
+        runtime = create_runtime_daemon(
+            model_id=args.model_id,
+            host=args.host,
+            port=args.port,
+            state_dir=state_dir,
+        )
+        runtime.start()
     if args.parent_pid:
         def monitor() -> None:
             while _parent_is_alive(args.parent_pid):

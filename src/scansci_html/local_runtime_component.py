@@ -35,8 +35,8 @@ RUNTIME_MANIFEST_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_URL"
 RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
-DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json"
-DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.3"
+DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json"
+DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.4"
 _RUNTIME_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 8.0)
 # Loading a downloaded vision/audio model can take longer than the old fixed
 # 45-second window, especially on the first CUDA initialization.  Do not kill
@@ -54,6 +54,19 @@ class LocalRuntimeInstallCancelled(RuntimeError):
 
 class _RetryableRuntimeDownloadError(RuntimeError):
     """A runtime download failed transiently and may safely resume."""
+
+
+def _semantic_version_less(current: str, required: str) -> bool:
+    """Compare managed component versions without guessing manual labels."""
+
+    pattern = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
+    current_match = pattern.fullmatch(str(current or "").strip())
+    required_match = pattern.fullmatch(str(required or "").strip())
+    if current_match is None or required_match is None:
+        return False
+    return tuple(int(value) for value in current_match.groups()) < tuple(
+        int(value) for value in required_match.groups()
+    )
 
 
 class LocalRuntimeComponent:
@@ -225,6 +238,8 @@ class LocalRuntimeComponent:
                 str(self._component_port()),
                 "--parent-pid",
                 str(os.getpid()),
+                "--state-dir",
+                str((self.root / "state").resolve()),
             ]
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
@@ -330,10 +345,18 @@ class LocalRuntimeComponent:
             if source_dependencies_ready
             else "missing"
         )
+        update_required = bool(
+            managed_component
+            and version
+            and _semantic_version_less(version, self.component_version)
+        )
         return {
             "id": self.component_id,
             "name": self.display_name,
             "version": version or (self.component_version if source_runtime or embedded_runtime else ""),
+            "required_version": self.component_version,
+            "update_available": bool(update_required and self.manifest_urls),
+            "update_required": update_required,
             "installed": bool(installed or source_dependencies_ready or embedded_runtime),
             "mode": mode,
             "executable": str(executable or ""),
@@ -674,6 +697,13 @@ class LocalRuntimeComponent:
 
         executable = self.executable()
         if executable is not None:
+            status = self.status()
+            if status.get("update_required"):
+                raise RuntimeError(
+                    f"{self.display_name} {status.get('version') or '旧版本'} 需要更新到 "
+                    f"{status.get('required_version') or self.component_version}；已下载的模型文件会继续复用。"
+                    "请前往设置 → 本地模型更新本地运行组件。"
+                )
             return executable
         build = current_build_info()
         if not bool(build.get("frozen")):

@@ -7,8 +7,10 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import tomllib
 from urllib.request import urlopen
 
+from scansci_html.app_update import APP_VERSION, AppUpdateService
 import scansci_html.build_info as build_info_module
 from scansci_html.build_info import current_build_info
 from scansci_html.webapp import create_notebook_server
@@ -17,6 +19,31 @@ from scansci_html.webapp import create_notebook_server
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = (PROJECT_ROOT / "src" / "scansci_html").resolve()
 PREVIEW_ENTRY = PROJECT_ROOT / "scripts" / "scansci_preview_entry.py"
+
+
+def test_source_and_release_version_declarations_cannot_drift() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package = json.loads((PROJECT_ROOT / "package.json").read_text(encoding="utf-8"))
+    package_lock = json.loads((PROJECT_ROOT / "package-lock.json").read_text(encoding="utf-8"))
+    release_contract = json.loads((PROJECT_ROOT / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    expected = str(release_contract["version"])
+
+    assert APP_VERSION == expected
+    assert pyproject["project"]["version"] == expected
+    assert package["version"] == expected
+    assert package_lock["version"] == expected
+    assert package_lock["packages"][""]["version"] == expected
+
+
+def test_update_service_defaults_to_the_runtime_build_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(build_info_module, "current_build_info", lambda: {"version": "9.8.7"})
+
+    service = AppUpdateService(manifest_url="", updates_root=tmp_path)
+
+    assert service.current_version == "9.8.7"
 
 
 def test_packaged_build_info_keeps_local_runtime_distribution_contract(

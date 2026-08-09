@@ -77,6 +77,7 @@ def test_desktop_release_preserves_multipart_runtime_contract(tmp_path: Path) ->
     assert blockmap["size"] == archive.stat().st_size
     assert len(blockmap["blocks"]) == (archive.stat().st_size + 65535) // 65536
     assert windows["blockmap"]["url"] == "https://example.test/ScanSci.zip.blockmap"
+    assert windows["size"] == archive.stat().st_size
     assert windows["blockmap"]["size"] == blockmap_path.stat().st_size
     assert windows["blockmap"]["sha256"]
     windows = stable["components"]["local-transformers"]["windows"]

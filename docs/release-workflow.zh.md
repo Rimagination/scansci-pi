@@ -59,6 +59,9 @@
 ```text
 releases\0.2.0+<build_id>\
   ScanSci\ScanSci.exe
+  update\ScanSci-<version>-windows-x64.zip
+  update\ScanSci-<version>-windows-x64.zip.blockmap
+  update\stable.json
   installer\ScanSci-<version>-windows-x64-setup.exe
   installer\installer-manifest.json
   diagnostics\
@@ -100,6 +103,8 @@ visual-evidence\visual-evidence.json
 - 完成同一候选的安全扫描与高风险问题处置；
 - 由网关维护者确认生产凭据、限流、监控与故障响应可用；
 - 发布不可变下载地址、SHA256、版本说明和回滚方案。
+- 将安装器、完整 Windows ZIP 和 `.zip.blockmap` 上传到同一个不可变版本标签，再最后上传 `stable.json`；不得只发布安装器却让应用指向不存在的更新清单；
+- 上传完成后必须运行 `scripts/verify_update_channel.py`，确认公开清单版本、资产大小与 SHA256 一致。HTTP Range 可用时走差分；不可用时必须明确验证完整包回退仍然可达。
 
 没有这些外部证据时，只能称为“已验证的发布候选”；代码签名缺失本身不会阻塞本轮候选构建，但不得隐瞒。
 

@@ -16,6 +16,8 @@ from urllib import parse, request
 
 from .model_downloads import ModelInstallManager, download_snapshot
 from .ollama_runtime import OLLAMA_VISION_CATALOG_ITEM
+from .local_runtime_compatibility import ModelCompatibilityStore
+from .local_runtime_contract import COMPONENT_VERSION
 
 
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -284,6 +286,7 @@ def _audio_runtime_info(identifier: str, config: dict[str, Any]) -> dict[str, An
 def installed_models() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     known: set[str] = set()
+    compatibility = ModelCompatibilityStore()
 
     def add_snapshot(repo_id: str, snapshot: Path) -> None:
         marker = f"{repo_id}|{snapshot}".casefold()
@@ -309,7 +312,7 @@ def installed_models() -> list[dict[str, Any]]:
             row["icon_url"] = icon_url
         if kind == "audio":
             row.update(_audio_runtime_info(repo_id, config))
-        rows.append(row)
+        rows.append(compatibility.apply(row, component_version=COMPONENT_VERSION))
 
     for configured_root in discover_model_roots():
         for root in _hub_roots(configured_root):
@@ -396,10 +399,14 @@ def _merge_catalog(rows: Any, installed: dict[str, dict[str, Any]], query: str) 
         item["installed"] = bool(local)
         item["ready"] = bool(local and local.get("ready"))
         item["local_path"] = str(local.get("path", "")) if local else ""
-        if local and item.get("kind") == "audio":
+        if local and "runtime_compatible" in local:
             item["runtime_compatible"] = bool(local.get("runtime_compatible"))
             item["runtime_backend"] = str(local.get("runtime_backend", ""))
-            item["runtime_message"] = str(local.get("runtime_message", ""))
+            item["runtime_message"] = str(
+                local.get("runtime_message", local.get("runtime_compatibility_message", ""))
+            )
+            item["runtime_verified"] = bool(local.get("runtime_verified", False))
+            item["model_files_present"] = bool(local.get("model_files_present", local.get("ready")))
         output.append(item)
     return output
 

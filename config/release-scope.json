@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "p0_objective": "发布 v0.3.0：Agent Reach 互联网路由、MinerU 云端 PDF 解析、GPU/CUDA 引导、向量索引加速、OCR 引擎扩展（Tesseract / Windows OCR / Paddle / DeepSeek OCR）、文献综述模板词过滤、证据检索去噪（STOPWORDS + F4 门禁）、桌面窗口窄屏适配（min 800px）、打包瘦身与组件化（Node/Tectonic 托管运行时）、应用图标更新及窗口最大化 DWM 修复。",
+  "p0_objective": "发布 v0.3.1：统一版本与自动更新身份；隔离本地模型崩溃并以真实加载生成判定可用性；完成回复中消息队列和深色模式修复。",
   "acceptance": [
     {
       "id": "app-icon",
@@ -27,8 +27,32 @@
       "requirement": "安装包不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"
     },
     {
+      "id": "local-runtime-upgrade",
+      "requirement": "core 能识别过期的 local-transformers 组件并引导独立升级；升级不重复下载或删除已有模型权重。"
+    },
+    {
       "id": "package-identity",
       "requirement": "应用版本、安装器版本、build_id、package_profile 与 SHA256 指向同一唯一构建。"
+    },
+    {
+      "id": "app-update",
+      "requirement": "关于页、运行时身份与更新器版本一致；正式发布同时提供完整 Windows ZIP、64 KiB blockmap 和 stable.json，公开通道校验失败或不支持 Range 时自动回退完整包。"
+    },
+    {
+      "id": "local-runtime-isolation",
+      "requirement": "本地运行组件使用守护进程与模型子进程隔离；模型原生崩溃不会拖死服务，并向界面返回明确错误。"
+    },
+    {
+      "id": "local-model-readiness",
+      "requirement": "Qwen3.5 仅在隔离环境复用已有模型文件并真实完成加载与最小生成后显示可用；不得为兼容性检测重新下载模型。"
+    },
+    {
+      "id": "queued-followups",
+      "requirement": "回复进行中不显示常驻选择卡；发送第二条消息后才按顺序显示逐行队列，默认完成后继续，并可逐条选择立即调整。"
+    },
+    {
+      "id": "dark-theme-legibility",
+      "requirement": "深色模式由统一语义主题变量管理；AI 回复、历史列表、模型按钮、设置内页、模型服务、知识库、MCP 与插件市场均使用深色背景与浅色文字，同时保留错误和状态颜色语义。"
     }
   ],
   "non_goals": [

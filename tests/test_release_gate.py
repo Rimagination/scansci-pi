@@ -4,9 +4,11 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from zipfile import ZipFile
 
 import pytest
 
+from scansci_html.update_blockmap import build_blockmap
 from scripts.verify_scansci_agent import _numbered_section_bullet_counts, _numbered_section_count
 
 
@@ -87,6 +89,7 @@ def test_real_release_contract_defaults_to_a_lightweight_core_package() -> None:
     assert contract["package"]["profile"] == "core"
     assert contract["package"]["exclude_runtimes"] is True
     assert int(contract["package"]["max_package_bytes"]) <= 450_000_000
+    assert "{version}" in contract["package"]["update_package_url"]
 
 
 def test_release_contract_accepts_only_https_runtime_component_manifests() -> None:
@@ -114,6 +117,25 @@ def test_release_contract_accepts_only_https_runtime_component_manifests() -> No
     del contract["package"]["tectonic_component_manifest_url"]
     with pytest.raises(release_gate.GateFailure, match="separately downloadable runtime components"):
         release_gate.validate_release_inputs(contract, _scope())
+
+
+def test_release_contract_requires_a_versioned_https_update_package_url() -> None:
+    contract = _contract()
+    contract["package"]["update_manifest_url"] = "https://downloads.example.com/stable.json"
+
+    with pytest.raises(release_gate.GateFailure, match="update_package_url"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+    contract["package"]["update_package_url"] = "http://downloads.example.com/ScanSci-{version}.zip"
+    with pytest.raises(release_gate.GateFailure, match="update_package_url"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+    contract["package"]["update_package_url"] = "https://downloads.example.com/ScanSci.zip"
+    with pytest.raises(release_gate.GateFailure, match="{version}"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+    contract["package"]["update_package_url"] = "https://downloads.example.com/ScanSci-{version}.zip"
+    release_gate.validate_release_inputs(contract, _scope())
 
 
 def test_release_gate_probes_external_runtime_manifests_and_assets(tmp_path: Path, monkeypatch) -> None:
@@ -769,7 +791,65 @@ def test_release_plan_requires_a_built_and_exercised_windows_installer(tmp_path:
     assert "build-installer" in plan["planned_steps"]
     assert "installer-integrity" in plan["planned_steps"]
     assert "installer-installation" in plan["planned_steps"]
+    assert "build-update-bundle" in plan["planned_steps"]
+    assert "update-bundle-integrity" in plan["planned_steps"]
     assert "signing-environment" in plan["planned_steps"]
+
+
+def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_path: Path) -> None:
+    contract = _contract()
+    contract["package"].update(
+        {
+            "profile": "core",
+            "update_manifest_url": "https://downloads.example.com/stable.json",
+            "update_package_url": "https://downloads.example.com/v{version}/ScanSci-{version}-windows-x64.zip",
+        }
+    )
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="update-assets",
+    )
+    identity = {
+        "version": contract["version"],
+        "build_id": gate.build_id,
+        "package_profile": "core",
+        "release_source_sha256": gate.source_sha256,
+    }
+    gate.report["artifacts"]["build_info"] = identity
+    gate.update_bundle_dir.mkdir(parents=True)
+    archive = gate.update_bundle_dir / f"ScanSci-{contract['version']}-windows-x64.zip"
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("ScanSci.exe", b"desktop")
+        zipped.writestr("_internal/scansci_html/build-info.json", json.dumps(identity))
+    blockmap_path = archive.with_suffix(archive.suffix + ".blockmap")
+    _write_json(blockmap_path, build_blockmap(archive))
+    _write_json(
+        gate.update_manifest,
+        {
+            "version": contract["version"],
+            "channel": "stable",
+            "windows": {
+                "url": gate._update_package_url(),
+                "sha256": release_gate._sha256(archive),
+                "size": archive.stat().st_size,
+                "blockmap": {
+                    "url": gate._update_package_url() + ".blockmap",
+                    "sha256": release_gate._sha256(blockmap_path),
+                    "size": blockmap_path.stat().st_size,
+                    "block_size": 65536,
+                },
+            },
+        },
+    )
+
+    details = gate.verify_update_bundle()
+
+    assert details["update_archive_sha256"] == release_gate._sha256(archive)
+    assert details["update_package_url"].endswith(f"/ScanSci-{contract['version']}-windows-x64.zip")
 
 
 def test_beta_plan_builds_and_exercises_an_unsigned_installer_without_formal_signing(tmp_path: Path) -> None:

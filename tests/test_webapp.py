@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from scansci_html.annotation_layers import write_annotation_layer
+from scansci_html.app_update import APP_VERSION
 from scansci_html.app_settings import save_settings
 from scansci_html.deep_research_evidence import build_task_fulltext_evidence
 from scansci_html.evidence_store import index_evidence_library
@@ -129,9 +130,9 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     assert health["status"] == "ok"
     assert health["workspace_exists"] is True
     assert health["evidence_store_exists"] is True
-    assert health["version"] == "0.2.3"
+    assert health["version"] == APP_VERSION
     assert health["build_id"] == "source"
-    assert update["current_version"] == "0.2.3"
+    assert update["current_version"] == APP_VERSION
     assert update["state"] in {"idle", "current"}
     assert workspace["counts"]["sources"] == 1
     assert answer["question"] == "What did Galunisertib reduce?"
@@ -370,6 +371,22 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "isError ? 10000 : 2800" in script
 
 
+def test_settings_compact_model_list_and_multiselect_ocr_languages_are_exposed(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert '<span data-ui-icon="server"></span><span class="settings-nav-label" data-i18n="modelServices">模型服务</span>' in page
+    assert 'select[name="ocr-language"]' in script
+    assert 'multiple' in script
+    assert 'select[name="ocr-language"] option:checked' in script
+    assert "settings-select-multi-check" in script
+    assert ".local-installed-model-list" in styles
+    assert "max-height: 360px" in styles
+    assert "overflow-y: auto" in styles
+
+
 def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     notebook = _payload(app.dispatch("GET", "/api/notebooks/immunotherapy"))
@@ -391,6 +408,25 @@ def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path)
     assert ".conversation-layout.is-evidence-expanded" in styles
     assert "installContextPanelResizer" in script
     assert "--context-panel-width" in styles
+
+
+def test_theme_takeover_bridge_covers_settings_state_surfaces(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "--accent-solid: var(--accent)" in styles
+    assert "/* Theme takeover bridge" in styles
+    for selector in (
+        ".local-capability-section > header > span",
+        ".runtime-components-panel > header > div > span",
+        ".runtime-component-card.is-ready",
+        ".runtime-component-primary",
+        ".local-model-recommendation.is-ready",
+        ".knowledge-settings-ready-text",
+        ".data-source-card.is-connected",
+        ".data-import-progress.is-complete",
+    ):
+        assert f"html[data-accent] {selector}" in styles
 
 
 def test_agent_control_plane_routes_and_ui_contract_are_exposed(tmp_path: Path):
@@ -598,6 +634,17 @@ def test_academic_writing_routes_source_backed_requests_to_research_documents(tm
     assert 'evidenceLevel === "external_source_abstracts"' in script
     assert '"公开学术摘要"' in script
     assert '"所选知识库原文"' in script
+
+
+def test_local_runtime_update_is_separate_from_model_downloads(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert "const runtimeNeedsUpdate = Boolean(state.localRuntime?.update_required);" in script
+    assert "更新本地运行组件" in script
+    assert "已下载模型不会重复下载" in script
+    assert "模型已存在；更新运行组件后可直接使用" in script
+    assert "runtime.update_required ? localRuntimeChannelRecoveryMarkup(runtime)" in script
 
 
 def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(tmp_path: Path):
@@ -1440,8 +1487,17 @@ def test_conversation_streaming_preserves_history_and_respects_manual_scroll(tmp
 
     assert 'id="conversationJumpLatest"' in html
     assert 'data-action="jump-conversation-latest"' in html
+    jump_button_prefix, jump_button = html.split('id="conversationJumpLatest"', 1)
+    jump_button = jump_button.split("</button>", 1)[0]
+    assert jump_button_prefix.rsplit("<button", 1)[1].strip().endswith('class="conversation-jump-latest"')
+    assert jump_button.split(">", 1)[0].strip().endswith("hidden")
+    assert 'data-ui-icon="chevron-down"' in jump_button
     assert "function conversationScrollSnapshot()" in script
     assert "state.conversationAutoFollow && distanceFromBottom < conversationFollowThreshold" in script
+    assert 'button.hidden = state.activeView !== "conversation"' in script
+    assert "|| state.conversationAutoFollow" in script
+    assert "|| distanceFromBottom < conversationFollowThreshold" in script
+    assert "state.conversationAutoFollow = distanceFromBottom < conversationFollowThreshold" in script
     assert "function restoreConversationScroll(" in script
     assert "answerArea.scrollTop = Math.min(Math.max(0, Number(snapshot?.top || 0)), maximum)" in script
     assert 'byId("answerArea")?.addEventListener("scroll"' in script
@@ -1455,6 +1511,12 @@ def test_conversation_streaming_preserves_history_and_respects_manual_scroll(tmp
     assert "if (isTaskFollowUp && activeRun)" in script
     assert "renderFailedTaskFollowUp(activeRun, question, error, selectedSkills)" in script
     assert ".conversation-jump-latest" in styles
+    jump_rule = styles.split(".conversation-jump-latest {", 1)[1].split("}", 1)[0]
+    assert "z-index: 40" in jump_rule
+    assert "background: color-mix(in srgb, var(--surface-elevated) 94%, transparent)" in jump_rule
+    jump_icon_rule = styles.split(".conversation-jump-latest .ui-icon {", 1)[1].split("}", 1)[0]
+    assert "display: block" in jump_icon_rule
+    assert "color: currentColor" in jump_icon_rule
     answer_rule = styles.split(".answer-area {", 1)[1].split("}", 1)[0]
     assert "overscroll-behavior: contain" in answer_rule
     assert "scrollbar-gutter: stable" in answer_rule

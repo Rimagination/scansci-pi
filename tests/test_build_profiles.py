@@ -8,7 +8,7 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     script = (ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8-sig")
 
     assert '[string]$PackageProfile = "core"' in script
-    assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json' in script
+    assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json' in script
     assert '[string]$NodeComponentManifestUrl' in script
     assert '[string]$TectonicComponentManifestUrl' in script
     assert 'Slim channel: do not embed node.exe or tectonic.exe in the bundle.' in script
@@ -63,6 +63,7 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
 def test_local_runtime_has_an_independent_versioned_build() -> None:
     script = (ROOT / "scripts" / "build_local_runtime.ps1").read_text(encoding="utf-8-sig")
 
+    assert '[string]$Version = "1.0.4"' in script
     assert 'ScanSciLocalRuntime' in script
     assert '"--additional-hooks-dir", $pyInstallerHooks' in script
     assert 'build\\component-cache\\$cacheName' in script
@@ -79,6 +80,7 @@ def test_local_runtime_has_an_independent_versioned_build() -> None:
     assert '"--hidden-import", "sentence_transformers.sentence_transformer.modules.normalize"' in script
     assert '"--hidden-import", "transformers.models.auto.modeling_auto"' in script
     assert '"--hidden-import", "transformers.generation.streamers"' in script
+    assert '"--hidden-import", "transformers.pipelines"' not in script
     assert '"--hidden-import", "transformers.models.qwen3.modeling_qwen3"' in script
     assert '"--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr"' in script
     assert '"--hidden-import", "transformers.models.hrm_text.modeling_hrm_text"' in script
@@ -92,6 +94,15 @@ def test_local_runtime_has_an_independent_versioned_build() -> None:
     assert '"scipy",' not in script
     assert '"sklearn",' not in script
     assert '"torch.testing",' not in script
+    for optional_module in (
+        '"datasets"',
+        '"nltk"',
+        '"pyarrow"',
+        '"tkinter"',
+        '"_tkinter"',
+        '"transformers.pipelines"',
+    ):
+        assert optional_module in script
     assert 'torch.version.cuda' in script
     assert 'Reusing stable local-runtime spec' in script
     assert 'freeze_pyinstaller_spec.py' in script
@@ -110,12 +121,14 @@ def test_local_runtime_has_an_independent_versioned_build() -> None:
     assert "$diagnosticProcess.WaitForExit(300000)" in script
 
 
-def test_runtime_entry_configures_text_only_transformers_before_server_import() -> None:
+def test_runtime_entry_defers_transformers_configuration_until_model_load() -> None:
     entry = (ROOT / "scripts" / "scansci_local_runtime_entry.py").read_text(encoding="utf-8")
+    local_asr = (ROOT / "src" / "scansci_html" / "local_asr.py").read_text(encoding="utf-8")
 
-    configure = entry.index("configure_text_only_transformers()")
-    server_import = entry.index("from scansci_html.local_runtime_server import main")
-    assert configure < server_import
+    assert "configure_text_only_transformers" not in entry
+    configure = local_asr.index("configure_text_only_transformers()")
+    transformers_import = local_asr.index('importlib.import_module("transformers")')
+    assert configure < transformers_import
 
 
 def test_qwen_desktop_hook_does_not_recursively_collect_pytorch_test_modules() -> None:

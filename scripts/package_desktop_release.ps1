@@ -70,6 +70,7 @@ $payload = [ordered]@{
     windows = [ordered]@{
         url = $PackageUrl
         sha256 = $sha256
+        size = [long](Get-Item -LiteralPath $archive).Length
         archive = [System.IO.Path]::GetFileName($archive)
         blockmap = [ordered]@{
             url = $resolvedBlockmapUrl

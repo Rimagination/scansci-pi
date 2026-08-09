@@ -498,6 +498,48 @@ def test_interrupted_replacement_does_not_hide_the_active_runtime(
     assert status["install_job"]["state"] == "interrupted"
 
 
+def test_outdated_managed_runtime_stays_visible_but_requires_component_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    root = tmp_path / "installed"
+    executable = root / "versions" / "1.0.3" / "ScanSciLocalRuntime.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"old-runtime")
+    (root / "active.json").write_text(
+        json.dumps(
+            {
+                "id": "local-transformers",
+                "version": "1.0.3",
+                "executable": str(executable.relative_to(root)),
+                "sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    component = LocalRuntimeComponent(
+        root=root,
+        manifest_url="https://downloads.example.com/local-transformers.json",
+        component_version="1.0.4",
+    )
+
+    status = component.status()
+
+    assert status["installed"] is True
+    assert status["version"] == "1.0.3"
+    assert status["required_version"] == "1.0.4"
+    assert status["update_available"] is True
+    assert status["update_required"] is True
+    assert Path(status["executable"]) == executable.resolve()
+    with pytest.raises(RuntimeError, match="1.0.4"):
+        component.ensure_installed()
+
+
 def test_runtime_component_rejects_corrupt_part(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         local_runtime_component,

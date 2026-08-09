@@ -50,6 +50,7 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
   "windows": {
     "url": "https://download.example/ScanSci-0.3.0-windows-x64.zip",
     "sha256": "<完整 ZIP 的 SHA256>",
+    "size": 123456789,
     "blockmap": {
       "url": "https://download.example/ScanSci-0.3.0-windows-x64.zip.blockmap",
       "sha256": "<blockmap 的 SHA256>",
@@ -80,6 +81,16 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 ```
 
 生产 CDN 必须正确转发 `Range` 请求并返回 `206 Partial Content`；如果 CDN 只返回 `200 OK`，客户端会安全地走全量下载。`local-transformers` 组件仍按自身版本和 SHA256 清单更新，不会因为 core 的差分更新被重复下载。
+
+正式 `release` 门禁会把完整 ZIP、`.zip.blockmap` 与 `stable.json` 作为同一组不可拆分的更新资产构建和校验。公开上传时先上传完整 ZIP 和 blockmap，最后上传 `stable.json`；上传完成后运行：
+
+```powershell
+python .\scripts\verify_update_channel.py `
+  --manifest-url https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json `
+  --expected-version 0.3.1
+```
+
+审计会核对版本、HTTPS 地址、完整包大小、SHA256、blockmap 身份和 HTTP Range。Range 不可用不会破坏更新通道，结果会明确标记使用完整包回退。
 
 ## 构建本地 AI 组件
 
@@ -117,6 +128,16 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 ```
 
 `active.json` 指向当前版本。更新 core 不触碰该目录；只有组件版本变化才下载新的运行时。组件下载和启用均经过 SHA256 校验，失败时会保留已经可用的旧版本。
+
+主程序必须比较 `active.json` 中的组件版本与当前 core 要求的组件契约版本。旧版本仍保留在版本目录中，但在完成兼容更新前不能被误报为“已就绪”；设置页应明确显示“更新本地运行组件”。组件更新只原子切换运行时目录，不删除 `%LOCALAPPDATA%\ScanSci\models\`、Hugging Face 缓存或用户配置的其他模型根目录，因此已经下载并校验过的模型权重不会重复下载。
+
+### 本地运行时的进程隔离与就绪判定
+
+`local-transformers` 必须采用“稳定守护进程 + 按模型启动的子进程”结构。守护进程只负责健康检查、请求转发、状态记录和子进程生命周期；PyTorch、Transformers、模型权重与生成状态只能存在于模型子进程中。模型加载失败、原生库崩溃、显存或页面文件不足时，守护进程应保持可响应并返回可诊断的结构化错误，不能让整个本地服务随模型一起退出。
+
+模型存在于磁盘不等于可用。只有隔离环境真实完成“加载指定模型并产生非空回复”的兼容性探测后，才能标记 `ready=true` 与 `runtime_compatible=true`。探测必须离线复用已经安装的组件、用户模型目录和 Hugging Face 缓存；不得为了重新检测而下载模型。待验证、加载失败或生成失败的模型仍可显示“文件已存在”，但必须明确显示为未就绪，不能进入正常模型选择列表或被自动路由使用。
+
+流式生成过程中如果模型子进程异常退出，守护进程应保留已经发送的 token，随后发送明确的错误事件和结束事件，并把运行时降级状态写入健康检查。下一次请求可以重启新的模型子进程，不需要重启主程序或重新安装组件。
 
 ## 正式发行
 

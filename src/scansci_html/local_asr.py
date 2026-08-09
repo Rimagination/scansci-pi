@@ -32,6 +32,7 @@ from .local_model_market import (
     installed_models,
 )
 from .local_runtime_component import default_local_runtime_component
+from .local_transformers_compat import configure_text_only_transformers
 
 
 @dataclass
@@ -123,6 +124,7 @@ class LocalASRRuntime:
         self._model_id = ""
         self._model_path = None
         gc.collect()
+        configure_text_only_transformers()
         try:
             torch = importlib.import_module("torch")
             transformers = importlib.import_module("transformers")

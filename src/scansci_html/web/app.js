@@ -1110,12 +1110,27 @@ function renderSettingsSelectLabel(target, option) {
   target.append(label);
 }
 
+function renderMultiSettingsSelectLabel(target, select) {
+  if (!target) return;
+  const selected = [...(select?.options || [])]
+    .filter((option) => option.selected)
+    .map((option) => option.textContent?.trim() || option.value)
+    .filter(Boolean);
+  target.replaceChildren();
+  const label = document.createElement("span");
+  label.className = "settings-select-multi-summary";
+  label.textContent = selected.join("、") || "请选择";
+  target.append(label);
+}
+
 function hydrateSettingsSelects(root = document) {
-  const selects = root.querySelectorAll?.(".settings-content select:not([multiple])") || [];
+  const selects = root.querySelectorAll?.(".settings-content select") || [];
   selects.forEach((select) => {
     if (select.closest("[data-settings-select]")) return;
+    const isMultiple = select.multiple;
     const wrapper = document.createElement("div");
     wrapper.className = "settings-select";
+    if (isMultiple) wrapper.classList.add("is-multiple");
     wrapper.dataset.settingsSelect = "true";
     select.parentNode.insertBefore(wrapper, select);
     wrapper.append(select);
@@ -1136,15 +1151,24 @@ function hydrateSettingsSelects(root = document) {
     menu.hidden = true;
     menu.id = `settings-select-menu-${++settingsSelectSequence}`;
     menu.setAttribute("role", "listbox");
+    if (isMultiple) menu.setAttribute("aria-multiselectable", "true");
     trigger.setAttribute("aria-controls", menu.id);
 
     const updateSelection = () => {
-      const selected = select.options[select.selectedIndex];
-      renderSettingsSelectLabel(trigger, selected);
+      if (isMultiple) renderMultiSettingsSelectLabel(trigger, select);
+      else renderSettingsSelectLabel(trigger, select.options[select.selectedIndex]);
       menu.querySelectorAll("[role=option]").forEach((option) => {
-        const isSelected = option.dataset.value === select.value;
+        const isSelected = isMultiple
+          ? [...select.options].some((candidate) => candidate.value === option.dataset.value && candidate.selected)
+          : option.dataset.value === select.value;
         option.classList.toggle("is-selected", isSelected);
         option.setAttribute("aria-selected", isSelected ? "true" : "false");
+        const check = option.querySelector(".settings-select-multi-check");
+        if (check) {
+          check.classList.toggle("is-selected", isSelected);
+          check.replaceChildren();
+          if (isSelected) check.append(iconElement("check"));
+        }
       });
     };
     const setOpen = (open) => {
@@ -1157,9 +1181,15 @@ function hydrateSettingsSelects(root = document) {
     [...select.options].forEach((option) => {
       const item = document.createElement("button");
       item.type = "button";
-      item.className = "settings-select-option";
+      item.className = `settings-select-option${isMultiple ? " is-multiple" : ""}`;
       item.dataset.value = option.value;
       renderSettingsSelectLabel(item, option);
+      if (isMultiple) {
+        const check = document.createElement("span");
+        check.className = "settings-select-multi-check";
+        check.setAttribute("aria-hidden", "true");
+        item.append(check);
+      }
       item.disabled = option.disabled;
       item.setAttribute("role", "option");
       item.setAttribute("aria-selected", "false");
@@ -1167,11 +1197,15 @@ function hydrateSettingsSelects(root = document) {
         event.preventDefault();
         event.stopPropagation();
         if (item.disabled) return;
-        select.value = option.value;
+        if (isMultiple) option.selected = !option.selected;
+        else select.value = option.value;
         select.dispatchEvent(new Event("change", { bubbles: true }));
         updateSelection();
-        setOpen(false);
-        trigger.focus();
+        if (isMultiple) item.focus();
+        else {
+          setOpen(false);
+          trigger.focus();
+        }
       });
       menu.append(item);
     });
@@ -1838,8 +1872,8 @@ function renderAppUpdate() {
     installing: "正在更新",
     restarting: "正在重启",
     available: "更新",
-    current: `v${update.current_version || "0.2.3"}`,
-    idle: `v${update.current_version || "0.2.3"}`,
+    current: `v${update.current_version || "—"}`,
+    idle: `v${update.current_version || "—"}`,
     error: "版本信息",
   };
   byId("appUpdateLabel").textContent = labels[status] || "版本信息";
@@ -4850,6 +4884,8 @@ function composerSendControlState() {
     if (job.status === "paused" && !job.pauseRequested) return { state: "paused", icon: "play", label: "继续回复" };
     if (job.pauseRequested) return { state: "pausing", icon: "square", label: "正在暂停回复" };
     if (["starting", "running", "retrying", "queued"].includes(job.status)) {
+      const queuedInput = String(byId("chatQuestionInput")?.value || "").trim();
+      if (queuedInput) return { state: "queueing", icon: "send", label: "加入后续队列" };
       return { state: "running", icon: "square", label: "暂停当前回复" };
     }
   }
@@ -4903,6 +4939,7 @@ function directTurnConfiguration({
     knowledgeScopePayloads: selectedKnowledge.length ? activeKnowledgeScopePayloads() : [],
     thinkingLevel: currentThinkingLevel(),
     webSearch: state.webSearchMode,
+    deliveryMode: "follow-up",
     createdAt: new Date().toISOString(),
   };
 }
@@ -5034,6 +5071,7 @@ function persistDirectChatJob(job) {
 
 function queueDirectChatTurn(job, turn, { front = false, announce = true } = {}) {
   if (!job || !turn?.question) return;
+  turn.deliveryMode = turn.deliveryMode === "steer" ? "steer" : "follow-up";
   if (front) job.queue.unshift(turn);
   else job.queue.push(turn);
   if (announce) toast(`已加入后续队列（${job.queue.length}）`);
@@ -5098,16 +5136,6 @@ function fallbackSteerDirectChat(job, turn, { reason = "unsupported" } = {}) {
 
 async function submitToRunningDirectChat(job, turn, input) {
   clearSubmittedDirectComposer(turn, input);
-  if (job.inputMode === "steer") {
-    job.steeringPending = true;
-    renderDirectLiveControls();
-    const steered = await steerDirectChat(job, turn);
-    if (!steered) {
-      fallbackSteerDirectChat(job, turn);
-    }
-    renderDirectLiveControls();
-    return;
-  }
   queueDirectChatTurn(job, turn);
 }
 
@@ -5125,7 +5153,6 @@ function beginDirectChatJob(turn) {
     controller: null,
     runId: "",
     status: "starting",
-    inputMode: "follow-up",
     currentStartedAt: 0,
     currentTurn: null,
     streamingMessage: null,
@@ -5715,7 +5742,7 @@ async function askQuestion(event, inputId) {
     }
     return;
   }
-  if (activatedSendButton && currentJob) {
+  if (activatedSendButton && currentJob && !input.value.trim()) {
     if (currentJob.status === "paused") resumeDirectChatJob(currentJob.conversationId);
     else if (!currentJob.pauseRequested) pauseDirectChatJob(currentJob.conversationId);
     return;
@@ -6154,46 +6181,50 @@ function renderDirectLiveControls() {
     return;
   }
   const paused = job.status === "paused" && !job.pauseRequested;
-  const phaseLabels = {
-    started: "Agent 已启动",
-    turn_started: "正在思考",
-    message_started: "正在生成",
-    message_completed: "正在整理",
-    turn_completed: "本轮已完成",
-    completed: "正在收尾",
-    settled: "正在保存",
-  };
-  const runningLabel = paused
-    ? "已暂停"
-    : job.status === "retrying"
-      ? "正在重试"
-      : job.status === "starting"
-        ? "正在连接"
-        : job.status === "queued"
-          ? "准备继续"
-          : phaseLabels[job.agentPhase] || "正在处理";
-  const elapsed = job.currentStartedAt ? formatProcessingDuration(performance.now() - job.currentStartedAt) : "不足 1 秒";
-  const queueRows = job.queue.map((turn) => `<li><span>${escapeHtml(compact(turn.question, 52))}</span><button type="button" data-action="remove-direct-follow-up" data-queue-id="${escapeHtml(turn.queueId)}" aria-label="移除这条后续消息" title="移除">${uiIcon("x")}</button></li>`).join("");
+  if (!job.queue.length) {
+    surface.hidden = true;
+    surface.innerHTML = "";
+    form?.classList.remove("has-live-direct-job");
+    if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
+    if (send) send.setAttribute("aria-label", paused ? "继续回复" : "发送下一条消息");
+    renderComposerSendButtons();
+    return;
+  }
+  const queueRows = job.queue.map((turn) => {
+    const queueId = escapeHtml(turn.queueId);
+    const deliveryMode = turn.deliveryMode === "steer" ? "steer" : "follow-up";
+    const steerDisabled = paused || job.steeringPending ? "disabled" : "";
+    return `<li data-queue-id="${queueId}"><span title="${escapeHtml(turn.question)}">${escapeHtml(compact(turn.question, 52))}</span><div class="direct-live-actions" role="group" aria-label="这条队列消息的处理方式"><button type="button" data-action="set-queued-direct-mode" data-queue-id="${queueId}" data-queue-mode="follow-up" class="${deliveryMode === "follow-up" ? "is-active" : ""}" aria-pressed="${deliveryMode === "follow-up"}">完成后继续</button><button type="button" data-action="set-queued-direct-mode" data-queue-id="${queueId}" data-queue-mode="steer" class="${deliveryMode === "steer" ? "is-active" : ""}" aria-pressed="${deliveryMode === "steer"}" ${steerDisabled}>立即调整</button><button type="button" data-action="remove-direct-follow-up" data-queue-id="${queueId}" aria-label="移除这条后续消息" title="移除">${uiIcon("x")}</button></div></li>`;
+  }).join("");
   const parallelCount = Math.max(0, directChatJobs.size - 1);
-  const controlAction = paused ? "resume-direct-chat" : "pause-direct-chat";
-  const controlIcon = paused ? "play" : "square";
-  const controlLabel = paused ? "继续当前回复" : "暂停当前回复";
+  const parallelSummary = parallelCount ? ` · 另有 ${parallelCount} 个对话并行` : "";
   surface.hidden = false;
-  const piPending = Number(job.piQueue?.pending_count || 0);
-  surface.innerHTML = `<div class="direct-live-summary"><span class="direct-live-pulse ${paused ? "is-paused" : ""}" aria-hidden="true"></span><strong>${runningLabel}</strong><time data-direct-job-timer="${escapeHtml(String(job.currentStartedAt || performance.now()))}">${elapsed}</time>${piPending ? `<em>Pi 队列 ${piPending}</em>` : ""}${parallelCount ? `<em>另有 ${parallelCount} 个对话并行</em>` : ""}</div><div class="direct-live-actions" role="group" aria-label="运行中消息方式">${paused ? "" : `<button type="button" data-action="set-direct-input-mode" data-direct-input-mode="follow-up" class="${job.inputMode === "follow-up" ? "is-active" : ""}" aria-pressed="${job.inputMode === "follow-up"}">完成后继续</button><button type="button" data-action="set-direct-input-mode" data-direct-input-mode="steer" class="${job.inputMode === "steer" ? "is-active" : ""}" aria-pressed="${job.inputMode === "steer"}" ${job.steeringPending ? "disabled" : ""}>${job.steeringPending ? "正在调整…" : "立即调整"}</button>`}<button type="button" class="direct-live-stop" data-action="${controlAction}" data-legacy-action="cancel-direct-chat" aria-label="${controlLabel}" title="${controlLabel}">${uiIcon(controlIcon)}</button></div>${queueRows ? `<div class="direct-live-queue"><span>接下来 ${job.queue.length}</span><ol>${queueRows}</ol></div>` : ""}`;
+  surface.innerHTML = `<div class="direct-live-queue"><span>接下来 ${job.queue.length}${parallelSummary}</span><ol>${queueRows}</ol></div>`;
   form?.classList.add("has-live-direct-job");
-  if (input) input.placeholder = paused ? "点击播放键继续当前回复" : job.inputMode === "steer" ? "输入要立即调整的方向" : "输入下一条消息；当前回复完成后自动继续";
-  if (send) send.setAttribute("aria-label", paused ? "继续回复" : job.inputMode === "steer" ? "立即调整当前回复" : "加入后续队列");
+  if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
+  if (send) send.setAttribute("aria-label", paused ? "继续回复" : "加入后续队列");
   renderComposerSendButtons();
-  updateProcessingTimers();
 }
 
-function setDirectChatInputMode(mode) {
+async function setQueuedDirectTurnMode(queueId, mode) {
   const job = directChatJob();
   if (!job) return;
-  job.inputMode = mode === "steer" ? "steer" : "follow-up";
+  const index = job.queue.findIndex((turn) => turn.queueId === String(queueId || ""));
+  if (index < 0) return;
+  const turn = job.queue[index];
+  turn.deliveryMode = mode === "steer" ? "steer" : "follow-up";
+  if (turn.deliveryMode !== "steer") {
+    renderDirectLiveControls();
+    return;
+  }
+  if (job.steeringPending || job.status === "paused") return;
+  job.queue.splice(index, 1);
+  job.steeringPending = true;
   renderDirectLiveControls();
-  byId("chatQuestionInput")?.focus();
+  const steered = await steerDirectChat(job, turn);
+  if (!steered) fallbackSteerDirectChat(job, turn);
+  renderDirectLiveControls();
+  renderTasks();
 }
 
 function removeQueuedDirectTurn(queueId) {
@@ -9858,9 +9889,10 @@ function resourceInstallSnapshot(resource) {
   const definition = ONBOARDING_RESOURCE_DEFINITIONS[resourceId] || LEGACY_RETRIEVAL_RESOURCE;
   const usesOllama = Boolean(definition.ollama);
   const localRuntimeMode = String(state.localRuntime?.mode || "");
+  const runtimeNeedsUpdate = Boolean(state.localRuntime?.update_required);
   const runtimeReady = usesOllama
     ? Boolean(state.ollama?.reachable)
-    : Boolean(state.localRuntime?.installed) && (!definition.audio || ["source", "embedded", "component"].includes(localRuntimeMode));
+    : Boolean(state.localRuntime?.installed) && !runtimeNeedsUpdate && (!definition.audio || ["source", "embedded", "component"].includes(localRuntimeMode));
   const isInstalledReady = (modelId) => installed.some((item) => item.id === modelId && item.ready && item.runtime_compatible !== false);
   const preferredReady = definition.models.every(isInstalledReady);
   const compatibleModel = usesOllama
@@ -9896,6 +9928,7 @@ function resourceInstallSnapshot(resource) {
     job: displayJob,
     legacyJob,
     runtimeReady,
+    runtimeNeedsUpdate,
     ownsRuntimeTask,
     waitingForSharedRuntime,
     compatibleModel,
@@ -9909,6 +9942,10 @@ function resourceInstallSnapshot(resource) {
 }
 
 function resourceInstallStatusCopy(resource) {
+  if (resource.state === "runtime_required" && resource.runtimeNeedsUpdate) return {
+    label: "更新本地运行组件",
+    hint: `检测到本地运行组件 ${state.localRuntime?.version || "旧版本"}，需要更新到 ${state.localRuntime?.required_version || "当前版本"}。已下载模型不会重复下载。`,
+  };
   if (resource.state === "runtime_required" && resource.waitingForSharedRuntime) return {
     label: "等待共享运行组件",
     hint: "本地运行组件正在准备；这个模型尚未开始下载，完成后可单独启动。",
@@ -9952,7 +9989,7 @@ function resourceSetupCard(resource) {
   const actionLabel = resource.state === "ready"
     ? "已就绪"
     : resource.state === "runtime_required"
-      ? resource.waitingForSharedRuntime ? "选择此模型" : state.localRuntime?.install_available ? "准备本地能力" : "查看安装选项"
+      ? resource.runtimeNeedsUpdate ? "更新本地运行组件" : resource.waitingForSharedRuntime ? "选择此模型" : state.localRuntime?.install_available ? "准备本地能力" : "查看安装选项"
     : ["failed", "runtime_failed", "interrupted", "cancelled"].includes(resource.state)
       ? resource.state === "runtime_failed" ? "继续安装" : "重试下载"
     : resource.state === "paused"
@@ -10848,7 +10885,7 @@ function renderAboutSettings() {
   const update = state.update || {};
   const isBusy = ["checking", "installing", "restarting"].includes(update.state);
   const hasUpdate = Boolean(update.available);
-  const version = update.current_version || "0.2.3";
+  const version = update.current_version || "—";
   const latestVersion = update.latest_version || version;
   const checkAction = hasUpdate && update.can_install ? "install-app-update" : "check-app-update";
   const checkLabel = isBusy ? (update.state === "installing" ? "正在更新" : "检查中") : (hasUpdate && update.can_install ? "立即更新" : "检查更新");
@@ -10922,7 +10959,7 @@ function renderLegacyLocalModelsSettings() {
   const presets = (state.presets?.local_models || []).map((item) => `<button type="button" class="quiet-add-chip" data-action="add-local-preset" data-preset-id="${escapeHtml(item.id)}">＋ ${escapeHtml(item.name)}</button>`).join("");
   const installedItems = state.localModelMarket?.installed || [];
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
-  const runtimeReady = Boolean(runtime.installed);
+  const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
   const runtimeJob = runtime.install_job || {};
   const runtimeInstalling = ["queued", "installing"].includes(runtimeJob.state);
   const runtimeNeedsRetry = ["failed", "cancelled", "interrupted"].includes(runtimeJob.state);
@@ -10934,10 +10971,12 @@ function renderLegacyLocalModelsSettings() {
     : runtimeNeedsRetry && runtime.install_available
       ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("refresh")}继续安装</button>`
     : runtime.install_available
-      ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")}安装本地运行能力</button>`
+      ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")}${runtime.update_required ? "更新本地运行组件" : "安装本地运行能力"}</button>`
       : `<button type="button" class="local-model-primary-action" data-action="open-local-runtime-setup">${uiIcon("settings")}查看本地运行设置</button>`;
   const runtimeDescription = runtimeReady
     ? "可使用已安装的本地模型；模型下载完成后会自动校验。"
+    : runtime.update_required
+      ? `检测到本地运行组件 ${runtime.version || "旧版本"}，需要更新到 ${runtime.required_version || "当前版本"}；已下载模型不会重复下载。`
     : runtimeInstalling
       ? "由 ScanSci 提供，正在下载、校验并自检；进度会持续保留。"
     : runtimeNeedsRetry
@@ -11088,7 +11127,7 @@ function localModelMarketRow(item, recommendedIds) {
   const ready = !incompatible && (isOllama ? Boolean(ollama.model_ready || item.ready) : Boolean(item.ready));
   const installed = isOllama ? ready : Boolean(item.installed);
   const runtime = state.localRuntime || {};
-  const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? Boolean(runtime.installed) && ["source", "embedded", "component"].includes(String(runtime.mode || "")) : Boolean(runtime.installed);
+  const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? Boolean(runtime.installed) && !runtime.update_required && ["source", "embedded", "component"].includes(String(runtime.mode || "")) : Boolean(runtime.installed) && !runtime.update_required;
   const job = (state.localModelInstall?.jobs || []).find((candidate) => Array.isArray(candidate?.models) && candidate.models.includes(item.id)) || null;
   const jobState = String(job?.state || "");
   const active = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(jobState);
@@ -11112,7 +11151,14 @@ function localModelMarketRow(item, recommendedIds) {
 }
 
 function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
-  if (runtime.installed) return "";
+  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.4";
+  if (runtime.update_required) {
+    const updateAction = runtime.install_available
+      ? `<button type="button" class="quiet-primary-button" data-action="install-local-runtime">${uiIcon("download")} 更新本地运行组件</button>`
+      : `<a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开组件发布页 ${uiIcon("arrow-up-right")}</a>`;
+    return `<section class="local-runtime-recovery is-update-required"><header><div><span>本地运行组件</span><strong>更新本地运行组件</strong></div>${updateAction}</header><div class="local-runtime-manual-fallback"><div><strong>检测到 ${escapeHtml(runtime.version || "旧版本")}，当前需要 ${escapeHtml(runtime.required_version || "新版本")}</strong><p>只更新独立运行组件；已下载模型不会重复下载，更新完成后会继续复用。</p></div>${runtime.install_available ? "" : `<button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地组件包</button>`}</div></section>`;
+  }
+  if (runtime.installed && !runtime.update_required) return "";
   const report = runtime.channels;
   const channels = Array.isArray(report?.channels) ? report.channels : [];
   const checked = Boolean(report?.checked_at);
@@ -11125,7 +11171,6 @@ function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
   const channelRows = channels.length
     ? `<div class="local-runtime-channel-list">${channels.map((item) => `<div><span>${escapeHtml(item.label || "下载通道")}</span><b class="${item.valid ? "is-ready" : "is-failed"}">${item.valid ? "可用" : "不可用"}</b></div>`).join("")}</div>`
     : `<p class="local-runtime-channel-empty">点击“检查通道”后，ScanSci 会逐个验证清单是否可读；启动时不会因为网络探测而卡住。</p>`;
-  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.3";
   const checking = Boolean(runtime.channelsChecking);
   return `<section class="local-runtime-recovery"><header><div><span>下载通道</span><strong>${escapeHtml(checking ? "正在检查自动通道…" : summary)}</strong></div><button type="button" class="quiet-text-button" data-action="check-local-runtime-channels" ${checking ? "disabled" : ""}>${uiIcon("refresh")} ${checking ? "检查中…" : checked ? "重新检查" : "检查通道"}</button></header>${channelRows}<div class="local-runtime-manual-fallback"><div><strong>网络仍不可用？可以手动安装</strong><p>从官方发布页下载 ZIP；如果是分片包，请把 JSON 清单和全部分片一起选中，ScanSci 会校验后再安装。</p></div><div class="local-runtime-recovery-actions"><button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地文件</button><a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开官方发布页 ${uiIcon("arrow-up-right")}</a></div></div></section>`;
 }
@@ -11137,7 +11182,7 @@ function renderLocalModelsSettings() {
   const incompatibleInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible === false).length;
   const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
-  const runtimeReady = Boolean(runtime.installed);
+  const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
   const runtimeJob = runtime.install_job || {};
   const runtimeInstalling = ["queued", "installing"].includes(runtimeJob.state);
   const runtimeNeedsRetry = ["failed", "cancelled", "interrupted"].includes(runtimeJob.state);
@@ -11154,10 +11199,12 @@ function renderLocalModelsSettings() {
       : runtimeNeedsRetry && runtime.install_available
         ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("refresh")} 继续安装</button>`
         : runtime.install_available
-          ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")} 安装本地能力</button>`
-          : `<button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 查看安装选项</button>`;
+          ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")} ${runtime.update_required ? "更新本地运行组件" : "安装本地能力"}</button>`
+          : `<button type="button" class="local-model-primary-action" data-action="choose-local-runtime-files">${uiIcon("download")} 选择本地组件包</button>`;
   const runtimeDescription = runtimeReady
     ? "本地模型会在需要时自动加载；不需要用户选择运行时。"
+    : runtime.update_required
+      ? `检测到本地运行组件 ${runtime.version || "旧版本"}，需要更新到 ${runtime.required_version || "当前版本"}；已下载模型不会重复下载。`
     : runtimeInstalling
       ? "ScanSci 正在准备本地能力，完成后会自动纳入 Agent 的选择范围。"
       : runtimeNeedsRetry
@@ -11202,7 +11249,9 @@ function renderLocalModelsSettings() {
   const externalByKind = (kind) => (state.settings.local_models || []).find((item) => item.enabled && item.model_id && Array.isArray(item.capabilities) && item.capabilities.includes(kind));
   const autoRoute = (kind) => {
     const installedModel = installedByKind(kind);
-    if (installedModel) return { name: installedModel.name || installedModel.id, note: "本机已安装；Agent 按需加载", tone: "ready" };
+    if (installedModel && runtimeReady) return { name: installedModel.name || installedModel.id, note: "本机已安装；Agent 按需加载", tone: "ready" };
+    if (installedModel && runtime.update_required) return { name: installedModel.name || installedModel.id, note: "模型已存在；更新运行组件后可直接使用", tone: "warning" };
+    if (installedModel) return { name: installedModel.name || installedModel.id, note: "模型已存在；准备运行组件后可直接使用", tone: "warning" };
     const externalModel = externalByKind(kind);
     if (externalModel) return { name: externalModel.name || externalModel.id, note: "已连接；调用前自动检测", tone: "ready" };
     if (kind === "vision" && ollama.reachable && ollama.model_ready) return { name: "Ollama · MiniCPM-V 4.6", note: "已检测到外部连接；需要图片时自动使用", tone: "ready" };
@@ -11218,7 +11267,7 @@ function renderLocalModelsSettings() {
     const route = autoRoute(kind);
     return `<article class="local-agent-route is-${route.tone}"><span class="local-agent-route-mark">${uiIcon(kind === "vision" ? "eye" : kind === "audio" ? "audio" : kind === "reranking" ? "filter" : "database")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p></div><div class="local-agent-route-target"><b>${escapeHtml(route.name)}</b><small>${escapeHtml(route.note)}</small></div></article>`;
   }).join("");
-  const runtimeRecovery = !runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "";
+  const runtimeRecovery = runtime.update_required ? localRuntimeChannelRecoveryMarkup(runtime) : !runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "";
   const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
   const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
     const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
@@ -11249,10 +11298,10 @@ function renderLocalModelsSettings() {
     return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
-    <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${runtimeReady ? escapeHtml(runtimeDescription) : "本地模型是可选项；基础对话和关键词检索无需额外安装。"}</span><button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button></footer></section>
+    <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtime.update_required ? "本地组件需更新" : runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${escapeHtml(runtimeDescription)}</span>${runtimeReady ? `<button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button>` : runtimeAction}</footer></section>
     ${runtimeRecovery}
     ${runtimeComponentsSettingsMarkup()}
-    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list">${installed}</div></section>
+    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
     <details class="local-model-disclosure local-model-market-disclosure"><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
     <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
     <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
@@ -11263,6 +11312,9 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
   const ocr = processing.ocr || { provider: "tesseract", base_url: "", languages: ["zh", "en"], enabled: true };
   const mineru = processing.mineru || { provider: "mineru", base_url: "https://mineru.net", enabled: false };
   const ocrLanguages = new Set(ocr.languages || []);
+  const ocrLanguageOptions = [["zh", "中文"], ["en", "English"]]
+    .map(([value, label]) => `<option value="${value}" ${ocrLanguages.has(value) ? "selected" : ""}>${label}</option>`)
+    .join("");
   const tesseractSelected = ocr.provider === "tesseract";
   const paddleSelected = ocr.provider === "paddle";
   const deepseekSelected = ocr.provider === "deepseek";
@@ -11303,7 +11355,7 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
     : settingsHeading("文档处理", "配置扫描页识别与学术 PDF 解析服务。密钥不会写入工作区文件。");
   return `${heading}
     <form id="${escapeHtml(formId)}" class="document-processing-form${embedded ? " embedded-document-processing-form" : ""}">
-      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR ${settingHelpMarkup("用于识别图片内文字。", "OCR 说明")}</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="tesseract" ${tesseractSelected ? "selected" : ""}>Tesseract OCR</option><option value="system" ${ocr.provider === "system" ? "selected" : ""}>Windows OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="deepseek" ${deepseekSelected ? "selected" : ""}>DeepSeek-OCR（硅基流动）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<div class="document-language-row"><span>识别语言</span><div class="language-chips"><label><input name="ocr-language" type="checkbox" value="zh" ${ocrLanguages.has("zh") ? "checked" : ""} />中文</label><label><input name="ocr-language" type="checkbox" value="en" ${ocrLanguages.has("en") ? "checked" : ""} />English</label></div></div>${ocrConnection}</section>
+      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR ${settingHelpMarkup("用于识别图片内文字。", "OCR 说明")}</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="tesseract" ${tesseractSelected ? "selected" : ""}>Tesseract OCR</option><option value="system" ${ocr.provider === "system" ? "selected" : ""}>Windows OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="deepseek" ${deepseekSelected ? "selected" : ""}>DeepSeek-OCR（硅基流动）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<label class="document-language-row"><span>识别语言</span><select name="ocr-language" multiple size="2" aria-label="识别语言">${ocrLanguageOptions}</select></label>${ocrConnection}</section>
       <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档处理 ${settingHelpMarkup("用于按版面解析论文，保留段落、表格、公式和图片结构。", "文档处理说明")}</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">可填写多个 MinerU 密钥时请使用英文逗号分隔；密钥仅保存在当前电脑的系统凭据管理器中。</p></section>
       <div class="settings-footer-actions"><button type="submit" class="save-button">保存文档处理配置</button></div>
     </form>`.replace('<h2>OCR 服务</h2>', '<h2>OCR</h2>').replace('<h2>文档解析</h2>', '<h2>文档处理</h2>');
@@ -11316,11 +11368,13 @@ function renderDocumentProcessingSettings() {
 function collectDocumentProcessingForm(formId = "") {
   const form = byId(formId) || byId("documentProcessingForm") || byId("defaultDocumentProcessingForm");
   if (!form) return state.settings.document_processing;
+  const languageOptions = [...form.querySelectorAll('select[name="ocr-language"] option:checked')];
+  const languageInputs = [...form.querySelectorAll('input[name="ocr-language"]:checked')];
   state.settings.document_processing = {
     ocr: {
       provider: form.elements["ocr-provider"].value,
       base_url: form.elements["ocr-base-url"]?.value.trim() || "",
-      languages: [...form.querySelectorAll('input[name="ocr-language"]:checked')].map((input) => input.value),
+      languages: (languageOptions.length ? languageOptions : languageInputs).map((input) => input.value),
       enabled: form.elements["ocr-enabled"].checked,
     },
     mineru: {
@@ -12921,7 +12975,7 @@ document.addEventListener("click", (event) => {
     if (source) openSourceReader(source);
   }
   else if (action === "retry-direct-message") retryDirectMessage(element.dataset.messageIndex || "");
-  else if (action === "set-direct-input-mode") setDirectChatInputMode(element.dataset.directInputMode || "follow-up");
+  else if (action === "set-queued-direct-mode") setQueuedDirectTurnMode(element.dataset.queueId || "", element.dataset.queueMode || "follow-up").catch((error) => toast(error.message, true));
   else if (action === "remove-direct-follow-up") removeQueuedDirectTurn(element.dataset.queueId || "");
   else if (action === "cancel-direct-chat") pauseDirectChatJob().catch((error) => toast(error.message, true));
   else if (action === "pause-direct-chat") pauseDirectChatJob().catch((error) => toast(error.message, true));
@@ -13370,6 +13424,7 @@ document.addEventListener("input", (event) => {
   }
   if (["homeQuestionInput", "chatQuestionInput"].includes(event.target.id)) {
     renderSkillSuggestions(event.target);
+    renderComposerSendButtons();
     return;
   }
   if (event.target.id === "historySearch") {

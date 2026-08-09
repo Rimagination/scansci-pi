@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$OutputDir = "",
-    [string]$Version = "1.0.3",
+    [string]$Version = "1.0.4",
     [string]$CacheKey = "",
     [string]$PackageUrl = "",
     [string]$PythonExecutable = "python",
@@ -31,6 +31,8 @@ $buildInputs = @(
     (Join-Path $projectRoot "scripts\scansci_local_runtime_entry.py"),
     (Join-Path $projectRoot "scripts\pyinstaller_hooks\hook-transformers.py"),
     (Join-Path $projectRoot "src\scansci_html\local_runtime_server.py"),
+    (Join-Path $projectRoot "src\scansci_html\local_runtime_daemon.py"),
+    (Join-Path $projectRoot "src\scansci_html\local_runtime_compatibility.py"),
     (Join-Path $projectRoot "src\scansci_html\local_runtime_contract.py"),
     (Join-Path $projectRoot "src\scansci_html\local_transformers_compat.py"),
     (Join-Path $projectRoot "src\scansci_html\local_model_inference.py"),
@@ -105,7 +107,6 @@ $pyInstallerArgs = @(
     "--hidden-import", "transformers.utils.quantization_config",
     "--hidden-import", "transformers.generation.stopping_criteria",
     "--hidden-import", "transformers.generation.streamers",
-    "--hidden-import", "transformers.pipelines",
     "--hidden-import", "transformers.generation.utils",
     "--hidden-import", "transformers.modeling_utils",
     "--hidden-import", "transformers.integrations.bitsandbytes",
@@ -126,12 +127,18 @@ $pyInstallerArgs = @(
     "--hidden-import", "scansci_html.local_asr",
     "--hidden-import", "transformers.models.qwen2.tokenization_qwen2_fast",
     "--hidden-import", "scansci_html.local_runtime_server",
+    "--hidden-import", "scansci_html.local_runtime_daemon",
+    "--hidden-import", "scansci_html.local_runtime_compatibility",
     "--distpath", $distPath,
     "--workpath", $buildPath,
     "--specpath", $specPath,
     $entryPoint
 )
-foreach ($module in @("__main__", "boto3", "botocore", "cv2", "IPython", "jupyter", "keras", "matplotlib", "pandas", "pygame", "pytest", "tensorflow", "torchaudio", "torch.utils.benchmark")) {
+# These optional training, dataset, and desktop-UI dependencies are not used by
+# the inference sidecar.  Excluding them also prevents PyInstaller runtime hooks
+# (notably nltk/tkinter) from doing expensive work before the health server can
+# start listening.
+foreach ($module in @("__main__", "boto3", "botocore", "cv2", "datasets", "IPython", "jupyter", "keras", "matplotlib", "nltk", "pandas", "pyarrow", "pygame", "pytest", "tensorflow", "tkinter", "_tkinter", "torchaudio", "torch.utils.benchmark", "transformers.pipelines")) {
     $pyInstallerArgs += @("--exclude-module", $module)
 }
 if ($Clean) { $pyInstallerArgs = @("--clean") + $pyInstallerArgs }

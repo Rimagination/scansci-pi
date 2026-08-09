@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 import re
 import shutil
@@ -24,6 +24,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from zipfile import BadZipFile, ZipFile
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -211,6 +212,15 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
     update_manifest_url = str(package.get("update_manifest_url", "")).strip()
     if update_manifest_url and urlparse(update_manifest_url).scheme.lower() != "https":
         raise GateFailure("package update_manifest_url must use HTTPS")
+    update_package_url = str(package.get("update_package_url", "")).strip()
+    if update_manifest_url and not update_package_url:
+        raise GateFailure("package update_package_url is required when automatic updates are enabled")
+    if update_package_url:
+        parsed_update_package = urlparse(update_package_url)
+        if parsed_update_package.scheme.lower() != "https" or not parsed_update_package.netloc:
+            raise GateFailure("package update_package_url must use HTTPS")
+        if "{version}" not in update_package_url:
+            raise GateFailure("package update_package_url must contain {version} for immutable release assets")
 
 
 def _template_command(parts: list[str], variables: dict[str, str]) -> list[str]:
@@ -689,6 +699,14 @@ class ReleaseGate:
         return self.release_dir / "installer"
 
     @property
+    def update_bundle_dir(self) -> Path:
+        return self.release_dir / "update"
+
+    @property
+    def update_manifest(self) -> Path:
+        return self.update_bundle_dir / "stable.json"
+
+    @property
     def installer_manifest(self) -> Path:
         return self.installer_dir / "installer-manifest.json"
 
@@ -925,6 +943,132 @@ class ReleaseGate:
             "package_bytes": package_bytes,
             "package_profile": expected_profile,
             "build_info": build_info,
+        }
+        self.report["artifacts"].update(details)
+        self._persist()
+        return details
+
+    def _update_package_url(self) -> str:
+        template = str(self.contract["package"].get("update_package_url", "")).strip()
+        return template.replace("{version}", str(self.contract["version"]))
+
+    def build_update_bundle(self) -> None:
+        """Build the full ZIP, blockmap, and stable manifest as one release set."""
+
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            raise GateFailure("PowerShell is required to build the Windows update bundle")
+        command = [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(PROJECT_ROOT / "scripts" / "package_desktop_release.ps1"),
+            "-BuildDir",
+            str(self.package_dir),
+            "-Version",
+            str(self.contract["version"]),
+            "-PackageUrl",
+            self._update_package_url(),
+            "-OutputDir",
+            str(self.update_bundle_dir),
+            "-Channel",
+            "stable",
+        ]
+        self.command_step(
+            step_id="build-update-bundle",
+            title="Windows 完整更新包、blockmap 与 stable.json 构建",
+            command=command,
+            required_result=self.update_manifest,
+            echo_output=False,
+        )
+
+    def verify_update_bundle(self) -> dict[str, Any]:
+        """Bind every updater asset to the package identity that passed this gate."""
+
+        if not self.update_manifest.is_file():
+            raise GateFailure(f"Update manifest is missing: {self.update_manifest}")
+        manifest = _read_json(self.update_manifest)
+        version = str(self.contract["version"])
+        if str(manifest.get("version", "")) != version:
+            raise GateFailure("Update manifest does not match the release version")
+        if str(manifest.get("channel", "")).casefold() != "stable":
+            raise GateFailure("Formal update manifest must use the stable channel")
+        windows = manifest.get("windows")
+        if not isinstance(windows, dict):
+            raise GateFailure("Update manifest is missing the Windows package")
+        archive = self.update_bundle_dir / f"ScanSci-{version}-windows-x64.zip"
+        blockmap_path = archive.with_suffix(archive.suffix + ".blockmap")
+        for path, label in ((archive, "full ZIP"), (blockmap_path, "blockmap")):
+            if not path.is_file() or path.stat().st_size <= 0:
+                raise GateFailure(f"Update {label} is missing or empty: {path}")
+        archive_sha256 = _sha256(archive)
+        if str(windows.get("url", "")) != self._update_package_url():
+            raise GateFailure("Update manifest package URL does not match the immutable release URL")
+        if str(windows.get("sha256", "")).casefold() != archive_sha256.casefold():
+            raise GateFailure("Update manifest ZIP SHA256 does not match the full package")
+        if int(windows.get("size", 0) or 0) != archive.stat().st_size:
+            raise GateFailure("Update manifest ZIP size does not match the full package")
+        blockmap_info = windows.get("blockmap")
+        if not isinstance(blockmap_info, dict):
+            raise GateFailure("Update manifest is missing blockmap metadata")
+        if str(blockmap_info.get("url", "")) != self._update_package_url() + ".blockmap":
+            raise GateFailure("Update manifest blockmap URL does not match the full package URL")
+        if str(blockmap_info.get("sha256", "")).casefold() != _sha256(blockmap_path).casefold():
+            raise GateFailure("Update manifest blockmap SHA256 does not match the published blockmap")
+        if int(blockmap_info.get("size", 0) or 0) != blockmap_path.stat().st_size:
+            raise GateFailure("Update manifest blockmap size does not match the published blockmap")
+
+        blockmap = _read_json(blockmap_path)
+        block_size = int(blockmap.get("block_size", 0) or 0)
+        blocks = blockmap.get("blocks")
+        if (
+            int(blockmap.get("schema_version", 0) or 0) != 1
+            or str(blockmap.get("algorithm", "")).casefold() != "sha256"
+            or block_size != 64 * 1024
+            or int(blockmap.get("size", 0) or 0) != archive.stat().st_size
+            or str(blockmap.get("sha256", "")).casefold() != archive_sha256.casefold()
+            or not isinstance(blocks, list)
+            or len(blocks) != (archive.stat().st_size + block_size - 1) // block_size
+            or any(not re.fullmatch(r"[a-fA-F0-9]{64}", str(item)) for item in blocks)
+        ):
+            raise GateFailure("Update blockmap does not describe the verified full ZIP")
+
+        expected_build_info = dict(self.report.get("artifacts", {}).get("build_info", {}) or {})
+        try:
+            with ZipFile(archive) as zipped:
+                members = [PurePosixPath(name.replace("\\", "/")) for name in zipped.namelist()]
+                if not members or any(path.is_absolute() or ".." in path.parts for path in members):
+                    raise GateFailure("Update ZIP contains an unsafe path")
+                if not any(path.name.casefold() == "scansci.exe" for path in members):
+                    raise GateFailure("Update ZIP does not contain ScanSci.exe")
+                build_info_member = next(
+                    (
+                        name
+                        for name in zipped.namelist()
+                        if name.replace("\\", "/").casefold().endswith("_internal/scansci_html/build-info.json")
+                    ),
+                    None,
+                )
+                if not build_info_member:
+                    raise GateFailure("Update ZIP does not contain build-info.json")
+                archived_build_info = json.loads(zipped.read(build_info_member).decode("utf-8-sig"))
+        except BadZipFile as error:
+            raise GateFailure("Update ZIP is not a valid archive") from error
+        for key in ("version", "build_id", "package_profile", "release_source_sha256"):
+            if str(archived_build_info.get(key, "")) != str(expected_build_info.get(key, "")):
+                raise GateFailure(f"Update ZIP build-info.json does not match verified package field {key}")
+
+        details = {
+            "update_manifest_path": str(self.update_manifest),
+            "update_archive_path": str(archive),
+            "update_archive_sha256": archive_sha256,
+            "update_archive_bytes": archive.stat().st_size,
+            "update_blockmap_path": str(blockmap_path),
+            "update_blockmap_sha256": _sha256(blockmap_path),
+            "update_blockmap_bytes": blockmap_path.stat().st_size,
+            "update_package_url": self._update_package_url(),
         }
         self.report["artifacts"].update(details)
         self._persist()
@@ -1359,6 +1503,10 @@ class ReleaseGate:
                 ]
             )
             if self.profile == "release":
+                steps[steps.index("build-installer"):steps.index("build-installer")] = [
+                    "build-update-bundle",
+                    "update-bundle-integrity",
+                ]
                 steps.append("visual-acceptance")
             else:
                 steps.append("beta-delivery")
@@ -1398,6 +1546,13 @@ class ReleaseGate:
             if self.is_packaged_profile:
                 self.build_desktop()
                 self.internal_step("package-integrity", "包完整性、build_id 与 SHA256", self.verify_package)
+                if self.profile == "release":
+                    self.build_update_bundle()
+                    self.internal_step(
+                        "update-bundle-integrity",
+                        "完整 ZIP、blockmap、stable.json 与包身份一致性",
+                        self.verify_update_bundle,
+                    )
                 self.build_installer()
                 self.internal_step("installer-integrity", "安装包、来源 EXE 与 SHA256", self.verify_installer_manifest)
                 self.verify_installer_installation()

@@ -54,7 +54,11 @@ def test_update_service_reads_verified_windows_release_manifest(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    status = AppUpdateService(manifest_url=manifest.as_uri(), updates_root=tmp_path / "updates").check()
+    status = AppUpdateService(
+        manifest_url=manifest.as_uri(),
+        current_version="0.2.3",
+        updates_root=tmp_path / "updates",
+    ).check()
 
     assert status["state"] == "available"
     assert status["latest_version"] == "0.3.0"
