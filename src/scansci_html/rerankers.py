@@ -540,6 +540,39 @@ def _load_jina_reranker_model(model_name: str, *, device: str = "cpu") -> Any:
     return move_model_to_device(model, device)
 
 
+def _resolve_qwen3_model_path(model_name: str) -> str:
+    """Resolve a ScanSci-downloaded model snapshot before falling back to HF cache.
+
+    ``download_snapshot`` writes ModelScope/HuggingFace snapshots under
+    ``model_root()/models--<owner>--<name>/snapshots/<revision>``.  HuggingFace's
+    ``from_pretrained(local_files_only=True)`` never looks there, so a model the
+    user just downloaded from the model market would fail to load.  Resolve the
+    snapshot directory ourselves and pass the concrete path instead.
+    """
+
+    try:
+        from .local_model_market import discover_model_roots, _hub_roots
+    except ImportError:  # pragma: no cover - local_model_market is bundled
+        return model_name
+    expected = "models--" + str(model_name).replace("/", "--")
+    for root in discover_model_roots():
+        for hub_root in _hub_roots(root):
+            if not hub_root.is_dir():
+                continue
+            folder = hub_root / expected
+            snapshots = folder / "snapshots"
+            if not snapshots.is_dir():
+                continue
+            candidates = sorted(
+                (item for item in snapshots.iterdir() if item.is_dir()),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates and any(item.suffix.lower() in {".safetensors", ".bin", ".pt"} for item in candidates[0].iterdir()):
+                return str(candidates[0])
+    return model_name
+
+
 def _load_qwen3_reranker_model(model_name: str, *, device: str = "cpu") -> tuple[Any, Any]:
     try:
         auto_models = importlib.import_module("transformers.models.auto.modeling_auto")
@@ -548,7 +581,8 @@ def _load_qwen3_reranker_model(model_name: str, *, device: str = "cpu") -> tuple
         AutoTokenizer = getattr(auto_tokenizers, "AutoTokenizer")
     except ImportError as error:  # pragma: no cover - optional dependency
         raise RuntimeError("transformers is required for the Qwen3 reranker") from error
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", local_files_only=True)
+    resolved_path = _resolve_qwen3_model_path(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(resolved_path, padding_side="left", local_files_only=True)
     load_kwargs: dict[str, Any] = {"local_files_only": True}
     if device.startswith("cuda"):
         load_kwargs["torch_dtype"] = "auto"
@@ -566,7 +600,7 @@ def _load_qwen3_reranker_model(model_name: str, *, device: str = "cpu") -> tuple
             except (ImportError, AttributeError):
                 # bitsandbytes not available; fall through to standard loading
                 pass
-    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs).eval()
+    model = AutoModelForCausalLM.from_pretrained(resolved_path, **load_kwargs).eval()
     model = move_model_to_device(model, device).eval()
     return tokenizer, model
 
