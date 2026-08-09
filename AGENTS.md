@@ -1,0 +1,45 @@
+# ScanSci Agent 工作规则
+
+这是 ScanSci 仓库级的 agent 入口。开始任何代码、打包、运行时、模型或桌面 UI 任务前，必须先阅读本文件和 [`docs/agent-startup.zh.md`](docs/agent-startup.zh.md)。本文件描述的是当前已经确认的架构契约，不是可随意替换的实现建议。
+
+## 开始任务前必须读取
+
+- [`docs/agent-startup.zh.md`](docs/agent-startup.zh.md)：多 agent 启动、交接和变更流程；
+- [`docs/project-governance.zh.md`](docs/project-governance.zh.md)：业务分层和模块边界；
+- [`docs/desktop-packaging.zh.md`](docs/desktop-packaging.zh.md)：core、运行组件和差分更新契约；
+- [`docs/release-workflow.zh.md`](docs/release-workflow.zh.md)：源码、桌面包和公开发布门禁；
+- [`config/release-scope.json`](config/release-scope.json)：当前 P0、验收项和明确非目标。
+
+如果任务会改变其中任何契约，必须同时更新对应文档、测试和发布门禁；不能只修改实现后把新策略留在当前对话里。
+
+## 当前不可悄悄改变的架构决定
+
+### 桌面包与本地 AI 运行时
+
+- `core` 是公开默认桌面包：包含应用界面、对话、知识库、文档、PPT、Skill 和 MCP，不包含 PyTorch、Transformers 或模型权重。
+- `local-transformers` 是默认推荐的本地 AI 组件，独立版本、独立下载和独立校验；它服务 Qwen3-ASR、原生 Hugging Face 视觉模型、语义检索和重排。
+- Ollama、LM Studio 等是可选外部运行时连接，不得为了“更简单”而替换默认 Transformers 路线，也不得强制用户同时安装多个本地运行时。
+- 模型权重属于用户按需安装的数据，不得偷偷打进 `core` 或因主程序小改动而重复分发。
+- `full` 只用于内部支持或离线交付，不能成为正式公开发布的默认 profile。
+
+### 应用更新
+
+- 主程序发布的是完整 Windows ZIP 加 `.zip.blockmap`，不是只有补丁包；完整 ZIP 永远是可用的回退和手动下载入口。
+- blockmap 默认使用 64 KiB SHA256 区块。更新器只有在存在已校验的当前版本缓存且 CDN 支持 HTTP `Range`/`206` 时才走差分。
+- 差分重建必须写临时文件，并在替换前通过完整包大小、SHA256、ZIP 路径安全和 `ScanSci.exe` 存在性校验。
+- 缺少缓存、清单或 blockmap 错误、Range 不可用、区块响应错误或最终校验失败时，必须自动回退完整 ZIP，不能留下半包或覆盖当前安装。
+- `stable.json` 的 `windows.url`/`sha256` 是旧清单兼容的必需字段；`windows.blockmap` 是可选增强字段。不能把旧版本清单升级成差分必需品。
+- `local-transformers`、Node、Tectonic 等组件继续按各自清单和版本更新，不因 core 差分更新而重复下载。
+
+## 不允许的快捷方案
+
+- 不要把所有依赖重新塞回 `core`，以解决单个模型或运行时问题。
+- 不要把 Ollama 当成默认唯一后端，除非用户明确改变产品决策并同步更新架构文档和验收项。
+- 不要删除完整包回退，只保留“差分一定成功”的路径。
+- 不要直接改发布产物、安装目录或用户数据来绕过测试。
+- 不要把 API key、token、cookie、签名私钥或内部接入点写入代码、日志、文档或提交。
+- 不要仅凭“源码能启动”宣称桌面包或公开发布完成；发布必须遵循 `docs/release-workflow.zh.md` 和 `release-report.json`。
+
+## Agent 交接要求
+
+每个 agent 结束任务时，必须说明：改了什么、依据哪个契约、运行了哪些验证、有哪些未完成项，以及是否需要更新下一轮 P0。架构决定不能只存在于聊天记录；应写入 `docs/`、`config/`、测试或实现注释中的稳定位置。
