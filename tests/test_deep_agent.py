@@ -342,8 +342,8 @@ def test_research_runtime_uses_deep_agents_for_configured_provider(tmp_path: Pat
     assert result["agent_runtime"] == {"thinking_level": "high", "evidence_budget": 6}
 
 
-def test_evidence_answer_defaults_to_product_owned_workflow_not_pi_tool_loop(tmp_path: Path, monkeypatch):
-    """A normal evidence turn must not wait for a provider-side tool loop."""
+def test_evidence_answer_keeps_product_owned_retrieval_but_routes_generation_through_pi(tmp_path: Path, monkeypatch):
+    """Host retrieval stays fixed while its model-mediated JSON pass uses Pi."""
 
     workspace = tmp_path / "workspace.sqlite"
     evidence_db = _indexed_evidence(tmp_path)
@@ -364,24 +364,31 @@ def test_evidence_answer_defaults_to_product_owned_workflow_not_pi_tool_loop(tmp
     )
     monkeypatch.setattr(research_agent_module, "get_provider_api_key", lambda *_args: "secret")
 
-    def pi_must_not_run(*_args, **_kwargs):
-        raise AssertionError("default evidence answers must skip the Pi planning loop")
-
     observed: dict[str, object] = {}
 
-    class FakeJsonClient:
-        pass
-
-    def fake_json_client(*_args, **_kwargs):
-        return FakeJsonClient()
+    def fake_pi_stream(self, **kwargs):
+        del self
+        observed["pi_request"] = dict(kwargs)
+        yield {"type": "delta", "content": '{"answer":"Grounded answer"}'}
+        yield {"type": "done", "stats": {}}
 
     def fake_answer_question(_db, question, **kwargs):
         observed["question"] = question
         observed["options"] = kwargs
+        observed["generated"] = kwargs["chat_client"].complete_json(
+            [{"role": "user", "content": "Use only the verified evidence."}],
+            schema_name="evidence_workflow_fixture",
+        )
         return {"reader_answer": {"text": "Grounded answer [1].", "citations": []}}
 
-    monkeypatch.setattr(research_agent_module.PiAgentClient, "stream_chat", pi_must_not_run)
-    monkeypatch.setattr(research_agent_module, "build_chat_json_client", fake_json_client)
+    monkeypatch.setattr(research_agent_module.PiAgentClient, "stream_chat", fake_pi_stream)
+    monkeypatch.setattr(
+        research_agent_module,
+        "build_chat_json_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("evidence JSON generation must not bypass Pi")
+        ),
+    )
     monkeypatch.setattr(research_agent_module, "answer_question", fake_answer_question)
 
     result = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db).answer_sync(
@@ -389,8 +396,10 @@ def test_evidence_answer_defaults_to_product_owned_workflow_not_pi_tool_loop(tmp
     )
 
     assert observed["question"] == "What did the field study report?"
-    assert isinstance(observed["options"]["chat_client"], FakeJsonClient)
-    assert result["pi_agent"]["harness"] == "provider-neutral-workflow"
+    assert observed["generated"] == {"answer": "Grounded answer"}
+    assert observed["pi_request"]["session_id"] is None
+    assert observed["pi_request"]["task_contract"]["allowed_tools"] == []
+    assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
 
 
 def test_research_runtime_uses_the_selected_vision_model_for_image_inputs(tmp_path: Path, monkeypatch):

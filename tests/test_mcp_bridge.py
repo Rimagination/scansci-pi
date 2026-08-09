@@ -7,8 +7,11 @@ from pathlib import Path
 import subprocess
 import threading
 
+import pytest
+
 from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.pi_agent import PiAgentClient
+from scansci_html.research_agent import ResearchAgentRuntime
 
 
 _TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
@@ -248,6 +251,286 @@ class _DeferredDottedWriteHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+
+class _OrdinaryMcpDiscoveryHandler(_DeferredDottedWriteHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "discover-ordinary-mcp",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["mcp__reader__search"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "The ordinary turn discovered its read-only MCP."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-ordinary-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-ordinary-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _DeferredReadFilterHandler(_DeferredDottedWriteHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "activate-deferred-search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["mcp__fixture__search"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 2:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "search-deferred-catalog",
+                    "type": "function",
+                    "function": {"name": "mcp__fixture__search", "arguments": "{}"},
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "Only read-authorized remote tools were visible."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-filter-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-filter-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+def test_ordinary_non_social_turn_discovers_enabled_read_only_mcp_without_regex_intent(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [
+        {
+            "id": "reader",
+            "name": "Reader MCP",
+            "enabled": True,
+            "transport": "stdio",
+            "command": str(node),
+            "args": f'"{fixture}"',
+            "allow_write": False,
+            "tool_effects": {"search_library": "read"},
+            "deferred": True,
+        },
+        {
+            "id": "writer",
+            "name": "Writer MCP",
+            "enabled": True,
+            "transport": "stdio",
+            "command": str(node),
+            "args": f'"{fixture}"',
+            "allow_write": True,
+            "deferred": True,
+        },
+        {
+            "id": "disabled-reader",
+            "name": "Disabled reader",
+            "enabled": False,
+            "transport": "stdio",
+            "command": str(node),
+            "args": f'"{fixture}"',
+            "allow_write": False,
+            "deferred": True,
+        },
+    ]
+    save_settings(workspace, settings)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    contract = runtime._compile_contract(
+        task_mode="general",
+        user_text="Help me think through this research idea.",
+    )
+
+    assert contract["allowed_mcp_servers"] == ["reader"]
+
+    _OrdinaryMcpDiscoveryHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OrdinaryMcpDiscoveryHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Help me think through this research idea."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract=contract,
+            timeout_seconds=30,
+            session_id="ordinary-read-mcp",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    loader_messages = [
+        message
+        for message in _OrdinaryMcpDiscoveryHandler.request_payloads[1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    loader = json.loads(str(loader_messages[-1]["content"]))
+    assert loader["activated"] == ["mcp__reader__search"]
+    assert "mcp__reader__search" in events[-1]["stats"]["toolInventory"]["names"]
+
+
+@pytest.mark.parametrize("mcp_scope", ["local-only", "selected-library"])
+def test_explicit_local_scopes_do_not_lease_unrelated_mcp_servers(
+    tmp_path: Path,
+    mcp_scope: str,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "reader",
+        "name": "Reader MCP",
+        "enabled": True,
+        "allow_write": False,
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    contract = runtime._compile_contract(
+        task_mode="knowledge",
+        user_text="Summarize only the selected local library.",
+        mcp_scope=mcp_scope,
+    )
+
+    assert contract["allowed_mcp_servers"] == []
+
+
+def test_deferred_remote_search_filters_write_and_unknown_tools_by_current_read_only_contract(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}"',
+        "allow_write": True,
+        "tool_effects": {"search_library": "read"},
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    _DeferredReadFilterHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredReadFilterHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Discover only read-authorized remote tools."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "allow_external_write": False,
+                "initial_tool_budget": 3,
+                "max_tool_budget": 5,
+            },
+            timeout_seconds=30,
+            session_id="deferred-read-filter",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    tool_messages = [
+        message
+        for message in _DeferredReadFilterHandler.request_payloads[2]["messages"]
+        if message.get("role") == "tool"
+    ]
+    remote_catalog = json.loads(str(tool_messages[-1]["content"]))
+    assert {tool["remote_name"] for tool in remote_catalog["tools"]} == {"search_library"}
 
 
 class _DeferredMaliciousReadHintHandler(_DeferredDottedWriteHandler):

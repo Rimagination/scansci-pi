@@ -51,15 +51,22 @@ def test_direct_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path,
     )
     attempted_models: list[str] = []
 
-    def fake_stream(*_args, **kwargs):
-        model = str(kwargs["model"])
+    def fake_pi_events(chat_request, **_kwargs):
+        model = str(chat_request.model_id)
         attempted_models.append(model)
         if model == "glm-4.7-flash":
             raise RuntimeError("HTTP 429 provider_rate_limited")
         yield {"type": "delta", "content": "已由备用模型完成回答。"}
         yield {"type": "done", "usage": {"total_tokens": 7}, "truncated": False}
 
-    monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
+    monkeypatch.setattr(
+        research_agent,
+        "stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an approved managed backup must remain inside Pi")
+        ),
+    )
     monkeypatch.setattr(
         runtime,
         "_managed_fallback_chat_request",
@@ -93,13 +100,20 @@ def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: P
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
-    attempted_models: list[str] = []
+    pi_models: list[str] = []
+    compatibility_models: list[str] = []
+
+    def fake_pi_events(chat_request, **_kwargs):
+        pi_models.append(str(chat_request.model_id))
+        raise RuntimeError("invalid request: unsupported response schema")
+        yield  # pragma: no cover - generator protocol
 
     def fake_stream(*_args, **kwargs):
-        attempted_models.append(str(kwargs["model"]))
+        compatibility_models.append(str(kwargs["model"]))
         raise RuntimeError("invalid request: unsupported response schema")
-        yield  # pragma: no cover - keep this a generator for the streaming API
+        yield  # pragma: no cover - streaming compatibility protocol
 
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
     monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
 
     events = list(runtime.chat_stream({
@@ -108,7 +122,8 @@ def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: P
         "messages": [{"role": "user", "content": "用一句话解释显著性水平。"}],
     }))
 
-    assert attempted_models == ["glm-4.7-flash"]
+    assert pi_models == ["glm-4.7-flash"]
+    assert compatibility_models == ["glm-4.7-flash"]
     assert events[-1]["type"] == "RUN_ERROR"
 
 
@@ -117,13 +132,20 @@ def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
-    attempted_models: list[str] = []
+    pi_models: list[str] = []
+    compatibility_models: list[str] = []
+
+    def fake_pi_events(chat_request, **_kwargs):
+        pi_models.append(str(chat_request.model_id))
+        raise RuntimeError("HTTP 429 provider_rate_limited")
+        yield  # pragma: no cover - generator protocol
 
     def fake_stream(*_args, **kwargs):
-        attempted_models.append(str(kwargs["model"]))
+        compatibility_models.append(str(kwargs["model"]))
         raise RuntimeError("HTTP 429 provider_rate_limited")
-        yield  # pragma: no cover - keep this a generator for the streaming API
+        yield  # pragma: no cover - streaming compatibility protocol
 
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
     monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
 
     events = list(runtime.chat_stream({
@@ -134,7 +156,8 @@ def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path
 
     # Qwen is a reachable standby route, but it cannot become a user-visible
     # automatic answer until it passes the same structured quality contract.
-    assert attempted_models == ["glm-4.7-flash"]
+    assert pi_models == ["glm-4.7-flash"]
+    assert compatibility_models == ["glm-4.7-flash"]
     assert events[-1]["type"] == "RUN_ERROR"
 
 
@@ -1027,7 +1050,10 @@ def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_p
 
     assert run["notebook_id"] == ""
     assert run["task_contract"]["task_mode"] == "web"
-    assert "kb_search" not in run["task_contract"]["allowed_tools"]
+    # The full ready read-only catalog remains discoverable; the product mode
+    # only controls initial hints and this standalone run carries no notebook.
+    assert "kb_search" in run["task_contract"]["allowed_tools"]
+    assert "kb_search" not in run["task_contract"]["initial_tools"]
 
     plan = {
         "title": "Scientific RAG evaluation",

@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { PI_PROTOCOL_FEATURES, PI_PROTOCOL_VERSION, negotiateProtocol } from "./protocol.js";
 import {
   buildToolCatalog,
+  executionModeForTool,
   initialToolNames,
   type CatalogRisk,
 } from "./tool-catalog.js";
@@ -982,6 +983,7 @@ function bridgeTool(
     name,
     label,
     description,
+    executionMode: executionModeForTool(name, toolRisk(name)),
     parameters,
     execute: async (_toolCallId, params) => {
       const result = boundedToolPayload(name, await callPythonTool(name, params as JsonRecord));
@@ -1207,6 +1209,10 @@ function deferredMcpTools(
       .filter(({ tool, policy }) => {
         if (!policy.remoteName || policy.effect === "unknown") return false;
         if (policy.effect !== "read" && raw.allow_write !== true) return false;
+        // The deferred catalog is remote state and may change between turns.
+        // Re-evaluate every result against the current host contract so a
+        // write/unknown tool cannot be surfaced by a stale session lease.
+        if (!contractAllowsTool(normalizeTaskContract(requestRef.current), callName, policy)) return false;
         return !normalized || `${policy.remoteName}\n${String(tool.description || "")}`.toLowerCase().includes(normalized);
       })
       .slice(0, limit);
@@ -1217,6 +1223,7 @@ function deferredMcpTools(
       name: searchName,
       label: `${serverLabel} · search`,
       description: `Search ${serverLabel} MCP tools on demand. This connects the server only when used.`,
+      executionMode: "sequential",
       parameters: Type.Object({
         query: Type.Optional(Type.String({ maxLength: 240 })),
         limit: Type.Optional(Type.Number({ minimum: 1, maximum: 20 })),
@@ -1255,6 +1262,7 @@ function deferredMcpTools(
       name: callName,
       label: `${serverLabel} · call`,
       description: `Call one ${serverLabel} MCP tool found through ${searchName}.`,
+      executionMode: "sequential",
       parameters: Type.Object({
         tool: Type.String({ minLength: 1, maxLength: 200 }),
         arguments: Type.Optional(Type.Unsafe<JsonRecord>({ type: "object", additionalProperties: true })),
@@ -1425,6 +1433,7 @@ async function externalMcpTools(
           name: localName,
           label: `${String(raw.name || raw.id || "MCP")} · ${remoteName}`,
           description: `${String(remoteTool.description || "MCP tool").slice(0, MAX_MCP_DESCRIPTION_CHARS)} (MCP: ${String(raw.name || raw.id || serverId)})`,
+          executionMode: "sequential",
           parameters: Type.Unsafe(inputSchema),
           execute: async (_toolCallId, params, signal) => {
             const activeRun = activeRunStorage.getStore();
@@ -2036,7 +2045,7 @@ function currentTurnSystemPrompt(request: RunStart): string {
   const artifactRule = hasMode("slides")
     ? "This request also requires a real artifact. Call the matching create_* or compile_latex tool, use retrieved/document evidence as its content, and report only the verified file_path returned by the tool. An outline or filename invented in prose is not delivery."
     : "";
-  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Call ONE tool at a time. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
+  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Independent tools marked parallel-safe may be called as siblings; all other tools run sequentially. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
 }
 
 function looksLikeDeferredAnswer(text: string): boolean {

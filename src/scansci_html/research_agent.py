@@ -65,7 +65,17 @@ from .research_ideation import (
 )
 from .embeddings import HashingEmbeddingProvider
 from .rerankers import LexicalReranker, build_reranker
-from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
+from .llm import (
+    CascadingChatJsonClient,
+    _parse_and_validate_structured_content,
+    analyze_vision_images,
+    # Retained as a compatibility seam for downstream harnesses.  Production
+    # model-mediated workflow calls below use the Pi-backed adapter exclusively.
+    build_chat_json_client,
+    complete_chat_text,
+    managed_gateway_session,
+    stream_chat_text,
+)
 from .model_transport import select_api_surface
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .local_asr import transcribe_local_audio
@@ -155,13 +165,6 @@ _CATALOG_LIST_INTENT_RE = re.compile(
     r"(?:有哪些|哪些|列出|罗列|显示|找出|题录|目录|清单|列表|list|show|find)"
     r"|(?:这个|当前|该|我的|我们(?:的)?)?(?:知识库|资料库|文献库).{0,12}"
     r"(?:有什么|有哪些|包含什么|收录什么)",
-    re.IGNORECASE,
-)
-_CATALOG_AMBIGUOUS_HINT_RE = re.compile(
-    r"(?:文献|论文|资料|题录|知识库|资料库|papers?|articles?|documents?)"
-    r".{0,20}(?:概览|概况|分布|覆盖|规模|多不多|收录|包含|overview|landscape|coverage|distribution)"
-    r"|(?:概览|概况|分布|覆盖|规模|多不多|收录|包含|overview|landscape|coverage|distribution)"
-    r".{0,20}(?:文献|论文|资料|题录|知识库|资料库|papers?|articles?|documents?)",
     re.IGNORECASE,
 )
 _CATALOG_TOPIC_PATTERNS = (
@@ -1470,6 +1473,141 @@ class _DurableModelClient:
         return getattr(self._client, name)
 
 
+class _PiBackedChatJsonClient:
+    """Run one bounded role-model request through an isolated Pi session.
+
+    Durable workflow models are nested inside a host-owned stage or tool call.
+    Reusing the parent Pi client would deadlock its single active request, so
+    every logical JSON request owns a fresh sidecar/client and a transient
+    session.  The explicit empty v2 lease keeps this synthesis-only adapter
+    from recursively discovering domain or MCP tools.
+    """
+
+    session = None
+    thinking_mode = "off"
+    logical_request_limit = 1
+
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        evidence_db: Path,
+        provider_kind: str,
+        provider_id: str,
+        base_url: str,
+        api_key: str,
+        model: str,
+        api_surface: str,
+        responses_enabled: bool,
+        role: str,
+        timeout_seconds: float,
+    ) -> None:
+        self.workspace = Path(workspace)
+        self.evidence_db = Path(evidence_db)
+        self.provider_kind = str(provider_kind)
+        self.provider_id = str(provider_id)
+        self.base_url = str(base_url)
+        self.api_key = str(api_key)
+        self.model = str(model)
+        self.api_surface = str(api_surface or "chat_completions")
+        self.responses_enabled = bool(responses_enabled)
+        self.role = str(role or "workflow")
+        self.timeout_seconds = float(timeout_seconds)
+
+    def _contract(self, *, schema_name: str, output_format: str) -> dict[str, Any]:
+        return {
+            "schema_version": "scansci.task-contract.v2",
+            "version": 2,
+            "contract_id": f"nested-{self.role}-{uuid4().hex[:12]}",
+            "goal": f"Produce the bounded {self.role} model result",
+            "request": str(schema_name),
+            "output_format": output_format,
+            "constraints": [
+                "Do not call tools or request interactions",
+                "Do not expand the parent workflow authority",
+            ],
+            "required_evidence": [],
+            "allowed_tools": [],
+            "initial_tools": [],
+            "allowed_mcp_servers": [],
+            "required_tool_groups": [],
+            "risk_level": "none",
+            "autonomy": "none",
+            "requires_plan": False,
+            "allow_external_write": False,
+            "initial_tool_budget": 1,
+            "max_tool_budget": 1,
+            "model_token_budget": 16_000,
+            "max_model_token_budget": 32_000,
+            "success_criteria": [f"Return one valid {output_format} result"],
+        }
+
+    def _complete(self, messages: list[dict[str, Any]], *, schema_name: str, json_only: bool) -> str:
+        role_contract = (
+            f"Nested ScanSci model role: {self.role}. "
+            "This is a synthesis-only Pi turn with no domain or MCP authority. "
+            "Do not call search_tools, ask_user, submit_plan, or any other tool. "
+        )
+        if json_only:
+            role_contract += (
+                f"Return exactly one JSON object for schema `{schema_name}`; "
+                "do not use Markdown fences or surrounding prose."
+            )
+        else:
+            role_contract += "Return only the requested text."
+        bounded_messages = [
+            {"role": "system", "content": role_contract},
+            *[
+                {"role": str(message.get("role", "user")), "content": str(message.get("content", ""))}
+                for message in list(messages or [])
+            ],
+        ]
+        client = PiAgentClient(workspace=self.workspace, evidence_db=self.evidence_db)
+        fragments: list[str] = []
+        try:
+            for event in client.stream_chat(
+                provider_kind=self.provider_kind,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model_id=self.model,
+                api_surface=self.api_surface,
+                responses_enabled=self.responses_enabled,
+                messages=bounded_messages,
+                thinking_level="off",
+                task_mode="model-json",
+                task_contract=self._contract(
+                    schema_name=schema_name,
+                    output_format="strict JSON object" if json_only else "text",
+                ),
+                timeout_seconds=self.timeout_seconds,
+                # Transient and independent by construction: never wait on or
+                # mutate a parent durable session that may currently own a
+                # Python bridge tool call.
+                session_id=None,
+            ):
+                event_type = str(event.get("type", ""))
+                if event_type == "delta":
+                    fragments.append(str(event.get("content", "")))
+                elif event_type in {"tool.completed", "tool.failed", "interaction"}:
+                    raise RuntimeError("Nested Pi role model attempted to expand its empty authority lease")
+                elif event_type == "cancelled":
+                    raise RuntimeError("Nested Pi role model was cancelled")
+        finally:
+            client.close()
+        text = "".join(fragments).strip()
+        if not text:
+            raise RuntimeError("Nested Pi role model returned an empty response")
+        return text
+
+    def complete_json(self, messages: list[dict[str, Any]], *, schema_name: str, **_kwargs: Any) -> Any:
+        text = self._complete(messages, schema_name=schema_name, json_only=True)
+        return _parse_and_validate_structured_content(text, schema_name=schema_name)
+
+    def complete_text(self, messages: list[dict[str, Any]], *, max_tokens: int = 700) -> str:
+        del max_tokens
+        return self._complete(messages, schema_name="plain_text", json_only=False)
+
+
 def _apply_direct_chat_profile(
     chat_request: _DirectChatRequest,
     task_profile: dict[str, Any] | None,
@@ -1635,6 +1773,11 @@ class ResearchAgentRuntime:
                     task_mode=task_mode,
                     user_text=self._task_request_text(payload) or str(run.get("title", "")),
                     workflow_type=workflow_type,
+                    mcp_scope=(
+                        "selected-library"
+                        if str(run.get("notebook_id", "")).strip()
+                        else "default"
+                    ),
                 ),
             )
 
@@ -1729,6 +1872,7 @@ class ResearchAgentRuntime:
         task_mode: str,
         user_text: str,
         workflow_type: str = "",
+        mcp_scope: str = "default",
     ) -> dict[str, Any]:
         required_groups = _required_pi_tool_groups(task_mode, user_text)
         preliminary = compile_task_contract(
@@ -1745,15 +1889,42 @@ class ResearchAgentRuntime:
             plugins=list(settings.get("plugins", []) or []),
         )
         profile = dict(preliminary.get("task_profile", {}) or {})
-        requested_mcp_servers = (
-            [
-                str(item.get("id") or item.get("name") or "").strip()
-                for item in list(settings.get("mcp_servers", []) or [])
-                if isinstance(item, dict) and item.get("enabled") and not item.get("uninstalled")
-            ]
-            if bool(profile.get("requires_tools", False))
-            else []
+        normalized_mcp_scope = str(mcp_scope or "default").strip().lower()
+        social_turn = "greeting" in set(profile.get("reasons", []) or [])
+        allow_unrelated_mcp = (
+            not social_turn
+            and normalized_mcp_scope not in {"disabled", "local-only", "selected-library"}
         )
+
+        def read_capable_mcp(item: dict[str, Any]) -> bool:
+            # A read-only connection is eligible even before its deferred
+            # catalog is loaded.  A write-enabled server must carry at least
+            # one host-owned read classification; remote annotations cannot
+            # create this lease.
+            if not bool(item.get("allow_write", False)):
+                return True
+            effects = [
+                str(effect).strip().lower()
+                for effect in dict(item.get("tool_effects", {}) or {}).values()
+            ]
+            policies = [
+                str(policy.get("effect", "")).strip().lower()
+                for policy in list(item.get("tool_policies", []) or [])
+                if isinstance(policy, dict)
+            ]
+            return any(effect in {"read", "read_only", "readonly"} for effect in [*effects, *policies])
+
+        requested_mcp_servers = [
+            str(item.get("id") or item.get("name") or "").strip()
+            for item in list(settings.get("mcp_servers", []) or [])
+            if (
+                allow_unrelated_mcp
+                and isinstance(item, dict)
+                and item.get("enabled")
+                and not item.get("uninstalled")
+                and read_capable_mcp(item)
+            )
+        ]
         lease = compile_capability_lease(
             catalog,
             preliminary.get("allowed_tools", []),
@@ -1894,6 +2065,7 @@ class ResearchAgentRuntime:
             task_mode=contract_mode,
             user_text=self._task_request_text(normalized),
             workflow_type=workflow_type,
+            mcp_scope="selected-library" if str(notebook.get("notebook_id", "")).strip() else "default",
         )
         knowledge_metadata = self._knowledge_run_metadata(notebook)
         routing_metadata = (
@@ -2676,15 +2848,15 @@ class ResearchAgentRuntime:
                     if isinstance(error, PiAgentRunError):
                         agent_fallback_failure = dict(error.failure or {})
             if result is None:
-                rag_client = build_chat_json_client(
-                    str(provider.get("kind", "")),
+                rag_client = self._pi_role_chat_client(
+                    provider_kind=str(provider.get("kind", "")),
+                    provider_id=str(provider.get("id", "")),
                     base_url=str(provider.get("base_url", "")),
                     api_key=api_key,
-                    model=str(active.get("model_id", "")),
-                    session=managed_gateway_session() if managed else None,
-                    thinking_mode="disabled" if managed else None,
+                    model_id=str(active.get("model_id", "")),
+                    role="evidence",
+                    timeout_seconds=35.0 if managed else 60.0,
                     api_surface=str(provider.get("api_surface", "chat_completions")),
-                    provider_id=str(provider.get("id", "")),
                     responses_enabled=bool(provider.get("responses_enabled", False)),
                 )
                 answer_options = {
@@ -2693,7 +2865,7 @@ class ResearchAgentRuntime:
                     "query_rewrite_provider": "llm",
                     "chat_client": rag_client,
                 }
-                agent_harness = "provider-neutral-workflow"
+                agent_harness = "pi-fixed-workflow"
         if result is None:
             if not evidence_db.exists():
                 raise FileNotFoundError(f"Evidence store does not exist: {evidence_db}")
@@ -3264,6 +3436,7 @@ class ResearchAgentRuntime:
             task_mode=resolved_task_mode,
             user_text=self._last_user_text(chat_request.messages),
             workflow_type=workflow_type,
+            mcp_scope="selected-library" if requested_notebook_ids else "default",
         )
         mode_parts = _pi_mode_parts(resolved_task_mode)
         local_evidence = None
@@ -3724,6 +3897,11 @@ class ResearchAgentRuntime:
             task_mode=resolved_task_mode,
             user_text=self._last_user_text(chat_request.messages),
             workflow_type=workflow_type,
+            mcp_scope=(
+                "selected-library"
+                if chat_request.notebook_id or chat_request.notebook_ids
+                else "default"
+            ),
         )
         return (
             "".join(fragments).strip(),
@@ -3957,7 +4135,15 @@ class ResearchAgentRuntime:
             )
         )
         user_text = self._last_user_text(chat_request.messages)
-        task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+        task_contract = self._compile_contract(
+            task_mode=pi_task_mode,
+            user_text=user_text,
+            mcp_scope=(
+                "selected-library"
+                if chat_request.notebook_id or chat_request.notebook_ids
+                else "default"
+            ),
+        )
         task_profile = dict(task_contract.get("task_profile", {}) or {})
         vision_direct = self._vision_direct_fallback(
             chat_request,
@@ -3969,7 +4155,15 @@ class ResearchAgentRuntime:
             # plain "explain this image" request into a tool task.  There is
             # no explicit evidence/search action to complete in this turn.
             pi_task_mode = "general"
-            task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+            task_contract = self._compile_contract(
+                task_mode=pi_task_mode,
+                user_text=user_text,
+                mcp_scope=(
+                    "selected-library"
+                    if chat_request.notebook_id or chat_request.notebook_ids
+                    else "default"
+                ),
+            )
             task_profile = dict(task_contract.get("task_profile", {}) or {})
         _required_capability_preflight(task_contract)
         pi_eligible = not local_facts and self._pi_eligible(chat_request, payload)
@@ -4233,6 +4427,11 @@ class ResearchAgentRuntime:
             task_mode=pi_task_mode,
             user_text=user_text,
             workflow_type=str(run.get("workflow_type", "")),
+            mcp_scope=(
+                "selected-library"
+                if chat_request.notebook_id or chat_request.notebook_ids
+                else "default"
+            ),
         )
         task_profile = dict(task_contract.get("task_profile", {}) or {})
         pi_needed = _pi_should_run(pi_task_mode, user_text, task_profile)
@@ -4704,15 +4903,6 @@ class ResearchAgentRuntime:
                 )
                 return
             if self._uses_verified_knowledge_answer(chat_request, ingestion=ingestion):
-                model_catalog_request = self._model_knowledge_catalog_request(chat_request)
-                if model_catalog_request is not None:
-                    yield from self._stream_knowledge_catalog_answer(
-                        run_id=run_id,
-                        message_id=message_id,
-                        chat_request=chat_request,
-                        request=model_catalog_request,
-                    )
-                    return
                 yield from self._stream_verified_knowledge_answer(
                     run_id=run_id,
                     message_id=message_id,
@@ -4732,7 +4922,15 @@ class ResearchAgentRuntime:
                 )
             )
             user_text = self._last_user_text(chat_request.messages)
-            task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+            task_contract = self._compile_contract(
+                task_mode=pi_task_mode,
+                user_text=user_text,
+                mcp_scope=(
+                    "selected-library"
+                    if chat_request.notebook_id or chat_request.notebook_ids
+                    else "default"
+                ),
+            )
             task_profile = dict(task_contract.get("task_profile", {}) or {})
             vision_direct = self._vision_direct_fallback(
                 chat_request,
@@ -4744,7 +4942,15 @@ class ResearchAgentRuntime:
                 # direct multimodal completion unless the user explicitly
                 # requested a tool-backed action.
                 pi_task_mode = "general"
-                task_contract = self._compile_contract(task_mode=pi_task_mode, user_text=user_text)
+                task_contract = self._compile_contract(
+                    task_mode=pi_task_mode,
+                    user_text=user_text,
+                    mcp_scope=(
+                        "selected-library"
+                        if chat_request.notebook_id or chat_request.notebook_ids
+                        else "default"
+                    ),
+                )
                 task_profile = dict(task_contract.get("task_profile", {}) or {})
             _required_capability_preflight(task_contract)
             pi_eligible = (
@@ -5470,83 +5676,6 @@ class ResearchAgentRuntime:
             and cls._knowledge_catalog_request(cls._last_user_text(chat_request.messages)) is not None
         )
 
-    def _model_knowledge_catalog_request(
-        self,
-        chat_request: _DirectChatRequest,
-    ) -> dict[str, Any] | None:
-        """Ask the configured model to disambiguate a library *operation*.
-
-        This is deliberately a planner, not an answerer: it receives only the
-        user's question and can choose a small enum.  The host validates its
-        JSON and still performs the catalogue query itself, so a model cannot
-        fabricate a document count or widen the selected-library scope.
-        """
-
-        question = self._last_user_text(chat_request.messages)
-        if not _CATALOG_AMBIGUOUS_HINT_RE.search(question):
-            return None
-        if chat_request.provider_kind not in {
-            "openai-compatible",
-            "openai",
-            "anthropic-compatible",
-            "anthropic",
-        }:
-            return None
-        try:
-            client = build_chat_json_client(
-                chat_request.provider_kind,
-                base_url=chat_request.base_url,
-                api_key=chat_request.api_key,
-                model=chat_request.model_id,
-                timeout=20.0,
-                session=chat_request.session,
-                thinking_mode="disabled",
-            )
-            raw_plan = client.complete_json(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a routing planner for a local research library. "
-                            "Return JSON only with operation, topic, confidence. "
-                            "operation must be one of count, list, evidence. "
-                            "Choose count or list only when the user wants an inventory, coverage, "
-                            "distribution, scale, or bibliography from the entire selected library. "
-                            "Choose evidence for factual explanation, comparison, or synthesis. "
-                            "Do not answer the question, estimate counts, cite sources, or request tools."
-                        ),
-                    },
-                    {"role": "user", "content": question[:1_200]},
-                ],
-                schema_name="knowledge_catalog_route",
-            )
-        except Exception:
-            # A planner may be unavailable or a user's provider may not honour
-            # JSON mode.  Evidence Q&A remains a safe fallback in either case.
-            return None
-        if not isinstance(raw_plan, dict):
-            return None
-        operation = str(raw_plan.get("operation", "")).strip().lower()
-        if operation not in {"count", "list"}:
-            return None
-        try:
-            confidence = float(raw_plan.get("confidence", 0) or 0)
-        except (TypeError, ValueError):
-            return None
-        if confidence < 0.78:
-            return None
-        topic = re.sub(r"\s+", " ", str(raw_plan.get("topic", "") or "")).strip(" ，。；;:：？?!！")
-        if len(topic) > 64:
-            return None
-        topic, aliases = self._catalog_match_terms(topic)
-        return {
-            "operation": operation,
-            "topic": topic,
-            "match_terms": list(dict.fromkeys(term.strip() for term in aliases if term.strip())),
-            "planner": "model",
-            "confidence": confidence,
-        }
-
     @staticmethod
     def _uses_verified_knowledge_answer(
         chat_request: _DirectChatRequest,
@@ -5664,6 +5793,51 @@ class ResearchAgentRuntime:
             {
                 "role": "user",
                 "content": f"用户请求：{request}\n\n已核验的本地证据：\n{evidence_pack}",
+            },
+        ]
+
+    @staticmethod
+    def _verified_answer_writing_prompt(
+        *,
+        request: str,
+        citations: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        """Build a concise Pi synthesis turn from host-verified evidence only."""
+
+        source_blocks: list[str] = []
+        for citation in citations:
+            citation_id = str(citation.get("citation_id", "")).strip()
+            exact_quote = " ".join(str(citation.get("exact_quote", "")).split())
+            if not citation_id or not exact_quote:
+                continue
+            provenance = " · ".join(
+                value
+                for value in [
+                    str(citation.get("paper", "")).strip(),
+                    str(citation.get("section", "")).strip(),
+                    str(citation.get("doi", "")).strip(),
+                ]
+                if value
+            )
+            source_blocks.append(
+                f"[{citation_id}] {provenance or '本地资料'}\n{exact_quote[:1_400]}"
+            )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是 ScanSci 的证据问答助手。只使用下方已经由宿主检索并核验的本地原文证据回答问题；"
+                    "不得补充证据未支持的事实、数字、论文或因果判断。请使用简洁、自然的简体中文，"
+                    "每个包含事实判断的非空段落末尾必须附对应方括号脚标，例如 [1]，且只能使用已提供的脚标。"
+                    "资料不足时明确说明边界，不要用常识补齐。不要输出参考文献表。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"用户问题：{request}\n\n已核验的本地证据：\n"
+                    + "\n\n".join(source_blocks)
+                ),
             },
         ]
 
@@ -5903,6 +6077,7 @@ class ResearchAgentRuntime:
             writer_contract = self._compile_contract(
                 task_mode="knowledge",
                 user_text=self._last_user_text(writer_request.messages),
+                mcp_scope="selected-library",
             )
             writer_runtime["task_contract"] = writer_contract
             writer_runtime["pi_attempted"] = True
@@ -6031,6 +6206,7 @@ class ResearchAgentRuntime:
                 "status": "completed" if not writing_fallback else "fallback",
             },
         ]
+
         if writer_runtime.get("compatibility_fallback"):
             trace.append({
                 "title": "Pi 兼容回退",
@@ -6514,7 +6690,7 @@ class ResearchAgentRuntime:
         chat_request: _DirectChatRequest,
         payload: dict[str, Any],
     ):
-        """Deliver a compact, per-sentence cited response for direct KB chat."""
+        """Retrieve locally, then let Pi synthesize the verified answer."""
 
         notebook_ids = list(
             dict.fromkeys(
@@ -6543,17 +6719,139 @@ class ResearchAgentRuntime:
                 # quote and citation-verification gates.
                 "agent_harness": "fixed-workflow",
                 "task_mode": "evidence",
+                # Retrieval and citation verification are deterministic host
+                # stages here.  The only model-mediated final generation is
+                # the Pi turn below, preserving one visible session lineage.
+                "force_local_evidence": True,
             }
         )
         knowledge_scope = dict(result.get("knowledge_scope", {}) or {})
         reader_answer = dict(result.get("reader_answer", {}) or {})
-        citations = list(reader_answer.get("citations", []) or [])
+        citations = []
+        for index, raw_citation in enumerate(list(reader_answer.get("citations", []) or []), start=1):
+            if not isinstance(raw_citation, dict):
+                continue
+            citation = dict(raw_citation)
+            citation["citation_id"] = str(
+                citation.get("citation_id") or citation.get("citation_no") or index
+            ).strip()
+            citations.append(citation)
         verification = dict(result.get("citation_verification", {}) or {})
         hits = list(result.get("hits", []) or [])
-        text = str(reader_answer.get("text", "")).strip()
-        if not text:
+        fallback_text = str(reader_answer.get("text", "")).strip()
+        if not fallback_text:
             limitations = list(dict(result.get("answer", {}) or {}).get("limitations", []) or [])
-            text = str(limitations[0]).strip() if limitations else "当前资料不足以形成带有原文脚标的回答。请缩小问题范围，或补充可检索资料。"
+            fallback_text = str(limitations[0]).strip() if limitations else "当前资料不足以形成带有原文脚标的回答。请缩小问题范围，或补充可检索资料。"
+
+        fixed_tool_calls = [
+            {"name": "search_local_evidence", "status": "completed"},
+            {"name": "build_verified_answer", "status": "completed"},
+        ]
+        writer_runtime: dict[str, Any] = {
+            "harness": "verified-evidence-fallback",
+            "task_mode": "knowledge",
+            "evidence_policy": "strict",
+            "tool_calls": list(fixed_tool_calls),
+            "session": {},
+            "compatibility_fallback": False,
+            "compatibility_error": "",
+            "pi_attempted": False,
+            "pi_success": False,
+        }
+        text = ""
+        usage: dict[str, int] = {}
+        if citations and verification.get("passed"):
+            writer_request = replace(
+                chat_request,
+                messages=self._verified_answer_writing_prompt(
+                    request=question,
+                    citations=citations,
+                ),
+            )
+            writer_contract = self._compile_contract(
+                task_mode="knowledge",
+                user_text=self._last_user_text(writer_request.messages),
+                mcp_scope="selected-library",
+            )
+            writer_runtime["task_contract"] = writer_contract
+            writer_runtime["pi_attempted"] = True
+            try:
+                fragments: list[str] = []
+                for writer_event in self._pi_events_with_compatibility_fallback(
+                    writer_request,
+                    task_mode="knowledge",
+                    session_id=str(payload.get("pi_session_id", "") or "") or None,
+                    active_run_id=run_id,
+                    precompleted_tool_calls=fixed_tool_calls,
+                    fallback_timeout_seconds=60.0,
+                    fallback_max_tokens=max(700, _direct_output_budget(question, [])),
+                    fallback_temperature=0.2,
+                    fallback_use_litellm=False,
+                ):
+                    event_type = str(writer_event.get("type", ""))
+                    if event_type == "delta":
+                        fragments.append(str(writer_event.get("content", "")))
+                    elif event_type == "done":
+                        raw_stats = writer_event.get("stats")
+                        received_usage = writer_event.get("usage")
+                        if not isinstance(received_usage, dict) and isinstance(raw_stats, dict):
+                            received_usage = raw_stats.get("tokens")
+                        if isinstance(received_usage, dict):
+                            usage = {
+                                str(key): int(value)
+                                for key, value in received_usage.items()
+                                if isinstance(value, int)
+                            }
+                    elif event_type == "session":
+                        writer_runtime["session"] = {
+                            "session_id": str(writer_event.get("session_id", "")),
+                            "session_file": str(writer_event.get("session_file", "")),
+                            "resumed": bool(writer_event.get("resumed", False)),
+                        }
+                    elif event_type == "tool.completed":
+                        writer_runtime["tool_calls"].append({
+                            "name": str(writer_event.get("name", "")),
+                            "status": "completed",
+                        })
+                    elif event_type == "tool.failed":
+                        writer_runtime["tool_calls"].append({
+                            "name": str(writer_event.get("name", "")),
+                            "status": "failed",
+                            "error": str(writer_event.get("error", ""))[:500],
+                        })
+                    elif event_type == "compatibility.fallback":
+                        writer_runtime["harness"] = "direct-provider"
+                        writer_runtime["compatibility_fallback"] = True
+                        writer_runtime["compatibility_error"] = str(writer_event.get("error", ""))
+                    elif event_type == "cancelled":
+                        raise _RunCancelled("Pi verified-answer writer was cancelled")
+                text = self._normalize_evidence_citation_markers("".join(fragments), citations)
+                text = self._remove_uncited_article_prose(text, citations)
+                if not self._evidence_article_uses_known_citations(text, citations):
+                    text = ""
+                if text and not writer_runtime["compatibility_fallback"]:
+                    writer_runtime["harness"] = "pi-agent-sdk"
+                    writer_runtime["pi_success"] = True
+            except _RunCancelled:
+                raise
+            except Exception as error:
+                writer_runtime["compatibility_error"] = (
+                    writer_runtime.get("compatibility_error")
+                    or f"{type(error).__name__}: {error}"[:500]
+                )
+                text = ""
+
+        if not text:
+            text = fallback_text
+            writer_runtime["pi_success"] = False
+            if writer_runtime.get("harness") == "pi-agent-sdk":
+                writer_runtime["harness"] = "verified-evidence-fallback"
+        reader_answer = {
+            **reader_answer,
+            "text": text,
+            "citations": citations,
+            "citation_count": len(citations),
+        }
 
         citation_count = len(citations)
         trace = [
@@ -6574,8 +6872,16 @@ class ResearchAgentRuntime:
                 "status": "completed",
             },
         ]
+        if writer_runtime.get("compatibility_fallback"):
+            trace.append({
+                "title": "Pi 兼容回退",
+                "detail": "Pi 在产生文本或启动新工具前失败；本轮显式切换为有界直连生成，不计为 Pi 成功。",
+                "status": "fallback",
+            })
         yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
         yield run_event(TEXT_MESSAGE_CONTENT, run_id=run_id, messageId=message_id, delta=text)
+        if usage:
+            yield run_event(CUSTOM, run_id=run_id, name="usage", value=usage)
 
         message: dict[str, Any] = {
             "role": "assistant",
@@ -6589,6 +6895,8 @@ class ResearchAgentRuntime:
         }
         if knowledge_scope.get("active") and str(knowledge_scope.get("type", "")) != "zotero-tag":
             message["knowledge_scope"] = knowledge_scope
+        if usage:
+            message["usage"] = usage
         yield run_event(TEXT_MESSAGE_END, run_id=run_id, messageId=message_id)
         yield run_event(
             RUN_FINISHED,
@@ -6598,13 +6906,7 @@ class ResearchAgentRuntime:
                 "message": message,
                 "model": {"provider_id": chat_request.provider_id, "model_id": chat_request.model_id},
                 "agent_runtime": {
-                    "harness": "verified-knowledge-answer",
-                    "task_mode": "knowledge",
-                    "evidence_policy": "strict",
-                    "tool_calls": [
-                        {"name": "search_local_evidence", "status": "completed"},
-                        {"name": "build_verified_answer", "status": "completed"},
-                    ],
+                    **writer_runtime,
                     "citation_verification": verification,
                 },
             },
@@ -9001,6 +9303,39 @@ class ResearchAgentRuntime:
     def _original_url(doc_id: str) -> str:
         return f"/api/sources/{quote(doc_id, safe='')}/original"
 
+    def _pi_role_chat_client(
+        self,
+        *,
+        provider_kind: str,
+        provider_id: str,
+        base_url: str,
+        api_key: str,
+        model_id: str,
+        role: str,
+        timeout_seconds: float,
+        api_surface: str = "chat_completions",
+        responses_enabled: bool = False,
+    ) -> _PiBackedChatJsonClient:
+        return _PiBackedChatJsonClient(
+            workspace=self.workspace,
+            evidence_db=self.evidence_db,
+            provider_kind=provider_kind,
+            provider_id=provider_id,
+            base_url=base_url,
+            api_key=api_key,
+            model=model_id,
+            api_surface=select_api_surface(
+                api_surface,
+                provider_kind=provider_kind,
+                provider_id=provider_id,
+                model=model_id,
+                responses_enabled=responses_enabled,
+            ),
+            responses_enabled=responses_enabled,
+            role=role,
+            timeout_seconds=timeout_seconds,
+        )
+
     def _writing_chat_client(self) -> Any:
         settings = load_settings(self.workspace)
         reference = self._role_reference(settings, "writing")
@@ -9027,16 +9362,15 @@ class ResearchAgentRuntime:
             cache_key = (provider_id, model_id, str(provider.get("base_url", "")))
             if managed and cache_key in self._managed_writing_clients:
                 return self._wrap_model_client(self._managed_writing_clients[cache_key])
-            primary_client = build_chat_json_client(
-                str(provider.get("kind", "")),
+            primary_client = self._pi_role_chat_client(
+                provider_kind=str(provider.get("kind", "")),
+                provider_id=provider_id,
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
-                model=model_id,
-                timeout=35.0 if managed else 60.0,
-                session=managed_gateway_session() if managed else None,
-                thinking_mode="disabled" if managed else None,
+                model_id=model_id,
+                role="writing",
+                timeout_seconds=35.0 if managed else 60.0,
                 api_surface=str(provider.get("api_surface", "chat_completions")),
-                provider_id=provider_id,
                 responses_enabled=bool(provider.get("responses_enabled", False)),
             )
             if not managed:
@@ -9052,14 +9386,16 @@ class ResearchAgentRuntime:
             if not fallback_model:
                 self._managed_writing_clients[cache_key] = primary_client
                 return self._wrap_model_client(primary_client)
-            fallback_client = build_chat_json_client(
-                str(provider.get("kind", "")),
+            fallback_client = self._pi_role_chat_client(
+                provider_kind=str(provider.get("kind", "")),
+                provider_id=provider_id,
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
-                model=fallback_model,
-                timeout=50.0,
-                session=managed_gateway_session(),
-                thinking_mode="disabled",
+                model_id=fallback_model,
+                role="writing",
+                timeout_seconds=50.0,
+                api_surface=str(provider.get("api_surface", "chat_completions")),
+                responses_enabled=bool(provider.get("responses_enabled", False)),
             )
             client = CascadingChatJsonClient([primary_client, fallback_client])
             self._managed_writing_clients[cache_key] = client
@@ -9080,11 +9416,14 @@ class ResearchAgentRuntime:
             model_id = str(local_model.get("model_id", "")).strip()
             if not base_url or not model_id:
                 raise ValueError("本地写作模型需要配置 Base URL 和模型 ID")
-            return self._wrap_model_client(build_chat_json_client(
-                "openai-compatible",
+            return self._wrap_model_client(self._pi_role_chat_client(
+                provider_kind="openai-compatible",
+                provider_id=f"local:{local_id}",
                 base_url=base_url,
                 api_key="scansci-local-runtime",
-                model=model_id,
+                model_id=model_id,
+                role="writing",
+                timeout_seconds=60.0,
             ))
         raise ValueError("尚未指定写作模型，请在“设置 → 模型服务 → 功能分工”中选择")
 
@@ -9450,18 +9789,15 @@ class ResearchAgentRuntime:
             api_key = "scansci-managed-gateway" if str(provider.get("auth_mode", "")) == "managed" else get_provider_api_key(self.workspace, provider_id)
             if not api_key:
                 raise ValueError("演示模型尚未配置 API Key")
-            return self._wrap_model_client(build_chat_json_client(
-                str(provider.get("kind", "")),
+            return self._wrap_model_client(self._pi_role_chat_client(
+                provider_kind=str(provider.get("kind", "")),
+                provider_id=provider_id,
                 base_url=str(provider.get("base_url", "")),
                 api_key=api_key,
-                model=model_id,
-                session=managed_gateway_session() if str(provider.get("auth_mode", "")) == "managed" else None,
-                # Planning a compact JSON deck should not wait for a long
-                # hidden chain of thought. This is supported by the managed
-                # GLM gateway; other providers keep their own default.
-                thinking_mode="disabled" if str(provider.get("auth_mode", "")) == "managed" else None,
+                model_id=model_id,
+                role="slides",
+                timeout_seconds=60.0,
                 api_surface=str(provider.get("api_surface", "chat_completions")),
-                provider_id=provider_id,
                 responses_enabled=bool(provider.get("responses_enabled", False)),
             ))
         if reference.startswith("local:"):
@@ -9478,11 +9814,14 @@ class ResearchAgentRuntime:
             model_id = str(local_model.get("model_id", "")).strip()
             if not base_url or not model_id:
                 raise ValueError("本地演示模型需要配置 Base URL 和模型 ID")
-            return self._wrap_model_client(build_chat_json_client(
-                "openai-compatible",
+            return self._wrap_model_client(self._pi_role_chat_client(
+                provider_kind="openai-compatible",
+                provider_id=f"local:{local_id}",
                 base_url=base_url,
                 api_key="scansci-local-runtime",
-                model=model_id,
+                model_id=model_id,
+                role="slides",
+                timeout_seconds=60.0,
             ))
         raise ValueError("尚未指定演示模型")
 

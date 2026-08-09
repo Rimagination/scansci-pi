@@ -12,7 +12,7 @@ import pytest
 
 from scansci_html.annotation_layers import write_annotation_layer
 from scansci_html.app_update import APP_VERSION
-from scansci_html.app_settings import save_settings
+from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.deep_research_evidence import build_task_fulltext_evidence
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.grounded_annotation import ground_draft_text
@@ -2118,11 +2118,17 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     app, workspace, _evidence = _build_app(tmp_path)
     _configure_local_evidence(workspace)
 
-    def model_must_not_run(*_args, **_kwargs):
-        raise AssertionError("library-scoped chat must use the verified evidence pipeline")
+    def direct_model_must_not_run(*_args, **_kwargs):
+        raise AssertionError("library-scoped final generation must be mediated by Pi")
         yield  # pragma: no cover
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", model_must_not_run)
+    def fake_pi_events(self, _request, **_kwargs):
+        del self
+        yield {"type": "delta", "content": "Galunisertib reduced regulatory T cells after treatment.[1]"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_must_not_run)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     events = list(app.research_agent.chat_stream({
         "chat_mode": "knowledge",
         "notebook_id": "immunotherapy",
@@ -2143,6 +2149,8 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
         "search_local_evidence",
         "build_verified_answer",
     }
+    assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert events[-1]["result"]["agent_runtime"]["pi_success"] is True
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     assert "directEvidenceAnswerMarkup" in script
     assert "data-direct-evidence-answer" in script
@@ -2230,7 +2238,7 @@ def test_direct_knowledge_catalog_counts_documents_not_evidence_hits(
     assert "已统计" in script
 
 
-def test_ambiguous_knowledge_turn_uses_model_only_to_plan_catalog_query(
+def test_ambiguous_knowledge_turn_never_calls_a_model_before_verified_pi(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2262,34 +2270,131 @@ def test_ambiguous_knowledge_turn_uses_model_only_to_plan_catalog_query(
         api_key="planner-key",
         model_id="planner-model",
     )
-    observed: dict[str, object] = {}
+    direct_planner_calls: list[str] = []
+    pi_calls: list[dict[str, object]] = []
 
-    class PlannerClient:
-        def complete_json(self, messages, *, schema_name):
-            observed["messages"] = messages
-            observed["schema_name"] = schema_name
-            return {"operation": "count", "topic": "photovoltaic", "confidence": 0.93}
+    def forbidden_direct_planner(*_args, **_kwargs):
+        direct_planner_calls.append("called")
+        raise AssertionError("catalog planning must not call a model before Pi")
+
+    def fake_answer_sync(_payload):
+        return {
+            "hits": [{"evidence_id": "pv-1.s0001"}],
+            "citation_verification": {"passed": True},
+            "reader_answer": {
+                "text": "Deterministic verified fallback.[1]",
+                "citations": [{
+                    "citation_no": 1,
+                    "quote_id": "q0001",
+                    "evidence_id": "pv-1.s0001",
+                    "doc_id": "pv-1",
+                    "paper": "Photovoltaic degradation",
+                    "section": "Results",
+                    "html_anchor": "s0001",
+                    "exact_quote": "Photovoltaic evidence is present in the selected library.",
+                }],
+            },
+        }
+
+    def fake_pi_events(self, request, *, task_mode=None, session_id=None, active_run_id=""):
+        del self
+        pi_calls.append({
+            "task_mode": task_mode,
+            "session_id": session_id,
+            "active_run_id": active_run_id,
+            "messages": request.messages,
+        })
+        yield {"type": "delta", "content": "The selected library contains relevant photovoltaic evidence.[1]"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 12}}}
 
     monkeypatch.setattr(app.research_agent, "_direct_chat_request", lambda *_args, **_kwargs: planned_request)
-    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", lambda *_args, **_kwargs: PlannerClient())
-    monkeypatch.setattr(
-        app.research_agent,
-        "answer_sync",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("model planning must not use RAG")),
-    )
+    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_planner)
+    monkeypatch.setattr(app.research_agent, "answer_sync", fake_answer_sync)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
 
     events = list(app.research_agent.chat_stream(payload))
 
     message = events[-1]["result"]["message"]
-    catalog = message["reader_answer"]["catalog"]
-    assert catalog["planner"] == "model"
-    assert catalog["planner_confidence"] == pytest.approx(0.93)
-    assert catalog["document_count"] == 2
-    assert catalog["match_terms"][0] == "光伏"
-    assert observed["schema_name"] == "knowledge_catalog_route"
-    assert observed["messages"][1]["content"] == "光伏文献的覆盖情况如何？"
-    assert any(item["tool_name"] == "plan_knowledge_catalog" for item in message["trace"])
-    assert events[-1]["result"]["agent_runtime"]["harness"] == "knowledge-catalog"
+    runtime = events[-1]["result"]["agent_runtime"]
+    assert direct_planner_calls == []
+    assert len(pi_calls) == 1
+    assert pi_calls[0]["task_mode"] == "knowledge"
+    assert message["evidence_answer"] is True
+    assert message["content"].endswith("[1]")
+    assert runtime["harness"] == "pi-agent-sdk"
+    assert runtime["pi_success"] is True
+
+
+def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    settings = load_settings(workspace)
+    settings["active_model"] = {"provider_id": "fixture-provider", "model_id": "fixture-model"}
+    settings["providers"] = [{
+        "id": "fixture-provider",
+        "name": "Fixture provider",
+        "kind": "openai-compatible",
+        "base_url": "https://fixture.invalid/v1",
+        "enabled": True,
+        "models": [{"id": "fixture-model", "name": "Fixture model"}],
+    }]
+    save_settings(workspace, settings)
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "fixture-key")
+
+    direct_calls: list[str] = []
+    pi_calls: list[dict[str, object]] = []
+
+    def forbidden_direct_client(*_args, **_kwargs):
+        direct_calls.append("called")
+        raise AssertionError("fixed verified workflow must use the Pi JSON adapter")
+
+    def fake_pi_stream(self, **kwargs):
+        del self
+        pi_calls.append(dict(kwargs))
+        yield {"type": "delta", "content": '{"answer":"verified"}'}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 7}}}
+
+    def fake_answer_question(_db, _question, **options):
+        generated = options["chat_client"].complete_json(
+            [
+                {"role": "system", "content": "Return a JSON answer."},
+                {"role": "user", "content": "Use the verified evidence."},
+            ],
+            schema_name="pi_fixed_workflow_fixture",
+        )
+        assert generated == {"answer": "verified"}
+        return {
+            "answer": {"text": "verified"},
+            "reader_answer": {"text": "verified", "citations": []},
+            "citation_verification": {"passed": True},
+            "hits": [],
+            "agentic_trace": {"steps": []},
+        }
+
+    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_client)
+    monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
+    monkeypatch.setattr("scansci_html.research_agent.answer_question", fake_answer_question)
+
+    result = app.research_agent.answer_sync({
+        "question": "What does the selected evidence show?",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "agent_harness": "fixed-workflow",
+        "task_mode": "evidence",
+    })
+
+    assert direct_calls == []
+    assert len(pi_calls) == 1
+    nested = pi_calls[0]
+    assert nested["session_id"] is None
+    assert nested["task_mode"] == "model-json"
+    assert nested["task_contract"]["schema_version"] == "scansci.task-contract.v2"
+    assert nested["task_contract"]["allowed_tools"] == []
+    assert nested["task_contract"]["initial_tools"] == []
+    assert nested["task_contract"]["allowed_mcp_servers"] == []
+    assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
 
 
 def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft(

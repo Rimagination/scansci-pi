@@ -35,9 +35,8 @@ const REVERSIBLE_TOOLS = new Set([
   "edit_slide",
 ]);
 
-// Metadata only until Task 4 wires Python dispatch concurrency.  Keep this
-// allow-list explicit: a read-only risk label does not prove that a composite,
-// control, plugin, or deferred MCP implementation is thread-safe.
+// Keep this allow-list explicit: a read-only risk label does not prove that a
+// composite, control, plugin, or deferred MCP implementation is thread-safe.
 const THREAD_SAFE_READ_TOOLS = new Set([
   "inspect_workspace",
   "inspect_available_tools",
@@ -62,6 +61,15 @@ const THREAD_SAFE_READ_TOOLS = new Set([
   "search_journal",
   "audit_references",
 ]);
+
+export function executionModeForTool(
+  name: string,
+  risk: CatalogRisk,
+): CatalogExecutionMode {
+  return risk === "read_only" && THREAD_SAFE_READ_TOOLS.has(String(name || ""))
+    ? "parallel"
+    : "sequential";
+}
 
 const TOOL_GROUPS: Record<string, string> = {
   inspect_workspace: "workspace",
@@ -164,12 +172,7 @@ export function buildToolCatalog(
         group,
         risk,
         availability: "ready" as const,
-        // Task 4 wires this metadata to the Python dispatch executor.  Keeping
-        // it in the catalog now makes the authorization and discovery schema
-        // stable without claiming end-to-end parallelism prematurely.
-        executionMode: risk === "read_only" && THREAD_SAFE_READ_TOOLS.has(name)
-          ? "parallel" as const
-          : "sequential" as const,
+        executionMode: executionModeForTool(name, risk),
       };
     })
     .filter((entry) => Boolean(entry.name))

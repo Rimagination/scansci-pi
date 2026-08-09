@@ -3,7 +3,12 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+from queue import Empty, Queue
+import subprocess
 import threading
+import time
+
+import pytest
 
 from scansci_html.pi_agent import PiAgentClient
 
@@ -223,11 +228,209 @@ class _EmptyLeaseSearchHandler(BaseHTTPRequestHandler):
         return
 
 
+class _SiblingToolHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+    tool_name = ""
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": index,
+                        "id": f"sibling-{index}",
+                        "type": "function",
+                        "function": {"name": type(self).tool_name, "arguments": "{}"},
+                    }
+                    for index in range(2)
+                ],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "Sibling calls completed."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-siblings-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-siblings-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 def _serve(handler: type[BaseHTTPRequestHandler]):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread
+
+
+def _sibling_calls_arrive_before_first_result(tmp_path: Path, tool_name: str) -> bool:
+    _SiblingToolHandler.request_payloads = []
+    _SiblingToolHandler.tool_name = tool_name
+    server, server_thread = _serve(_SiblingToolHandler)
+    node, sidecar = PiAgentClient.runtime_paths()
+    environment = PiAgentClient._node_environment()
+    environment["SCANSCIPI_PROVIDER_KEY"] = "fixture-key"
+    process = subprocess.Popen(
+        [str(node), str(sidecar)],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    output: Queue[str | None] = Queue()
+
+    def drain_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output.put(line)
+        output.put(None)
+
+    reader = threading.Thread(target=drain_stdout, daemon=True)
+    reader.start()
+    request_id = f"execution-mode-{tool_name}"
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps({
+            "type": "run.start",
+            "pi_protocol_version": 4,
+            "required_features": ["task_contract_v2", "dynamic_tools"],
+            "request_id": request_id,
+            "session_id": request_id,
+            "cwd": str(tmp_path),
+            "agent_dir": str(tmp_path / ".agent"),
+            "provider_kind": "openai-compatible",
+            "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+            "model_id": "fixture-model",
+            "api_surface": "chat_completions",
+            "thinking_level": "off",
+            "system_prompt": "",
+            "prompt": "Call both supplied sibling tools exactly once.",
+            "task_mode": "general",
+            "task_contract": {
+                **_TASK_CONTRACT_V2,
+                "contract_id": request_id,
+                "risk_level": "read_only",
+                "allowed_tools": [tool_name],
+                "initial_tools": [tool_name],
+                "initial_tool_budget": 4,
+                "max_tool_budget": 6,
+            },
+            "mcp_servers": [],
+            "disabled_tools": [],
+        }) + "\n")
+        process.stdin.flush()
+
+        calls: list[dict[str, object]] = []
+        deadline = time.monotonic() + 20
+        while not calls:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "sidecar did not emit the first sibling tool call"
+            try:
+                line = output.get(timeout=min(1.0, remaining))
+            except Empty:
+                continue
+            assert line is not None, process.stderr.read() if process.stderr else "sidecar closed"
+            event = json.loads(line)
+            if event.get("type") == "run.failed":
+                raise AssertionError(event)
+            if event.get("type") == "tool.call":
+                calls.append(event)
+
+        probe_deadline = time.monotonic() + 0.75
+        while len(calls) < 2 and time.monotonic() < probe_deadline:
+            try:
+                line = output.get(timeout=max(0.01, probe_deadline - time.monotonic()))
+            except Empty:
+                break
+            assert line is not None, "sidecar closed before sibling dispatch completed"
+            event = json.loads(line)
+            if event.get("type") == "tool.call":
+                calls.append(event)
+            elif event.get("type") == "run.failed":
+                raise AssertionError(event)
+        arrived_before_result = len(calls) == 2
+
+        def send_result(call: dict[str, object]) -> None:
+            assert process.stdin is not None
+            process.stdin.write(json.dumps({
+                "type": "tool.result",
+                "request_id": request_id,
+                "call_id": str(call["call_id"]),
+                "ok": True,
+                "result": {"ok": True},
+            }) + "\n")
+            process.stdin.flush()
+
+        send_result(calls[0])
+        if len(calls) < 2:
+            while len(calls) < 2:
+                line = output.get(timeout=10)
+                assert line is not None, "sidecar closed before sequential sibling dispatch"
+                event = json.loads(line)
+                if event.get("type") == "tool.call":
+                    calls.append(event)
+                elif event.get("type") == "run.failed":
+                    raise AssertionError(event)
+        send_result(calls[1])
+        while True:
+            line = output.get(timeout=10)
+            assert line is not None, "sidecar closed before run completion"
+            event = json.loads(line)
+            if event.get("type") == "run.failed":
+                raise AssertionError(event)
+            if event.get("type") == "run.completed":
+                break
+        return arrived_before_result
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        server.shutdown()
+        server_thread.join(timeout=2)
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_parallel"),
+    [
+        ("inspect_workspace", True),
+        ("self_assess", False),
+    ],
+)
+def test_real_sdk_sibling_dispatch_honors_tool_definition_execution_mode(
+    tmp_path: Path,
+    tool_name: str,
+    expected_parallel: bool,
+) -> None:
+    assert _sibling_calls_arrive_before_first_result(tmp_path, tool_name) is expected_parallel
 
 
 def test_sidecar_starts_bootstrap_only_then_additively_activates_an_authorized_tool(tmp_path: Path) -> None:
