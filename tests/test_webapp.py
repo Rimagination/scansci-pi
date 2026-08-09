@@ -1620,6 +1620,17 @@ def test_conditional_exact_doi_request_keeps_document_and_acquisition_tools():
     assert prior_only == "task-documents"
 
 
+def test_last_user_text_ignores_inline_image_bytes():
+    content = [
+        {"type": "text", "text": "只解释这张图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,c2VhcmNoIHdlYg=="}},
+    ]
+
+    text = ResearchAgentRuntime._last_user_text([{"role": "user", "content": content}])
+
+    assert text == "只解释这张图"
+
+
 def test_workspace_evidence_status_is_forced_through_bounded_pi_inspection():
     message = {
         "role": "user",
@@ -1984,6 +1995,7 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
 
     events = list(runtime.chat_stream({
         "chat_mode": "knowledge",
+        "web_search": "on",
         "messages": [{"role": "user", "content": "解读这个图的内容"}],
         "images": [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
     }))

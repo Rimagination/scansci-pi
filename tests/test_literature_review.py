@@ -26,6 +26,7 @@ from scansci_html.literature_review import (
     _semantic_cues_are_grounded,
     _subject_balanced_section_citation_ids,
     _strip_inline_citation_markers,
+    _synthesize_plain_review_section,
     _synthesize_review_in_parts,
     _verify_review_document,
     plan_literature_review,
@@ -253,6 +254,24 @@ def test_synthesis_preserves_external_source_links_without_a_local_reader():
     reference = result["review_document"]["references"][0]
     assert reference["reader_url"] == ""
     assert reference["original_url"].startswith("https://doi.org/10.1000/")
+    assert reference["source_href"] == reference["original_url"]
+
+
+def test_synthesis_keeps_public_source_url_alongside_local_evidence_reader():
+    research = _research_payload()
+    for index, row in enumerate(research["evidence"], start=1):
+        row["source_url"] = f"https://doi.org/10.2000/{index}"
+
+    result = synthesize_literature_review(
+        research,
+        chat_client=FakeReviewClient(),
+        reader_url_builder=lambda doc_id, anchor: f"/reader/{doc_id}#{anchor}",
+    )
+
+    reference = result["review_document"]["references"][0]
+    assert reference["reader_url"].startswith("/reader/")
+    assert reference["source_href"].startswith("https://doi.org/10.2000/")
+    assert reference["original_url"] == reference["source_href"]
 
 
 def test_synthesis_preserves_sentence_level_citation_placement():
@@ -286,14 +305,27 @@ def test_synthesis_preserves_sentence_level_citation_placement():
     ]
 
 
-def test_plain_text_fallback_does_not_repeat_the_whole_citation_batch_per_sentence():
+def test_plain_text_recovery_is_used_before_literal_quote_fallback():
     class PlainOnlyClient:
-        def complete_json(self, _messages, *, schema_name):
-            assert schema_name == "literature_review_section"
-            raise ValueError("provider returned invalid structured output")
+        def complete_json(self, messages, *, schema_name):
+            if schema_name == "literature_review_section":
+                raise ValueError("provider returned invalid structured output")
+            assert schema_name == "literature_review_citation_attribution"
+            payload = json.loads(messages[1]["content"])
+            citation_ids = [item["citation_id"] for item in payload["evidence"]]
+            return {
+                "assignments": [
+                    {
+                        "sentence_id": item["sentence_id"],
+                        "citation_ids": [citation_ids[min(index, len(citation_ids) - 1)]],
+                    }
+                    for index, item in enumerate(payload["sentences"])
+                ]
+            }
 
-        def complete_text(self, _messages, *, max_tokens=700):
-            raise AssertionError("direct evidence should run before the plain paragraph fallback")
+        def complete_text(self, messages, *, max_tokens=700):
+            payload = json.loads(messages[1]["content"])
+            return " ".join(item["exact_quote"] for item in payload["evidence"])
 
     plan = {
         "title": "Evidence-bounded review",
@@ -324,6 +356,50 @@ def test_plain_text_fallback_does_not_repeat_the_whole_citation_batch_per_senten
     ]
     assert sentences
     assert all(len(sentence["citation_ids"]) == 1 for sentence in sentences)
+    assert result["writing_runtime"]["model_section_count"] == 3
+    assert result["writing_runtime"]["fallback_section_count"] == 0
+
+
+def test_plain_text_recovery_accepts_inline_sentence_citations_without_json_attribution():
+    class InlineCitationClient:
+        def complete_json(self, _messages, *, schema_name):
+            raise AssertionError(f"inline citations should avoid {schema_name}")
+
+        def complete_text(self, _messages, *, max_tokens=700):
+            assert max_tokens == 2048
+            return (
+                "The retrieval architecture indexes documents and supplies selected passages to the generator [1]. "
+                "The evaluation reports accuracy and citation-quality scores on a held-out benchmark. [2]"
+            )
+
+    evidence = [
+        {
+            "citation_id": "1",
+            "paper": "Architecture paper",
+            "exact_quote": "The retrieval architecture indexes documents and supplies selected passages to the generator.",
+        },
+        {
+            "citation_id": "2",
+            "paper": "Evaluation paper",
+            "exact_quote": "The evaluation reports accuracy and citation-quality scores on a held-out benchmark.",
+        },
+    ]
+
+    result = _synthesize_plain_review_section(
+        "How should an evidence-grounded review describe retrieval architecture?",
+        {
+            "id": "architecture",
+            "title": "Retrieval architecture",
+            "objective": "Describe retrieval architecture and its evaluation",
+        },
+        evidence,
+        text_completion=InlineCitationClient().complete_text,
+        citation_client=InlineCitationClient(),
+    )
+
+    assert result["citation_ids"] == ["1", "2"]
+    assert [sentence["citation_ids"] for sentence in result["sentences"]] == [["1"], ["2"]]
+    assert "[1]" not in result["text"]
 
 
 def test_model_authored_grouped_numeric_citations_are_removed_before_verified_markers():
@@ -819,6 +895,12 @@ def test_review_readability_gate_rejects_corruption_and_runaway_repetition():
     assert _review_text_is_readable("开发集集数据上上 上出现异常。") is False
     assert _review_text_is_readable(r"权重 \\ \\ \\times H 在微调中引入。") is False
     assert _review_text_is_readable("参数量从 1B �长到 10B。") is False
+    long_readable = " ".join(
+        f"Evidence-grounded synthesis item {index} remains readable and source-specific."
+        for index in range(55)
+    )
+    assert len(long_readable) > 2000
+    assert _review_text_is_readable(long_readable) is True
 
 
 def test_three_model_comparison_rejects_side_model_substitution():

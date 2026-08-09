@@ -548,6 +548,21 @@ def _synthesize_review_in_parts(
             if literal_section:
                 raw_section = literal_section
                 model_written = False
+        if not raw_section and callable(text_completion):
+            # Some OpenAI-compatible reasoning endpoints return an empty
+            # message for a large JSON response even though ordinary text
+            # completion works.  Recover with one bounded prose call and a
+            # separate sentence-level citation attribution pass before
+            # falling all the way back to literal source excerpts.
+            raw_section = _synthesize_plain_review_section(
+                question,
+                dict(planned),
+                section_evidence,
+                text_completion=text_completion,
+                citation_client=chat_client,
+                writing_brief=writing_brief,
+            )
+            model_written = bool(raw_section)
         if not raw_section:
             fallback_titles.append(str(planned.get("title", "")))
             raw_section = _deterministic_grounded_review_section(
@@ -587,6 +602,7 @@ def _synthesize_review_in_parts(
                     section_evidence,
                     text_completion=text_completion,
                     citation_client=chat_client,
+                    writing_brief=writing_brief,
                 )
         if (
             (not raw_section or len(re.findall(r"[\u3400-\u9fff]", str(raw_section.get("text", "")))) < 45)
@@ -1260,6 +1276,7 @@ def _synthesize_plain_review_section(
     *,
     text_completion: Callable[..., str],
     citation_client: ChatJsonClient | None = None,
+    writing_brief: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use one plain-text model call before falling back to source-language excerpts."""
 
@@ -1275,18 +1292,34 @@ def _synthesize_plain_review_section(
     if not rows:
         return {}
     required_subjects = _required_review_subjects(question, planned)
+    brief = _normalize_writing_brief(writing_brief)
+    chinese_output = bool(re.search(r"[\u3400-\u9fff]", question))
+    if chinese_output:
+        length_ranges = {"short": "200 到 400 字", "standard": "400 到 800 字", "long": "600 到 1200 字"}
+        system_prompt = (
+            "你是证据约束的中文文献综述作者。只依据输入 exact_quote 写一个"
+            f"{length_ranges[brief['length']]}的连贯中文段落，不得复制目录、表格、章节号或无关细节，"
+            "不得引入外部知识。逐一覆盖 required_subjects 中列出的对象；若证据不对称，只写有直接证据支持的边界，"
+            "不制造对称结论。每个句号、问号或感叹号后必须紧跟 1 到 2 个支持整句的证据编号，格式只能是 [7] 或 [7,8]；"
+            "不得使用输入 evidence 之外的编号。不要输出标题、项目符号或解释，只输出带句级证据编号的正文。"
+        )
+    else:
+        length_ranges = {"short": "120 to 240 words", "standard": "220 to 420 words", "long": "350 to 650 words"}
+        system_prompt = (
+            "You are an evidence-constrained literature-review writer. Use only the supplied exact_quote values to write one "
+            f"coherent {length_ranges[brief['length']]} paragraph. Do not copy table-of-contents fragments, section numbering, "
+            "or irrelevant procedural detail, and do not introduce outside knowledge. Address every required_subject when the "
+            "evidence supports it; when support is asymmetric, state only the supported boundary. Immediately after every sentence, "
+            "append one or two citation IDs that directly support the whole sentence, using only [7] or [7,8] syntax and only IDs "
+            "present in the evidence input. Return prose only, without a heading, bullets, or commentary."
+        )
     try:
-        text = str(
+        model_text = str(
             text_completion(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "你是证据约束的中文文献综述作者。只依据输入 exact_quote 写一个 100 到 260 字的连贯中文段落，"
-                            "不得复制目录、表格、章节号或受试者招募细节，不得引入外部知识。"
-                            "逐一覆盖 required_subjects 中列出的对象；若证据不对称，只写有直接证据支持的边界，不制造对称结论。"
-                            "不要输出标题、项目符号、引用编号或解释，只输出正文。"
-                        ),
+                        "content": system_prompt,
                     },
                     {
                         "role": "user",
@@ -1299,6 +1332,7 @@ def _synthesize_plain_review_section(
                                     "required_subjects": required_subjects,
                                 },
                                 "evidence": rows,
+                                "writing_brief": brief,
                             },
                             ensure_ascii=False,
                         ),
@@ -1309,24 +1343,86 @@ def _synthesize_plain_review_section(
         ).strip()
     except Exception:
         return {}
-    text = _strip_unrequested_model_detours(
+    model_text = _strip_unrequested_model_detours(
         question,
         planned,
-        _strip_inline_citation_markers(text),
+        model_text,
     )
-    text = _strip_review_excerpt_artifacts(text)
+    model_text = _strip_review_excerpt_artifacts(model_text)
+    inline_cited = _parse_inline_review_sentence_citations(model_text, rows)
+    text = _strip_inline_citation_markers(model_text)
     if not _review_text_is_readable(text):
         return {}
-    if len(re.findall(r"[\u3400-\u9fff]", text)) < 45:
+    if chinese_output:
+        if len(re.findall(r"[\u3400-\u9fff]", text)) < 45:
+            return {}
+    elif len(re.findall(r"\b[A-Za-z][A-Za-z'-]*\b", text)) < 20:
         return {}
     if not _claim_addresses_review_section({"text": text}, planned):
         return {}
+    if inline_cited:
+        return inline_cited
     attributed_sentences = _attribute_plain_review_sentence_citations(
         _split_review_sentences(text),
         rows,
         chat_client=citation_client,
     )
     return _cited_text_from_sentences(attributed_sentences) if attributed_sentences else {}
+
+
+def _parse_inline_review_sentence_citations(
+    text: str,
+    evidence: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Parse model-authored markers while retaining citation authority locally."""
+
+    known_ids = {
+        str(row.get("citation_id", "")).strip()
+        for row in evidence
+        if str(row.get("citation_id", "")).strip()
+    }
+    quote_text_by_id = {
+        str(row.get("citation_id", "")).strip(): str(row.get("exact_quote", ""))
+        for row in evidence
+        if str(row.get("citation_id", "")).strip()
+    }
+    if not known_ids:
+        return {}
+    marker = r"(?:\[\s*\d{1,4}(?:\s*[,，;；]\s*\d{1,4})?\s*\]|【\s*\d{1,4}(?:\s*[,，;；]\s*\d{1,4})?\s*】)"
+    pattern = re.compile(
+        rf"(?P<text>.*?)(?P<markers>(?:\s*{marker})+)(?P<punct>[。！？!?；；.]?)(?=\s+|$)",
+        flags=re.DOTALL,
+    )
+    source = str(text or "").strip()
+    if not source:
+        return {}
+    cited_sentences: list[dict[str, Any]] = []
+    cursor = 0
+    for match in pattern.finditer(source):
+        if match.start() != cursor and source[cursor:match.start()].strip():
+            return {}
+        sentence_text = " ".join(
+            f"{match.group('text') or ''}{match.group('punct') or ''}".split()
+        ).strip()
+        if len(_split_review_sentences(sentence_text)) != 1:
+            return {}
+        citation_ids = list(
+            dict.fromkeys(re.findall(r"\d{1,4}", str(match.group("markers") or "")))
+        )
+        if not sentence_text or not 1 <= len(citation_ids) <= 2:
+            return {}
+        if any(citation_id not in known_ids for citation_id in citation_ids):
+            return {}
+        if not _semantic_cues_are_grounded(
+            {"text": sentence_text, "quote_ids": citation_ids},
+            quote_text_by_id,
+        ):
+            return {}
+        cited_sentences.append({"text": sentence_text, "citation_ids": citation_ids})
+        cursor = match.end()
+    if source[cursor:].strip() or not cited_sentences:
+        return {}
+    return _cited_text_from_sentences(cited_sentences)
 
 
 def _attribute_plain_review_sentence_citations(
@@ -1783,7 +1879,7 @@ def _review_text_is_readable(text: str) -> bool:
     # characters.  The former 700-character ceiling silently rejected valid
     # model output and even two bounded evidence excerpts.  Keep a generous
     # corruption guard while allowing the configured long-form profile.
-    if not value or len(value) > 2000:
+    if not value or len(value) > 10000:
         return False
     if any(marker in value for marker in ("�", "nâ", "â€", "ï¬")):
         return False

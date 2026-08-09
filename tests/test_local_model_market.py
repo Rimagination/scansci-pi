@@ -47,6 +47,7 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "architecture": "Qwen2ForCausalLM",
             "model_type": "qwen2",
             "format": "transformers",
+            "icon_url": "https://resources.modelscope.cn/avatar/4c40e6ce-1348-43b5-a3bc-6bafec6ac805.jpg",
         }
     ]
 

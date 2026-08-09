@@ -2180,6 +2180,7 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .quiet-model-row p { overflow: hidden; margin: 3px 0 0; color: #88888f; font-size: 11px; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; }
 .quiet-model-mark { display: grid; width: 25px; height: 25px; place-items: center; border: 1px solid #dedee2; border-radius: 7px; color: #44444a; background: #fafafa; font-size: 14px; line-height: 1; }
 .quiet-model-mark.is-muted { color: #9a9aa0; }
+.model-market-icon { display: block; width: 26px; height: 26px; border: 1px solid #e3e3e6; border-radius: 7px; background: #ffffff; object-fit: cover; }
 .quiet-row-note { color: #74747b; font-size: 11px; white-space: nowrap; }
 .quiet-row-size { min-width: 52px; color: #97979e; font-size: 11px; text-align: right; white-space: nowrap; }
 .quiet-empty { padding: 22px 0; color: #93939a; font-size: 12px; }

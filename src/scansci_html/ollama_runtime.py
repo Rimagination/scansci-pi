@@ -21,6 +21,7 @@ OLLAMA_VISION_CATALOG_ITEM = {
     "source": "ollama",
     "size_hint": "约 1.6 GB",
     "description": "轻量本地视觉模型；安装 Ollama 后可识别图片、图表和扫描页面。",
+    "icon_url": "https://ollama.com/public/ollama.png",
 }
 
 

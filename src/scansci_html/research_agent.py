@@ -2815,8 +2815,9 @@ class ResearchAgentRuntime:
             and all(isinstance(item.get("content"), str) for item in chat_request.messages)
         )
 
-    @staticmethod
+    @classmethod
     def _vision_direct_fallback(
+        cls,
         chat_request: _DirectChatRequest,
         *,
         task_mode: str,
@@ -2832,7 +2833,23 @@ class ResearchAgentRuntime:
         direct vision completion is the correct route.
         """
 
-        return bool(chat_request.vision_route) and not _pi_requires_tools(task_mode, user_text)
+        if not chat_request.vision_route:
+            return False
+
+        # ``task_mode`` also contains capabilities enabled by ambient UI state
+        # (for example, the global web toggle or the selected knowledge chat
+        # mode).  Those capabilities must remain available to an ordinary text
+        # turn, but they are not an explicit request to search or inspect data.
+        # Reclassify the *visible user text* with ambient capabilities disabled;
+        # only a concrete request such as "search the web for this image" or
+        # "verify this against my knowledge base" should leave the direct
+        # multimodal transport.
+        explicit_mode = cls._direct_pi_task_mode(
+            "general",
+            "off",
+            messages=[{"role": "user", "content": user_text}],
+        )
+        return not _pi_requires_tools(explicit_mode, user_text)
 
     @staticmethod
     def _pi_task_mode(chat_mode: str) -> str:
@@ -2856,7 +2873,19 @@ class ResearchAgentRuntime:
     def _last_user_text(messages: list[dict[str, Any]] | None) -> str:
         for message in reversed(list(messages or [])):
             if str(message.get("role", "")).strip().lower() == "user":
-                return str(message.get("content", "")).strip()
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    text_parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = str(block.get("type", "")).strip().lower()
+                        if block_type in {"text", "input_text"}:
+                            value = block.get("text", block.get("content", ""))
+                            if str(value or "").strip():
+                                text_parts.append(str(value).strip())
+                    return "\n".join(text_parts).strip()
+                return str(content).strip()
         return ""
 
     @staticmethod

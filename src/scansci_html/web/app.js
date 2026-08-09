@@ -10983,7 +10983,7 @@ function renderLegacyLocalModelsSettings() {
           ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
           : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
     const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
-    return `<article class="quiet-model-row"><span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span><span>${status}</span></div></div>${action}</article>`;
+    return `<article class="quiet-model-row">${item.icon_url ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />` : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   const runtimeRows = (state.settings.local_models || []).map((item, index) => ({ item, index })).filter(({ item }) => item.runtime !== "builtin").map(({ item, index }) => `<details class="quiet-runtime-row"><summary><span class="quiet-model-mark">◌</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.runtime)} · ${item.enabled ? "可用" : "已停用"}</small></span><span class="quiet-row-note">配置</span></summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>启用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button><button type="button" class="quiet-danger-button" data-action="remove-local-model" data-local-index="${index}">移除</button></div></div></details>`).join("") || '<div class="quiet-empty">尚未添加外部本地运行时。</div>';
   const capabilityCards = ONBOARDING_RESOURCE_ORDER
@@ -11171,7 +11171,10 @@ function renderLocalModelsSettings() {
     const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
     const incompatible = item.runtime_compatible === false;
     const status = incompatible ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : item.ready ? "可用" : "未完成";
-    return `<article class="quiet-model-row"><span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span><div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
+    const icon = item.icon_url
+      ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />`
+      : `<span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span>`;
+    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
   }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
   const manualRuntimeItems = (state.settings.local_models || [])
     .map((item, index) => ({ item, index }))
@@ -11240,7 +11243,10 @@ function renderLocalModelsSettings() {
           ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
           : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
     const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
-    return `<article class="quiet-model-row"><span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
+    const icon = item.icon_url
+      ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />`
+      : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`;
+    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
     <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${runtimeReady ? escapeHtml(runtimeDescription) : "本地模型是可选项；基础对话和关键词检索无需额外安装。"}</span><button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button></footer></section>
@@ -13913,6 +13919,10 @@ document.addEventListener("contextmenu", (event) => {
 document.addEventListener("error", (event) => {
   const image = event.target?.closest?.("img[data-site-icon]");
   if (!image) return;
+  if (image.classList.contains("model-market-icon")) {
+    image.remove();
+    return;
+  }
   image.closest(".site-link-icon")?.classList.add("is-fallback");
 }, true);
 
