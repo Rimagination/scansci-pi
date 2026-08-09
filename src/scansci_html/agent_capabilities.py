@@ -257,6 +257,18 @@ def builtin_capability_catalog() -> list[dict[str, Any]]:
     return descriptors
 
 
+def builtin_capability_descriptor(capability_id: object) -> dict[str, Any] | None:
+    """Return one host-owned bridge descriptor without inventing metadata."""
+
+    normalized = str(capability_id or "").strip()
+    if not normalized:
+        return None
+    return next(
+        (dict(item) for item in builtin_capability_catalog() if str(item.get("id", "")) == normalized),
+        None,
+    )
+
+
 def capability_catalog(
     *,
     workspace: str | Path,
@@ -384,6 +396,7 @@ __all__ = [
     "allowed_capability_projection",
     "artifact_uri",
     "builtin_capability_catalog",
+    "builtin_capability_descriptor",
     "capability_catalog",
     "compile_capability_lease",
     "evidence_uri",

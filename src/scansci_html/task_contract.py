@@ -10,7 +10,9 @@ import re
 from typing import Any
 
 
-TASK_CONTRACT_SCHEMA = "scansci.task-contract.v1"
+TASK_CONTRACT_SCHEMA = "scansci.task-contract.v2"
+TASK_CONTRACT_VERSION = 2
+LEGACY_TASK_CONTRACT_SCHEMAS = frozenset({"scansci.task-contract.v1", "1", "2"})
 
 
 def _items(value: Any, *, limit: int = 32) -> tuple[str, ...]:
@@ -31,11 +33,14 @@ class TaskContract:
     constraints: tuple[str, ...] = ()
     required_evidence: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
+    initial_tools: tuple[str, ...] = ()
     pause_policy: str = "pause only when a missing user choice changes the result"
     success_criteria: tuple[str, ...] = ()
     contract_id: str = ""
     version: str = TASK_CONTRACT_SCHEMA
     extra: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    _allowed_tools_present: bool = field(default=False, compare=False, repr=False)
+    _initial_tools_present: bool = field(default=False, compare=False, repr=False)
 
     @classmethod
     def from_payload(
@@ -46,6 +51,8 @@ class TaskContract:
         task_mode: str = "general",
     ) -> "TaskContract":
         raw = dict(payload or {})
+        allowed_tools_present = "allowed_tools" in raw
+        initial_tools_present = "initial_tools" in raw
         clean_request = re.sub(r"\s+", " ", str(request or "")).strip()
         goal = str(raw.get("goal") or clean_request or "Complete the requested task").strip()[:1200]
         mode = str(task_mode or "general")
@@ -58,7 +65,7 @@ class TaskContract:
             contract_id = f"task-{digest}"
         known = {
             "contract_id", "goal", "request", "output_format", "constraints", "required_evidence",
-            "allowed_tools", "pause_policy", "success_criteria", "version",
+            "allowed_tools", "initial_tools", "pause_policy", "success_criteria", "version", "schema_version",
         }
         extra = {key: value for key, value in raw.items() if key not in known}
         return cls(
@@ -68,27 +75,42 @@ class TaskContract:
             constraints=_items(raw.get("constraints")),
             required_evidence=required,
             allowed_tools=_items(raw.get("allowed_tools")),
+            # A legacy v1 payload had no initial activation subset.  Reading
+            # it preserves its authority while migrating the old behaviour
+            # into an explicit v2 initial subset.  An omitted hard lease stays
+            # omitted and must never be interpreted as an allow-all value.
+            initial_tools=_items(
+                raw.get("initial_tools")
+                if initial_tools_present
+                else raw.get("allowed_tools") if allowed_tools_present else None
+            ),
             pause_policy=str(raw.get("pause_policy") or cls.pause_policy).strip()[:300],
             success_criteria=_items(raw.get("success_criteria"), limit=12),
             contract_id=contract_id,
-            version=str(raw.get("version") or TASK_CONTRACT_SCHEMA),
+            version=TASK_CONTRACT_SCHEMA,
             extra=extra,
+            _allowed_tools_present=allowed_tools_present,
+            _initial_tools_present=initial_tools_present or allowed_tools_present,
         )
 
     def to_dict(self) -> dict[str, Any]:
         payload = dict(self.extra)
         payload.update({
-            "schema_version": self.version,
+            "schema_version": TASK_CONTRACT_SCHEMA,
+            "version": TASK_CONTRACT_VERSION,
             "contract_id": self.contract_id,
             "goal": self.goal,
             "request": self.request,
             "output_format": self.output_format,
             "constraints": list(self.constraints),
             "required_evidence": list(self.required_evidence),
-            "allowed_tools": list(self.allowed_tools),
             "pause_policy": self.pause_policy,
             "success_criteria": list(self.success_criteria),
         })
+        if self._allowed_tools_present:
+            payload["allowed_tools"] = list(self.allowed_tools)
+        if self._initial_tools_present:
+            payload["initial_tools"] = list(self.initial_tools)
         return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
 
     def prompt_block(self) -> str:
@@ -108,4 +130,9 @@ class TaskContract:
         return "\n".join(lines)
 
 
-__all__ = ["TASK_CONTRACT_SCHEMA", "TaskContract"]
+__all__ = [
+    "LEGACY_TASK_CONTRACT_SCHEMAS",
+    "TASK_CONTRACT_SCHEMA",
+    "TASK_CONTRACT_VERSION",
+    "TaskContract",
+]

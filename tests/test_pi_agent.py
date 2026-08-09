@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import subprocess
 from pathlib import Path
 import threading
 import time
@@ -874,6 +875,71 @@ class _OpenAIToolLoopHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIPlanDefaultDenyHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            call = {
+                "index": 0,
+                "id": "call_plan",
+                "type": "function",
+                "function": {
+                    "name": "submit_plan",
+                    "arguments": json.dumps({
+                        "summary": "Download one paper",
+                        "steps": [{"id": "download", "title": "Download"}],
+                    }),
+                },
+            }
+            finish = "tool_calls"
+            delta = {"role": "assistant", "tool_calls": [call]}
+        elif turn == 2:
+            call = {
+                "index": 0,
+                "id": "call_download",
+                "type": "function",
+                "function": {
+                    "name": "download_and_index",
+                    "arguments": '{"identifiers":["10.1/denied"]}',
+                },
+            }
+            finish = "tool_calls"
+            delta = {"role": "assistant", "tool_calls": [call]}
+        else:
+            finish = "stop"
+            delta = {"role": "assistant", "content": "Plan was not approved."}
+        chunks = [
+            {
+                "id": f"chatcmpl-plan-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-plan-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class _OpenAIDeferredWebHandler(BaseHTTPRequestHandler):
     request_payloads: list[dict[str, object]] = []
 
@@ -1118,7 +1184,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     assert status["ready"] is True
     assert status["runtime"] == "pi"
     assert status["version"] == "0.80.10"
-    assert status["protocol"] == 3
+    assert status["protocol"] == 4
     assert {
         "multi_session",
         "ask_user",
@@ -1126,7 +1192,44 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
         "follow_up",
         "structured_recovery",
         "session_fork",
+        "task_contract_v2",
+        "host_tool_authorization",
+        "structured_mcp_effects",
+        "current_request_context",
     }.issubset(set(status["capabilities"]))
+
+
+def test_pi_sidecar_rejects_incompatible_protocol_before_starting_a_run() -> None:
+    node, sidecar = PiAgentClient.runtime_paths()
+    process = subprocess.Popen(
+        [str(node), str(sidecar)],
+        env=PiAgentClient._node_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps({
+            "type": "run.start",
+            "pi_protocol_version": 3,
+            "required_features": ["task_contract_v2"],
+            "request_id": "protocol-mismatch",
+            "session_id": "protocol-mismatch",
+        }) + "\n")
+        process.stdin.flush()
+        response = json.loads(process.stdout.readline())
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+    assert response["type"] == "run.failed"
+    assert response["failure"]["code"] == "protocol_incompatible"
+    assert response["failure"]["protocol"] == 3
 
 
 def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch) -> None:
@@ -1163,6 +1266,95 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert events[-1]["type"] == "done"
     assert captured["task_contract"]["contract_id"] == "contract-test"
     assert captured["task_contract"]["allowed_tools"] == ["kb_search"]
+    assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
+    assert captured["pi_protocol_version"] == 4
+    assert "host_tool_authorization" in captured["required_features"]
+
+
+def test_python_bridge_reauthorizes_spoofed_tool_call_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    dispatched: list[tuple[str, dict[str, object]]] = []
+    written: list[dict[str, object]] = []
+    fake_process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: fake_process)
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_tool",
+        lambda name, arguments: dispatched.append((name, dict(arguments))) or {"ok": True},
+    )
+    client._output.put(json.dumps({
+        "type": "tool.call",
+        "request_id": "request-current",
+        "call_id": "spoofed-call",
+        "name": "download_and_index",
+        "arguments": {"identifiers": ["10.1/spoofed"]},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+
+    events = list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "knowledge",
+            "task_contract": {
+                "schema_version": "scansci.task-contract.v2",
+                "allowed_tools": ["inspect_workspace"],
+                "risk_level": "read_only",
+                "max_tool_budget": 2,
+            },
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert dispatched == []
+    rejected = next(message for message in written if message.get("call_id") == "spoofed-call")
+    assert rejected["ok"] is False
+    assert "authorization" in str(rejected["error"]).lower() or "lease" in str(rejected["error"]).lower()
+    assert any(event.get("type") == "tool.failed" for event in events)
+
+
+def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) -> None:
+    _OpenAIStreamHandler.request_payload = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Do not use tools."}],
+            thinking_level="off",
+            task_mode="knowledge",
+            task_contract={"allowed_tools": [], "risk_level": "read_only"},
+            timeout_seconds=30,
+            session_id="empty-lease-session",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    advertised = {
+        str(dict(tool.get("function", {}) or {}).get("name", ""))
+        for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
+        if isinstance(tool, dict)
+    }
+    assert advertised <= {"ask_user", "submit_plan"}
 
 
 def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
@@ -1690,6 +1882,73 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
     assert any(message.get("role") == "tool" for message in second_messages)
 
 
+def test_plan_approval_defaults_to_deny_without_explicit_approve(tmp_path: Path) -> None:
+    _OpenAIPlanDefaultDenyHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPlanDefaultDenyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    dispatched: list[str] = []
+    client._execute_tool = lambda name, _arguments: dispatched.append(name) or {"ok": True}  # type: ignore[method-assign]
+    events: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            events.extend(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Download one paper after approval."}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    "allowed_tools": ["download_and_index"],
+                    "risk_level": "reversible",
+                    "requires_plan": True,
+                    "initial_tool_budget": 2,
+                    "max_tool_budget": 4,
+                },
+                timeout_seconds=30,
+                session_id="default-deny-plan",
+            ))
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        deadline = time.monotonic() + 10
+        interaction: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            interaction = next((item for item in events if item.get("type") == "interaction"), None)
+            if interaction is not None:
+                break
+            time.sleep(0.01)
+        assert interaction is not None
+        assert client.respond_interaction(
+            str(interaction["interaction_id"]),
+            {},
+            request_id=str(interaction["request_id"]),
+        ) is True
+        consumer.join(timeout=10)
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert not consumer.is_alive()
+    assert errors == []
+    assert "download_and_index" not in dispatched
+    assert not any(
+        event.get("type") == "tool.failed" and event.get("name") == "download_and_index"
+        for event in events
+    )
+    assert events[-1]["type"] == "done"
+
+
 def test_pi_continues_after_deferred_web_plan_until_tool_backed_final(tmp_path: Path) -> None:
     _OpenAIDeferredWebHandler.request_payloads = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIDeferredWebHandler)
@@ -1942,6 +2201,13 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
     assert second_session["session_file"] == first_session["session_file"]
     second_messages = _OpenAIPersistentHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "assistant" and "turn-1" in str(message.get("content")) for message in second_messages)
+    second_system = "\n".join(
+        str(message.get("content", ""))
+        for message in second_messages
+        if message.get("role") in {"system", "developer"}
+    )
+    assert "Task contract turn-two: goal=second question." in second_system
+    assert "Task contract turn-one: goal=first question." not in second_system
 
 
 def test_pi_cancel_aborts_active_sdk_run_without_killing_client(tmp_path: Path) -> None:

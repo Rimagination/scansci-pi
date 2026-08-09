@@ -15,6 +15,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { PI_PROTOCOL_FEATURES, PI_PROTOCOL_VERSION, negotiateProtocol } from "./protocol.js";
 
 type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -22,6 +23,8 @@ type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
 interface RunStart extends JsonRecord {
   type: "run.start";
+  pi_protocol_version?: number;
+  required_features?: string[];
   request_id: string;
   session_id: string;
   session_file?: string;
@@ -45,8 +48,19 @@ interface RunStart extends JsonRecord {
 }
 
 type ToolRisk = "read_only" | "reversible" | "high";
+type McpEffect = "read" | "write" | "destructive" | "unknown";
+
+interface McpToolPolicy {
+  serverId: string;
+  serverAlias: string;
+  remoteName: string;
+  effect: McpEffect;
+  idempotent: boolean;
+  annotations: JsonRecord;
+}
 
 interface NormalizedTaskContract {
+  schemaVersion: string;
   contractId: string;
   goal: string;
   outputFormat: string;
@@ -56,6 +70,8 @@ interface NormalizedTaskContract {
   riskLevel: string;
   requiresPlan: boolean;
   allowedTools: Set<string>;
+  initialTools: Set<string>;
+  hasToolLease: boolean;
   allowedMcpServers: Set<string>;
   hasMcpLease: boolean;
   requiredToolGroups: Set<string>[];
@@ -72,6 +88,7 @@ interface NormalizedTaskContract {
 interface SessionState {
   session: AgentSession;
   request: RunStart;
+  requestRef: { current: RunStart };
   signature: string;
   unsubscribe: () => void;
   currentRequestId?: string;
@@ -673,6 +690,7 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
     1_000_000,
   );
   return {
+    schemaVersion: String(raw.schema_version || (Number(raw.version) === 2 ? "scansci.task-contract.v2" : "scansci.task-contract.v1")),
     contractId: String(raw.contract_id || `legacy-${request.request_id}`),
     goal: String(raw.goal || finalUserRequestText(request.prompt || "")).slice(0, 1200),
     outputFormat: String(raw.output_format || "text").slice(0, 120),
@@ -688,6 +706,16 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
         ? raw.allowed_tools.map(String).filter(Boolean)
         : [],
     ),
+    initialTools: new Set(
+      Array.isArray(raw.initial_tools)
+        ? raw.initial_tools.map(String).filter((name) => (
+          Boolean(name) && Array.isArray(raw.allowed_tools) && raw.allowed_tools.map(String).includes(String(name))
+        ))
+        : Array.isArray(raw.allowed_tools)
+          ? raw.allowed_tools.map(String).filter(Boolean)
+          : [],
+    ),
+    hasToolLease: Object.prototype.hasOwnProperty.call(raw, "allowed_tools") && Array.isArray(raw.allowed_tools),
     allowedMcpServers: new Set(
       Array.isArray(raw.allowed_mcp_servers)
         ? raw.allowed_mcp_servers.map(String).filter(Boolean)
@@ -710,9 +738,12 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
   };
 }
 
-function toolRisk(name: string): ToolRisk {
+function toolRisk(name: string, mcpPolicy?: McpToolPolicy): ToolRisk {
+  if (mcpPolicy) return mcpPolicy.effect === "read" ? "read_only" : "high";
   const normalized = String(name || "");
-  if (normalized.startsWith("mcp__") && isWriteLikeMcpTool(normalized)) return "high";
+  // MCP effects are never inferred from a local or remote name.  A missing
+  // structured policy is an unknown effect and therefore high risk.
+  if (normalized.startsWith("mcp__")) return "high";
   if (new Set([
     "download_and_index",
     "create_document",
@@ -748,18 +779,17 @@ function toolFingerprint(name: string, args: JsonRecord): string {
   return `${String(name)}:${JSON.stringify(stableToolValue(args))}`;
 }
 
-function assertCapabilityLease(activeRun: ActiveRun, name: string): void {
-  const risk = toolRisk(name);
+function assertCapabilityLease(activeRun: ActiveRun, name: string, mcpPolicy?: McpToolPolicy): void {
+  const risk = toolRisk(name, mcpPolicy);
   const contract = activeRun.taskContract;
-  if (
-    contract.allowedTools.size > 0
-    && !String(name).startsWith("mcp__")
-    && !contract.allowedTools.has(name)
-  ) {
+  if (!String(name).startsWith("mcp__") && (!contract.hasToolLease || !contract.allowedTools.has(name))) {
     throw new Error(`Capability lease denied tool ${name}; it is outside the current task contract.`);
   }
-  if (String(name).startsWith("mcp__") && contract.hasMcpLease) {
-    const serverId = String(name).split("__")[1] || "";
+  if (String(name).startsWith("mcp__")) {
+    if (!contract.hasMcpLease) {
+      throw new Error("Capability lease denied MCP tool because the server lease is missing.");
+    }
+    const serverId = mcpPolicy?.serverId || "";
     if (!contract.allowedMcpServers.has(serverId)) {
       throw new Error(`Capability lease denied MCP server ${serverId || "unknown"}.`);
     }
@@ -777,10 +807,10 @@ function assertCapabilityLease(activeRun: ActiveRun, name: string): void {
   }
 }
 
-function claimToolCall(name: string, args: JsonRecord): ActiveRun {
+function claimToolCall(name: string, args: JsonRecord, mcpPolicy?: McpToolPolicy): ActiveRun {
   const activeRun = activeRunStorage.getStore();
   if (!activeRun) throw new Error("No active Pi run owns this tool call");
-  assertCapabilityLease(activeRun, name);
+  assertCapabilityLease(activeRun, name, mcpPolicy);
   const fingerprint = toolFingerprint(name, args);
   const repeats = activeRun.toolFingerprints.get(fingerprint) || 0;
   if (repeats >= 2) {
@@ -911,8 +941,65 @@ function splitCommandArgs(value: unknown): string[] {
   return args;
 }
 
-function isWriteLikeMcpTool(name: string): boolean {
-  return /(?:^|[_-])(add|append|create|delete|edit|import|insert|move|remove|rename|save|set|update|upload|write)(?:$|[_-])/i.test(name);
+function normalizeMcpEffect(value: unknown): McpEffect {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["read", "read_only", "readonly"].includes(normalized)) return "read";
+  if (["write", "reversible", "mutation"].includes(normalized)) return "write";
+  if (["destructive", "delete", "high"].includes(normalized)) return "destructive";
+  return "unknown";
+}
+
+function mcpToolPolicy(
+  raw: JsonRecord,
+  serverId: string,
+  serverAlias: string,
+  remoteTool: JsonRecord,
+): McpToolPolicy {
+  const remoteName = String(remoteTool.name || "").trim();
+  const annotations = remoteTool.annotations && typeof remoteTool.annotations === "object"
+    ? remoteTool.annotations as JsonRecord
+    : {};
+  const configuredEffects = raw.tool_effects && typeof raw.tool_effects === "object"
+    ? raw.tool_effects as JsonRecord
+    : {};
+  const configuredPolicy = Array.isArray(raw.tool_policies)
+    ? (raw.tool_policies as unknown[]).find((value) => (
+      Boolean(value && typeof value === "object")
+      && String((value as JsonRecord).name || (value as JsonRecord).tool || "") === remoteName
+    )) as JsonRecord | undefined
+    : raw.tool_policies && typeof raw.tool_policies === "object"
+      ? ((raw.tool_policies as JsonRecord)[remoteName] as JsonRecord | undefined)
+      : undefined;
+  let effect = normalizeMcpEffect(configuredPolicy?.effect || configuredEffects[remoteName]);
+  if (effect === "unknown") {
+    if (annotations.destructiveHint === true) effect = "destructive";
+    else if (annotations.readOnlyHint === true) effect = "read";
+    else if (annotations.readOnlyHint === false) effect = "write";
+  }
+  return {
+    serverId,
+    serverAlias,
+    remoteName,
+    effect,
+    idempotent: configuredPolicy?.idempotent === true || effect === "read" || annotations.idempotentHint === true,
+    annotations: {
+      readOnlyHint: annotations.readOnlyHint,
+      destructiveHint: annotations.destructiveHint,
+      idempotentHint: annotations.idempotentHint,
+      openWorldHint: annotations.openWorldHint,
+    },
+  };
+}
+
+function mcpPolicyRecord(policy: McpToolPolicy): JsonRecord {
+  return {
+    server_id: policy.serverId,
+    server_alias: policy.serverAlias,
+    remote_name: policy.remoteName,
+    effect: policy.effect,
+    idempotent: policy.idempotent,
+    annotations: policy.annotations,
+  };
 }
 
 type McpTransport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
@@ -938,13 +1025,14 @@ function createMcpTransport(raw: JsonRecord, request: RunStart): McpTransport | 
 
 function deferredMcpTools(
   raw: JsonRecord,
-  request: RunStart,
-  serverId: string,
+  requestRef: { current: RunStart },
+  rawServerId: string,
+  serverAlias: string,
   clients: McpClient[],
-): ReturnType<typeof defineTool>[] {
-  const serverLabel = String(raw.name || raw.id || serverId);
-  const searchName = `mcp__${serverId}__search`;
-  const callName = `mcp__${serverId}__call`;
+): { tools: ReturnType<typeof defineTool>[]; policies: Map<string, McpToolPolicy> } {
+  const serverLabel = String(raw.name || raw.id || rawServerId);
+  const searchName = `mcp__${serverAlias}__search`;
+  const callName = `mcp__${serverAlias}__call`;
   let client: McpClient | undefined;
   let remoteTools: JsonRecord[] = [];
   let connection: Promise<JsonRecord[]> | undefined;
@@ -953,14 +1041,15 @@ function deferredMcpTools(
     if (connection) return connection;
     connection = (async () => {
       const startedAt = Date.now();
+      const currentRequest = requestRef.current;
       emit({
         type: "status.update",
-        request_id: request.request_id,
+        request_id: currentRequest.request_id,
         status: "mcp_connecting",
         name: serverLabel,
-        details: { activation_mode: "deferred" },
+        details: { activation_mode: "deferred", server_id: rawServerId, server_alias: serverAlias },
       });
-      const transport = createMcpTransport(raw, request);
+      const transport = createMcpTransport(raw, currentRequest);
       if (!transport) throw new Error(`MCP server ${serverLabel} has no usable transport configuration`);
       const next = new McpClient({ name: "scansci-pi", version: "0.2.0" }, { capabilities: {} });
       try {
@@ -973,11 +1062,11 @@ function deferredMcpTools(
           .slice(0, MAX_MCP_TOOLS_PER_SERVER);
         emit({
           type: "status.update",
-          request_id: request.request_id,
+          request_id: requestRef.current.request_id,
           status: "mcp_ready",
           name: serverLabel,
           duration_ms: Date.now() - startedAt,
-          details: { activation_mode: "deferred", tool_count: remoteTools.length },
+          details: { activation_mode: "deferred", tool_count: remoteTools.length, server_id: rawServerId, server_alias: serverAlias },
         });
         return remoteTools;
       } catch (error) {
@@ -986,7 +1075,7 @@ function deferredMcpTools(
         connection = undefined;
         emit({
           type: "status.update",
-          request_id: request.request_id,
+          request_id: requestRef.current.request_id,
           status: "mcp_unavailable",
           name: serverLabel,
           error: errorText(error),
@@ -997,19 +1086,26 @@ function deferredMcpTools(
     return connection;
   };
 
-  const visibleTools = async (query: string, limit: number): Promise<JsonRecord[]> => {
+  const visibleTools = async (
+    query: string,
+    limit: number,
+  ): Promise<Array<{ tool: JsonRecord; policy: McpToolPolicy }>> => {
     const normalized = query.trim().toLowerCase();
-    const tools = await ensureConnected();
-    return tools
-      .filter((tool) => {
-        const name = String(tool.name || "");
-        if (!name || (isWriteLikeMcpTool(name) && raw.allow_write !== true)) return false;
-        return !normalized || `${name}\n${String(tool.description || "")}`.toLowerCase().includes(normalized);
+    const remote = await ensureConnected();
+    return remote
+      .map((tool) => ({
+        tool,
+        policy: mcpToolPolicy(raw, rawServerId, serverAlias, tool),
+      }))
+      .filter(({ tool, policy }) => {
+        if (!policy.remoteName || policy.effect === "unknown") return false;
+        if (policy.effect !== "read" && raw.allow_write !== true) return false;
+        return !normalized || `${policy.remoteName}\n${String(tool.description || "")}`.toLowerCase().includes(normalized);
       })
       .slice(0, limit);
   };
 
-  return [
+  const definedTools = [
     defineTool({
       name: searchName,
       label: `${serverLabel} · search`,
@@ -1020,27 +1116,30 @@ function deferredMcpTools(
       }),
       execute: async (_toolCallId, params) => {
         const result = await visibleTools(String(params.query || ""), Math.max(1, Math.min(20, Number(params.limit || 8))));
-        const compact = result.map((tool) => {
+        const compact = result.map(({ tool, policy }) => {
           const schema = tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema as JsonRecord : undefined;
           return {
-            name: String(tool.name || ""),
+            name: policy.remoteName,
             description: String(tool.description || "").slice(0, MAX_MCP_DESCRIPTION_CHARS),
             input_schema: schema && jsonBytes(schema) <= MAX_MCP_SCHEMA_BYTES ? schema : undefined,
-            write_authorized: !isWriteLikeMcpTool(String(tool.name || "")) || raw.allow_write === true,
+            ...mcpPolicyRecord(policy),
+            write_authorized: policy.effect === "read" || raw.allow_write === true,
           };
         });
         const payload = boundedToolPayload(searchName, {
           server: serverLabel,
+          server_id: rawServerId,
+          server_alias: serverAlias,
           activation_mode: "deferred",
           count: compact.length,
           tools: compact,
         });
         emit({
           type: "status.update",
-          request_id: request.request_id,
+          request_id: requestRef.current.request_id,
           status: "mcp_discovered",
           name: serverLabel,
-          details: { activation_mode: "deferred", tool_count: compact.length },
+          details: { activation_mode: "deferred", tool_count: compact.length, server_id: rawServerId, server_alias: serverAlias },
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], details: payload };
       },
@@ -1056,24 +1155,25 @@ function deferredMcpTools(
       execute: async (_toolCallId, params, signal) => {
         const remoteName = String(params.tool || "").trim();
         const available = await visibleTools(remoteName, MAX_MCP_TOOLS_PER_SERVER);
-        const selected = available.find((tool) => String(tool.name || "") === remoteName);
+        const selected = available.find(({ policy }) => policy.remoteName === remoteName);
         if (!selected) throw new Error(`MCP tool is unavailable or not authorized: ${remoteName}`);
         if (!client) throw new Error(`MCP server did not connect: ${serverLabel}`);
         const argumentsRecord = (params.arguments && typeof params.arguments === "object" ? params.arguments : {}) as JsonRecord;
-        const fingerprint = toolFingerprint(`${callName}:${remoteName}`, argumentsRecord);
-        const effectful = isWriteLikeMcpTool(remoteName);
+        const claimedArguments = { ...argumentsRecord, _scansci_remote_tool: remoteName };
+        const fingerprint = toolFingerprint(callName, claimedArguments);
+        const effectful = selected.policy.effect !== "read";
         const activeRun = activeRunStorage.getStore();
         if (!activeRun) throw new Error("No active Pi run owns this MCP tool call");
         let result = effectful ? activeRun.idempotentResults.get(fingerprint) : undefined;
         if (!result) {
           emit({
             type: "status.update",
-            request_id: request.request_id,
+            request_id: requestRef.current.request_id,
             status: "mcp_calling",
             name: serverLabel,
-            details: { activation_mode: "deferred", tool: remoteName },
+            details: { activation_mode: "deferred", ...mcpPolicyRecord(selected.policy) },
           });
-          claimToolCall(`${callName}:${remoteName}`, argumentsRecord);
+          claimToolCall(callName, claimedArguments, selected.policy);
           result = boundedToolPayload(
             `${callName}:${remoteName}`,
             await client.callTool(
@@ -1085,26 +1185,58 @@ function deferredMcpTools(
           if (effectful) activeRun.idempotentResults.set(fingerprint, result);
           emit({
             type: "status.update",
-            request_id: request.request_id,
+            request_id: requestRef.current.request_id,
             status: "mcp_called",
             name: serverLabel,
-            details: { activation_mode: "deferred", tool: remoteName },
+            details: { activation_mode: "deferred", ...mcpPolicyRecord(selected.policy) },
           });
         }
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
       },
     }),
   ];
+  return {
+    tools: definedTools,
+    policies: new Map<string, McpToolPolicy>([
+      [searchName, {
+        serverId: rawServerId,
+        serverAlias,
+        remoteName: "__catalog__",
+        effect: "read",
+        idempotent: true,
+        annotations: { readOnlyHint: true, idempotentHint: true },
+      }],
+      [callName, {
+        serverId: rawServerId,
+        serverAlias,
+        remoteName: "__deferred_call__",
+        effect: "read",
+        idempotent: false,
+        annotations: { readOnlyHint: true },
+      }],
+    ]),
+  };
 }
 
-async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<typeof defineTool>[]; clients: McpClient[] }> {
+async function externalMcpTools(
+  requestRef: { current: RunStart },
+  enforceLease = true,
+): Promise<{
+  tools: ReturnType<typeof defineTool>[];
+  clients: McpClient[];
+  policies: Map<string, McpToolPolicy>;
+}> {
+  const request = requestRef.current;
   const exposed: ReturnType<typeof defineTool>[] = [];
   const clients: McpClient[] = [];
+  const policies = new Map<string, McpToolPolicy>();
   const usedNames = new Set<string>();
-  const contract = request.task_contract ? normalizeTaskContract(request) : undefined;
+  const contract = normalizeTaskContract(request);
   const enabledServers = (Array.isArray(request.mcp_servers) ? request.mcp_servers : [])
     .filter((raw) => raw && raw.enabled !== false && raw.uninstalled !== true)
-    .filter((raw) => !contract || !contract.hasMcpLease || contract.allowedMcpServers.has(String(raw.id || raw.name || "")));
+    .filter((raw) => !enforceLease || (
+      contract.hasMcpLease && contract.allowedMcpServers.has(String(raw.id || raw.name || ""))
+    ));
   if (enabledServers.length > MAX_MCP_SERVERS) {
     emit({
       type: "status.update",
@@ -1134,8 +1266,10 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
       }
       usedNames.add(`mcp__${serverId}__search`);
       usedNames.add(`mcp__${serverId}__call`);
-      const deferred = deferredMcpTools(raw, request, serverId, clients);
-      exposed.push(...deferred);
+      const rawServerId = String(raw.id || raw.name || "").trim();
+      const deferred = deferredMcpTools(raw, requestRef, rawServerId, serverId, clients);
+      exposed.push(...deferred.tools);
+      for (const [name, policy] of deferred.policies) policies.set(name, policy);
       continue;
     }
     const transport = createMcpTransport(raw, request);
@@ -1158,11 +1292,15 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
       for (const remoteTool of remoteTools.slice(0, MAX_MCP_TOOLS_PER_SERVER)) {
         if (exposed.length >= MAX_MCP_TOOLS) break;
         const remoteName = String(remoteTool.name || "").trim();
-        if (!remoteName || (isWriteLikeMcpTool(remoteName) && raw.allow_write !== true)) continue;
+        const rawServerId = String(raw.id || raw.name || "").trim();
+        const policy = mcpToolPolicy(raw, rawServerId, serverId, remoteTool as JsonRecord);
+        if (!remoteName || policy.effect === "unknown") continue;
+        if (policy.effect !== "read" && raw.allow_write !== true) continue;
         let localName = `mcp__${serverId}__${safeToolSegment(remoteName)}`;
         let suffix = 2;
         while (usedNames.has(localName)) localName = `mcp__${serverId}__${safeToolSegment(remoteName)}_${suffix++}`;
         usedNames.add(localName);
+        policies.set(localName, policy);
         const inputSchema = remoteTool.inputSchema && typeof remoteTool.inputSchema === "object"
           ? remoteTool.inputSchema as JsonRecord
           : { type: "object", properties: {} };
@@ -1186,10 +1324,10 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
             if (!activeRun) throw new Error("No active Pi run owns this MCP tool call");
             const argumentsRecord = params as JsonRecord;
             const fingerprint = toolFingerprint(localName, argumentsRecord);
-            const effectful = toolRisk(localName) !== "read_only";
+            const effectful = policy.effect !== "read";
             let result = effectful ? activeRun.idempotentResults.get(fingerprint) : undefined;
             if (!result) {
-              claimToolCall(localName, argumentsRecord);
+              claimToolCall(localName, argumentsRecord, policy);
               result = boundedToolPayload(
                 localName,
                 await client.callTool(
@@ -1218,12 +1356,13 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
       });
     }
   }
-  return { tools: exposed, clients };
+  return { tools: exposed, clients, policies };
 }
 
 function tools(
   taskMode: string,
   mcpTools: ReturnType<typeof defineTool>[] = [],
+  mcpPolicies: Map<string, McpToolPolicy> = new Map(),
   disabledTools: string[] = [],
   taskContract?: NormalizedTaskContract,
 ) {
@@ -1287,9 +1426,9 @@ function tools(
       }),
       execute: async (_toolCallId, params) => {
         const response = await requestInteraction("plan", params as JsonRecord);
-        const decision = String(response.decision || response.action || response.value || "approve").toLowerCase();
+        const decision = String(response.decision || response.action || response.value || "").trim().toLowerCase();
         const activeRun = activeRunStorage.getStore();
-        if (activeRun && !["cancel", "reject", "denied", "deny"].includes(decision)) {
+        if (activeRun && decision === "approve") {
           activeRun.planApproved = true;
         }
         const result = boundedToolPayload(
@@ -1667,13 +1806,15 @@ function tools(
       : undefined
   );
   const modeBuiltins = enabled ? enabledAvailable.filter((tool) => enabled.has(tool.name)) : enabledAvailable;
-  const builtins = taskContract && taskContract.allowedTools.size > 0
-    ? modeBuiltins.filter((tool) => taskContract.allowedTools.has(tool.name))
-    : modeBuiltins;
+  const builtins = taskContract
+    ? modeBuiltins.filter((tool) => taskContract.hasToolLease && taskContract.allowedTools.has(tool.name))
+    : [];
   const allowExternal = [...modeParts].some((part) => ["general", "knowledge", "research", "benchmark"].includes(part));
   const leasedMcpTools = taskContract
     ? mcpTools.filter((tool) => {
-      const risk = toolRisk(tool.name);
+      const policy = mcpPolicies.get(tool.name);
+      if (!policy || !taskContract.hasMcpLease || !taskContract.allowedMcpServers.has(policy.serverId)) return false;
+      const risk = toolRisk(tool.name, policy);
       return riskRank(risk) <= riskRank(taskContract.riskLevel)
         && (risk !== "high" || taskContract.allowExternalWrite);
     })
@@ -1853,7 +1994,9 @@ function taskContractSessionSignature(request: RunStart): JsonRecord {
     autonomy: contract.autonomy,
     riskLevel: contract.riskLevel,
     requiresPlan: contract.requiresPlan,
+    hasToolLease: contract.hasToolLease,
     allowedTools: [...contract.allowedTools].sort(),
+    initialTools: [...contract.initialTools].sort(),
     requiredToolGroups: contract.requiredToolGroups
       .map((group) => [...group].sort())
       .sort((left, right) => left.join("|").localeCompare(right.join("|"))),
@@ -1909,6 +2052,7 @@ async function createSession(
   const apiKey = process.env.SCANSCIPI_PROVIDER_KEY || "";
   if (!apiKey) throw new Error("Provider API key is unavailable");
   const taskContract = normalizeTaskContract(request);
+  const requestRef = { current: request };
   const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
   runtime.registerProvider("scansci-pi", {
     name: "ScanSci Pi provider",
@@ -1938,8 +2082,12 @@ async function createSession(
     extensionFactories: [{
       name: "scansci-provider-request-guard",
       factory: (pi) => {
+        pi.on("before_agent_start", () => ({
+          systemPrompt: systemPrompt(requestRef.current),
+        }));
         pi.on("before_provider_request", (event) => {
-          const payload = providerApi(request.provider_kind, request.api_surface) === "openai-completions"
+          const currentRequest = requestRef.current;
+          const payload = providerApi(currentRequest.provider_kind, currentRequest.api_surface) === "openai-completions"
             ? normalizeTextOnlyOpenAIRequest(event.payload)
             : event.payload;
           return guardProviderRequest(payload, PROVIDER_INPUT_LIMIT);
@@ -1948,12 +2096,13 @@ async function createSession(
     }],
   });
   await loader.reload();
-  const external = await externalMcpTools(request);
+  const external = await externalMcpTools(requestRef);
   const customTools = tools(
     String(request.task_mode || "general"),
     external.tools,
+    external.policies,
     request.disabled_tools || [],
-    request.task_contract ? taskContract : undefined,
+    taskContract,
   );
   const prefixShape = buildPrefixShape(request, customTools.map((tool) => String(tool.name)));
   const sessionDir = `${request.agent_dir}/sessions`;
@@ -1990,6 +2139,7 @@ async function createSession(
   const state: SessionState = {
     session: created.session,
     request,
+    requestRef,
     signature: sessionSignature(request),
     unsubscribe: () => undefined,
     mcpClients: external.clients,
@@ -1998,15 +2148,16 @@ async function createSession(
   };
   state.unsubscribe = state.session.subscribe((event) => {
     const requestId = state.currentRequestId || "";
+    const currentRequest = state.request;
     if (event.type === "agent_start") {
-      emit({ type: "agent.started", request_id: requestId, session_id: request.session_id });
+      emit({ type: "agent.started", request_id: requestId, session_id: currentRequest.session_id });
     } else if (event.type === "turn_start") {
-      emit({ type: "agent.turn_started", request_id: requestId, session_id: request.session_id });
+      emit({ type: "agent.turn_started", request_id: requestId, session_id: currentRequest.session_id });
     } else if (event.type === "message_start") {
       emit({
         type: "agent.message_started",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         role: String(event.message.role || ""),
       });
     } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -2015,14 +2166,14 @@ async function createSession(
       emit({
         type: "agent.message_completed",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         role: String(event.message.role || ""),
       });
     } else if (event.type === "turn_end") {
       emit({
         type: "agent.turn_completed",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         role: String(event.message.role || ""),
         tool_result_count: event.toolResults.length,
       });
@@ -2030,16 +2181,16 @@ async function createSession(
       emit({
         type: "agent.completed",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         will_retry: event.willRetry,
       });
     } else if (event.type === "agent_settled") {
-      emit({ type: "agent.settled", request_id: requestId, session_id: request.session_id });
+      emit({ type: "agent.settled", request_id: requestId, session_id: currentRequest.session_id });
     } else if (event.type === "queue_update") {
       emit({
         type: "agent.queue_updated",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         steering: [...event.steering],
         follow_up: [...event.followUp],
         pending_count: event.steering.length + event.followUp.length,
@@ -2058,12 +2209,12 @@ async function createSession(
         error: redactSensitiveText(event.errorMessage),
       });
     } else if (event.type === "compaction_start") {
-      emit({ type: "session.compaction_started", request_id: requestId, session_id: request.session_id, reason: event.reason });
+      emit({ type: "session.compaction_started", request_id: requestId, session_id: currentRequest.session_id, reason: event.reason });
     } else if (event.type === "compaction_end") {
       emit({
         type: "session.compaction_completed",
         request_id: requestId,
-        session_id: request.session_id,
+        session_id: currentRequest.session_id,
         reason: event.reason,
         aborted: event.aborted,
         error: redactSensitiveText(event.errorMessage || ""),
@@ -2078,6 +2229,8 @@ async function getSession(request: RunStart): Promise<{ state: SessionState; res
   const existing = sessions.get(request.session_id);
   if (existing && existing.signature === sessionSignature(request)) {
     existing.request = request;
+    existing.requestRef.current = request;
+    existing.prefixShape = buildPrefixShape(request, existing.activeToolNames);
     return { state: existing, resumed: true };
   }
   if (existing) {
@@ -2637,14 +2790,21 @@ async function probeMcp(message: JsonRecord): Promise<void> {
       }))
       : [],
   } satisfies RunStart;
-  const connected = await externalMcpTools(request);
+  const connected = await externalMcpTools({ current: request }, false);
   try {
     emit({
       type: "mcp.probe.completed",
       request_id: requestId,
       server_count: connected.clients.length,
       tool_count: connected.tools.length,
-      tools: connected.tools.map((tool) => ({ name: tool.name, label: tool.label })),
+      tools: connected.tools.map((tool) => {
+        const policy = connected.policies.get(tool.name);
+        return {
+          name: tool.name,
+          label: tool.label,
+          ...(policy ? mcpPolicyRecord(policy) : {}),
+        };
+      }),
     });
   } finally {
     await Promise.all(connected.clients.map((client) => client.close().catch(() => undefined)));
@@ -2678,33 +2838,55 @@ input.on("line", (line) => {
     return;
   }
   if (message.type === "ping") {
+    const required = Array.isArray(message.required_features)
+      ? message.required_features.map(String).filter(Boolean)
+      : [];
+    const supported = new Set<string>(PI_PROTOCOL_FEATURES);
     emit({
       type: "pong",
       runtime: "pi",
       version: "0.80.10",
-      protocol: 3,
-      capabilities: [
-        "multi_session",
-        "task_contracts",
-        "bounded_autonomy",
-        "ask_user",
-        "plan_approval",
-        "follow_up",
-        "structured_recovery",
-        "session_fork",
-      ],
+      protocol: PI_PROTOCOL_VERSION,
+      capabilities: [...PI_PROTOCOL_FEATURES],
+      negotiated_features: required.filter((feature) => supported.has(feature)),
+      missing_features: required.filter((feature) => !supported.has(feature)),
     });
   } else if (message.type === "tool.result") {
     const callId = String(message.call_id || "");
     const pending = pendingTools.get(callId);
     if (!pending) return;
+    if (String(message.request_id || "") !== pending.requestId) {
+      emit({
+        type: "protocol.error",
+        request_id: String(message.request_id || ""),
+        error: "Tool result belongs to another run",
+      });
+      return;
+    }
     pendingTools.delete(callId);
     if (message.ok === false) pending.reject(new Error(String(message.error || "Tool failed")));
     else pending.resolve((message.result || {}) as JsonRecord);
   } else if (message.type === "interaction.response") {
     resolveInteraction(message);
   } else if (message.type === "run.start") {
-    void run(message as RunStart);
+    const negotiation = negotiateProtocol(message);
+    if (!negotiation.ok) {
+      emit({
+        type: "run.failed",
+        request_id: String(message.request_id || ""),
+        session_id: String(message.session_id || ""),
+        error: negotiation.error || "Pi protocol negotiation failed",
+        failure: {
+          code: "protocol_incompatible",
+          message: negotiation.error || "Pi protocol negotiation failed",
+          retryable: false,
+          protocol: negotiation.protocol,
+          missing_features: negotiation.missingFeatures,
+        },
+      });
+    } else {
+      void run(message as RunStart);
+    }
   } else if (message.type === "mcp.probe") {
     void probeMcp(message).catch((error) => emit({
       type: "mcp.probe.failed",

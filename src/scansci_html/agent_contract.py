@@ -13,6 +13,8 @@ import re
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
+from .task_contract import TASK_CONTRACT_SCHEMA, TASK_CONTRACT_VERSION
+
 
 _READ_ONLY_TOOLS = {
     "inspect_workspace",
@@ -203,6 +205,7 @@ class TaskContract:
 
     contract_id: str
     version: int
+    schema_version: str
     goal: str
     workflow_type: str
     task_mode: str
@@ -211,6 +214,7 @@ class TaskContract:
     confidence: float
     requires_plan: bool
     allowed_tools: tuple[str, ...]
+    initial_tools: tuple[str, ...]
     required_tool_groups: tuple[tuple[str, ...], ...]
     success_criteria: tuple[str, ...]
     initial_tool_budget: int
@@ -227,6 +231,7 @@ class TaskContract:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["allowed_tools"] = list(self.allowed_tools)
+        payload["initial_tools"] = list(self.initial_tools)
         payload["required_tool_groups"] = [list(group) for group in self.required_tool_groups]
         payload["success_criteria"] = list(self.success_criteria)
         payload["task_profile"] = self.task_profile.to_dict()
@@ -521,7 +526,8 @@ def compile_task_contract(
     requires_plan = task_profile.requires_plan
     return TaskContract(
         contract_id=f"contract-{uuid4().hex}",
-        version=2,
+        version=TASK_CONTRACT_VERSION,
+        schema_version=TASK_CONTRACT_SCHEMA,
         goal=_goal_text(user_text, normalized_workflow),
         workflow_type=normalized_workflow,
         task_mode=normalized_mode,
@@ -530,6 +536,10 @@ def compile_task_contract(
         confidence=task_profile.confidence,
         requires_plan=requires_plan,
         allowed_tools=tuple(sorted(allowed)),
+        # v2 separates hard authority from the initially active subset.  Task
+        # 2 will make this subset progressively loaded; preserving the v1
+        # active surface here keeps this protocol migration behaviour-neutral.
+        initial_tools=tuple(sorted(allowed)),
         required_tool_groups=required,
         success_criteria=tuple(success),
         initial_tool_budget=initial_budget,

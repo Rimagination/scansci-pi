@@ -1,0 +1,13 @@
+{
+  "schema_version": "scansci.task-contract.v2",
+  "version": 2,
+  "contract_id": "contract-fixture-v2",
+  "goal": "Inspect the selected evidence library",
+  "task_mode": "knowledge",
+  "risk_level": "read_only",
+  "allowed_tools": ["inspect_workspace", "kb_search"],
+  "initial_tools": ["inspect_workspace"],
+  "allowed_mcp_servers": [],
+  "initial_tool_budget": 3,
+  "max_tool_budget": 6
+}

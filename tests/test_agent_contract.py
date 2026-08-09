@@ -15,6 +15,9 @@ def test_plain_conversation_gets_no_tool_authority() -> None:
     assert contract["requires_plan"] is False
     assert contract["task_profile"]["route"] == "direct_chat"
     assert contract["task_profile"]["execution_complexity"] == "none"
+    assert contract["schema_version"] == "scansci.task-contract.v2"
+    assert contract["version"] == 2
+    assert contract["initial_tools"] == []
 
 
 def test_research_download_is_reversible_and_progress_budgeted() -> None:
@@ -41,6 +44,7 @@ def test_research_download_is_reversible_and_progress_budgeted() -> None:
         ["summarize_documents"],
         ["check_task_completion"],
     ]
+    assert set(contract["initial_tools"]).issubset(contract["allowed_tools"])
 
 
 def test_external_or_destructive_request_requires_plan() -> None:

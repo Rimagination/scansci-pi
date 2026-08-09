@@ -26,6 +26,8 @@ from uuid import uuid4
 
 from .academic_search import search_academic_papers
 from .academic_planning import plan_academic_search
+from .agent_capabilities import builtin_capability_descriptor
+from .agent_contract import compile_task_contract as compile_host_task_contract
 from .agent_reach import run_agent_reach
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
@@ -65,6 +67,11 @@ from .obsidian_integration import obsidian_backlinks, obsidian_status, read_obsi
 from .prefix_diagnostics import build_prefix_shape
 from .run_manifest import RunManifest
 from .task_contract import TaskContract
+from .tool_authorization import (
+    ApprovalToken,
+    approval_token_from_response,
+    authorize_tool_call,
+)
 
 
 class PiRuntimeUnavailable(RuntimeError):
@@ -86,6 +93,14 @@ _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
 _GATEWAY_TRANSPORT_ATTEMPTS = 3
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
+_PI_PROTOCOL_VERSION = 4
+_PI_REQUIRED_FEATURES = (
+    "task_contract_v2",
+    "explicit_empty_leases",
+    "host_tool_authorization",
+    "structured_mcp_effects",
+    "current_request_context",
+)
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
     r"tool_call\s*\(\s*name\s*=\s*[\"'](?P<name>[A-Za-z0-9_-]+)[\"']"
@@ -931,6 +946,9 @@ class PiAgentClient:
         self._cancel_requested = threading.Event()
         self._active_request_id = ""
         self._active_session_id = ""
+        self._interaction_lock = threading.Lock()
+        self._pending_interaction_kinds: dict[str, tuple[str, str]] = {}
+        self._approval_tokens: dict[str, ApprovalToken] = {}
         self._provider_key_fingerprint = ""
         self._gateway_adapter: _ManagedGatewayAdapter | None = None
         self._gateway_adapter_signature = ""
@@ -996,7 +1014,11 @@ class PiAgentClient:
         try:
             assert process.stdin is not None
             assert process.stdout is not None
-            process.stdin.write('{"type":"ping"}\n')
+            process.stdin.write(json.dumps({
+                "type": "ping",
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }) + "\n")
             process.stdin.flush()
             output: Queue[str | None] = Queue()
 
@@ -1013,12 +1035,18 @@ class PiAgentClient:
             response = json.loads(line)
             if response.get("type") != "pong":
                 raise PiRuntimeUnavailable(f"Unexpected Pi sidecar response: {response.get('type', '')}")
+            protocol = int(response.get("protocol", 0) or 0)
+            capabilities = {str(value) for value in list(response.get("capabilities", []) or [])}
+            missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
+            if protocol != _PI_PROTOCOL_VERSION or missing_features:
+                detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
+                raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
             return {
                 "ready": True,
                 "runtime": str(response.get("runtime", "pi")),
                 "version": str(response.get("version", "")),
-                "protocol": int(response.get("protocol", 0) or 0),
-                "capabilities": list(response.get("capabilities", []) or []),
+                "protocol": protocol,
+                "capabilities": sorted(capabilities),
                 "node": str(node_path),
                 "sidecar": str(script_path),
             }
@@ -1167,11 +1195,20 @@ class PiAgentClient:
             ),
             prompt,
         )
-        effective_contract = TaskContract.from_payload(
-            task_contract,
-            request=final_request,
-            task_mode=task_mode,
-        ).to_dict()
+        if task_contract is None:
+            # A direct transport caller still goes through the trusted host
+            # compiler.  In contrast, a supplied payload that omits
+            # ``allowed_tools`` remains omitted and therefore fail-closed.
+            effective_contract = compile_host_task_contract(
+                task_mode=task_mode,
+                user_text=final_request,
+            )
+        else:
+            effective_contract = TaskContract.from_payload(
+                task_contract,
+                request=final_request,
+                task_mode=task_mode,
+            ).to_dict()
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
         tool_set = {
             "mcp_servers": [str(item.get("id", "")) for item in self._enabled_mcp_servers() if isinstance(item, dict)],
@@ -1195,6 +1232,8 @@ class PiAgentClient:
         )
         start_message = {
             "type": "run.start",
+            "pi_protocol_version": _PI_PROTOCOL_VERSION,
+            "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": logical_session_id,
             "session_file": session_file,
@@ -1352,6 +1391,8 @@ class PiAgentClient:
         deadline = time.monotonic() + timeout_seconds
         terminal_tool_completed = ""
         terminal_received = False
+        task_contract = dict(start_message.get("task_contract", {}) or {})
+        authorized_call_count = 0
 
         try:
             while True:
@@ -1382,6 +1423,20 @@ class PiAgentClient:
                     name = str(event.get("name", ""))
                     arguments = dict(event.get("arguments", {}) or {})
                     try:
+                        # Tool calls are executable protocol messages, so an
+                        # omitted request id is not accepted as a legacy event.
+                        # The Python host independently rechecks every bridge
+                        # call before entering the dispatcher.
+                        authorize_tool_call(
+                            tool_name=name,
+                            contract=task_contract,
+                            descriptor=builtin_capability_descriptor(name),
+                            request_id=event_request_id,
+                            active_request_id=request_id,
+                            approval_token=self._approval_tokens.get(request_id),
+                            call_count=authorized_call_count,
+                        )
+                        authorized_call_count += 1
                         if self._cancel_requested.is_set():
                             raise InterruptedError("Pi tool execution was cancelled before it started")
                         result = self._execute_tool(name, arguments)
@@ -1412,6 +1467,7 @@ class PiAgentClient:
                         })
                         response = {
                             "type": "tool.result",
+                            "request_id": request_id,
                             "call_id": call_id,
                             "ok": True,
                             "result": model_result,
@@ -1435,6 +1491,7 @@ class PiAgentClient:
                         })
                         response = {
                             "type": "tool.result",
+                            "request_id": request_id,
                             "call_id": call_id,
                             "ok": False,
                             "error": f"{type(error).__name__}: {public_error}",
@@ -1467,6 +1524,7 @@ class PiAgentClient:
                 elif event_type == "status.update":
                     yield {
                         "type": "status",
+                        "request_id": event_request_id or request_id,
                         "status": str(event.get("status", "")),
                         "name": str(event.get("name", "")),
                         "attempt": event.get("attempt"),
@@ -1519,12 +1577,17 @@ class PiAgentClient:
                         "queued": int(event.get("queued", 0) or 0),
                     }
                 elif event_type == "interaction.requested":
+                    interaction_id = str(event.get("interaction_id", ""))
+                    interaction_kind = str(event.get("interaction_kind", ""))
+                    if interaction_id:
+                        with self._interaction_lock:
+                            self._pending_interaction_kinds[interaction_id] = (request_id, interaction_kind)
                     yield {
                         "type": "interaction",
                         "request_id": request_id,
                         "session_id": session_id,
-                        "interaction_id": str(event.get("interaction_id", "")),
-                        "interaction_kind": str(event.get("interaction_kind", "")),
+                        "interaction_id": interaction_id,
+                        "interaction_kind": interaction_kind,
                         "payload": dict(event.get("payload", {}) or {}),
                     }
                 elif event_type == "run.completed":
@@ -1580,6 +1643,15 @@ class PiAgentClient:
                     pass
             self._active_request_id = ""
             self._active_session_id = ""
+            with self._interaction_lock:
+                self._approval_tokens.pop(request_id, None)
+                stale_interactions = [
+                    interaction_id
+                    for interaction_id, (pending_request_id, _kind) in self._pending_interaction_kinds.items()
+                    if pending_request_id == request_id
+                ]
+                for interaction_id in stale_interactions:
+                    self._pending_interaction_kinds.pop(interaction_id, None)
             self._run_lock.release()
 
     @property
@@ -1643,11 +1715,22 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target or not str(interaction_id).strip():
             return False
+        normalized_interaction_id = str(interaction_id).strip()
+        with self._interaction_lock:
+            pending = self._pending_interaction_kinds.get(normalized_interaction_id)
+            if pending and pending[0] == target and pending[1] == "plan":
+                token = approval_token_from_response(target, response)
+                if token is None:
+                    self._approval_tokens.pop(target, None)
+                else:
+                    self._approval_tokens[target] = token
+            if pending and pending[0] == target:
+                self._pending_interaction_kinds.pop(normalized_interaction_id, None)
         self._write(
             {
                 "type": "interaction.response",
                 "request_id": target,
-                "interaction_id": str(interaction_id).strip(),
+                "interaction_id": normalized_interaction_id,
                 "response": dict(response or {}),
             }
         )
@@ -1884,6 +1967,8 @@ class PiAgentClient:
                         "endpoint",
                         "connector_kind",
                         "allow_write",
+                        "tool_effects",
+                        "tool_policies",
                         "deferred",
                         "enabled",
                         "uninstalled",

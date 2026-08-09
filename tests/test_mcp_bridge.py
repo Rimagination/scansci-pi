@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 
+from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.pi_agent import PiAgentClient
 
 
-def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict[str, object]:
+def _probe(
+    tmp_path: Path,
+    *,
+    allow_write: bool,
+    deferred: bool = False,
+    server_id: str = "fixture",
+    fixture_name: str = "fake_mcp_server.mjs",
+) -> dict[str, object]:
     node, sidecar = PiAgentClient.runtime_paths()
-    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    fixture = Path(__file__).parent / "fixtures" / fixture_name
     if not deferred:
         return PiAgentClient.probe_mcp_server(
             workspace=tmp_path,
             server={
-                "id": "fixture",
+                "id": server_id,
                 "name": "Fixture MCP",
                 "enabled": True,
                 "transport": "stdio",
@@ -51,7 +61,7 @@ def _probe(tmp_path: Path, *, allow_write: bool, deferred: bool = False) -> dict
                     "cwd": str(tmp_path),
                     "mcp_servers": [
                         {
-                            "id": "fixture",
+                            "id": server_id,
                             "name": "Fixture MCP",
                             "enabled": True,
                             "transport": "stdio",
@@ -93,6 +103,7 @@ def test_pi_mcp_bridge_exposes_write_tools_after_explicit_authorization(tmp_path
     assert {tool["name"] for tool in result["tools"]} == {
         "mcp__fixture__search_library",
         "mcp__fixture__create_note",
+        "mcp__fixture__notes_put",
     }
 
 
@@ -104,3 +115,136 @@ def test_pi_mcp_bridge_deferred_mode_exposes_compact_proxy_without_starting_serv
         "mcp__fixture__search",
         "mcp__fixture__call",
     }
+
+
+def test_pi_mcp_unknown_effect_is_denied_by_default(tmp_path: Path) -> None:
+    result = _probe(
+        tmp_path,
+        allow_write=True,
+        fixture_name="fake_mcp_unknown_server.mjs",
+    )
+
+    assert result["tool_count"] == 0
+    assert result["tools"] == []
+
+
+def test_pi_mcp_keeps_raw_dotted_slashed_server_id_separate_from_local_alias(tmp_path: Path) -> None:
+    result = _probe(tmp_path, allow_write=False, server_id="lab.v1/search")
+
+    tool = result["tools"][0]
+    assert tool["server_id"] == "lab.v1/search"
+    assert tool["server_alias"] == "lab_v1_search"
+    assert tool["remote_name"] == "search_library"
+    assert tool["effect"] == "read"
+    assert tool["name"] == "mcp__lab_v1_search__search_library"
+
+
+class _DeferredDottedWriteHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-dotted-write",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__fixture__call",
+                        "arguments": '{"tool":"notes.put","arguments":{}}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "The unapproved write was denied."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-mcp-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: Path) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}"',
+        "allow_write": True,
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    _DeferredDottedWriteHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredDottedWriteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Write only after approval."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                "allowed_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "high",
+                "allow_external_write": True,
+                "requires_plan": True,
+                "initial_tool_budget": 2,
+                "max_tool_budget": 4,
+            },
+            timeout_seconds=30,
+            session_id="deferred-dotted-write",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert not any(event.get("status") == "mcp_called" for event in events)
+    tool_messages = [
+        message
+        for message in _DeferredDottedWriteHandler.request_payloads[1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert tool_messages
+    assert "approved plan" in str(tool_messages[-1].get("content", "")).lower()
