@@ -100,6 +100,7 @@ _PI_REQUIRED_FEATURES = (
     "host_tool_authorization",
     "structured_mcp_effects",
     "current_request_context",
+    "dynamic_tools",
 )
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
@@ -1210,9 +1211,31 @@ class PiAgentClient:
                 task_mode=task_mode,
             ).to_dict()
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
+        registered_tools = sorted({
+            "ask_user",
+            "search_tools",
+            "submit_plan",
+            *[str(name) for name in list(effective_contract.get("allowed_tools", []) or []) if str(name)],
+        })
+        required_initial = {
+            str(name)
+            for group in list(effective_contract.get("required_tool_groups", []) or [])
+            if isinstance(group, (list, tuple, set, frozenset))
+            for name in group
+            if str(name)
+        }
+        active_tools = sorted({
+            "ask_user",
+            "search_tools",
+            "submit_plan",
+            *[str(name) for name in list(effective_contract.get("initial_tools", []) or []) if str(name)],
+            *required_initial,
+        } & set(registered_tools))
         tool_set = {
             "mcp_servers": [str(item.get("id", "")) for item in self._enabled_mcp_servers() if isinstance(item, dict)],
             "disabled_tools": self._disabled_artifact_tools(),
+            "registered_tools": registered_tools,
+            "active_tools": active_tools,
         }
         contract_shape = {
             key: effective_contract.get(key)
@@ -1299,7 +1322,11 @@ class PiAgentClient:
                     if event_type in {"done", "session_stats"}:
                         stats = event.get("stats") or event.get("value")
                         if isinstance(stats, dict):
-                            manifest.record_context_stats(stats, prefix_shape=prefix_shape)
+                            runtime_prefix = stats.get("prefixShape")
+                            manifest.record_context_stats(
+                                stats,
+                                prefix_shape=runtime_prefix if isinstance(runtime_prefix, dict) else prefix_shape,
+                            )
                 yield event
             if manifest is not None:
                 manifest.finish(

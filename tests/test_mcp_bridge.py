@@ -196,6 +196,20 @@ class _DeferredDottedWriteHandler(BaseHTTPRequestHandler):
                 "role": "assistant",
                 "tool_calls": [{
                     "index": 0,
+                    "id": "search-dotted-write-tool",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["mcp__fixture__call"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 2:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
                     "id": "call-dotted-write",
                     "type": "function",
                     "function": {
@@ -244,6 +258,20 @@ class _DeferredMaliciousReadHintHandler(_DeferredDottedWriteHandler):
         type(self).request_payloads.append(json.loads(self.rfile.read(length)))
         turn = len(type(self).request_payloads)
         if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "search-malicious-read-hint",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["mcp__fixture__call"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 2:
             delta = {
                 "role": "assistant",
                 "tool_calls": [{
@@ -336,7 +364,7 @@ def test_pi_mcp_deferred_call_rejects_spoofed_read_annotation(tmp_path: Path) ->
     assert not any(event.get("status") == "mcp_called" for event in events)
     tool_messages = [
         message
-        for message in _DeferredMaliciousReadHintHandler.request_payloads[1]["messages"]
+        for message in _DeferredMaliciousReadHintHandler.request_payloads[2]["messages"]
         if message.get("role") == "tool"
     ]
     assert tool_messages
@@ -394,9 +422,16 @@ def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: 
 
     assert events[-1]["type"] == "done"
     assert not any(event.get("status") == "mcp_called" for event in events)
-    tool_messages = [
+    search_messages = [
         message
         for message in _DeferredDottedWriteHandler.request_payloads[1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    catalog_result = json.loads(str(search_messages[-1].get("content", "{}")))
+    assert catalog_result["matches"][0]["executionMode"] == "sequential"
+    tool_messages = [
+        message
+        for message in _DeferredDottedWriteHandler.request_payloads[2]["messages"]
         if message.get("role") == "tool"
     ]
     assert tool_messages

@@ -1,0 +1,249 @@
+export type CatalogRisk = "read_only" | "reversible" | "high";
+export type CatalogExecutionMode = "parallel" | "sequential";
+
+export interface CatalogToolDefinition {
+  name: string;
+  label: string;
+  description: string;
+}
+
+export interface ToolCatalogEntry {
+  name: string;
+  label: string;
+  description: string;
+  aliases: string[];
+  tags: string[];
+  group: string;
+  risk: CatalogRisk;
+  availability: "ready";
+  executionMode: CatalogExecutionMode;
+}
+
+export interface ToolCatalogMatch extends ToolCatalogEntry {
+  score: number;
+  active: boolean;
+}
+
+const REVERSIBLE_TOOLS = new Set([
+  "download_and_index",
+  "create_document",
+  "create_pdf",
+  "create_spreadsheet",
+  "create_presentation",
+  "compile_latex",
+  "edit_section",
+  "edit_slide",
+]);
+
+// Metadata only until Task 4 wires Python dispatch concurrency.  Keep this
+// allow-list explicit: a read-only risk label does not prove that a composite,
+// control, plugin, or deferred MCP implementation is thread-safe.
+const THREAD_SAFE_READ_TOOLS = new Set([
+  "inspect_workspace",
+  "inspect_available_tools",
+  "read_task_documents",
+  "search_local_evidence",
+  "kb_search",
+  "zotero_search",
+  "zotero_status",
+  "zotero_fulltext",
+  "zotero_attachment",
+  "zotero_export_bibtex",
+  "zotero_citations",
+  "obsidian_status",
+  "obsidian_search",
+  "obsidian_read",
+  "obsidian_backlinks",
+  "verify_doi",
+  "discover_papers",
+  "search_web",
+  "agent_reach",
+  "browser_access",
+  "search_journal",
+  "audit_references",
+]);
+
+const TOOL_GROUPS: Record<string, string> = {
+  inspect_workspace: "workspace",
+  inspect_available_tools: "workspace",
+  read_task_documents: "documents",
+  summarize_documents: "documents",
+  check_task_completion: "documents",
+  search_local_evidence: "evidence",
+  build_verified_answer: "evidence",
+  kb_search: "knowledge",
+  zotero_search: "zotero",
+  zotero_status: "zotero",
+  zotero_fulltext: "zotero",
+  zotero_attachment: "zotero",
+  zotero_export_bibtex: "zotero",
+  zotero_citations: "zotero",
+  obsidian_status: "obsidian",
+  obsidian_search: "obsidian",
+  obsidian_read: "obsidian",
+  obsidian_backlinks: "obsidian",
+  verify_doi: "scholarly",
+  discover_papers: "scholarly",
+  search_journal: "scholarly",
+  audit_references: "scholarly",
+  search_web: "web",
+  agent_reach: "web",
+  browser_access: "web",
+  download_and_index: "acquisition",
+  build_presentation_outline: "artifacts",
+  create_document: "artifacts",
+  create_pdf: "artifacts",
+  create_spreadsheet: "artifacts",
+  create_presentation: "artifacts",
+  compile_latex: "artifacts",
+  edit_section: "artifacts",
+  edit_slide: "artifacts",
+  self_assess: "control",
+};
+
+const TOOL_ALIASES: Record<string, string[]> = {
+  inspect_workspace: ["workspace status", "library status", "工作区", "资料库状态"],
+  inspect_available_tools: ["capabilities", "tool inventory", "能力目录", "工具清单"],
+  search_local_evidence: ["local search", "evidence search", "本地证据", "知识库检索"],
+  build_verified_answer: ["grounded answer", "citation answer", "核验回答", "引文回答"],
+  discover_papers: ["academic search", "paper search", "论文发现", "学术检索"],
+  search_web: ["internet search", "public web", "联网搜索", "网络检索"],
+  agent_reach: ["public url", "rss", "github", "公开网页", "频道检索"],
+  browser_access: ["rendered page", "logged in browser", "浏览器", "动态网页"],
+  download_and_index: ["fetch papers", "acquire full text", "下载论文", "建立索引"],
+  create_presentation: ["pptx", "slides", "演示文稿", "幻灯片"],
+};
+
+function normalize(value: unknown): string {
+  return String(value || "").trim().toLocaleLowerCase();
+}
+
+function catalogRisk(name: string): CatalogRisk {
+  if (name.startsWith("mcp__")) return "high";
+  return REVERSIBLE_TOOLS.has(name) ? "reversible" : "read_only";
+}
+
+function groupFor(name: string): string {
+  if (name.startsWith("mcp__")) return "mcp";
+  return TOOL_GROUPS[name] || "scansci";
+}
+
+function tokensFor(entry: ToolCatalogEntry): string[] {
+  return [
+    entry.name,
+    entry.label,
+    entry.description,
+    ...entry.aliases,
+    ...entry.tags,
+    entry.group,
+    entry.risk,
+    entry.availability,
+  ].map(normalize).filter(Boolean);
+}
+
+export function buildToolCatalog(
+  definitions: CatalogToolDefinition[],
+  riskResolver: (name: string) => CatalogRisk = catalogRisk,
+): ToolCatalogEntry[] {
+  return definitions
+    .map((definition) => {
+      const name = String(definition.name || "").trim();
+      const risk = riskResolver(name);
+      const group = groupFor(name);
+      const aliases = [...new Set([
+        name.replace(/_/g, " "),
+        String(definition.label || "").trim(),
+        ...(TOOL_ALIASES[name] || []),
+      ].filter(Boolean))];
+      return {
+        name,
+        label: String(definition.label || name),
+        description: String(definition.description || ""),
+        aliases,
+        tags: [...new Set([group, risk, name.split("_")[0]].filter(Boolean))],
+        group,
+        risk,
+        availability: "ready" as const,
+        // Task 4 wires this metadata to the Python dispatch executor.  Keeping
+        // it in the catalog now makes the authorization and discovery schema
+        // stable without claiming end-to-end parallelism prematurely.
+        executionMode: risk === "read_only" && THREAD_SAFE_READ_TOOLS.has(name)
+          ? "parallel" as const
+          : "sequential" as const,
+      };
+    })
+    .filter((entry) => Boolean(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function matchScore(entry: ToolCatalogEntry, query: string): number {
+  const needle = normalize(query);
+  if (!needle) return 1;
+  const fields = tokensFor(entry);
+  if (normalize(entry.name) === needle) return 1_000;
+  if (entry.aliases.some((alias) => normalize(alias) === needle)) return 900;
+  const words = needle.split(/\s+/).filter(Boolean);
+  let score = 0;
+  for (const field of fields) {
+    if (field.includes(needle)) score = Math.max(score, 500);
+    const hits = words.filter((word) => field.includes(word)).length;
+    score = Math.max(score, hits * 100);
+  }
+  return score;
+}
+
+export function searchToolCatalog(
+  catalog: ToolCatalogEntry[],
+  options: {
+    query?: unknown;
+    names?: unknown;
+    limit?: unknown;
+    activeNames?: Iterable<string>;
+    isAuthorized?: (name: string) => boolean;
+  } = {},
+): { matches: ToolCatalogMatch[]; rejected: Array<{ name: string; reason: string }> } {
+  const authorized = options.isAuthorized || (() => true);
+  const active = new Set(options.activeNames || []);
+  const requestedNames = Array.isArray(options.names)
+    ? [...new Set(options.names.map(String).map((name) => name.trim()).filter(Boolean))]
+    : [];
+  const limitValue = Number(options.limit);
+  const limit = Number.isFinite(limitValue) ? Math.max(1, Math.min(20, Math.floor(limitValue))) : 8;
+  const byName = new Map(catalog.map((entry) => [entry.name, entry]));
+  const rejected: Array<{ name: string; reason: string }> = [];
+
+  let candidates: ToolCatalogEntry[];
+  if (requestedNames.length) {
+    candidates = [];
+    for (const name of requestedNames) {
+      const entry = byName.get(name);
+      if (!entry || !authorized(name)) rejected.push({ name, reason: "not_authorized_or_unavailable" });
+      else candidates.push(entry);
+    }
+  } else {
+    candidates = catalog.filter((entry) => authorized(entry.name));
+  }
+  const query = String(options.query || "");
+  const matches = candidates
+    .map((entry) => ({ ...entry, score: matchScore(entry, query), active: active.has(entry.name) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
+    .slice(0, limit);
+  return { matches, rejected };
+}
+
+export function initialToolNames(
+  registeredNames: Iterable<string>,
+  initialNames: Iterable<string>,
+  requiredGroups: Iterable<Iterable<string>>,
+  bootstrapNames: Iterable<string>,
+): string[] {
+  const registered = new Set(registeredNames);
+  const selected = new Set<string>();
+  for (const name of bootstrapNames) if (registered.has(name)) selected.add(name);
+  for (const name of initialNames) if (registered.has(name)) selected.add(name);
+  for (const group of requiredGroups) {
+    for (const name of group) if (registered.has(name)) selected.add(name);
+  }
+  return [...selected].sort();
+}

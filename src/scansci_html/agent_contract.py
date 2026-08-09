@@ -128,6 +128,21 @@ _MODE_TOOLS = {
         "self_assess",
     },
 }
+_MODE_INITIAL_TOOLS = {
+    "workspace-status": {"inspect_workspace"},
+    "zotero-status": {"zotero_status"},
+    "zotero-search": {"zotero_search"},
+    "task-documents": {"read_task_documents"},
+    "web": {"search_web", "agent_reach", "browser_access", "discover_papers"},
+    # AUTO is a cognition hint, not a reason to pay the schema cost for every
+    # public reader. Pi starts with search_tools and activates a reader only
+    # when the current question actually depends on public information.
+    "web-auto": set(),
+    "knowledge": {"inspect_available_tools"},
+    "research": {"discover_papers"},
+    "verified-answer": {"build_verified_answer"},
+    "slides": {"build_presentation_outline"},
+}
 _WORKFLOW_REVERSIBLE = {
     "paper_download",
     "paper_download_batch",
@@ -332,7 +347,11 @@ def classify_task_profile(
     }:
         risk_level = "read_only"
     else:
-        risk_level = "none"
+        # Every non-social model turn is mediated by Pi.  Its baseline
+        # authority is therefore a read-only inventory even when no tool is
+        # mandatory.  Regex classification may guide initial activation, but
+        # it must not hide a safe capability from the model.
+        risk_level = "read_only"
 
     bulk = bool(_BULK_PATTERN.search(normalized_text))
     durable_workflow = not social_turn and bool(
@@ -460,16 +479,21 @@ def compile_task_contract(
     normalized_mode = str(task_mode or "general").strip().lower() or "general"
     normalized_workflow = str(workflow_type or "").strip().lower()
     parts = _mode_parts(normalized_mode)
-    allowed: set[str] = set()
-    for part in parts:
-        allowed.update(_MODE_TOOLS.get(part, set()))
-
     task_profile = classify_task_profile(
         task_mode=normalized_mode,
         user_text=user_text,
         workflow_type=normalized_workflow,
         required_tool_groups=required_tool_groups,
     )
+    social_turn = "greeting" in task_profile.reasons
+    # Pi owns research strategy.  Every ready read-only builtin is inside the
+    # hard envelope for a non-social turn; product modes only hint which tools
+    # should be active first.  Reversible tools remain tied to an explicit
+    # product workflow and are never granted by the broad read inventory.
+    allowed: set[str] = set() if social_turn else set(_READ_ONLY_TOOLS)
+    mode_authorized: set[str] = set()
+    for part in parts:
+        mode_authorized.update(_MODE_TOOLS.get(part, set()))
     high_risk = task_profile.risk_level == "high"
     reversible = task_profile.risk_level == "reversible"
     if high_risk:
@@ -487,18 +511,8 @@ def compile_task_contract(
         allowed.update(
             tool
             for tool in _REVERSIBLE_LOCAL_TOOLS
-            if tool in set().union(*(_MODE_TOOLS.get(part, set()) for part in parts))
+            if tool in mode_authorized
         )
-    if task_profile.execution_complexity == "none":
-        # A direct-conversation turn normally receives no tool lease.  However,
-        # when the user has explicitly enabled web search (toggle "on" or
-        # "auto"), the model must receive the read-only public web tools so it
-        # can honour that instruction.  Without tools, the model will report
-        # that it cannot search — frustrating the user who just enabled search.
-        if not (parts & {"web", "web-auto"}):
-            allowed.clear()
-        else:
-            allowed.intersection_update(_MODE_TOOLS.get("web-auto", set()))
 
     unavailable_tools: tuple[str, ...] = ()
     if available_tool_ids is not None:
@@ -511,6 +525,12 @@ def compile_task_contract(
         for group in list(required_tool_groups or [])
         if group
     )
+    initial: set[str] = set()
+    for part in parts:
+        initial.update(_MODE_INITIAL_TOOLS.get(part, set()))
+    for group in required:
+        initial.update(group)
+    initial.intersection_update(allowed)
     success = ["Return a direct answer to the user's final request"]
     if required:
         success.append("Complete every required tool group before claiming success")
@@ -536,10 +556,7 @@ def compile_task_contract(
         confidence=task_profile.confidence,
         requires_plan=requires_plan,
         allowed_tools=tuple(sorted(allowed)),
-        # v2 separates hard authority from the initially active subset.  Task
-        # 2 will make this subset progressively loaded; preserving the v1
-        # active surface here keeps this protocol migration behaviour-neutral.
-        initial_tools=tuple(sorted(allowed)),
+        initial_tools=tuple(sorted(initial)),
         required_tool_groups=required,
         success_criteria=tuple(success),
         initial_tool_budget=initial_budget,

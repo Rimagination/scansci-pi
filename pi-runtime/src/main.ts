@@ -16,6 +16,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { PI_PROTOCOL_FEATURES, PI_PROTOCOL_VERSION, negotiateProtocol } from "./protocol.js";
+import {
+  buildToolCatalog,
+  initialToolNames,
+  type CatalogRisk,
+} from "./tool-catalog.js";
+import { createSearchToolsTool } from "./runtime-extension.js";
 
 type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -95,6 +101,7 @@ interface SessionState {
   currentRequestId?: string;
   mcpClients: McpClient[];
   activeToolNames: string[];
+  registeredToolNames: string[];
   prefixShape: JsonRecord;
 }
 
@@ -449,7 +456,11 @@ function stableHash(value: unknown): string {
     .digest("hex");
 }
 
-function buildPrefixShape(request: RunStart, activeToolNames: string[]): JsonRecord {
+function buildPrefixShape(
+  request: RunStart,
+  registeredToolNames: string[],
+  activeToolNames: string[],
+): JsonRecord {
   const selectedSkillIds = [...String(request.system_prompt || "").matchAll(/<selected_skill\s+id="([^"]+)"/gi)]
     .map((match) => String(match[1] || ""))
     .filter(Boolean)
@@ -459,7 +470,10 @@ function buildPrefixShape(request: RunStart, activeToolNames: string[]): JsonRec
     model: String(request.model_id || ""),
     api_surface: String(request.api_surface || "chat_completions"),
     system_prompt_hash: stableHash(String(request.system_prompt || "")),
-    tool_names_hash: stableHash([...activeToolNames].sort()),
+    registered_tool_names_hash: stableHash([...registeredToolNames].sort()),
+    active_tool_names_hash: stableHash([...activeToolNames].sort()),
+    registered_tool_count: registeredToolNames.length,
+    active_tool_count: activeToolNames.length,
     selected_skill_ids: selectedSkillIds,
     mcp_server_ids: (Array.isArray(request.mcp_servers) ? request.mcp_servers : [])
       .map((server) => String(server.id || server.name || ""))
@@ -468,7 +482,7 @@ function buildPrefixShape(request: RunStart, activeToolNames: string[]): JsonRec
     contract_shape: taskContractSessionSignature(request),
   };
   return {
-    schema_version: "scansci.prefix-shape.v1",
+    schema_version: "scansci.prefix-shape.v2",
     hash: stableHash(components),
     components,
   };
@@ -551,7 +565,9 @@ function sessionStats(state: SessionState): JsonRecord {
   const contextTokens = Number(context.tokens || 0);
   const classified = messageTokens + systemToolTokens + mcpToolTokens + skillTokens + systemPromptTokens;
   const otherTokens = Math.max(0, contextTokens - classified);
-  const activeTools = [...state.activeToolNames];
+  const activeTools = state.session.getActiveToolNames().map(String).sort();
+  state.activeToolNames = activeTools;
+  const registeredTools = [...state.registeredToolNames].sort();
   const mcpTools = activeTools.filter((name) => name.startsWith("mcp__"));
   const rawTokens = base.tokens && typeof base.tokens === "object" ? base.tokens as JsonRecord : {};
   const inputTokens = Math.max(0, Number(rawTokens.input ?? rawTokens.inputTokens ?? rawTokens.prompt_tokens ?? 0) || 0);
@@ -581,10 +597,12 @@ function sessionStats(state: SessionState): JsonRecord {
     },
     toolInventory: {
       active: activeTools.length,
+      registered: registeredTools.length,
       system: activeTools.length - mcpTools.length,
       mcp: mcpTools.length,
       mcpServers: Array.isArray(state.request.mcp_servers) ? state.request.mcp_servers.length : 0,
       names: activeTools,
+      registeredNames: registeredTools,
     },
     skillInventory: {
       selected: selectedSkillBlocks.length,
@@ -1000,6 +1018,22 @@ function normalizeMcpEffect(value: unknown): McpEffect {
   if (["write", "reversible", "mutation"].includes(normalized)) return "write";
   if (["destructive", "delete", "high"].includes(normalized)) return "destructive";
   return "unknown";
+}
+
+function contractAllowsTool(
+  contract: NormalizedTaskContract,
+  name: string,
+  mcpPolicy?: McpToolPolicy,
+): boolean {
+  if (!contract.contractValid) return false;
+  const risk = toolRisk(name, mcpPolicy);
+  if (name.startsWith("mcp__")) {
+    if (!mcpPolicy || !contract.hasMcpLease || !contract.allowedMcpServers.has(mcpPolicy.serverId)) return false;
+  } else if (!contract.hasToolLease || !contract.allowedTools.has(name)) {
+    return false;
+  }
+  return riskRank(risk) <= riskRank(contract.riskLevel)
+    && (risk !== "high" || contract.allowExternalWrite);
 }
 
 function mcpNameEffect(value: unknown): McpEffect {
@@ -1444,6 +1478,7 @@ function tools(
       name: "ask_user",
       label: "Ask user",
       description: "Pause only when a missing user choice materially changes the task. Ask one concise question with concrete options; do not use this merely to report progress.",
+      executionMode: "sequential",
       parameters: Type.Object({
         question: Type.String({ minLength: 1, maxLength: 1200 }),
         reason: Type.Optional(Type.String({ maxLength: 1200 })),
@@ -1486,6 +1521,7 @@ function tools(
       name: "submit_plan",
       label: "Submit plan for approval",
       description: "Pause before an expensive, destructive, ambiguous, or long multi-stage task and submit a concise executable plan. Continue directly for ordinary reversible work.",
+      executionMode: "sequential",
       parameters: Type.Object({
         summary: Type.String({ minLength: 1, maxLength: 1600 }),
         steps: Type.Array(Type.Object({
@@ -1855,34 +1891,12 @@ function tools(
   ];
   const blocked = new Set(disabledTools.map(String));
   const enabledAvailable = available.filter((tool) => !blocked.has(tool.name));
-  const namesByMode: Record<string, Set<string>> = {
-    knowledge: new Set(["inspect_workspace", "inspect_available_tools", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
-    research: new Set(["inspect_workspace", "inspect_available_tools", "search_web", "agent_reach", "browser_access", "discover_papers", "download_and_index", "summarize_documents", "check_task_completion", "verify_doi", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
-    "workspace-status": new Set(["inspect_workspace"]),
-    "zotero-status": new Set(["zotero_status"]),
-    "zotero-search": new Set(["zotero_search"]),
-    "task-documents": new Set(["read_task_documents", "summarize_documents", "check_task_completion", "self_assess"]),
-    "web-auto": new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
-    web: new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
-    // The verified-answer endpoint has one mandatory terminal action. Keeping
-    // only this composite tool prevents small/text-only models from spending
-    // their bounded generation window on an intermediate search and stopping.
-    "verified-answer": new Set(["build_verified_answer"]),
-    slides: new Set(["inspect_workspace", "build_presentation_outline", "create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex", "edit_section", "edit_slide", "self_assess"]),
-    benchmark: new Set(enabledAvailable.map((tool) => tool.name)),
-  };
-  const modeParts = new Set(String(taskMode || "general").split("+").filter(Boolean));
-  const exactMode = namesByMode[taskMode];
-  const enabled = exactMode || (
-    modeParts.size > 1
-      ? new Set([...modeParts].flatMap((part) => [...(namesByMode[part] || new Set<string>())]))
-      : undefined
-  );
-  const modeBuiltins = enabled ? enabledAvailable.filter((tool) => enabled.has(tool.name)) : enabledAvailable;
+  // Task mode is evidence/budget/initial-activation guidance.  It must never
+  // become a second permission system that hides an otherwise leased tool.
+  void taskMode;
   const builtins = taskContract
-    ? modeBuiltins.filter((tool) => taskContract.hasToolLease && taskContract.allowedTools.has(tool.name))
+    ? enabledAvailable.filter((tool) => taskContract.hasToolLease && taskContract.allowedTools.has(tool.name))
     : [];
-  const allowExternal = [...modeParts].some((part) => ["general", "knowledge", "research", "benchmark"].includes(part));
   const leasedMcpTools = taskContract
     ? mcpTools.filter((tool) => {
       const policy = mcpPolicies.get(tool.name);
@@ -1892,7 +1906,7 @@ function tools(
         && (risk !== "high" || taskContract.allowExternalWrite);
     })
     : mcpTools;
-  return allowExternal ? [...controlTools, ...builtins, ...leasedMcpTools] : [...controlTools, ...builtins];
+  return [...controlTools, ...builtins, ...leasedMcpTools];
 }
 
 function evidencePolicy(taskMode: string): "off" | "assist" | "strict" {
@@ -2195,14 +2209,55 @@ async function createSession(
   });
   await loader.reload();
   const external = await externalMcpTools(requestRef);
-  const customTools = tools(
+  const leasedTools = tools(
     String(request.task_mode || "general"),
     external.tools,
     external.policies,
     request.disabled_tools || [],
     taskContract,
   );
-  const prefixShape = buildPrefixShape(request, customTools.map((tool) => String(tool.name)));
+  const controlNames = new Set(["ask_user", "submit_plan"]);
+  const domainDefinitions = leasedTools.filter((tool) => !controlNames.has(String(tool.name)));
+  const catalog = buildToolCatalog(
+    domainDefinitions.map((tool) => ({
+      name: String(tool.name),
+      label: String(tool.label || tool.name),
+      description: String(tool.description || ""),
+    })),
+    (name): CatalogRisk => toolRisk(name, external.policies.get(name)),
+  );
+  let sessionRef: AgentSession | undefined;
+  let stateRef: SessionState | undefined;
+  const isAuthorized = (name: string): boolean => contractAllowsTool(
+    normalizeTaskContract(requestRef.current),
+    name,
+    external.policies.get(name),
+  );
+  const searchTools = createSearchToolsTool({
+    catalog,
+    getSession: () => sessionRef,
+    isAuthorized,
+    requestId: () => String(requestRef.current.request_id || ""),
+    emit,
+    onActivation: (activeNames) => {
+      if (!stateRef) return;
+      stateRef.activeToolNames = [...activeNames].sort();
+      stateRef.prefixShape = buildPrefixShape(
+        requestRef.current,
+        stateRef.registeredToolNames,
+        stateRef.activeToolNames,
+      );
+    },
+  });
+  const customTools = [searchTools, ...leasedTools];
+  const registeredToolNames = customTools.map((tool) => String(tool.name)).sort();
+  const activeToolNames = initialToolNames(
+    registeredToolNames,
+    taskContract.initialTools,
+    taskContract.requiredToolGroups,
+    ["search_tools", "ask_user", "submit_plan"],
+  );
+  const prefixShape = buildPrefixShape(request, registeredToolNames, activeToolNames);
   const sessionDir = `${request.agent_dir}/sessions`;
   fs.mkdirSync(sessionDir, { recursive: true });
   const resumeFile = String(request.session_file || "");
@@ -2234,6 +2289,11 @@ async function createSession(
       },
     }),
   });
+  sessionRef = created.session;
+  // Register the whole authorized inventory, then reduce the active surface.
+  // Passing `tools` to createAgentSession would make it a hard registry
+  // allowlist, leaving search_tools unable to activate inactive definitions.
+  created.session.setActiveToolsByName(activeToolNames);
   const state: SessionState = {
     session: created.session,
     request,
@@ -2241,9 +2301,11 @@ async function createSession(
     signature: sessionSignature(request),
     unsubscribe: () => undefined,
     mcpClients: external.clients,
-    activeToolNames: customTools.map((tool) => String(tool.name)),
+    activeToolNames,
+    registeredToolNames,
     prefixShape,
   };
+  stateRef = state;
   state.unsubscribe = state.session.subscribe((event) => {
     const requestId = state.currentRequestId || "";
     const currentRequest = state.request;
@@ -2328,7 +2390,12 @@ async function getSession(request: RunStart): Promise<{ state: SessionState; res
   if (existing && existing.signature === sessionSignature(request)) {
     existing.request = request;
     existing.requestRef.current = request;
-    existing.prefixShape = buildPrefixShape(request, existing.activeToolNames);
+    existing.activeToolNames = existing.session.getActiveToolNames().map(String).sort();
+    existing.prefixShape = buildPrefixShape(
+      request,
+      existing.registeredToolNames,
+      existing.activeToolNames,
+    );
     return { state: existing, resumed: true };
   }
   if (existing) {

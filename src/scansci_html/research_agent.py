@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import quote
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -259,26 +259,17 @@ def _pi_should_run(
     user_text: str = "",
     task_profile: dict[str, Any] | None = None,
 ) -> bool:
-    """Keep ordinary conversation off the expensive tool-agent path.
+    """Route every model-mediated text turn through Pi.
 
-    Pi is valuable when a turn needs ScanSci state or an actual tool action.
-    Running every plain explanation, calculation, or rewrite through a full
-    AgentSession needlessly sends tool schemas and agent instructions to the
-    provider, increasing latency and token cost without improving the answer.
+    ``task_mode`` and the deterministic profile remain useful for evidence,
+    risk, budget and initial-tool hints.  They no longer select a cheaper
+    direct-provider cognition path: one session abstraction is what gives the
+    model continuity, progressive tools and auditable lifecycle semantics.
+    Deterministic local facts bypass this helper at the caller.
     """
 
-    route = str(dict(task_profile or {}).get("route", "")).strip()
-    if route:
-        return route != "direct_chat"
-    if _pi_requires_tools(task_mode, user_text):
-        return True
-    # A web toggle ("on" or "auto") must activate Pi so the model receives
-    # the search tools it needs to honour the user's request.  Without Pi,
-    # the model has no tool access and will report that it cannot search.
-    web_parts = {"web", "web-auto"}
-    if _pi_mode_parts(task_mode) & web_parts:
-        return True
-    return bool(_pi_mode_parts(task_mode) - {"general", "web-auto"})
+    del task_mode, user_text, task_profile
+    return True
 
 
 def _is_managed_service_fallback_error(error: BaseException) -> bool:
@@ -2806,14 +2797,12 @@ class ResearchAgentRuntime:
 
     @staticmethod
     def _pi_eligible(chat_request: _DirectChatRequest, payload: dict[str, Any]) -> bool:
-        requested_harness = str(payload.get("agent_harness", "pi") or "pi").strip().lower()
-        # Local models are no longer blanket-blocked from Pi.  Many Ollama/
-        # LM Studio models support tool calling (Qwen, Llama 3, etc.), and
-        # the fallback at _complete_with_pi adequately handles failures.
-        return (
-            requested_harness not in {"legacy", "direct", "fixed-workflow"}
-            and all(isinstance(item.get("content"), str) for item in chat_request.messages)
-        )
+        del payload
+        # Harness selection is a host architecture decision, not a client-side
+        # escape hatch.  Task 5 extends this boundary to validated image blocks;
+        # for now every text-only request is Pi eligible, including local
+        # OpenAI-compatible models.
+        return all(isinstance(item.get("content"), str) for item in chat_request.messages)
 
     @classmethod
     def _vision_direct_fallback(
@@ -3256,10 +3245,8 @@ class ResearchAgentRuntime:
             *([chat_request.notebook_id] if chat_request.notebook_id else []),
         ]))
         evidence_dbs: list[Path] = []
-        selected_notebooks: list[dict[str, Any]] = []
         for notebook_id in requested_notebook_ids:
             notebook = self._notebook(notebook_id)
-            selected_notebooks.append(notebook)
             candidate = self._evidence_db_for_notebook(notebook)
             if candidate not in evidence_dbs:
                 evidence_dbs.append(candidate)
@@ -3279,43 +3266,6 @@ class ResearchAgentRuntime:
             workflow_type=workflow_type,
         )
         mode_parts = _pi_mode_parts(resolved_task_mode)
-        if requested_notebook_ids and "knowledge" in mode_parts and "research" not in mode_parts:
-            library_kinds = {
-                str(dict(notebook.get("metadata", {}) or {}).get("library_kind", "")).strip().lower()
-                for notebook in selected_notebooks
-            }
-            scoped_tools = {
-                "inspect_workspace",
-                "inspect_available_tools",
-                "self_assess",
-            }
-            if "zotero" in library_kinds:
-                scoped_tools.update({
-                    "kb_search",
-                    "zotero_search",
-                    "zotero_status",
-                    "zotero_fulltext",
-                    "zotero_attachment",
-                    "zotero_export_bibtex",
-                    "zotero_citations",
-                })
-            if "obsidian" in library_kinds:
-                scoped_tools.update({
-                    "obsidian_status",
-                    "obsidian_search",
-                    "obsidian_read",
-                    "obsidian_backlinks",
-                })
-            if any(path.is_file() for path in evidence_dbs):
-                scoped_tools.update({"search_local_evidence", "build_verified_answer"})
-            turn_contract = {
-                **turn_contract,
-                "allowed_tools": [
-                    tool
-                    for tool in list(turn_contract.get("allowed_tools", []) or [])
-                    if str(tool) in scoped_tools
-                ],
-            }
         local_evidence = None
         if mode_parts & {"knowledge", "research", "verified-answer", "benchmark"}:
             local_evidence = self._local_evidence_stack(evidence_db, quality_profile="balanced")
@@ -3489,6 +3439,11 @@ class ResearchAgentRuntime:
         session_id: str | None = None,
         active_run_id: str = "",
         fallback_attempted: bool = False,
+        precompleted_tool_calls: Iterable[dict[str, Any]] | None = None,
+        fallback_timeout_seconds: float = 45.0,
+        fallback_max_tokens: int | None = None,
+        fallback_temperature: float = 0.2,
+        fallback_use_litellm: bool | None = None,
     ):
         """Prefer Pi, but safely fall back before any visible/effectful event.
 
@@ -3501,8 +3456,9 @@ class ResearchAgentRuntime:
         effect_started = False
         completed_web_search: dict[str, Any] | None = None
         completed_document_summary: dict[str, Any] | None = None
-        capability_ledger = CapabilityLedger(
-            _required_pi_tool_groups(task_mode, self._last_user_text(chat_request.messages))
+        capability_ledger = CapabilityLedger.from_tool_calls(
+            _required_pi_tool_groups(task_mode, self._last_user_text(chat_request.messages)),
+            precompleted_tool_calls,
         )
         try:
             model_event_kwargs: dict[str, Any] = {
@@ -3597,6 +3553,11 @@ class ResearchAgentRuntime:
                     session_id=None,
                     active_run_id=active_run_id,
                     fallback_attempted=True,
+                    precompleted_tool_calls=precompleted_tool_calls,
+                    fallback_timeout_seconds=fallback_timeout_seconds,
+                    fallback_max_tokens=fallback_max_tokens,
+                    fallback_temperature=fallback_temperature,
+                    fallback_use_litellm=fallback_use_litellm,
                 )
                 return
             if (
@@ -3642,12 +3603,18 @@ class ResearchAgentRuntime:
                     if isinstance(recovery_error, CapabilityDeliveryError):
                         raise
                     raise capability_ledger.delivery_error(cause=recovery_error)
-            if _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages)):
+            if (
+                _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages))
+                and not capability_ledger.ready
+            ):
                 raise capability_ledger.delivery_error(cause=error)
             yield {
                 "type": "compatibility.fallback",
                 "error": f"{type(error).__name__}: {error}"[:500],
             }
+            fallback_transport = _model_transport_kwargs(chat_request)
+            if fallback_use_litellm is not None:
+                fallback_transport["use_litellm"] = fallback_use_litellm
             yield from stream_chat_text(
                 chat_request.provider_kind,
                 base_url=chat_request.base_url,
@@ -3656,18 +3623,17 @@ class ResearchAgentRuntime:
                 messages=chat_request.messages,
                 thinking_mode=_direct_thinking_mode(chat_request),
                 session=chat_request.session,
-                timeout=45.0,
-                max_tokens=_direct_output_budget(
-                    self._last_user_text(chat_request.messages),
-                    chat_request.selected_skills,
+                timeout=fallback_timeout_seconds,
+                max_tokens=fallback_max_tokens or _direct_output_budget(
+                    self._last_user_text(chat_request.messages), chat_request.selected_skills
                 ),
                 max_continuations=_direct_max_continuations(
                     self._last_user_text(chat_request.messages),
                     chat_request.selected_skills,
                 ),
-                temperature=0.2,
+                temperature=fallback_temperature,
                 max_requests=1,
-                **_model_transport_kwargs(chat_request),
+                **fallback_transport,
             )
 
     def _complete_with_pi(
@@ -4052,21 +4018,21 @@ class ResearchAgentRuntime:
                     raise RuntimeError(
                         "ScanSci 未能完成本轮必需的工具调用；为避免编造能力或结果，本轮不会退化为裸模型回答"
                     ) from error
-                    completion = complete_chat_text(
-                        chat_request.provider_kind,
-                        base_url=chat_request.base_url,
-                        api_key=chat_request.api_key,
-                        model=chat_request.model_id,
+                completion = complete_chat_text(
+                    chat_request.provider_kind,
+                    base_url=chat_request.base_url,
+                    api_key=chat_request.api_key,
+                    model=chat_request.model_id,
                     messages=chat_request.messages,
                     thinking_mode=_direct_thinking_mode(chat_request),
                     session=chat_request.session,
                     include_usage=True,
                     timeout=45.0,
-                        max_requests=1,
-                        max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                        temperature=0.2,
-                        **_model_transport_kwargs(chat_request),
-                    )
+                    max_requests=1,
+                    max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
+                    temperature=0.2,
+                    **_model_transport_kwargs(chat_request),
+                )
                 if isinstance(completion, tuple):
                     text, usage = completion
                 else:
@@ -4726,6 +4692,7 @@ class ResearchAgentRuntime:
                     run_id=run_id,
                     message_id=message_id,
                     chat_request=chat_request,
+                    session_id=str(payload.get("pi_session_id", "") or "") or None,
                 )
                 return
             if self._uses_knowledge_catalog_answer(chat_request, ingestion=ingestion):
@@ -5104,7 +5071,7 @@ class ResearchAgentRuntime:
             )
             removed_terminal_loop = removed_terminal_loop or stream_repetition_detected
             structured_gap = _structured_output_contract_gap(user_text, text)
-            if structured_completion_requested and structured_gap and not pi_needed:
+            if structured_completion_requested and structured_gap:
                 # Nothing has crossed the buffered delivery boundary yet, so a
                 # controlled repair can safely recover a transient greeting or
                 # a partially formatted answer.  Two repair attempts give the
@@ -5133,29 +5100,44 @@ class ResearchAgentRuntime:
                     retry_fragments: list[str] = []
                     retry_usage: dict[str, int] = {}
                     retry_truncated = False
-                    for retry_event in stream_chat_text(
-                        chat_request.provider_kind,
-                        base_url=chat_request.base_url,
-                        api_key=chat_request.api_key,
-                        model=chat_request.model_id,
-                        messages=_structured_retry_messages(
-                            chat_request.messages,
-                            user_text,
-                            previous_gap=last_gap,
-                            attempt=repair_attempt,
-                        ),
-                        thinking_mode=_direct_thinking_mode(chat_request),
-                        session=chat_request.session,
-                        timeout=45.0,
-                        max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                        max_continuations=_direct_max_continuations(
-                            user_text,
-                            chat_request.selected_skills,
-                        ),
-                        temperature=0.2,
-                        max_requests=1,
-                        **_model_transport_kwargs(chat_request),
-                    ):
+                    repair_messages = _structured_retry_messages(
+                        chat_request.messages,
+                        user_text,
+                        previous_gap=last_gap,
+                        attempt=repair_attempt,
+                    )
+                    if pi_eligible and pi_needed:
+                        repair_request = replace(chat_request, messages=repair_messages)
+                        repair_session_id = str(
+                            dict(agent_runtime.get("session", {}) or {}).get("session_id", "")
+                            or payload.get("pi_session_id", "")
+                        ).strip() or None
+                        retry_events = self._pi_events_with_compatibility_fallback(
+                            repair_request,
+                            task_mode=pi_task_mode if pi_task_mode != "general" else None,
+                            session_id=repair_session_id,
+                            active_run_id=run_id,
+                        )
+                    else:
+                        retry_events = stream_chat_text(
+                            chat_request.provider_kind,
+                            base_url=chat_request.base_url,
+                            api_key=chat_request.api_key,
+                            model=chat_request.model_id,
+                            messages=repair_messages,
+                            thinking_mode=_direct_thinking_mode(chat_request),
+                            session=chat_request.session,
+                            timeout=45.0,
+                            max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
+                            max_continuations=_direct_max_continuations(
+                                user_text,
+                                chat_request.selected_skills,
+                            ),
+                            temperature=0.2,
+                            max_requests=1,
+                            **_model_transport_kwargs(chat_request),
+                        )
+                    for retry_event in retry_events:
                         if retry_event.get("type") == "delta":
                             retry_content = str(retry_event.get("content", ""))
                             if retry_content:
@@ -5163,12 +5145,42 @@ class ResearchAgentRuntime:
                         elif retry_event.get("type") == "done":
                             retry_truncated = bool(retry_event.get("truncated"))
                             received_retry_usage = retry_event.get("usage")
+                            raw_retry_stats = retry_event.get("stats")
+                            if isinstance(raw_retry_stats, dict):
+                                session_stats = dict(raw_retry_stats)
+                                if not isinstance(received_retry_usage, dict):
+                                    received_retry_usage = raw_retry_stats.get("tokens")
                             if isinstance(received_retry_usage, dict):
                                 retry_usage = {
                                     str(key): value
                                     for key, value in received_retry_usage.items()
                                     if isinstance(value, int)
                                 }
+                        elif retry_event.get("type") == "session":
+                            agent_runtime["session"] = {
+                                "session_id": str(retry_event.get("session_id", "")),
+                                "session_file": str(retry_event.get("session_file", "")),
+                                "resumed": bool(retry_event.get("resumed", False)),
+                            }
+                        elif retry_event.get("type") == "tool.completed":
+                            tool_name = str(retry_event.get("name", ""))
+                            agent_runtime["tool_calls"].append({"name": tool_name, "status": "completed"})
+                        elif retry_event.get("type") == "tool.failed":
+                            tool_name = str(retry_event.get("name", ""))
+                            agent_runtime["tool_calls"].append({"name": tool_name, "status": "failed"})
+                        elif retry_event.get("type") == "compatibility.fallback":
+                            agent_runtime["harness"] = "direct-provider"
+                            agent_runtime["compatibility_fallback"] = True
+                            agent_runtime["compatibility_error"] = str(retry_event.get("error", ""))
+                            trace.append(
+                                {
+                                    "title": "Pi 兼容回退",
+                                    "detail": "Pi 在结构化修复产生文本前失败；已显式切换为有界直连兼容传输。",
+                                }
+                            )
+                            yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                        elif retry_event.get("type") == "cancelled":
+                            raise _RunCancelled("Pi Agent repair run was cancelled")
                     retry_text = _normalize_direct_chat_output(
                         "".join(retry_fragments),
                         chat_request.selected_skills,
@@ -5800,6 +5812,7 @@ class ResearchAgentRuntime:
         run_id: str,
         message_id: str,
         chat_request: _DirectChatRequest,
+        session_id: str | None = None,
     ):
         """Retrieve verified local evidence first, then draft readable prose from it.
 
@@ -5866,42 +5879,107 @@ class ResearchAgentRuntime:
         text = ""
         usage: dict[str, int] = {}
         writing_fallback = False
+        fixed_tool_calls = [
+            {"name": "search_local_evidence", "status": "completed"},
+            {"name": "build_verified_answer", "status": "completed"},
+        ]
+        writer_runtime: dict[str, Any] = {
+            "harness": "verified-evidence-fallback",
+            "task_mode": "knowledge",
+            "evidence_policy": "grounded-writing",
+            "tool_calls": list(fixed_tool_calls),
+            "session": {},
+            "compatibility_fallback": False,
+            "compatibility_error": "",
+            "pi_attempted": False,
+            "pi_success": False,
+        }
 
         if citations and (verification.get("passed") or result.get("evidence_table")):
+            writer_request = replace(
+                chat_request,
+                messages=self._evidence_writing_prompt(request=question, citations=citations),
+            )
+            writer_contract = self._compile_contract(
+                task_mode="knowledge",
+                user_text=self._last_user_text(writer_request.messages),
+            )
+            writer_runtime["task_contract"] = writer_contract
+            writer_runtime["pi_attempted"] = True
             try:
-                completion = complete_chat_text(
-                    chat_request.provider_kind,
-                    base_url=chat_request.base_url,
-                    api_key=chat_request.api_key,
-                    model=chat_request.model_id,
-                    messages=self._evidence_writing_prompt(request=question, citations=citations),
-                    thinking_mode=_direct_thinking_mode(chat_request),
-                    session=chat_request.session,
-                    include_usage=True,
-                    timeout=90.0,
-                    max_tokens=max(1_200, _direct_output_budget(question, chat_request.selected_skills)),
-                    temperature=0.35,
-                    **_model_transport_kwargs(chat_request),
-                    # This OpenAI-compatible call needs no provider adapter.
-                    # Avoid importing LiteLLM's broad optional provider graph
-                    # before the only user-visible writing request.
-                    use_litellm=False,
-                )
-                if isinstance(completion, tuple):
-                    text, usage = completion
-                else:
-                    text = str(completion)
+                fragments: list[str] = []
+                for writer_event in self._pi_events_with_compatibility_fallback(
+                    writer_request,
+                    task_mode="knowledge",
+                    session_id=session_id,
+                    active_run_id=run_id,
+                    precompleted_tool_calls=fixed_tool_calls,
+                    fallback_timeout_seconds=90.0,
+                    fallback_max_tokens=max(
+                        1_200,
+                        _direct_output_budget(question, chat_request.selected_skills),
+                    ),
+                    fallback_temperature=0.35,
+                    fallback_use_litellm=False,
+                ):
+                    event_type = str(writer_event.get("type", ""))
+                    if event_type == "delta":
+                        fragments.append(str(writer_event.get("content", "")))
+                    elif event_type == "done":
+                        raw_stats = writer_event.get("stats")
+                        received_usage = writer_event.get("usage")
+                        if not isinstance(received_usage, dict) and isinstance(raw_stats, dict):
+                            received_usage = raw_stats.get("tokens")
+                        if isinstance(received_usage, dict):
+                            usage = {
+                                str(key): int(value)
+                                for key, value in received_usage.items()
+                                if isinstance(value, int)
+                            }
+                    elif event_type == "session":
+                        writer_runtime["session"] = {
+                            "session_id": str(writer_event.get("session_id", "")),
+                            "session_file": str(writer_event.get("session_file", "")),
+                            "resumed": bool(writer_event.get("resumed", False)),
+                        }
+                    elif event_type == "tool.completed":
+                        writer_runtime["tool_calls"].append({
+                            "name": str(writer_event.get("name", "")),
+                            "status": "completed",
+                        })
+                    elif event_type == "tool.failed":
+                        writer_runtime["tool_calls"].append({
+                            "name": str(writer_event.get("name", "")),
+                            "status": "failed",
+                            "error": str(writer_event.get("error", ""))[:500],
+                        })
+                    elif event_type == "compatibility.fallback":
+                        writer_runtime["harness"] = "direct-provider"
+                        writer_runtime["compatibility_fallback"] = True
+                        writer_runtime["compatibility_error"] = str(writer_event.get("error", ""))
+                    elif event_type == "cancelled":
+                        raise _RunCancelled("Pi evidence writer was cancelled")
+                text = "".join(fragments)
                 text = _normalize_direct_chat_output(text, chat_request.selected_skills)
                 text = self._normalize_evidence_citation_markers(text, citations)
                 text = self._remove_uncited_article_prose(text, citations)
                 text = self._ensure_evidence_article_title(text)
                 if not self._evidence_article_uses_known_citations(text, citations):
                     text = ""
-            except Exception:
+                if text and not writer_runtime["compatibility_fallback"]:
+                    writer_runtime["harness"] = "pi-agent-sdk"
+                    writer_runtime["pi_success"] = True
+            except _RunCancelled:
+                raise
+            except Exception as error:
                 # The verified retrieval result is still useful.  Do not turn a
                 # temporary writing-provider failure into a loss of the user's
                 # source-grounded answer.
                 text = ""
+                writer_runtime["compatibility_error"] = (
+                    writer_runtime.get("compatibility_error")
+                    or f"{type(error).__name__}: {error}"[:500]
+                )
 
         if not text:
             text = (
@@ -5910,6 +5988,9 @@ class ResearchAgentRuntime:
                 or "当前资料不足以生成带原文脚标的文章草稿。请缩小主题或补充可检索资料。"
             )
             writing_fallback = True
+            writer_runtime["pi_success"] = False
+            if writer_runtime.get("harness") == "pi-agent-sdk":
+                writer_runtime["harness"] = "verified-evidence-fallback"
 
         citation_count = len(citations)
         scope_note = (
@@ -5950,6 +6031,12 @@ class ResearchAgentRuntime:
                 "status": "completed" if not writing_fallback else "fallback",
             },
         ]
+        if writer_runtime.get("compatibility_fallback"):
+            trace.append({
+                "title": "Pi 兼容回退",
+                "detail": "Pi 在产生写作文本或启动新工具前失败；本轮已显式切换为有界直连写作，不计为 Pi 成功。",
+                "status": "fallback",
+            })
         yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
         yield run_event(TEXT_MESSAGE_CONTENT, run_id=run_id, messageId=message_id, delta=text)
         if usage:
@@ -5978,13 +6065,7 @@ class ResearchAgentRuntime:
                 "message": message,
                 "model": {"provider_id": chat_request.provider_id, "model_id": chat_request.model_id},
                 "agent_runtime": {
-                    "harness": "evidence-grounded-writing",
-                    "task_mode": "knowledge",
-                    "evidence_policy": "grounded-writing",
-                    "tool_calls": [
-                        {"name": "search_local_evidence", "status": "completed"},
-                        {"name": "build_verified_answer", "status": "completed"},
-                    ],
+                    **writer_runtime,
                     "citation_verification": verification,
                     "writing_fallback": writing_fallback,
                 },

@@ -1312,7 +1312,7 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
         for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
         if isinstance(tool, dict)
     }
-    assert advertised <= {"ask_user", "submit_plan"}
+    assert advertised <= {"ask_user", "search_tools", "submit_plan"}
 
 
 def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch) -> None:
@@ -1442,7 +1442,7 @@ def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) ->
         for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
         if isinstance(tool, dict)
     }
-    assert advertised <= {"ask_user", "submit_plan"}
+    assert advertised <= {"ask_user", "search_tools", "submit_plan"}
 
 
 def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
@@ -2338,6 +2338,7 @@ def test_pi_reused_session_applies_current_mcp_lease_in_both_directions(
         "initial_tool_budget": 2,
         "max_tool_budget": 4,
     }
+    done_events: list[dict[str, object]] = []
     try:
         for turn, granted in enumerate((grant_first, not grant_first), start=1):
             events = list(client.stream_chat(
@@ -2358,6 +2359,7 @@ def test_pi_reused_session_applies_current_mcp_lease_in_both_directions(
                 session_id=f"mcp-lease-{'grant' if grant_first else 'revoke'}-first",
             ))
             assert events[-1]["type"] == "done"
+            done_events.append(events[-1])
     finally:
         client.close()
         server.shutdown()
@@ -2373,12 +2375,20 @@ def test_pi_reused_session_applies_current_mcp_lease_in_both_directions(
             if isinstance(tool, dict)
         })
     mcp_names = {"mcp__fixture__search", "mcp__fixture__call"}
+    # MCP definitions follow the same dynamic-tool contract as built-ins:
+    # authorization registers them, while the bootstrap surface stays small
+    # until search_tools activates a selected definition.
+    assert all(mcp_names.isdisjoint(names) for names in tool_names_by_turn)
+    registered_by_turn = [
+        set(dict(dict(event.get("stats", {}) or {}).get("toolInventory", {}) or {}).get("registeredNames", []) or [])
+        for event in done_events
+    ]
     if grant_first:
-        assert mcp_names <= tool_names_by_turn[0]
-        assert mcp_names.isdisjoint(tool_names_by_turn[1])
+        assert mcp_names <= registered_by_turn[0]
+        assert mcp_names.isdisjoint(registered_by_turn[1])
     else:
-        assert mcp_names.isdisjoint(tool_names_by_turn[0])
-        assert mcp_names <= tool_names_by_turn[1]
+        assert mcp_names.isdisjoint(registered_by_turn[0])
+        assert mcp_names <= registered_by_turn[1]
 
 
 def test_pi_cancel_aborts_active_sdk_run_without_killing_client(tmp_path: Path) -> None:

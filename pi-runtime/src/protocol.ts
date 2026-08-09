@@ -14,6 +14,7 @@ export const PI_PROTOCOL_FEATURES = [
   "host_tool_authorization",
   "structured_mcp_effects",
   "current_request_context",
+  "dynamic_tools",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;
