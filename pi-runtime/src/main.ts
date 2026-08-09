@@ -1925,7 +1925,15 @@ function guardProviderRequest(payload: unknown, budget: number): unknown {
   return payload;
 }
 
-function systemPrompt(request: RunStart): string {
+function sessionInvariantSystemPrompt(): string {
+  return [
+    "You are the ScanSci Pi agent runtime.",
+    "This session-level base prompt is invariant and grants no per-turn authority.",
+    "Current-turn system content, date, task contract, capability leases, risk policy, and budgets are supplied separately by the before_agent_start lifecycle hook.",
+  ].join("\n");
+}
+
+function currentTurnSystemPrompt(request: RunStart): string {
   const taskMode = String(request.task_mode || "general");
   const contract = normalizeTaskContract(request);
   const currentHostDate = new Intl.DateTimeFormat("en-CA", {
@@ -2144,13 +2152,16 @@ async function createSession(
   const loader = new DefaultResourceLoader({
     cwd: request.cwd,
     agentDir: request.agent_dir,
-    systemPromptOverride: () => systemPrompt(requestRef.current),
+    systemPromptOverride: () => sessionInvariantSystemPrompt(),
     appendSystemPromptOverride: () => [],
     extensionFactories: [{
       name: "scansci-provider-request-guard",
       factory: (pi) => {
-        pi.on("before_agent_start", () => ({
-          systemPrompt: systemPrompt(requestRef.current),
+        pi.on("before_agent_start", (event) => ({
+          // Compose from Pi's actual cached base prompt.  The loader base is
+          // deliberately session-invariant; all authority and date-sensitive
+          // content comes from the current request reference on every turn.
+          systemPrompt: `${event.systemPrompt}\n\n${currentTurnSystemPrompt(requestRef.current)}`,
         }));
         pi.on("before_provider_request", (event) => {
           const currentRequest = requestRef.current;
@@ -2705,14 +2716,6 @@ async function compactSession(message: JsonRecord): Promise<void> {
     return;
   }
   try {
-    const currentRequest = state.requestRef.current;
-    const currentContract = normalizeTaskContract(currentRequest);
-    const baseSystemPrompt = systemPrompt(currentRequest);
-    const basePrompt = {
-      request_id: currentRequest.request_id,
-      contract_id: currentContract.contractId,
-      sha256: createHash("sha256").update(baseSystemPrompt).digest("hex"),
-    };
     const cleanup = pruneStaleToolResults(state);
     const result = await state.session.compact(String(message.instructions || "") || undefined);
     emit({
@@ -2720,7 +2723,6 @@ async function compactSession(message: JsonRecord): Promise<void> {
       command_id: commandId,
       session_id: sessionId,
       result,
-      base_prompt: basePrompt,
       stats: { ...sessionStats(state), contextCleanup: cleanup },
     });
   } catch (error) {

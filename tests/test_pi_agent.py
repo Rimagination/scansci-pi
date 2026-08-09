@@ -2299,6 +2299,7 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
         for message in second_messages
         if message.get("role") in {"system", "developer"}
     )
+    assert "session-level base prompt is invariant and grants no per-turn authority" in second_system
     assert "Task contract turn-two: goal=second question." in second_system
     assert "Task contract turn-one: goal=first question." not in second_system
 
@@ -2525,7 +2526,7 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
                         "schema_version": "scansci.task-contract.v2",
                         "version": 2,
                         "contract_id": f"compact-turn-{turn}",
-                        "goal": f"turn {turn}: alpha beta gamma",
+                        "goal": f"authority-sentinel-{turn}",
                         "allowed_tools": [],
                         "initial_tools": [],
                         "risk_level": "read_only",
@@ -2544,6 +2545,17 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
     assert result["summary"]
     records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
     assert any(record.get("type") == "compaction" for record in records)
-    assert result["_base_prompt"]["contract_id"] == "compact-turn-3"
-    assert result["_base_prompt"]["request_id"]
-    assert len(result["_base_prompt"]["sha256"]) == 64
+    current_turn_system = "\n".join(
+        str(message.get("content", ""))
+        for message in _OpenAIPersistentHandler.request_payloads[-2]["messages"]
+        if message.get("role") in {"system", "developer"}
+    )
+    assert "session-level base prompt is invariant and grants no per-turn authority" in current_turn_system
+    assert "authority-sentinel-3" in current_turn_system
+    assert "authority-sentinel-0" not in current_turn_system
+
+    compaction_payload = json.dumps(_OpenAIPersistentHandler.request_payloads[-1], ensure_ascii=False)
+    assert "context summarization assistant" in compaction_payload
+    assert "session-level base prompt is invariant" not in compaction_payload
+    assert "authority-sentinel-0" not in compaction_payload
+    assert "authority-sentinel-3" not in compaction_payload
