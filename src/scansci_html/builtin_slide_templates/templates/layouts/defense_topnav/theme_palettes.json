@@ -1,0 +1,73 @@
+{
+  "schema_version": "easyslides.theme_palettes.v1",
+  "template_id": "defense_topnav",
+  "default_palette": "academic_blue",
+  "replace_roles": [
+    "primary",
+    "primary_dark",
+    "soft_surface",
+    "border",
+    "emphasis_text"
+  ],
+  "roles": {
+    "primary": "Main active surfaces: top navigation tab text, title accents, page number square, and primary strokes.",
+    "primary_dark": "Darker supporting surfaces and active navigation emphasis.",
+    "soft_surface": "Light tint for key-message bars and subtle filled content surfaces.",
+    "border": "Low-contrast border for cards and figure frames.",
+    "emphasis_text": "Dark tinted text used on soft theme surfaces."
+  },
+  "palettes": {
+    "academic_blue": {
+      "name": "Academic Blue",
+      "primary_hex": "#183A6A",
+      "colors": {
+        "primary": "#183A6A",
+        "primary_dark": "#10284A",
+        "soft_surface": "#E7E6E6",
+        "border": "#C8D4E3",
+        "emphasis_text": "#081B33",
+        "primary_mid": "#426C9A",
+        "primary_light": "#D9E2EE"
+      }
+    },
+    "wine": {
+      "name": "Academic Red",
+      "primary_hex": "#8B0012",
+      "colors": {
+        "primary": "#8B0012",
+        "primary_dark": "#68000D",
+        "soft_surface": "#F8F2F3",
+        "border": "#D9C7CA",
+        "emphasis_text": "#3A0008",
+        "primary_mid": "#A03343",
+        "primary_light": "#E8CDD1"
+      }
+    },
+    "academic_purple": {
+      "name": "Academic Purple",
+      "primary_hex": "#80308B",
+      "colors": {
+        "primary": "#80308B",
+        "primary_dark": "#5D2066",
+        "soft_surface": "#F8F2F9",
+        "border": "#D8C5DC",
+        "emphasis_text": "#331038",
+        "primary_mid": "#9A58A3",
+        "primary_light": "#E7D3EA"
+      }
+    },
+    "academic_green": {
+      "name": "Academic Green",
+      "primary_hex": "#016F35",
+      "colors": {
+        "primary": "#016F35",
+        "primary_dark": "#014B24",
+        "soft_surface": "#F1F7F4",
+        "border": "#C4D8CD",
+        "emphasis_text": "#002B15",
+        "primary_mid": "#3A8B5E",
+        "primary_light": "#D2E7DA"
+      }
+    }
+  }
+}

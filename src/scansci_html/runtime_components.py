@@ -21,6 +21,7 @@ NODE_COMPONENT_ID = "node"
 NODE_EXECUTABLE_NAME = "node.exe"
 NODE_MANIFEST_ENV = "SCANSCI_NODE_COMPONENT_MANIFEST_URL"
 NODE_MANIFEST_FALLBACKS_ENV = "SCANSCI_NODE_COMPONENT_MANIFEST_FALLBACKS"
+NODE_EXECUTABLE_ENV = "SCANSCI_NODE_COMPONENT_EXECUTABLE"
 NODE_DEFAULT_MANIFEST_URL = (
     "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json"
 )
@@ -32,6 +33,7 @@ TECTONIC_COMPONENT_ID = "tectonic"
 TECTONIC_EXECUTABLE_NAME = "tectonic.exe"
 TECTONIC_MANIFEST_ENV = "SCANSCI_TECTONIC_COMPONENT_MANIFEST_URL"
 TECTONIC_MANIFEST_FALLBACKS_ENV = "SCANSCI_TECTONIC_COMPONENT_MANIFEST_FALLBACKS"
+TECTONIC_EXECUTABLE_ENV = "SCANSCI_TECTONIC_COMPONENT_EXECUTABLE"
 TECTONIC_DEFAULT_MANIFEST_URL = (
     "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json"
 )
@@ -60,6 +62,10 @@ class NodeRuntimeComponent(LocalRuntimeComponent):
             default_release_url=NODE_DEFAULT_RELEASE_URL,
             manifest_env=NODE_MANIFEST_ENV,
             fallbacks_env=NODE_MANIFEST_FALLBACKS_ENV,
+            executable_env=NODE_EXECUTABLE_ENV,
+            build_manifest_key="node_component_manifest_url",
+            display_name="Agent 运行组件",
+            system_executable_names=("node.exe", "node"),
             source_dependency_modules=(),
         )
 
@@ -84,6 +90,10 @@ class TectonicRuntimeComponent(LocalRuntimeComponent):
             default_release_url=TECTONIC_DEFAULT_RELEASE_URL,
             manifest_env=TECTONIC_MANIFEST_ENV,
             fallbacks_env=TECTONIC_MANIFEST_FALLBACKS_ENV,
+            executable_env=TECTONIC_EXECUTABLE_ENV,
+            build_manifest_key="tectonic_component_manifest_url",
+            display_name="LaTeX 排版组件",
+            system_executable_names=("tectonic.exe", "tectonic"),
             source_dependency_modules=(),
         )
 
@@ -124,11 +134,13 @@ __all__ = [
     "NODE_EXECUTABLE_NAME",
     "NODE_DEFAULT_MANIFEST_URL",
     "NODE_DEFAULT_RELEASE_URL",
+    "NODE_EXECUTABLE_ENV",
     "NodeRuntimeComponent",
     "TECTONIC_COMPONENT_ID",
     "TECTONIC_EXECUTABLE_NAME",
     "TECTONIC_DEFAULT_MANIFEST_URL",
     "TECTONIC_DEFAULT_RELEASE_URL",
+    "TECTONIC_EXECUTABLE_ENV",
     "TectonicRuntimeComponent",
     "default_node_component",
     "default_tectonic_component",

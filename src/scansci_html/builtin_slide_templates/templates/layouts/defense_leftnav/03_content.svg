@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>
+
+  <g id="page-number">
+    <rect x="1233.33" y="673.33" width="46.67" height="46.67" fill="#8B0012"/>
+    <text x="1256.67" y="704.64" text-anchor="middle" xml:space="preserve" font-family="微软雅黑, Microsoft YaHei, sans-serif" font-size="24" fill="#FFFFFF" font-weight="bold" data-slot="PAGE_NUM" data-slot-token="{{PAGE_NUM}}" data-pptx-textbox="true" data-pptx-box-x="1233.33" data-pptx-box-y="673.33" data-pptx-box-w="46.67" data-pptx-box-h="46.67" data-pptx-valign="middle"><tspan>1</tspan></text>
+  </g>
+
+  <g id="left-navigation" data-slot="ACTIVE_SECTION" data-component="left-navigation" data-style-ref="component_styles.navigation_styles.left_navigation">
+    <rect id="nav-surface" x="0" y="0" width="253.38" height="720" fill="#F2F2F2"/>
+
+    <g id="nav-inactive-items" font-family="微软雅黑, Microsoft YaHei, sans-serif" font-size="24" fill="#595959">
+      <g id="nav-inactive-item-1" data-nav-index="1" data-nav-icon="research-background">
+        <path d="M 47.18 201.94 L 38.71 193.47 C 40.99 189.46 40.42 184.25 37 180.83 C 32.9 176.72 26.23 176.72 22.13 180.83 C 18.02 184.93 18.02 191.6 22.13 195.7 C 25.55 199.12 30.76 199.69 34.77 197.41 L 43.24 205.88 C 44.32 206.96 46.09 206.96 47.18 205.88 C 48.26 204.79 48.26 203.02 47.18 201.94 Z M 34.91 193.61 C 31.96 196.55 27.17 196.55 24.22 193.61 C 21.27 190.66 21.27 185.87 24.22 182.92 C 27.17 179.98 31.96 179.98 34.91 182.92 C 37.85 185.87 37.85 190.66 34.91 193.61 Z" fill="#595959" stroke="none" stroke-width="1"/>
+        <text x="72.54" y="198.31" text-anchor="start" xml:space="preserve" data-nav-label="inactive" data-nav-index="1"><tspan>研究背景</tspan></text>
+      </g>
+      <g id="nav-inactive-item-2" data-nav-index="2" data-nav-icon="purpose-significance">
+        <path d="M 38.53 275.44 C 40.41 275.44 41.94 276.96 41.94 278.85 C 41.94 280.73 40.41 282.26 38.53 282.26 C 36.65 282.26 35.12 280.73 35.12 278.85 C 35.12 276.96 36.65 275.44 38.53 275.44 Z M 38.53 272.16 C 34.85 272.16 31.84 275.15 31.84 278.85 C 31.84 282.53 34.84 285.53 38.53 285.53 C 42.22 285.53 45.22 282.53 45.22 278.85 C 45.22 275.16 42.22 272.16 38.53 272.16 Z M 38.53 263.73 C 39.98 263.73 41.15 264.91 41.15 266.35 L 41.15 268.06 C 45.18 269.03 48.34 272.2 49.31 276.22 L 51.02 276.22 C 52.47 276.22 53.65 277.4 53.65 278.85 C 53.65 280.3 52.47 281.47 51.02 281.47 L 49.31 281.47 C 48.34 285.5 45.18 288.66 41.15 289.63 L 41.15 291.34 C 41.15 292.79 39.98 293.97 38.53 293.97 C 37.08 293.97 35.91 292.79 35.91 291.34 L 35.91 289.63 C 31.88 288.66 28.71 285.5 27.74 281.47 L 26.03 281.47 C 24.59 281.47 23.41 280.3 23.41 278.85 C 23.41 277.4 24.59 276.22 26.03 276.22 L 27.74 276.22 C 28.71 272.2 31.88 269.03 35.91 268.06 L 35.91 266.35 C 35.91 264.91 37.08 263.73 38.53 263.73 Z" fill="#595959" stroke="none" stroke-width="1"/>
+        <text x="72.54" y="283.04" text-anchor="start" xml:space="preserve" data-nav-label="inactive" data-nav-index="2"><tspan>目的及意义</tspan></text>
+      </g>
+      <g id="nav-inactive-item-3" data-nav-index="3" data-nav-icon="materials-methods">
+        <path d="M 52.75 375.36 L 51.66 375.36 L 51.66 370.93 C 51.66 369.99 50.86 369.22 49.87 369.22 L 39.87 369.22 L 39.87 366.38 C 40.37 366.38 41.41 366.38 42.46 366.39 C 43.88 366.39 45.32 366.39 45.37 366.39 C 48.22 366.39 50.55 364.17 50.55 361.44 C 50.55 358.71 48.22 356.49 45.37 356.49 C 45.32 356.49 45.28 356.49 45.24 356.49 C 44.71 353.23 41.74 350.73 38.17 350.73 C 34.84 350.73 32 352.91 31.22 355.93 C 28.56 356.29 26.51 358.49 26.51 361.12 C 26.51 364.02 28.98 366.38 32.01 366.38 L 37.18 366.38 L 37.18 369.22 L 27.19 369.22 C 26.2 369.22 25.4 369.99 25.4 370.93 L 25.4 375.36 L 24.31 375.36 C 23.81 375.36 23.41 375.74 23.41 376.22 L 23.41 380.12 C 23.41 380.59 23.81 380.97 24.31 380.97 L 29.18 380.97 C 29.68 380.97 30.08 380.59 30.08 380.12 L 30.08 376.22 C 30.08 375.74 29.68 375.36 29.18 375.36 L 28.09 375.36 L 28.09 371.79 L 37.18 371.79 L 37.18 375.36 L 36.09 375.36 C 35.6 375.36 35.2 375.74 35.2 376.22 L 35.2 380.12 C 35.2 380.59 35.6 380.97 36.09 380.97 L 40.96 380.97 C 41.46 380.97 41.86 380.59 41.86 380.12 L 41.86 376.22 C 41.86 375.74 41.46 375.36 40.96 375.36 L 39.87 375.36 L 39.87 371.79 L 48.97 371.79 L 48.97 375.36 L 47.88 375.36 C 47.38 375.36 46.98 375.74 46.98 376.22 L 46.98 380.12 C 46.98 380.59 47.38 380.97 47.88 380.97 L 52.75 380.97 C 53.24 380.97 53.65 380.59 53.65 380.12 L 53.65 376.22 C 53.65 375.74 53.24 375.36 52.75 375.36 Z M 29.2 361.12 C 29.2 359.65 30.46 358.44 32.01 358.44 L 32.04 358.44 C 32.05 358.44 32.06 358.44 32.08 358.44 C 32.08 358.44 32.08 358.44 32.09 358.44 C 32.14 358.45 32.18 358.45 32.23 358.45 C 32.88 358.45 33.63 358.02 33.73 357.1 C 33.98 354.93 35.89 353.3 38.17 353.3 C 40.64 353.3 42.64 355.21 42.64 357.56 L 42.64 357.62 C 42.64 357.63 42.64 357.64 42.64 357.65 C 42.61 358.08 42.74 358.47 43.02 358.77 C 43.31 359.07 43.71 359.24 44.13 359.24 C 44.29 359.24 44.44 359.22 44.59 359.17 C 44.84 359.1 45.1 359.06 45.37 359.06 C 46.74 359.06 47.86 360.12 47.86 361.44 C 47.86 362.75 46.74 363.82 45.37 363.82 C 45.31 363.82 43.88 363.82 42.47 363.82 C 41.05 363.81 39.63 363.81 39.59 363.81 L 32.01 363.81 C 30.46 363.81 29.2 362.61 29.2 361.12 Z" fill="#595959" stroke="none" stroke-width="1"/>
+        <text x="72.54" y="370.05" text-anchor="start" xml:space="preserve" data-nav-label="inactive" data-nav-index="3"><tspan>材料与方法</tspan></text>
+      </g>
+      <g id="nav-inactive-item-4" data-nav-index="4" data-nav-icon="results-analysis">
+        <path d="M 42.31 437.74 L 27.19 437.74 C 25.11 437.74 23.43 439.1 23.43 440.76 L 23.41 464.95 C 23.41 466.61 25.09 467.98 27.17 467.98 L 49.87 467.98 C 51.95 467.98 53.65 466.61 53.65 464.95 L 53.65 446.81 L 42.31 437.74 Z M 46.09 461.93 L 30.97 461.93 L 30.97 458.9 L 46.09 458.9 L 46.09 461.93 Z M 46.09 455.88 L 30.97 455.88 L 30.97 452.86 L 46.09 452.86 L 46.09 455.88 Z M 40.42 448.32 L 40.42 440.01 L 50.81 448.32 L 40.42 448.32 Z" fill="#595959" stroke="none" stroke-width="1"/>
+        <text x="72.54" y="457.05" text-anchor="start" xml:space="preserve" data-nav-label="inactive" data-nav-index="4"><tspan>结果与分析</tspan></text>
+      </g>
+      <g id="nav-inactive-item-5" data-nav-index="5" data-nav-icon="conclusion-discussion">
+        <path d="M 27.75 551.83 C 27.36 551.83 26.98 551.73 26.64 551.54 C 25.91 551.14 25.45 550.34 25.45 549.47 L 25.45 547 C 22.19 544.64 20.26 541.03 20.26 537.22 C 20.26 530.34 26.41 524.74 33.97 524.74 C 41.53 524.74 47.68 530.34 47.68 537.22 C 47.68 544.1 41.53 549.7 33.97 549.7 C 33.26 549.7 32.53 549.64 31.8 549.53 L 30.68 550.3 C 30.63 550.34 30.57 550.38 30.52 550.42 L 29.01 551.44 C 28.63 551.7 28.19 551.83 27.75 551.83 Z M 33.97 526.78 C 27.51 526.78 22.25 531.47 22.25 537.22 C 22.25 540.51 24.02 543.63 26.98 545.6 L 27.43 545.9 L 27.43 549.47 C 27.43 549.59 27.49 549.69 27.59 549.75 C 27.71 549.81 27.82 549.8 27.92 549.73 L 31.34 547.39 L 31.73 547.46 C 32.49 547.59 33.25 547.66 33.97 547.66 C 40.43 547.66 45.69 542.98 45.69 537.22 C 45.69 531.47 40.44 526.78 33.97 526.78 Z M 49.12 538.34 C 49.14 538.64 49.17 538.94 49.17 539.25 C 49.17 540.59 48.94 541.88 48.5 543.09 C 48.5 543.12 48.51 543.16 48.51 543.2 C 48.51 545.73 47.14 548.14 44.86 549.65 L 44.4 549.95 L 44.38 552.94 C 44.38 552.94 44.37 552.94 44.37 552.94 L 41.56 551.03 L 41.18 551.1 C 40.58 551.2 40 551.25 39.44 551.25 C 39.36 551.25 39.29 551.24 39.21 551.24 C 38.02 551.55 36.77 551.73 35.47 551.73 C 34.75 551.73 34.02 551.68 33.29 551.57 L 33.27 551.58 C 35.03 552.66 37.16 553.29 39.44 553.29 C 39.98 553.29 40.55 553.25 41.11 553.17 L 41.92 553.72 C 41.97 553.76 42.01 553.8 42.05 553.82 L 43.25 554.64 C 43.59 554.86 43.97 554.98 44.37 554.98 C 44.71 554.98 45.04 554.89 45.33 554.73 C 45.98 554.37 46.39 553.67 46.39 552.9 L 46.39 551.05 C 48.97 549.14 50.5 546.25 50.5 543.2 C 50.5 541.44 50 539.78 49.12 538.34 Z" fill="#595959" stroke="none" stroke-width="1"/>
+        <text x="72.54" y="544.06" text-anchor="start" xml:space="preserve" data-nav-label="inactive" data-nav-index="5"><tspan>结论与讨论</tspan></text>
+      </g>
+    </g>
+
+    <g id="nav-active-state" data-active-index="1" data-active-section="{{ACTIVE_SECTION}}" data-active-icon="research-background">
+      <rect id="nav-active-band" x="0" y="159.13" width="291.05" height="65.42" fill="#8B0012"/>
+      <g id="nav-active-fold">
+        <polygon id="nav-active-pointer" points="291.04,224.54 252.90,224.54 252.90,241.13" fill="#68000D" stroke="none" stroke-width="1"/>
+      </g>
+      <path id="nav-active-icon" data-icon-id="research-background" d="M 47.18 201.94 L 38.71 193.47 C 40.99 189.46 40.42 184.25 37 180.83 C 32.9 176.72 26.23 176.72 22.13 180.83 C 18.02 184.93 18.02 191.6 22.13 195.7 C 25.55 199.12 30.76 199.69 34.77 197.41 L 43.24 205.88 C 44.32 206.96 46.09 206.96 47.18 205.88 C 48.26 204.79 48.26 203.02 47.18 201.94 Z M 34.91 193.61 C 31.96 196.55 27.17 196.55 24.22 193.61 C 21.27 190.66 21.27 185.87 24.22 182.92 C 27.17 179.98 31.96 179.98 34.91 182.92 C 37.85 185.87 37.85 190.66 34.91 193.61 Z" fill="#FFFFFF" stroke="none" stroke-width="1"/>
+      <text id="nav-active-label" x="72.54" y="201.55" text-anchor="start" xml:space="preserve" font-family="微软雅黑, Microsoft YaHei, sans-serif" font-size="26.67" fill="#FFFFFF" font-weight="bold" letter-spacing="4" data-slot="ACTIVE_SECTION_LABEL" data-slot-token="{{ACTIVE_SECTION_LABEL}}" data-pptx-box-x="72.54" data-pptx-box-y="159.13" data-pptx-box-w="202" data-pptx-box-h="65.42" data-pptx-valign="middle" data-pptx-textbox="true"><tspan>研究背景</tspan></text>
+    </g>
+  </g>
+
+  <g id="content-header">
+    <g id="title-marker">
+      <polygon points="360,62 332,78 332,46" fill="#8B0012"/>
+    </g>
+    <text x="392" y="72.4" text-anchor="start" xml:space="preserve" font-family="微软雅黑, Microsoft YaHei, sans-serif" font-size="32" fill="#000000" font-weight="bold" data-slot="PAGE_TITLE" data-pptx-box-x="388" data-pptx-box-y="40" data-pptx-box-w="620" data-pptx-box-h="44" data-pptx-valign="middle" data-pptx-textbox="true"><tspan>{{PAGE_TITLE}}</tspan></text>
+    <rect id="header-separator" x="310" y="90" width="910" height="2.4" fill="#8B0012"/>
+  </g>
+
+  <g id="key-message">
+    <rect x="310" y="112" width="910" height="48" rx="4" ry="4" fill="#F8F2F3" stroke="#8B0012" stroke-width="1" stroke-opacity="0.18"/>
+    <rect x="310" y="112" width="7" height="48" fill="#8B0012"/>
+    <text x="334" y="142.5" text-anchor="start" xml:space="preserve" font-family="微软雅黑, Microsoft YaHei, sans-serif" font-size="20" fill="#3A0008" font-weight="bold" data-slot="KEY_MESSAGE" data-pptx-box-x="334" data-pptx-box-y="120" data-pptx-box-w="862" data-pptx-box-h="32" data-pptx-valign="middle" data-pptx-textbox="true"><tspan>{{KEY_MESSAGE}}</tspan></text>
+  </g>
+
+  <g id="body-region">
+    <rect id="content-area" data-slot="CONTENT_AREA" x="310" y="210" width="910" height="440" rx="12" ry="12" fill="none" stroke="none"/>
+    <text x="334" y="252" text-anchor="start" xml:space="preserve" font-family="微软雅黑 Light, Microsoft YaHei, sans-serif" font-size="23" fill="#000000" data-slot="CONTENT_BODY" data-pptx-box-x="334" data-pptx-box-y="230" data-pptx-box-w="862" data-pptx-box-h="390" data-pptx-textbox="true" data-pptx-valign="top"><tspan>{{CONTENT_BODY}}</tspan></text>
+  </g>
+</svg>

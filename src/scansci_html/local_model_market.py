@@ -27,6 +27,7 @@ _CURATED = (
     {"id": "Qwen/Qwen3-4B-Instruct-2507", "name": "Qwen3 4B Instruct", "kind": "chat", "gpu": "recommended", "size_hint": "约 8 GB", "description": "更强的本地推理与写作能力。"},
     {"id": "Qwen/Qwen3-Embedding-0.6B", "name": "Qwen3 Embedding 0.6B", "kind": "embedding", "gpu": "cpu", "size_hint": "约 1 GB", "description": "中文与英文语义检索。"},
     {"id": "Qwen/Qwen3-Reranker-0.6B", "name": "Qwen3 Reranker 0.6B", "kind": "reranking", "gpu": "cpu", "size_hint": "约 1 GB", "description": "提升资料库检索排序质量。"},
+    {"id": "Qwen/Qwen3-Reranker-4B", "name": "Qwen3 Reranker 4B（推荐）", "kind": "reranking", "gpu": "recommended", "size_hint": "约 8 GB / 4-bit 约 4 GB", "description": "更强检索重排序；GPU 下自动加载 4-bit 量化，质量接近全量。"},
     {"id": QWEN3_ASR_NATIVE_MODEL_ID, "name": "Qwen3 ASR 0.6B（Transformers 原生）", "kind": "audio", "gpu": "recommended", "size_hint": "约 2 GB", "description": "本地语音转写；使用 Transformers 原生格式，下载后可由 ScanSci 直接运行。"},
     {"id": "openbmb/MiniCPM-V-4.6-BNB", "name": "MiniCPM-V 4.6（BNB 4-bit）", "kind": "vision", "runtime": "local-huggingface", "gpu": "required", "size_hint": "约 1.1 GB", "description": "需要 NVIDIA 显卡的 4-bit 视觉模型；ScanSci 可通过本地 Transformers 运行。"},
     {"id": "openbmb/MiniCPM-V-4.6-GPTQ", "name": "MiniCPM-V 4.6（GPTQ）", "kind": "vision", "runtime": "local-huggingface", "gpu": "required", "size_hint": "约 1.9 GB", "description": "需要 NVIDIA 显卡的 GPTQ 4-bit 视觉模型；需要兼容 GPTQModel 的本地运行环境。"},
@@ -346,11 +347,17 @@ def market_catalog(query: str = "", *, limit: int = 30) -> dict[str, Any]:
             )
         ]
     try:
-        # The no-query view is intentionally broad; curated rows are merged to
-        # retain reliable small embedding, reranking, audio, and vision
-        # recommendations. Matching curated rows remain visible when the user
-        # searches, so the native ASR checkpoint is not hidden by a remote
-        # result with the legacy Qwen3-ASR name.
+        # The initial view is intentionally curated and offline-friendly.  A
+        # remote Hugging Face catalog probe is only useful after the user has
+        # entered a search term, and otherwise adds avoidable latency on
+        # mainland-China networks.
+        if not clean:
+            return {"items": _merge_catalog(curated_rows, installed, clean), "source": "curated"}
+        # Curated rows are merged into search results to retain reliable small
+        # embedding, reranking, audio, and vision recommendations. Matching
+        # curated rows remain visible when the user searches, so the native ASR
+        # checkpoint is not hidden by a remote result with the legacy
+        # Qwen3-ASR name.
         remote = _remote_catalog(clean, limit)
         rows = [*curated_rows, *remote]
         return {"items": _merge_catalog(rows, installed, clean), "source": "curated" if not clean else "huggingface"}

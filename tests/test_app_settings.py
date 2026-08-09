@@ -201,6 +201,12 @@ def test_provider_and_local_runtime_presets_are_credential_free():
     assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp", "local-huggingface"}
 
 
+def test_ollama_minicpm_preset_is_optional_when_transformers_is_the_default_local_route():
+    runtimes = {item["id"]: item for item in local_model_presets()}
+
+    assert runtimes["ollama-minicpm-v4.6"]["enabled"] is False
+
+
 def test_provider_catalog_includes_cherry_documented_and_desktop_services():
     providers = {item["id"]: item for item in provider_presets()}
 

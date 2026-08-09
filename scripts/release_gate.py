@@ -23,7 +23,7 @@ from threading import Thread
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +187,27 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
     runtime_manifest_url = str(package.get("runtime_manifest_url", "")).strip()
     if runtime_manifest_url and urlparse(runtime_manifest_url).scheme.lower() != "https":
         raise GateFailure("package runtime_manifest_url must use HTTPS")
+    for key in ("node_component_manifest_url", "tectonic_component_manifest_url"):
+        component_manifest_url = str(package.get(key, "")).strip()
+        parsed_component_manifest = urlparse(component_manifest_url)
+        if component_manifest_url and (
+            parsed_component_manifest.scheme.lower() != "https" or not parsed_component_manifest.netloc
+        ):
+            raise GateFailure(f"package {key} must use HTTPS")
+    if (
+        str(package.get("profile", "")).strip().casefold() == "core"
+        and bool(package.get("exclude_runtimes", False))
+    ):
+        missing_component_channels = [
+            key
+            for key in ("node_component_manifest_url", "tectonic_component_manifest_url")
+            if not str(package.get(key, "")).strip()
+        ]
+        if missing_component_channels:
+            raise GateFailure(
+                "A lightweight core package requires separately downloadable runtime components: "
+                + ", ".join(missing_component_channels)
+            )
     update_manifest_url = str(package.get("update_manifest_url", "")).strip()
     if update_manifest_url and urlparse(update_manifest_url).scheme.lower() != "https":
         raise GateFailure("package update_manifest_url must use HTTPS")
@@ -683,6 +704,107 @@ class ReleaseGate:
 
         return self.profile == "release" and bool(self.contract["package"].get("signature_required", False))
 
+    @property
+    def requires_runtime_component_channels(self) -> bool:
+        """Whether a slim desktop release depends on external binary components."""
+
+        package = dict(self.contract.get("package", {}) or {})
+        return (
+            self.is_packaged_profile
+            and str(package.get("profile", "")).strip().casefold() == "core"
+            and bool(package.get("exclude_runtimes", False))
+        )
+
+    @staticmethod
+    def _runtime_component_record(manifest: dict[str, Any], component_id: str) -> dict[str, Any]:
+        if str(manifest.get("id", "")).strip() == component_id:
+            return manifest
+        components = manifest.get("components")
+        if isinstance(components, dict) and isinstance(components.get(component_id), dict):
+            return dict(components[component_id])
+        raise GateFailure(f"Runtime component manifest does not contain {component_id!r}")
+
+    @staticmethod
+    def _validate_component_asset(component_id: str, record: dict[str, Any]) -> list[str]:
+        version = str(record.get("version", "")).strip()
+        windows = record.get("windows")
+        if not version or not isinstance(windows, dict):
+            raise GateFailure(f"Runtime component {component_id!r} is missing version or Windows package metadata")
+        overall_checksum = str(windows.get("sha256", "")).strip()
+        try:
+            overall_size = int(windows.get("size", 0))
+        except (TypeError, ValueError) as error:
+            raise GateFailure(f"Runtime component {component_id!r} package has an invalid size") from error
+        if not re.fullmatch(r"[A-Fa-f0-9]{64}", overall_checksum) or overall_size <= 0:
+            raise GateFailure(f"Runtime component {component_id!r} package is missing SHA256 or size")
+
+        def validate_download(download: dict[str, Any], label: str) -> str:
+            url = str(download.get("url", "")).strip()
+            parsed = urlparse(url)
+            checksum = str(download.get("sha256", "")).strip()
+            try:
+                size = int(download.get("size", 0))
+            except (TypeError, ValueError) as error:
+                raise GateFailure(f"Runtime component {component_id!r} {label} has an invalid size") from error
+            if parsed.scheme.lower() != "https" or not parsed.netloc:
+                raise GateFailure(f"Runtime component {component_id!r} {label} must use HTTPS")
+            if not re.fullmatch(r"[A-Fa-f0-9]{64}", checksum) or size <= 0:
+                raise GateFailure(f"Runtime component {component_id!r} {label} is missing SHA256 or size")
+            return url
+
+        parts = windows.get("parts")
+        if isinstance(parts, list) and parts:
+            if not all(isinstance(part, dict) for part in parts):
+                raise GateFailure(f"Runtime component {component_id!r} has an invalid multipart package")
+            return [validate_download(dict(part), f"part {index}") for index, part in enumerate(parts, start=1)]
+        return [validate_download(windows, "package")]
+
+    def verify_runtime_component_channels(self) -> dict[str, Any]:
+        """Prove that every binary removed from the core has a usable release channel."""
+
+        package = dict(self.contract.get("package", {}) or {})
+        manifests = {
+            "node": str(package.get("node_component_manifest_url", "")).strip(),
+            "tectonic": str(package.get("tectonic_component_manifest_url", "")).strip(),
+        }
+        verified: dict[str, Any] = {}
+        for component_id, manifest_url in manifests.items():
+            try:
+                request = Request(manifest_url, headers={"User-Agent": "ScanSci-release-gate/1"})
+                with urlopen(request, timeout=20) as response:
+                    payload = json.loads(response.read().decode("utf-8-sig"))
+            except Exception as error:
+                raise GateFailure(
+                    f"Runtime component manifest is unavailable for {component_id}: {manifest_url} ({error})"
+                ) from error
+            if not isinstance(payload, dict):
+                raise GateFailure(f"Runtime component manifest for {component_id} must be a JSON object")
+            record = self._runtime_component_record(payload, component_id)
+            asset_urls = self._validate_component_asset(component_id, record)
+            # Probe each immutable asset without downloading it. A valid JSON
+            # file that points to a missing ZIP is still a broken release.
+            for asset_url in asset_urls:
+                try:
+                    request = Request(
+                        asset_url,
+                        method="HEAD",
+                        headers={"User-Agent": "ScanSci-release-gate/1"},
+                    )
+                    with urlopen(request, timeout=20) as response:
+                        status = int(response.getcode() or 200)
+                    if status >= 400:
+                        raise GateFailure(f"HTTP {status}")
+                except Exception as error:
+                    raise GateFailure(
+                        f"Runtime component asset is unavailable for {component_id}: {asset_url} ({error})"
+                    ) from error
+            verified[component_id] = {
+                "manifest_url": manifest_url,
+                "version": str(record.get("version", "")).strip(),
+                "asset_count": len(asset_urls),
+            }
+        return {"components": verified}
+
     def build_desktop(self) -> None:
         previous = self._previous("build-desktop")
         if self.package_dir.exists() and not (previous and previous.get("status") == "passed"):
@@ -720,6 +842,12 @@ class ReleaseGate:
         runtime_manifest_url = str(package.get("runtime_manifest_url", "")).strip()
         if runtime_manifest_url:
             command.extend(["-RuntimeManifestUrl", runtime_manifest_url])
+        node_component_manifest_url = str(package.get("node_component_manifest_url", "")).strip()
+        if node_component_manifest_url:
+            command.extend(["-NodeComponentManifestUrl", node_component_manifest_url])
+        tectonic_component_manifest_url = str(package.get("tectonic_component_manifest_url", "")).strip()
+        if tectonic_component_manifest_url:
+            command.extend(["-TectonicComponentManifestUrl", tectonic_component_manifest_url])
         if bool(package.get("exclude_runtimes", False)):
             command.append("-ExcludeRuntimes")
         # PyInstaller's full profile emits a long analysis log. Keep it in the
@@ -757,6 +885,10 @@ class ReleaseGate:
         expected_runtime_manifest = str(self.contract["package"].get("runtime_manifest_url", "")).strip()
         if expected_runtime_manifest and str(build_info.get("runtime_manifest_url", "")).strip() != expected_runtime_manifest:
             raise GateFailure("Packaged build-info.json does not match the runtime component manifest")
+        for key in ("node_component_manifest_url", "tectonic_component_manifest_url"):
+            expected_component_manifest = str(self.contract["package"].get(key, "")).strip()
+            if expected_component_manifest and str(build_info.get(key, "")).strip() != expected_component_manifest:
+                raise GateFailure(f"Packaged build-info.json does not match {key}")
         if str(build_info.get("release_source_sha256", "")).casefold() != self.source_sha256.casefold():
             raise GateFailure("Packaged build-info.json is not bound to the source fingerprint that passed this gate")
         package_bytes = sum(path.stat().st_size for path in self.package_dir.rglob("*") if path.is_file())
@@ -773,7 +905,11 @@ class ReleaseGate:
                 {
                     path.relative_to(internal).as_posix()
                     for path in internal.rglob("*")
-                    if any(segment.casefold() in CORE_RUNTIME_FORBIDDEN_SEGMENTS for segment in path.relative_to(internal).parts)
+                    if any(
+                        segment.casefold() in CORE_RUNTIME_FORBIDDEN_SEGMENTS
+                        or segment.casefold().startswith("models--")
+                        for segment in path.relative_to(internal).parts
+                    )
                 }
             )
             forbidden.extend(bundled_runtime)
@@ -1202,6 +1338,8 @@ class ReleaseGate:
         steps = ["scope-contract"]
         if self.profile == "release":
             steps.append("signing-environment")
+        if self.requires_runtime_component_channels:
+            steps.append("runtime-component-channels")
         groups = ["targeted_commands"]
         if self.profile in {"source", "beta", "release"}:
             groups.extend(["full_commands", "real_verifications"])
@@ -1246,6 +1384,12 @@ class ReleaseGate:
                     "signing-environment",
                     "正式版签名环境预检",
                     self.signing_environment,
+                )
+            if self.requires_runtime_component_channels:
+                self.internal_step(
+                    "runtime-component-channels",
+                    "独立运行组件下载通道",
+                    self.verify_runtime_component_channels,
                 )
             self.run_configured_commands("targeted_commands")
             if self.profile in {"source", "beta", "release"}:

@@ -1,0 +1,18 @@
+{
+  "schema_version": "easyslides.template.v1",
+  "template_id": "defense_leftnav",
+  "name": "Defense Leftnav",
+  "source_template": "retired_full_defense_roster",
+  "mode": "classic",
+  "distillation_model": "compact_shells_plus_body_variants",
+  "description": "Compact burgundy left-navigation thesis defense template with dynamic active-section highlighting and componentized body-area styles.",
+  "files": {
+    "design_spec": "design_spec.md",
+    "layouts": "layouts.json",
+    "navigation_states": "navigation_states.json",
+    "body_variants": "body_variants.json",
+    "component_styles": "component_styles.json",
+    "theme_palettes": "theme_palettes.json",
+    "rules": "rules.md"
+  }
+}

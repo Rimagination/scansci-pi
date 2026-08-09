@@ -64,6 +64,7 @@ interface NormalizedTaskContract {
   maxToolBudget: number;
   recoveryBudget: number;
   modelTokenBudget: number;
+  maxModelTokenBudget: number;
   allowExternalWrite: boolean;
   taskProfile: JsonRecord;
 }
@@ -97,8 +98,13 @@ interface ActiveRun {
   askUserCount: number;
   modelTokens: number;
   modelTokenBudget: number;
+  maxModelTokenBudget: number;
   modelTokenBudgetExceeded: boolean;
 }
+
+const PROVIDER_CONTEXT_WINDOW = 128_000;
+const PROVIDER_COMPACTION_RESERVE = 16_384;
+const PROVIDER_INPUT_LIMIT = PROVIDER_CONTEXT_WINDOW - PROVIDER_COMPACTION_RESERVE;
 
 interface PendingTool {
   requestId: string;
@@ -227,7 +233,7 @@ function classifyError(error: unknown): JsonRecord {
   if (normalized.includes("model-token budget") || normalized.includes("model token budget")) {
     return {
       code: "agent_token_budget_exhausted",
-      message: "本轮已达到模型 token 安全预算。ScanSci 已停止继续请求，并保留成功的工具结果。",
+      message: "本轮累计请求已达到异常消耗保护上限。ScanSci 已停止继续请求，并保留成功的工具结果。",
       retryable: true,
       recovery_actions: [
         { id: "follow_up", label: "基于已有结果回答", kind: "follow_up" },
@@ -654,6 +660,18 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
       String(request.task_mode || "general"),
       finalUserRequestText(request.prompt || ""),
     );
+  const tokenLease = boundedInteger(
+    raw.model_token_budget,
+    modelTokenBudget(String(request.task_mode || "general")),
+    16_000,
+    768_000,
+  );
+  const maxTokenLease = boundedInteger(
+    raw.max_model_token_budget,
+    maxModelTokenBudget(String(request.task_mode || "general")),
+    tokenLease,
+    1_000_000,
+  );
   return {
     contractId: String(raw.contract_id || `legacy-${request.request_id}`),
     goal: String(raw.goal || finalUserRequestText(request.prompt || "")).slice(0, 1200),
@@ -683,12 +701,8 @@ function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
     initialToolBudget,
     maxToolBudget,
     recoveryBudget: boundedInteger(raw.recovery_budget, 2, 1, 4),
-    modelTokenBudget: boundedInteger(
-      raw.model_token_budget,
-      modelTokenBudget(String(request.task_mode || "general")),
-      4_000,
-      64_000,
-    ),
+    modelTokenBudget: tokenLease,
+    maxModelTokenBudget: maxTokenLease,
     allowExternalWrite: raw.allow_external_write === true,
     taskProfile: raw.task_profile && typeof raw.task_profile === "object"
       ? raw.task_profile as JsonRecord
@@ -1637,7 +1651,7 @@ function tools(
     "zotero-search": new Set(["zotero_search"]),
     "task-documents": new Set(["read_task_documents", "summarize_documents", "check_task_completion", "self_assess"]),
     "web-auto": new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
-    web: new Set(["search_web", "agent_reach", "browser_access", "self_assess"]),
+    web: new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
     // The verified-answer endpoint has one mandatory terminal action. Keeping
     // only this composite tool prevents small/text-only models from spending
     // their bounded generation window on an intermediate search and stopping.
@@ -1677,40 +1691,37 @@ function evidencePolicy(taskMode: string): "off" | "assist" | "strict" {
 function toolCallBudget(taskMode: string): number {
   const parts = new Set(String(taskMode || "general").split("+").filter(Boolean));
   if (parts.has("research") || parts.has("slides")) return 6;
-  if (parts.has("knowledge") || parts.has("task-documents")) return 4;
-  if (parts.has("web") || parts.has("web-auto")) return 3;
-  if (parts.has("workspace-status") || parts.has("zotero-status") || parts.has("zotero-search")) return 2;
-  return 2;
+  if (parts.has("knowledge") || parts.has("task-documents")) return 5;
+  if (parts.has("web") || parts.has("web-auto")) return 4;
+  return 3;
 }
 
 function modelOutputBudget(taskMode: string): number {
   const parts = new Set(String(taskMode || "general").split("+").filter(Boolean));
-  if (parts.has("research") || parts.has("slides")) return 4096;
-  if (parts.has("knowledge") || parts.has("task-documents")) return 3072;
-  if (parts.has("web") || parts.has("web-auto")) return 2048;
-  return 1536;
+  if (parts.has("research") || parts.has("slides")) return 8192;
+  if (parts.has("knowledge") || parts.has("task-documents")) return 6144;
+  if (parts.has("web") || parts.has("web-auto")) return 4096;
+  return 2048;
 }
 
 function modelTokenBudget(taskMode: string): number {
   const parts = new Set(String(taskMode || "general").split("+").filter(Boolean));
-  if (parts.has("research") || parts.has("slides")) return 48_000;
-  if (parts.has("knowledge") || parts.has("task-documents")) return 32_000;
-  if (parts.has("web") || parts.has("web-auto")) return 24_000;
-  if (parts.has("workspace-status") || parts.has("zotero-status") || parts.has("zotero-search")) return 12_000;
-  return 12_000;
+  if (parts.has("research") || parts.has("slides")) return 192_000;
+  if (parts.has("knowledge") || parts.has("task-documents")) return 128_000;
+  if (parts.has("web") || parts.has("web-auto")) return 96_000;
+  return 48_000;
 }
 
-function providerInputBudget(taskMode: string): number {
+function maxModelTokenBudget(taskMode: string): number {
   const parts = new Set(String(taskMode || "general").split("+").filter(Boolean));
-  if (parts.has("research") || parts.has("slides")) return 48_000;
-  if (parts.has("knowledge") || parts.has("task-documents")) return 32_000;
-  if (parts.has("web") || parts.has("web-auto")) return 24_000;
-  return 12_000;
+  if (parts.has("research") || parts.has("slides")) return 768_000;
+  if (parts.has("knowledge") || parts.has("task-documents")) return 512_000;
+  if (parts.has("web") || parts.has("web-auto")) return 384_000;
+  return 192_000;
 }
 
-function guardProviderRequest(payload: unknown, taskMode: string): unknown {
+function guardProviderRequest(payload: unknown, budget: number): unknown {
   const estimatedTokens = estimateProviderInputTokens(payload);
-  const budget = providerInputBudget(taskMode);
   if (estimatedTokens > budget) {
     throw new Error(
       `Provider input budget exceeded before network request: estimated ${estimatedTokens} tokens ` +
@@ -1789,7 +1800,7 @@ function systemPrompt(request: RunStart): string {
   const artifactRule = hasMode("slides")
     ? "This request also requires a real artifact. Call the matching create_* or compile_latex tool, use retrieved/document evidence as its content, and report only the verified file_path returned by the tool. An outline or filename invented in prose is not delivery."
     : "";
-  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Call ONE tool at a time. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. The hard cumulative model-token ceiling is ${contract.modelTokenBudget}. Avoid repeating equivalent searches and deliver the best truthful partial result before the lease is exhausted.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
+  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Call ONE tool at a time. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
 }
 
 function looksLikeDeferredAnswer(text: string): boolean {
@@ -1850,6 +1861,7 @@ function taskContractSessionSignature(request: RunStart): JsonRecord {
     maxToolBudget: contract.maxToolBudget,
     recoveryBudget: contract.recoveryBudget,
     modelTokenBudget: contract.modelTokenBudget,
+    maxModelTokenBudget: contract.maxModelTokenBudget,
     allowExternalWrite: contract.allowExternalWrite,
   };
 }
@@ -1896,6 +1908,7 @@ async function createSession(
 ): Promise<SessionState> {
   const apiKey = process.env.SCANSCIPI_PROVIDER_KEY || "";
   if (!apiKey) throw new Error("Provider API key is unavailable");
+  const taskContract = normalizeTaskContract(request);
   const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
   runtime.registerProvider("scansci-pi", {
     name: "ScanSci Pi provider",
@@ -1908,7 +1921,7 @@ async function createSession(
       reasoning: thinkingLevel(request.thinking_level) !== "off",
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
+      contextWindow: PROVIDER_CONTEXT_WINDOW,
       maxTokens: modelOutputBudget(String(request.task_mode || "general")),
       compat: modelCompat(request),
     }],
@@ -1929,14 +1942,13 @@ async function createSession(
           const payload = providerApi(request.provider_kind, request.api_surface) === "openai-completions"
             ? normalizeTextOnlyOpenAIRequest(event.payload)
             : event.payload;
-          return guardProviderRequest(payload, String(request.task_mode || "general"));
+          return guardProviderRequest(payload, PROVIDER_INPUT_LIMIT);
         });
       },
     }],
   });
   await loader.reload();
   const external = await externalMcpTools(request);
-  const taskContract = normalizeTaskContract(request);
   const customTools = tools(
     String(request.task_mode || "general"),
     external.tools,
@@ -1986,8 +1998,52 @@ async function createSession(
   };
   state.unsubscribe = state.session.subscribe((event) => {
     const requestId = state.currentRequestId || "";
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+    if (event.type === "agent_start") {
+      emit({ type: "agent.started", request_id: requestId, session_id: request.session_id });
+    } else if (event.type === "turn_start") {
+      emit({ type: "agent.turn_started", request_id: requestId, session_id: request.session_id });
+    } else if (event.type === "message_start") {
+      emit({
+        type: "agent.message_started",
+        request_id: requestId,
+        session_id: request.session_id,
+        role: String(event.message.role || ""),
+      });
+    } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       emit({ type: "message.delta", request_id: requestId, delta: event.assistantMessageEvent.delta });
+    } else if (event.type === "message_end") {
+      emit({
+        type: "agent.message_completed",
+        request_id: requestId,
+        session_id: request.session_id,
+        role: String(event.message.role || ""),
+      });
+    } else if (event.type === "turn_end") {
+      emit({
+        type: "agent.turn_completed",
+        request_id: requestId,
+        session_id: request.session_id,
+        role: String(event.message.role || ""),
+        tool_result_count: event.toolResults.length,
+      });
+    } else if (event.type === "agent_end") {
+      emit({
+        type: "agent.completed",
+        request_id: requestId,
+        session_id: request.session_id,
+        will_retry: event.willRetry,
+      });
+    } else if (event.type === "agent_settled") {
+      emit({ type: "agent.settled", request_id: requestId, session_id: request.session_id });
+    } else if (event.type === "queue_update") {
+      emit({
+        type: "agent.queue_updated",
+        request_id: requestId,
+        session_id: request.session_id,
+        steering: [...event.steering],
+        follow_up: [...event.followUp],
+        pending_count: event.steering.length + event.followUp.length,
+      });
     } else if (event.type === "tool_execution_start") {
       emit({ type: "status.update", request_id: requestId, status: "tool_started", name: event.toolName });
     } else if (event.type === "tool_execution_end") {
@@ -2073,6 +2129,7 @@ async function run(request: RunStart): Promise<void> {
     askUserCount: 0,
     modelTokens: 0,
     modelTokenBudget: taskContract.modelTokenBudget,
+    maxModelTokenBudget: Math.max(taskContract.modelTokenBudget, taskContract.maxModelTokenBudget),
     modelTokenBudgetExceeded: false,
   };
   activeRuns.set(runState.requestId, runState);
@@ -2102,7 +2159,26 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
       if (event.type === "auto_retry_start") lastRetryError = event.errorMessage;
       if (event.type === "message_end" && event.message.role === "assistant") {
         runState.modelTokens += freshUsageTokens(event.message.usage);
-        if (runState.modelTokens > runState.modelTokenBudget && !runState.modelTokenBudgetExceeded) {
+        if (runState.modelTokens > runState.modelTokenBudget && runState.modelTokenBudget < runState.maxModelTokenBudget) {
+          const previousBudget = runState.modelTokenBudget;
+          runState.modelTokenBudget = Math.min(
+            runState.maxModelTokenBudget,
+            Math.max(previousBudget * 2, runState.modelTokens + PROVIDER_COMPACTION_RESERVE),
+          );
+          emit({
+            type: "status.update",
+            request_id: request.request_id,
+            status: "model_budget_extended",
+            name: "progressive_token_lease",
+            details: {
+              previous_budget: previousBudget,
+              current_budget: runState.modelTokenBudget,
+              max_budget: runState.maxModelTokenBudget,
+              used_tokens: runState.modelTokens,
+            },
+          });
+        }
+        if (runState.modelTokens > runState.maxModelTokenBudget && !runState.modelTokenBudgetExceeded) {
           runState.modelTokenBudgetExceeded = true;
           void state?.session.abort();
         }
@@ -2132,6 +2208,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         initial_tool_budget: runState.taskContract.initialToolBudget,
         max_tool_budget: runState.taskContract.maxToolBudget,
         model_token_budget: runState.taskContract.modelTokenBudget,
+        max_model_token_budget: runState.taskContract.maxModelTokenBudget,
       },
       prefix_shape: state.prefixShape,
       context_policy: request.context_policy || {},
@@ -2147,7 +2224,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         if (runState.modelTokenBudgetExceeded) {
           throw new Error(
             `Model-token budget exhausted after ${runState.modelTokens} tokens ` +
-            `(limit ${runState.modelTokenBudget}).`,
+            `(emergency limit ${runState.maxModelTokenBudget}).`,
           );
         }
         throw error;
@@ -2155,7 +2232,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
       if (runState.modelTokenBudgetExceeded) {
         throw new Error(
           `Model-token budget exhausted after ${runState.modelTokens} tokens ` +
-          `(limit ${runState.modelTokenBudget}).`,
+          `(emergency limit ${runState.maxModelTokenBudget}).`,
         );
       }
       let previousProgressSignature: string | undefined;
@@ -2222,7 +2299,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         if (runState.modelTokenBudgetExceeded) {
           throw new Error(
             `Model-token budget exhausted after ${runState.modelTokens} tokens ` +
-            `(limit ${runState.modelTokenBudget}).`,
+            `(emergency limit ${runState.maxModelTokenBudget}).`,
           );
         }
       }
@@ -2257,6 +2334,9 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         tool_call_budget: runState.toolCallBudget,
         max_tool_call_budget: runState.maxToolCallBudget,
         successful_tool_calls: runState.successfulToolCalls,
+        model_tokens: runState.modelTokens,
+        model_token_budget: runState.modelTokenBudget,
+        max_model_token_budget: runState.maxModelTokenBudget,
       },
     });
   } catch (error) {
@@ -2266,7 +2346,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
       const effectiveError = runState.modelTokenBudgetExceeded
         ? new Error(
             `Model-token budget exhausted after ${runState.modelTokens} tokens ` +
-            `(limit ${runState.modelTokenBudget}).`,
+            `(emergency limit ${runState.maxModelTokenBudget}).`,
           )
         : error;
       const failure = classifyError(effectiveError);

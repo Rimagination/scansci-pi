@@ -609,6 +609,7 @@ def test_evidence_quality_audit_rejects_oversized_fragments(tmp_path: Path):
     quality = assess_evidence_structure(db_path, max_span_characters=1_200)
 
     assert quality["passed"] is False
+    assert quality["claim_ready"] is True
     assert quality["oversized_spans"] == 1
     assert quality["issues"][0]["type"] == "oversized_span"
 

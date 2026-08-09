@@ -209,7 +209,10 @@ _LOCAL_MODEL_PRESETS: list[dict[str, Any]] = [
         "base_url": "http://127.0.0.1:11434/v1",
         "model_id": "minicpm-v4.6",
         "capabilities": ["vision"],
-        "enabled": True,
+        # Transformers is ScanSci's default local route for native HF vision,
+        # ASR, embeddings, and reranking. Keep this as an opt-in external
+        # connection so a second MiniCPM checkpoint is never pulled silently.
+        "enabled": False,
     },
     {
         "id": "qwen3-asr-0.6b",

@@ -1046,6 +1046,41 @@ class _OpenAIPersistentHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIHighUsageHandler(BaseHTTPRequestHandler):
+    """One successful answer whose billed usage crosses the soft lease."""
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        chunks = [
+            {
+                "id": "chatcmpl-high-usage",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "completed answer"}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-high-usage",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 20_000, "completion_tokens": 32, "total_tokens": 20_032},
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class _OpenAISlowHandler(BaseHTTPRequestHandler):
     started = threading.Event()
     release = threading.Event()
@@ -1577,6 +1612,19 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
     assert _OpenAIStreamHandler.request_payload["model"] == "fixture-model"
     assert _OpenAIStreamHandler.request_payload["stream"] is True
     assert _OpenAIStreamHandler.request_payload["tools"]
+    lifecycle = {
+        str(item.get("event", ""))
+        for item in events
+        if item.get("type") == "lifecycle"
+    }
+    assert {
+        "started",
+        "turn_started",
+        "message_started",
+        "message_completed",
+        "turn_completed",
+        "completed",
+    }.issubset(lifecycle)
 
 
 def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> None:
@@ -1679,6 +1727,96 @@ def test_pi_continues_after_deferred_web_plan_until_tool_backed_final(tmp_path: 
     assert any(event.get("type") == "tool.completed" and event.get("name") == "search_web" for event in events)
     assert "最终市场概况" in "".join(str(event.get("content", "")) for event in events if event.get("type") == "delta")
     assert events[-1]["type"] == "done"
+
+
+def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: Path) -> None:
+    """The sidecar must not silently reapply its former 24K/2K web limits."""
+
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "a" * 100_000}],
+                thinking_level="off",
+                task_mode="web",
+                task_contract={
+                    "contract_id": "contract-web-budget",
+                    "autonomy": "direct",
+                    "risk_level": "read_only",
+                    "allowed_tools": ["search_web"],
+                    "required_tool_groups": [],
+                    "task_profile": {
+                        "route": "direct_chat",
+                        "cognitive_complexity": "low",
+                        "execution_complexity": "none",
+                    },
+                    "initial_tool_budget": 4,
+                    "max_tool_budget": 8,
+                    "model_token_budget": 96_000,
+                    "max_model_token_budget": 384_000,
+                },
+                timeout_seconds=30,
+                session_id="web-budget-session",
+            )
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert len(_OpenAIPersistentHandler.request_payloads) == 1
+    payload = _OpenAIPersistentHandler.request_payloads[0]
+    assert payload.get("max_tokens", payload.get("max_completion_tokens")) == 4096
+
+
+def test_pi_extends_soft_model_token_lease_instead_of_failing_sound_answer(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIHighUsageHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "answer completely"}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    "contract_id": "contract-progressive-model-budget",
+                    "allowed_tools": [],
+                    "initial_tool_budget": 3,
+                    "max_tool_budget": 6,
+                    "model_token_budget": 16_000,
+                    "max_model_token_budget": 64_000,
+                },
+                timeout_seconds=30,
+                session_id="progressive-model-budget-session",
+            )
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    extension = next(event for event in events if event.get("status") == "model_budget_extended")
+    assert extension["details"]["previous_budget"] == 16_000
+    assert extension["details"]["current_budget"] > 20_000
+    assert events[-1]["control"]["model_tokens"] == 20_032
 
 
 def test_pi_verified_answer_tool_ends_run_without_second_model_answer(tmp_path: Path) -> None:
@@ -1852,6 +1990,76 @@ def test_pi_cancel_aborts_active_sdk_run_without_killing_client(tmp_path: Path) 
 
     assert not consumer.is_alive()
     assert not errors
+    assert events[-1]["type"] == "cancelled"
+
+
+def test_pi_steer_reports_native_queue_and_control_acknowledgement(tmp_path: Path) -> None:
+    _OpenAISlowHandler.started = threading.Event()
+    _OpenAISlowHandler.release = threading.Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAISlowHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            events.extend(
+                client.stream_chat(
+                    provider_kind="openai-compatible",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    api_key="fixture-key",
+                    model_id="fixture-model",
+                    messages=[{"role": "user", "content": "take a long time"}],
+                    thinking_level="off",
+                    task_mode="knowledge",
+                    timeout_seconds=30,
+                    session_id="steer-session",
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        assert _OpenAISlowHandler.started.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while not client.active_request_id and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert client.steer("focus on the requested detail") is True
+        acknowledgement_deadline = time.monotonic() + 5
+        while not any(
+            event.get("type") == "control"
+            and event.get("action") == "steer"
+            and event.get("status") == "accepted"
+            for event in events
+        ) and time.monotonic() < acknowledgement_deadline:
+            time.sleep(0.01)
+        assert client.cancel() is True
+        _OpenAISlowHandler.release.set()
+        consumer.join(timeout=10)
+    finally:
+        _OpenAISlowHandler.release.set()
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert not consumer.is_alive()
+    assert not errors
+    assert any(
+        event.get("type") == "control"
+        and event.get("action") == "steer"
+        and event.get("status") == "accepted"
+        for event in events
+    )
+    assert any(
+        event.get("type") == "queue"
+        and "focus on the requested detail" in list(event.get("steering", []))
+        for event in events
+    )
     assert events[-1]["type"] == "cancelled"
 
 

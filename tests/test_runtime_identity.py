@@ -34,6 +34,8 @@ def test_packaged_build_info_keeps_local_runtime_distribution_contract(
                 "build_id": "internal-beta-lightweight",
                 "package_profile": "core",
                 "runtime_manifest_url": "https://downloads.example.com/local-transformers.json",
+                "node_component_manifest_url": "https://downloads.example.com/node.json",
+                "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
                 "cache_key": "desktop-cache",
                 "source_tree_sha256": "a" * 64,
                 "release_source_sha256": "b" * 64,
@@ -48,6 +50,8 @@ def test_packaged_build_info_keeps_local_runtime_distribution_contract(
 
     assert identity["package_profile"] == "core"
     assert identity["runtime_manifest_url"] == "https://downloads.example.com/local-transformers.json"
+    assert identity["node_component_manifest_url"] == "https://downloads.example.com/node.json"
+    assert identity["tectonic_component_manifest_url"] == "https://downloads.example.com/tectonic.json"
     assert identity["cache_key"] == "desktop-cache"
     assert identity["source_tree_sha256"] == "a" * 64
     assert identity["release_source_sha256"] == "b" * 64

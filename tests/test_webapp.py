@@ -231,6 +231,73 @@ def test_local_runtime_install_control_api_delegates_to_component(
     assert calls == [action]
 
 
+def test_managed_runtime_component_apis_keep_node_and_tectonic_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    node = app.runtime_components["node"]
+    tectonic = app.runtime_components["tectonic"]
+    node_status = {
+        "id": "node",
+        "name": "Agent 运行组件",
+        "installed": False,
+        "mode": "missing",
+        "install_available": True,
+        "install_job": {"job_id": "runtime:node", "state": "idle"},
+    }
+    tectonic_status = {
+        "id": "tectonic",
+        "name": "LaTeX 排版组件",
+        "installed": True,
+        "mode": "system",
+        "install_available": False,
+        "install_job": {"job_id": "runtime:tectonic", "state": "idle"},
+    }
+    started = {"job_id": "runtime:node", "state": "queued", "source": "automatic"}
+    paused = {"job_id": "runtime:node", "state": "paused"}
+    manual = {"job_id": "runtime:node", "state": "queued", "source": "manual"}
+    selected: list[list[str]] = []
+    monkeypatch.setattr(node, "status", lambda: dict(node_status))
+    monkeypatch.setattr(tectonic, "status", lambda: dict(tectonic_status))
+    monkeypatch.setattr(node, "install_status", lambda: dict(started))
+    monkeypatch.setattr(node, "start_install", lambda: dict(started))
+    monkeypatch.setattr(node, "pause_install", lambda: dict(paused))
+
+    def start_local(paths: list[str]) -> dict[str, object]:
+        selected.append(list(paths))
+        return dict(manual)
+
+    monkeypatch.setattr(node, "start_local_install", start_local)
+
+    components = _payload(app.dispatch("GET", "/api/runtime-components"))
+    progress = _payload(app.dispatch("GET", "/api/runtime-components/install-status?component=node"))
+    automatic = app.dispatch(
+        "POST",
+        "/api/runtime-components/install",
+        json.dumps({"component": "node"}).encode("utf-8"),
+    )
+    controlled = app.dispatch(
+        "POST",
+        "/api/runtime-components/install-control",
+        json.dumps({"component": "node", "action": "pause"}).encode("utf-8"),
+    )
+    local = app.dispatch(
+        "POST",
+        "/api/runtime-components/install-local",
+        json.dumps({"component": "node", "paths": ["C:/Downloads/node.zip"]}).encode("utf-8"),
+    )
+
+    assert set(components["components"]) == {"node", "tectonic"}
+    assert components["components"]["node"]["installed"] is False
+    assert components["components"]["tectonic"]["installed"] is True
+    assert progress == started
+    assert automatic.status == 202 and _payload(automatic) == started
+    assert controlled.status == 202 and _payload(controlled) == paused
+    assert local.status == 202 and _payload(local) == manual
+    assert selected == [["C:/Downloads/node.zip"]]
+
+
 def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
@@ -247,7 +314,15 @@ def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_pa
     assert 'openSettings("local-models");' in script
     assert 'data-action="choose-local-runtime-files"' in script
     assert 'data-action="check-local-runtime-channels"' in script
+    assert "/api/runtime-components" in script
+    assert "scheduleRuntimeComponentInstallPoll" in script
+    assert 'data-action="install-runtime-component"' in script
+    assert 'data-action="choose-runtime-component-files"' in script
+    assert "Agent 运行组件" in script
+    assert "LaTeX 排版组件" in script
+    assert "设置 → 资源配置" not in script
     assert ".local-runtime-recovery" in styles
+    assert ".runtime-component-card" in styles
     assert ".download-activity" in styles
     assert ".download-task-section" in styles
 
@@ -275,6 +350,8 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "refreshInstalledModelInventory" in script
     assert "已有可用模型" in script
     assert "usingExistingModel" in script
+    assert 'compatibleKinds: ["chat", "vision"]' in script
+    assert "localModelResourcePreference" in script
     assert "waitingForSharedRuntime" in script
     assert "const job = directJob;" in script
     assert "guided flow now starts one" in script
@@ -344,6 +421,70 @@ def test_agent_control_plane_routes_and_ui_contract_are_exposed(tmp_path: Path):
     assert "function advisorAction" in script
     assert "agent-interaction-card" in script
     assert ".run-control-panel" in styles
+
+
+def test_direct_chat_jobs_are_conversation_scoped_and_keep_live_turn_controls(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert 'id="chatLiveControls"' in page
+    assert "const directChatJobs = new Map();" in script
+    assert "function directChatJob" in script
+    assert "function beginDirectChatJob" in script
+    assert "function runDirectChatTurn" in script
+    assert "directChatJobs.set(conversationId, job);" in script
+    assert "directChatJobs.delete(job.conversationId);" in script
+    assert "conversation_id: job.conversationId" in script
+    assert "job.queue.shift()" in script
+    assert "void runDirectChatTurn(job, nextTurn)" in script
+    assert 'request("/api/chat/steer"' in script
+    assert 'request("/api/chat/cancel"' in script
+    assert 'request("/api/chat/pause"' in script
+    assert "job.restartForSteer = true;" in script
+    assert "function fallbackSteerDirectChat" in script
+    assert 'payload.name === "agent_control"' in script
+    assert 'payload.name === "agent_lifecycle"' in script
+    assert 'payload.name === "agent_queue"' in script
+    assert "function pauseDirectChatJob" in script
+    assert "function resumeDirectChatJob" in script
+    assert "完成后继续" in script
+    assert "立即调整" in script
+    assert 'data-action="remove-direct-follow-up"' in script
+    assert 'data-action="cancel-direct-chat"' in script
+    assert "directChatJobs.size - 1" in script
+    assert ".direct-live-controls" in styles
+    assert ".direct-live-pulse" in styles
+
+
+def test_pause_routes_delegate_to_run_and_direct_chat_controls(tmp_path: Path, monkeypatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        app.research_agent,
+        "pause",
+        lambda run_id: calls.append(("run", run_id)) or {"run_id": run_id, "status": "paused"},
+    )
+    monkeypatch.setattr(
+        app.research_agent,
+        "pause_chat",
+        lambda payload: calls.append(("chat", str(payload.get("run_id", "")))) or True,
+    )
+
+    run_response = app.dispatch("POST", "/api/runs/run-pause-test/pause", b"{}")
+    chat_response = app.dispatch(
+        "POST",
+        "/api/chat/pause",
+        json.dumps({"run_id": "chat-pause-test"}).encode("utf-8"),
+    )
+
+    assert run_response.status == 202
+    assert _payload(run_response) == {"run_id": "run-pause-test", "status": "paused"}
+    assert chat_response.status == 200
+    assert _payload(chat_response) == {"ok": True}
+    assert calls == [("run", "run-pause-test"), ("chat", "chat-pause-test")]
 
 
 def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public_search(tmp_path: Path, monkeypatch):
@@ -429,6 +570,8 @@ def test_research_document_ui_preserves_request_conversation_and_source_navigati
     assert "Transformer、BERT 与 GPT-3：架构、训练与能力边界" in script
     assert "function researchDocumentPresentation" in script
     assert "function reviewRequestContextMarkup" in script
+    assert "answer.citations, payload.citations, artifact?.citations" in script
+    assert "reader.text || answer.text" in script
     assert 'class="review-request-context"' in script
     assert 'data-action="return-review-conversation"' in script
     assert "reviewDocumentOpen: false" in script
@@ -1037,7 +1180,8 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert "state.knowledgeScopeIds = sanitizeKnowledgeScopeIds();" in script
     assert 'data-action="choose-composer-source"' in page
     assert 'class="composer-source-strip"' in page
-    assert 'notebook_ids: selectedKnowledge.map' in script
+    assert "notebookIds: selectedKnowledge.map" in script
+    assert "notebook_ids: turn.notebookIds" in script
     assert "const total = hasDirectional ? prompt + completion : providerTotal" in script
     assert 'class="composer-knowledge-button-label"' in page
     assert "本轮将检索：" in script
@@ -1382,6 +1526,27 @@ def test_notebook_webapp_reports_tesseract_status_separately(tmp_path: Path, mon
     assert status["provider"] == "tesseract"
     assert status["backend"] == "tesseract"
     assert status["requested_languages"] == ["zh", "en"]
+    assert status["install"]["state"] == "idle"
+
+
+def test_notebook_webapp_starts_tesseract_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    captured: dict[str, object] = {}
+
+    def start(languages):
+        captured["languages"] = languages
+        return {"state": "queued", "progress": 0.01}
+
+    monkeypatch.setattr(app.tesseract_installs, "start", start)
+    response = app.dispatch(
+        "POST",
+        "/api/settings/document-processing/ocr/install",
+        json.dumps({"languages": ["zh", "en"]}).encode("utf-8"),
+    )
+
+    assert response.status == 202
+    assert _payload(response)["state"] == "queued"
+    assert captured["languages"] == ["zh", "en"]
 
 
 def test_provider_secret_reveal_is_explicit_and_kept_out_of_public_settings(
@@ -2386,6 +2551,40 @@ def test_explicit_web_access_skill_forces_required_pi_web_mode(
     assert "web-access" in observed["skills"]
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
         {"name": "search_web", "status": "completed"}
+    ]
+
+
+def test_direct_public_url_read_satisfies_explicit_web_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    observed: dict[str, object] = {}
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
+        observed["task_mode"] = task_mode
+        yield {"type": "tool.completed", "name": "agent_reach", "result": {"ok": True}}
+        yield {"type": "delta", "content": "已读取公开 URL。"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+
+    events = list(runtime.chat_stream({
+        "web_search": "on",
+        "messages": [{"role": "user", "content": "读取 https://api.openalex.org/works?per-page=1"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert observed["task_mode"] == "web"
+    contract = events[-1]["result"]["agent_runtime"]["task_contract"]
+    assert set(contract["required_tool_groups"][0]) == {
+        "agent_reach",
+        "browser_access",
+        "discover_papers",
+        "search_web",
+    }
+    assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
+        {"name": "agent_reach", "status": "completed"}
     ]
 
 

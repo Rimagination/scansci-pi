@@ -104,6 +104,20 @@ def test_market_catalog_marks_cached_model_without_network(tmp_path: Path, monke
     assert row["ready"] is True
 
 
+def test_market_catalog_does_not_probe_huggingface_for_default_view(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+
+    def unexpected_remote_probe(_query, _limit):
+        raise AssertionError("the curated default view must not probe Hugging Face")
+
+    monkeypatch.setattr(local_model_market, "_remote_catalog", unexpected_remote_probe)
+
+    catalog = local_model_market.market_catalog()
+
+    assert catalog["source"] == "curated"
+    assert any(item["id"] == "openbmb/MiniCPM-V-4.6-BNB" for item in catalog["items"])
+
+
 def test_market_catalog_keeps_native_asr_visible_when_searching(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
     monkeypatch.setattr(local_model_market, "_remote_catalog", lambda _query, _limit: [])

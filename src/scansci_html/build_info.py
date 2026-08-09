@@ -18,6 +18,8 @@ _PACKAGED_BUILD_INFO_KEYS = {
     "package_profile",
     "exclude_runtimes",
     "runtime_manifest_url",
+    "node_component_manifest_url",
+    "tectonic_component_manifest_url",
     "cache_key",
     "source_tree_sha256",
     "release_source_sha256",

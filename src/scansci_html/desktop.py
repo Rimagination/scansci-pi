@@ -485,6 +485,24 @@ class ScanSciDesktopApi:
         )
         return [str(path) for path in list(result or [])]
 
+    def choose_runtime_component_files(self, component_id: str = "") -> list[str]:
+        """Pick a managed Node/Tectonic component without exposing paths to web code."""
+
+        windows = list(getattr(self.webview, "windows", []) or [])
+        if not windows:
+            return []
+        identifier = str(component_id or "").strip().lower()
+        label = "Agent 运行组件" if identifier == "node" else "LaTeX 排版组件" if identifier == "tectonic" else "ScanSci 运行组件"
+        result = windows[0].create_file_dialog(
+            getattr(self.webview, "OPEN_DIALOG", 0),
+            allow_multiple=True,
+            file_types=(
+                f"{label} (*.zip;*.json;*.part*)",
+                "所有文件 (*.*)",
+            ),
+        )
+        return [str(path) for path in list(result or [])]
+
     @staticmethod
     def _existing_local_path(raw_path: str) -> Path:
         """Resolve a path supplied by a trusted local artifact record."""

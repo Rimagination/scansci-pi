@@ -1,0 +1,178 @@
+{
+  "schema_version": "easyslides.navigation_states.v1",
+  "template_id": "defense_leftnav",
+  "source_shell": "03_content.svg",
+  "reference_pptx": "external://template-sources/left-navigation.pptx",
+  "style_ref": "component_styles.navigation_styles.left_navigation",
+  "active_section_slot": "ACTIVE_SECTION",
+  "active_label_slot": "ACTIVE_SECTION_LABEL",
+  "render_rule": "The content shell ships with section 1 highlighted. To activate another section, select its section entry, update nav-active-band.y, nav-active-pointer.points using the pre-flattened fold coordinates, nav-active-icon path/fill/icon id, nav-active-label.y, nav-active-label text, nav-active-label data-pptx-box-y, and data-active-index. Keep nav-active-fold untransformed so native PPTX export preserves the fold position. Inactive labels and icons remain fixed under the active ribbon.",
+  "variant_model": {
+    "mode": "single_svg_five_active_section_variants",
+    "shape_policy": "preserve_navigation_shapes_switch_active_state",
+    "base_shell": "templates/layouts/defense_leftnav/03_content.svg",
+    "variant_count": 5,
+    "selection_key": "ACTIVE_SECTION",
+    "immutable_elements": [
+      "nav-surface",
+      "nav-inactive-items",
+      "page-number",
+      "content-header",
+      "key-message",
+      "body-region"
+    ],
+    "mutable_elements": [
+      "nav-active-band",
+      "nav-active-fold",
+      "nav-active-pointer",
+      "nav-active-icon",
+      "nav-active-label"
+    ],
+    "generator_contract": "Choose exactly one navigation variant for every content slide. Do not duplicate or reshape the left navigation; switch only the active-state elements listed above."
+  },
+  "navigation_variants": [
+    {
+      "variant_id": "D01-NAV-01",
+      "name": "left_nav_active_research_background",
+      "svg_path": "templates/layouts/defense_leftnav/03_content.svg",
+      "active_section_index": 1,
+      "active_section_title": "研究背景",
+      "section_ref": "sections[0]",
+      "shape_policy": "preserve_navigation_shapes_switch_active_state",
+      "mutable_elements": ["nav-active-band", "nav-active-fold", "nav-active-pointer", "nav-active-icon", "nav-active-label"],
+      "best_for": "研究背景章节内的所有内容页。"
+    },
+    {
+      "variant_id": "D01-NAV-02",
+      "name": "left_nav_active_purpose_significance",
+      "svg_path": "templates/layouts/defense_leftnav/03_content.svg",
+      "active_section_index": 2,
+      "active_section_title": "目的及意义",
+      "section_ref": "sections[1]",
+      "shape_policy": "preserve_navigation_shapes_switch_active_state",
+      "mutable_elements": ["nav-active-band", "nav-active-fold", "nav-active-pointer", "nav-active-icon", "nav-active-label"],
+      "best_for": "目的及意义章节内的所有内容页。"
+    },
+    {
+      "variant_id": "D01-NAV-03",
+      "name": "left_nav_active_materials_methods",
+      "svg_path": "templates/layouts/defense_leftnav/03_content.svg",
+      "active_section_index": 3,
+      "active_section_title": "材料与方法",
+      "section_ref": "sections[2]",
+      "shape_policy": "preserve_navigation_shapes_switch_active_state",
+      "mutable_elements": ["nav-active-band", "nav-active-fold", "nav-active-pointer", "nav-active-icon", "nav-active-label"],
+      "best_for": "材料与方法章节内的所有内容页。"
+    },
+    {
+      "variant_id": "D01-NAV-04",
+      "name": "left_nav_active_results_analysis",
+      "svg_path": "templates/layouts/defense_leftnav/03_content.svg",
+      "active_section_index": 4,
+      "active_section_title": "结果与分析",
+      "section_ref": "sections[3]",
+      "shape_policy": "preserve_navigation_shapes_switch_active_state",
+      "mutable_elements": ["nav-active-band", "nav-active-fold", "nav-active-pointer", "nav-active-icon", "nav-active-label"],
+      "best_for": "结果与分析章节内的所有内容页。"
+    },
+    {
+      "variant_id": "D01-NAV-05",
+      "name": "left_nav_active_conclusion_discussion",
+      "svg_path": "templates/layouts/defense_leftnav/03_content.svg",
+      "active_section_index": 5,
+      "active_section_title": "结论与讨论",
+      "section_ref": "sections[4]",
+      "shape_policy": "preserve_navigation_shapes_switch_active_state",
+      "mutable_elements": ["nav-active-band", "nav-active-fold", "nav-active-pointer", "nav-active-icon", "nav-active-label"],
+      "best_for": "结论与讨论章节内的所有内容页。"
+    }
+  ],
+  "navigation_surface": {"x": 0, "y": 0, "width": 253.38, "height": 720, "fill": "#F2F2F2"},
+  "active_band_template": {"x": 0, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+  "active_fold_template": {"fill": "#68000D", "source_shape": "等腰三角形 39"},
+  "sections": [
+    {
+      "index": 1,
+      "title": "研究背景",
+      "icon_id": "research-background",
+      "row_y": 159.13,
+      "inactive_label": {"x": 72.54, "y": 198.31, "anchor": "start"},
+      "active_band": {"x": 0, "y": 159.13, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+      "pointer_points": "291.04,224.54 252.90,224.54 252.90,241.13",
+      "active_pointer": {
+        "points": "291.04,224.54 252.90,224.54 252.90,241.13",
+        "fill": "#68000D"
+      },
+      "active_icon": {"icon_id": "research-background", "fill": "#FFFFFF"},
+      "active_label": {"x": 72.54, "y": 201.55, "anchor": "start", "font_size": 26.67, "letter_spacing": 4, "box": {"x": 72.54, "y": 159.13, "width": 202, "height": 65.42, "vertical_anchor": "middle"}}
+    },
+    {
+      "index": 2,
+      "title": "目的及意义",
+      "icon_id": "purpose-significance",
+      "row_y": 246.13,
+      "inactive_label": {"x": 72.54, "y": 283.04, "anchor": "start"},
+      "active_band": {"x": 0, "y": 246.13, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+      "pointer_points": "291.04,311.54 252.90,311.54 252.90,328.13",
+      "active_pointer": {
+        "points": "291.04,311.54 252.90,311.54 252.90,328.13",
+        "fill": "#68000D"
+      },
+      "active_icon": {"icon_id": "purpose-significance", "fill": "#FFFFFF"},
+      "active_label": {"x": 72.54, "y": 288.55, "anchor": "start", "font_size": 26.67, "letter_spacing": 4, "box": {"x": 72.54, "y": 246.13, "width": 202, "height": 65.42, "vertical_anchor": "middle"}}
+    },
+    {
+      "index": 3,
+      "title": "材料与方法",
+      "icon_id": "materials-methods",
+      "row_y": 333.14,
+      "inactive_label": {"x": 72.54, "y": 370.05, "anchor": "start"},
+      "active_band": {"x": 0, "y": 333.14, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+      "pointer_points": "291.04,398.55 252.90,398.55 252.90,415.14",
+      "active_pointer": {
+        "points": "291.04,398.55 252.90,398.55 252.90,415.14",
+        "fill": "#68000D"
+      },
+      "active_icon": {"icon_id": "materials-methods", "fill": "#FFFFFF"},
+      "active_label": {"x": 72.54, "y": 375.56, "anchor": "start", "font_size": 26.67, "letter_spacing": 4, "box": {"x": 72.54, "y": 333.14, "width": 202, "height": 65.42, "vertical_anchor": "middle"}}
+    },
+    {
+      "index": 4,
+      "title": "结果与分析",
+      "icon_id": "results-analysis",
+      "row_y": 420.14,
+      "inactive_label": {"x": 72.54, "y": 457.05, "anchor": "start"},
+      "active_band": {"x": 0, "y": 420.14, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+      "pointer_points": "291.04,485.55 252.90,485.55 252.90,502.14",
+      "active_pointer": {
+        "points": "291.04,485.55 252.90,485.55 252.90,502.14",
+        "fill": "#68000D"
+      },
+      "active_icon": {"icon_id": "results-analysis", "fill": "#FFFFFF"},
+      "active_label": {"x": 72.54, "y": 462.56, "anchor": "start", "font_size": 26.67, "letter_spacing": 4, "box": {"x": 72.54, "y": 420.14, "width": 202, "height": 65.42, "vertical_anchor": "middle"}}
+    },
+    {
+      "index": 5,
+      "title": "结论与讨论",
+      "icon_id": "conclusion-discussion",
+      "row_y": 507.15,
+      "inactive_label": {"x": 72.54, "y": 544.06, "anchor": "start"},
+      "active_band": {"x": 0, "y": 507.15, "width": 291.05, "height": 65.42, "fill": "#8B0012"},
+      "pointer_points": "291.04,572.56 252.90,572.56 252.90,589.15",
+      "active_pointer": {
+        "points": "291.04,572.56 252.90,572.56 252.90,589.15",
+        "fill": "#68000D"
+      },
+      "active_icon": {"icon_id": "conclusion-discussion", "fill": "#FFFFFF"},
+      "active_label": {"x": 72.54, "y": 549.57, "anchor": "start", "font_size": 26.67, "letter_spacing": 4, "box": {"x": 72.54, "y": 507.15, "width": 202, "height": 65.42, "vertical_anchor": "middle"}}
+    }
+  ],
+  "content_area": {"x": 310, "y": 210, "width": 910, "height": 440},
+  "colors": {
+    "active_band": "#8B0012",
+    "active_pointer": "#68000D",
+    "active_text": "#FFFFFF",
+    "inactive_text": "#595959",
+    "nav_surface": "#F2F2F2"
+  }
+}

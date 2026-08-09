@@ -1,0 +1,51 @@
+{
+  "schema_version": "easyslides.defense_topnav.component_styles.v1",
+  "template_id": "defense_topnav",
+  "tokens": {
+    "canvas": {"width": 1280, "height": 720},
+    "colors": {
+      "primary": "#183A6A",
+      "primary_dark": "#10284A",
+      "soft_surface": "#E7E6E6",
+      "border": "#C8D4E3",
+      "emphasis_text": "#081B33",
+      "light_gray": "#E7E6E6",
+      "text": "#000000",
+      "muted": "#595959",
+      "white": "#FFFFFF"
+    },
+    "font_stack": "\"Microsoft YaHei\", \"Source Han Sans CN\", Arial, sans-serif",
+    "content_area": {"x": 54.0, "y": 188.0, "width": 1172.0, "height": 486.0}
+  },
+  "navigation_styles": {
+    "top_navigation": {
+      "surface": {"x": 0, "y": 0, "width": 1280, "height": 100, "fill": "#183A6A"},
+      "logo_frame": {"shape": "circle", "cx": 56.65, "cy": 50, "r": 37.92, "fill": "#FFFFFF"},
+      "active_tab": {"y": 0, "height": 101.15, "fill": "#FFFFFF"},
+      "title": {"font_size": 24, "weight": "bold", "active_fill": "#183A6A", "inactive_fill": "#FFFFFF"},
+      "subtitle": {"font_size": 12, "active_fill": "#183A6A", "inactive_fill": "#FFFFFF", "inactive_opacity": 0.4}
+    }
+  },
+  "content_styles": {
+    "page_title": {"x": 58.11, "y": 152.66, "font_size": 32, "fill": "#000000", "weight": "bold", "text_valign": "middle"},
+    "key_message_bar": {"x": 261.6, "y": 127.62, "width": 956.32, "height": 50.07, "fill": "#E7E6E6", "rx": 5.81},
+    "key_message": {"x": 288, "y": 152.66, "font_size": 21.33, "fill": "#000000", "weight": "bold", "text_valign": "middle"},
+    "open_content_frame": {"x": 54.0, "y": 188.0, "width": 1172.0, "height": 486.0, "fill": "none", "stroke": "none", "visibility": "invisible_layout_guide"},
+    "body_text_box": {"x": 86, "y": 212, "width": 1114, "height": 438, "font_size": 22},
+    "page_number": {"x": 1168, "y": 688, "font_size": 18, "fill": "#183A6A", "weight": "bold"}
+  },
+  "composition_primitives": {
+    "card_frame": {"fill": "#FFFFFF", "stroke": "#183A6A", "stroke_width": 1.667, "rx": 8},
+    "card_header": {"fill": "#183A6A", "font_size": 21.33, "text_fill": "#FFFFFF"},
+    "figure_frame": {"fill": "#FFFFFF", "stroke": "#C8D4E3", "stroke_width": 1.4, "rx": 8},
+    "callout": {"fill": "#E7E6E6", "text_fill": "#081B33", "accent_fill": "#183A6A"},
+    "table_header": {"fill": "#183A6A", "text_fill": "#FFFFFF"},
+    "connector": {"stroke": "#183A6A", "stroke_width": 1.5, "stroke_opacity": 0.45}
+  },
+  "toc_styles": {
+    "left_panel": {"x": 0, "y": 0, "width": 545.07, "height": 720, "fill": "#183A6A"},
+    "title": {"x": 153.96, "y": 388.6, "font_size": 117.33, "fill": "#FFFFFF"},
+    "item_number": {"x": 690.74, "font_size": 53.33, "fill": "#183A6A"},
+    "item_title": {"x": 773.41, "font_size": 37.33, "fill": "#000000"}
+  }
+}

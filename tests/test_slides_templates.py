@@ -107,6 +107,22 @@ def test_active_easyslides_templates_expose_svg_previews(tmp_path: Path):
         slide_template_asset("academic_general", "../layouts_index.json", root)
 
 
+def test_builtin_templates_remain_available_without_an_external_plugin(tmp_path: Path):
+    missing_root = tmp_path / "missing-easyslides"
+
+    catalog = list_slide_templates(missing_root)
+    template = get_slide_template("academic_general", missing_root)
+
+    assert catalog["available"] is True
+    assert catalog["built_in"] is True
+    assert catalog["catalog_source"] == "builtin"
+    assert len(catalog["templates"]) >= 5
+    assert template["generation_mode"] == "compatibility"
+    assert template["renderer_label"] == "ScanSci 内置可编辑模板"
+    assert resolve_slide_template_dir("academic_general", missing_root).is_dir()
+    assert slide_template_asset("academic_general", "01_cover.svg", missing_root).is_file()
+
+
 def test_webapp_serves_template_catalog_and_preview(tmp_path: Path):
     root = _easy_slides_fixture(tmp_path)
     app = NotebookWebApp(

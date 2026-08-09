@@ -10,6 +10,10 @@ const state = {
   localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false },
   localModelInstall: { jobs: [], active: null },
   localRuntime: { installed: false, install_available: false, manual_install_available: true, mode: "missing", channels: null },
+  runtimeComponents: {
+    node: { id: "node", name: "Agent 运行组件", installed: false, install_available: false, mode: "missing" },
+    tectonic: { id: "tectonic", name: "LaTeX 排版组件", installed: false, install_available: false, mode: "missing" },
+  },
   ollama: { reachable: false, model_ready: false, model_id: "minicpm-v4.6", error: "" },
   localRuntimeManualOpen: false,
   downloadStatusError: "",
@@ -174,12 +178,18 @@ const state = {
 const byId = (id) => document.getElementById(id);
 const sourceList = byId("sourceList");
 let directConversationRenderFrame = 0;
+const pendingDirectConversationRenders = new Set();
+// A direct chat run belongs to its conversation, not to the whole window.
+// Keeping these jobs separate lets users move to another conversation and
+// start work there while the first one continues in the background.
+const directChatJobs = new Map();
 let activeDirectChatController = null;
 let composerSubmissionInFlight = false;
 let confirmDialogResolve = null;
 let confirmDialogPreviousFocus = null;
 let localModelInstallPollTimer = 0;
 let localRuntimeInstallPollTimer = 0;
+const runtimeComponentInstallPollTimers = new Map();
 let notionWizardResolve = null;
 
 const applicationCopy = Object.freeze({
@@ -468,11 +478,21 @@ async function streamChatWithRecovery(payload, onEvent, { signal, onRetry, maxAt
   throw new Error("The streaming response could not be completed.");
 }
 
-function scheduleDirectConversationRender() {
+function scheduleDirectConversationRender(conversationId = state.directConversationId, { forceFollow = false } = {}) {
+  const id = String(conversationId || "");
+  if (id) pendingDirectConversationRenders.add(id);
   if (directConversationRenderFrame) return;
   directConversationRenderFrame = window.requestAnimationFrame(() => {
     directConversationRenderFrame = 0;
-    renderDirectConversation();
+    const activeId = String(state.directConversationId || "");
+    if (!id || pendingDirectConversationRenders.has(activeId)) {
+      const job = directChatJobs.get(activeId);
+      if (job) state.directMessages = job.messages;
+      if (!state.activeTaskId && state.activeView === "conversation") renderDirectConversation({ forceFollow });
+    }
+    pendingDirectConversationRenders.clear();
+    renderDirectLiveControls();
+    renderTasks();
   });
 }
 
@@ -1275,7 +1295,7 @@ function safeEvidenceSourceUrl(value) {
 }
 
 function citationPublicSourceUrl(record = {}) {
-  const supplied = safeEvidenceSourceUrl(record.original_url || record.source_url || record.url || "");
+  const supplied = safeEvidenceSourceUrl(record.source_href || record.original_url || record.source_url || record.url || "");
   if (supplied) return supplied;
   const doi = String(record.doi || "")
     .trim()
@@ -2069,7 +2089,7 @@ async function initialize() {
     renderWorkspace();
     renderResourceOnboarding();
 
-    const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
+    const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, runtimeComponents, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
       request("/api/capabilities").catch(() => ({})),
       request("/api/runs?view=all&limit=200").catch(() => ({ runs: [] })),
       request(`/api/chat/history?view=${state.historyView === "archived" ? "archived" : "active"}&limit=200`).catch(() => ({ conversations: [] })),
@@ -2078,6 +2098,7 @@ async function initialize() {
       request("/api/local-models/market").catch(() => ({ items: [] })),
       request("/api/local-models/install-status").catch(() => ({ jobs: [], active: null })),
       request("/api/local-runtime").catch(() => ({ installed: false, install_available: false, mode: "missing" })),
+      request("/api/runtime-components").catch(() => ({ components: {} })),
       request("/api/ollama/status").catch(() => ({ reachable: false, model_ready: false, model_id: "minicpm-v4.6", error: "" })),
       request("/api/model-health").catch(() => ({ checked_at: "", providers: {}, models: {} })),
       request("/api/skills").catch(() => ({ skills: [], library_path: "" })),
@@ -2090,6 +2111,7 @@ async function initialize() {
     state.localModelMarket = { installed: localInstalled.models || [], catalog: localCatalog.items || [], source: localCatalog.source || "", loading: false };
     state.localModelInstall = localInstall || { jobs: [], active: null };
     state.localRuntime = { ...(localRuntime || { installed: false, install_available: false, mode: "missing" }), channels: null };
+    state.runtimeComponents = { ...state.runtimeComponents, ...(runtimeComponents?.components || {}) };
     state.ollama = ollamaStatus || state.ollama;
     state.modelHealth = modelHealthPayload || state.modelHealth;
     state.extensions.skills = skillsPayload.skills || [];
@@ -2115,6 +2137,9 @@ async function initialize() {
     void ensureActiveKnowledgeIndex();
     if (state.localModelInstall?.active) scheduleLocalModelInstallPoll();
     if (["queued", "installing"].includes(state.localRuntime?.install_job?.state)) scheduleLocalRuntimeInstallPoll();
+    for (const [componentId, component] of Object.entries(state.runtimeComponents || {})) {
+      if (["queued", "installing"].includes(component?.install_job?.state)) scheduleRuntimeComponentInstallPoll(componentId);
+    }
 
     // Restore the last opened task after a reload.  The history list is loaded
     // asynchronously, so relying on the in-memory activeTaskId would leave
@@ -2214,6 +2239,8 @@ function formatDownloadDuration(value) {
 
 function downloadJobTitle(job, kind = "model") {
   if (kind === "runtime") return "本地运行组件";
+  if (kind === "component:node") return "Agent 运行组件";
+  if (kind === "component:tectonic") return "LaTeX 排版组件";
   if (job?.job_id === "retrieval-core") return "研究检索组件";
   const models = Array.isArray(job?.models) ? job.models : [];
   const names = {
@@ -2270,8 +2297,17 @@ function downloadJobProgressSummary(job) {
 function downloadTaskEntries({ includeReady = false } = {}) {
   const entries = [];
   const runtimeJob = state.localRuntime?.install_job;
-  if (runtimeJob?.state && runtimeJob.state !== "idle" && (includeReady || runtimeJob.state !== "ready")) {
+  const runtimeReplacementFailed = Boolean(state.localRuntime?.installed)
+    && ["failed", "cancelled", "interrupted"].includes(String(runtimeJob?.state || ""));
+  if (runtimeJob?.state && runtimeJob.state !== "idle" && !runtimeReplacementFailed && (includeReady || runtimeJob.state !== "ready")) {
     entries.push({ kind: "runtime", job: runtimeJob });
+  }
+  for (const [componentId, component] of Object.entries(state.runtimeComponents || {})) {
+    const job = component?.install_job;
+    const replacementFailed = Boolean(component?.installed)
+      && ["failed", "cancelled", "interrupted"].includes(String(job?.state || ""));
+    if (!job?.state || job.state === "idle" || replacementFailed || (!includeReady && job.state === "ready")) continue;
+    entries.push({ kind: `component:${componentId}`, job });
   }
   for (const job of state.localModelInstall?.jobs || []) {
     if (!includeReady && job.state === "ready") continue;
@@ -2281,7 +2317,7 @@ function downloadTaskEntries({ includeReady = false } = {}) {
 }
 
 function downloadTaskControls(entry) {
-  if (!["model", "runtime"].includes(entry.kind) || !entry.job?.job_id) return "";
+  if (!(entry.kind === "model" || entry.kind === "runtime" || String(entry.kind).startsWith("component:")) || !entry.job?.job_id) return "";
   const job = entry.job;
   const jobId = escapeHtml(job.job_id);
   const kind = escapeHtml(entry.kind);
@@ -2305,7 +2341,8 @@ function downloadTaskRow(entry) {
   const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress || 0) * 100)));
   const telemetry = downloadJobTelemetry(job);
   const progressSummary = downloadJobProgressSummary(job);
-  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(entry.kind === "runtime" ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${progressSummary ? ` · ${escapeHtml(progressSummary)}` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div>${downloadTaskControls(entry)}</div></article>`;
+  const runtimeKind = entry.kind === "runtime" || String(entry.kind).startsWith("component:");
+  return `<article class="download-task-row is-${escapeHtml(status.tone)}"><span class="download-task-icon">${uiIcon(runtimeKind ? "cpu" : "download")}</span><div class="download-task-copy"><header><strong>${escapeHtml(downloadJobTitle(job, entry.kind))}</strong><b>${escapeHtml(status.label)}${progressSummary ? ` · ${escapeHtml(progressSummary)}` : ""}</b></header><p>${escapeHtml(status.detail)}</p>${telemetry ? `<small>${escapeHtml(telemetry)}</small>` : ""}<div class="download-task-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span class="${progressWidthClass(progress)}"></span></div>${downloadTaskControls(entry)}</div></article>`;
 }
 
 function renderDownloadActivity() {
@@ -2326,7 +2363,8 @@ function renderDownloadActivity() {
   host.hidden = false;
   const primary = entries[0];
   const count = entries.length;
-  host.innerHTML = `<button type="button" class="download-activity-card ${state.downloadStatusError ? "has-connection-error" : ""}" data-action="open-download-center"><span class="download-activity-symbol">${uiIcon(state.downloadStatusError ? "wifi-off" : primary?.kind === "runtime" ? "cpu" : "download")}</span><span class="download-activity-copy"><strong>${state.downloadStatusError ? "暂时无法读取下载进度" : escapeHtml(downloadJobTitle(primary.job, primary.kind))}</strong><small>${state.downloadStatusError ? "ScanSci 正在重试连接，下载任务不会因此被删除。" : escapeHtml([downloadJobStatus(primary.job).label, downloadJobProgressSummary(primary.job), downloadJobTelemetry(primary.job)].filter(Boolean).join(" · "))}</small></span>${count > 1 ? `<b>${count}</b>` : ""}<span class="download-activity-open">${uiIcon("chevron-right")}</span><span class="download-activity-progress"><i class="${progressWidthClass(Math.round(Number(primary?.job?.progress || 0) * 100))}"></i></span></button>`;
+  const primaryRuntime = primary?.kind === "runtime" || String(primary?.kind || "").startsWith("component:");
+  host.innerHTML = `<button type="button" class="download-activity-card ${state.downloadStatusError ? "has-connection-error" : ""}" data-action="open-download-center"><span class="download-activity-symbol">${uiIcon(state.downloadStatusError ? "wifi-off" : primaryRuntime ? "cpu" : "download")}</span><span class="download-activity-copy"><strong>${state.downloadStatusError ? "暂时无法读取下载进度" : escapeHtml(downloadJobTitle(primary.job, primary.kind))}</strong><small>${state.downloadStatusError ? "ScanSci 正在重试连接，下载任务不会因此被删除。" : escapeHtml([downloadJobStatus(primary.job).label, downloadJobProgressSummary(primary.job), downloadJobTelemetry(primary.job)].filter(Boolean).join(" · "))}</small></span>${count > 1 ? `<b>${count}</b>` : ""}<span class="download-activity-open">${uiIcon("chevron-right")}</span><span class="download-activity-progress"><i class="${progressWidthClass(Math.round(Number(primary?.job?.progress || 0) * 100))}"></i></span></button>`;
   hydrateIcons(host);
 }
 
@@ -2363,18 +2401,27 @@ function scheduleLocalModelInstallPoll(delay = 900) {
 
 async function controlDownloadTask(jobId, action, kind = "model") {
   const runtime = kind === "runtime";
-  const job = await request(runtime ? "/api/local-runtime/install-control" : "/api/local-models/install-control", {
+  const componentId = String(kind).startsWith("component:") ? String(kind).split(":", 2)[1] : "";
+  const endpoint = componentId
+    ? "/api/runtime-components/install-control"
+    : runtime
+      ? "/api/local-runtime/install-control"
+      : "/api/local-models/install-control";
+  const job = await request(endpoint, {
     method: "POST",
-    body: JSON.stringify(runtime ? { action } : { job_id: jobId, action }),
+    body: JSON.stringify(componentId ? { component: componentId, action } : runtime ? { action } : { job_id: jobId, action }),
   });
-  if (runtime) {
+  if (componentId) {
+    state.runtimeComponents[componentId] = { ...(state.runtimeComponents?.[componentId] || {}), install_job: job };
+  } else if (runtime) {
     state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
   } else {
     mergeLocalModelInstall(job);
   }
   renderDownloadActivity();
   if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
-  if (runtime) scheduleLocalRuntimeInstallPoll(250);
+  if (componentId) scheduleRuntimeComponentInstallPoll(componentId, 250);
+  else if (runtime) scheduleLocalRuntimeInstallPoll(250);
   else scheduleLocalModelInstallPoll(250);
   toast({ pause: "下载已暂停", resume: "下载已恢复", retry: "已重新开始下载", cancel: "下载已取消" }[action] || "下载任务已更新");
 }
@@ -2412,6 +2459,203 @@ function scheduleLocalRuntimeInstallPoll(delay = 700) {
       scheduleLocalRuntimeInstallPoll(2200);
     }
   }, delay);
+}
+
+function runtimeComponentSnapshot(componentId) {
+  const identifier = String(componentId || "").trim().toLowerCase();
+  const fallback = identifier === "tectonic"
+    ? { id: "tectonic", name: "LaTeX 排版组件", installed: false, install_available: false, manual_install_available: true, mode: "missing" }
+    : { id: "node", name: "Agent 运行组件", installed: false, install_available: false, manual_install_available: true, mode: "missing" };
+  const component = { ...fallback, ...(state.runtimeComponents?.[identifier] || {}) };
+  const job = component.install_job || {};
+  const jobState = String(job.state || "idle");
+  const active = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(jobState);
+  const failed = ["failed", "cancelled", "interrupted"].includes(jobState);
+  const paused = jobState === "paused";
+  // An interrupted replacement must never hide a previously usable binary.
+  // The stable executable remains authoritative until a new version passes
+  // validation and atomically replaces active.json.
+  const stableInstalled = Boolean(component.installed);
+  return {
+    ...component,
+    id: identifier,
+    job,
+    active,
+    failed,
+    paused,
+    progress: stableInstalled ? 100 : Math.max(0, Math.min(100, Math.round(Number(job.progress || 0) * 100))),
+    state: stableInstalled ? "ready" : active ? jobState : paused ? "paused" : failed ? jobState : "missing",
+  };
+}
+
+function runtimeComponentDefinition(componentId) {
+  return componentId === "tectonic"
+    ? {
+      icon: "file-text",
+      eyebrow: "可选 · 学术排版",
+      title: "LaTeX 排版组件",
+      description: "用于生成 LaTeX 与高质量 PDF；普通对话、检索和文档预览不依赖它。",
+    }
+    : {
+      icon: "cpu",
+      eyebrow: "推荐 · Agent 核心",
+      title: "Agent 运行组件",
+      description: "为 Pi Agent 提供工具编排、联网检索和持续任务运行环境。已有系统 Node 时会直接复用。",
+    };
+}
+
+function runtimeComponentModeLabel(component) {
+  if (component.mode === "system") return "已复用系统安装";
+  if (component.mode === "component") return "已安装，可跨版本复用";
+  if (component.mode === "embedded") return "随当前应用提供";
+  if (component.mode === "source") return "开发环境可用";
+  if (component.mode === "external") return "已复用外部组件";
+  return "尚未安装";
+}
+
+function runtimeComponentCardMarkup(componentId, { compact = false } = {}) {
+  const component = runtimeComponentSnapshot(componentId);
+  const definition = runtimeComponentDefinition(component.id);
+  const active = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(component.state);
+  const statusLabel = component.state === "ready"
+    ? runtimeComponentModeLabel(component)
+    : active
+      ? `${component.job?.message || "正在安装"} ${component.progress}%`
+      : component.state === "paused"
+        ? "安装已暂停"
+        : component.failed
+          ? component.state === "interrupted" ? "安装已中断" : "安装未完成"
+          : component.id === "tectonic" ? "未安装（可选）" : "尚未就绪";
+  const statusHint = component.state === "ready"
+    ? (component.executable ? `正在使用 ${component.executable}` : "当前环境已经可以直接使用。")
+    : active
+      ? (downloadJobTelemetry(component.job) || "正在下载并校验独立组件")
+      : component.state === "paused"
+        ? "继续安装会复用已经下载的内容。"
+        : component.failed
+          ? (component.job?.error || component.job?.message || "可以重试，或选择本地组件文件。")
+          : component.install_available
+            ? "仅在你确认后下载；不会随启动自动安装。"
+            : "可直接复用系统安装，也可选择已下载的官方组件 ZIP。";
+  const progress = active
+    ? `<div class="runtime-component-progress" role="progressbar" aria-label="${escapeHtml(definition.title)}安装进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${component.progress}"><span class="${progressWidthClass(component.progress)}"></span></div>`
+    : "";
+  let action = "";
+  if (component.state === "ready") {
+    action = `<span class="runtime-component-ready">${uiIcon("check")} 可用</span>`;
+  } else if (active) {
+    action = `<span class="runtime-component-running">${uiIcon("loader-circle")}</span>`;
+  } else if (component.state === "paused") {
+    action = `<button type="button" class="runtime-component-primary" data-action="control-download-task" data-download-kind="component:${escapeHtml(component.id)}" data-download-action="resume" data-job-id="${escapeHtml(component.job?.job_id || `runtime:${component.id}`)}">${uiIcon("download")}继续安装</button>`;
+  } else {
+    const installButton = component.install_available
+      ? `<button type="button" class="runtime-component-primary" data-action="install-runtime-component" data-component-id="${escapeHtml(component.id)}">${uiIcon(component.failed ? "refresh" : "download")}${component.failed ? "重试安装" : "安装组件"}</button>`
+      : "";
+    const manualButton = component.manual_install_available
+      ? `<button type="button" class="runtime-component-secondary" data-action="choose-runtime-component-files" data-component-id="${escapeHtml(component.id)}">选择本地文件</button>`
+      : "";
+    action = `<div class="runtime-component-actions">${installButton}${manualButton}</div>`;
+  }
+  return `<article class="runtime-component-card is-${escapeHtml(component.state)} ${compact ? "is-compact" : ""}"><span class="runtime-component-icon">${uiIcon(definition.icon)}</span><div class="runtime-component-copy"><span>${escapeHtml(definition.eyebrow)}</span><strong>${escapeHtml(definition.title)}</strong><p>${escapeHtml(definition.description)}</p><small>${escapeHtml(statusLabel)} · ${escapeHtml(statusHint)}</small>${progress}</div><div class="runtime-component-action">${action}</div></article>`;
+}
+
+function runtimeComponentsSettingsMarkup() {
+  return `<section class="runtime-components-panel"><header><div><span>APP COMPONENTS</span><h2>应用运行组件</h2><p>主程序保持轻量；独立组件只安装一次，并会被之后的 ScanSci 版本继续复用。</p></div><button type="button" class="quiet-text-button" data-action="refresh-runtime-components">重新检测</button></header><div class="runtime-component-list">${runtimeComponentCardMarkup("node")}${runtimeComponentCardMarkup("tectonic")}</div></section>`;
+}
+
+async function refreshRuntimeComponents({ render = true } = {}) {
+  const payload = await request("/api/runtime-components");
+  state.runtimeComponents = { ...state.runtimeComponents, ...(payload?.components || {}) };
+  if (render) {
+    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.onboardingOpen) renderResourceOnboarding();
+    renderDownloadActivity();
+  }
+  return state.runtimeComponents;
+}
+
+function scheduleRuntimeComponentInstallPoll(componentId, delay = 700) {
+  const identifier = String(componentId || "").trim().toLowerCase();
+  if (!identifier || runtimeComponentInstallPollTimers.has(identifier)) return;
+  const timer = window.setTimeout(async () => {
+    runtimeComponentInstallPollTimers.delete(identifier);
+    try {
+      const job = await request(`/api/runtime-components/install-status?component=${encodeURIComponent(identifier)}`);
+      state.downloadStatusError = "";
+      state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
+      if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+      if (state.onboardingOpen) renderResourceOnboarding();
+      renderDownloadActivity();
+      if (["queued", "downloading", "installing", "pausing", "cancelling"].includes(String(job.state || ""))) {
+        scheduleRuntimeComponentInstallPoll(identifier, 700);
+        return;
+      }
+      const before = runtimeComponentSnapshot(identifier);
+      await refreshRuntimeComponents();
+      const after = runtimeComponentSnapshot(identifier);
+      if (after.state === "ready" && before.state !== "ready") {
+        toast(`${runtimeComponentDefinition(identifier).title}已就绪`);
+      } else if (!after.installed && ["failed", "cancelled", "interrupted"].includes(String(job.state || ""))) {
+        toast(job.error || job.message || `${runtimeComponentDefinition(identifier).title}安装未完成`, true);
+      }
+    } catch (error) {
+      state.downloadStatusError = error?.message || "无法读取运行组件安装进度";
+      renderDownloadActivity();
+      scheduleRuntimeComponentInstallPoll(identifier, 2200);
+    }
+  }, delay);
+  runtimeComponentInstallPollTimers.set(identifier, timer);
+}
+
+async function startRuntimeComponentInstall(componentId) {
+  const identifier = String(componentId || "").trim().toLowerCase();
+  const current = runtimeComponentSnapshot(identifier);
+  if (current.installed) {
+    toast(`${runtimeComponentDefinition(identifier).title}已经可用，无需重复下载`);
+    return current;
+  }
+  if (!current.install_available) {
+    await chooseRuntimeComponentFiles(identifier);
+    return current;
+  }
+  const job = await request("/api/runtime-components/install", {
+    method: "POST",
+    body: JSON.stringify({ component: identifier }),
+  });
+  state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.onboardingOpen) renderResourceOnboarding();
+  renderDownloadActivity();
+  scheduleRuntimeComponentInstallPoll(identifier);
+  toast(`${runtimeComponentDefinition(identifier).title}已开始安装`);
+  return job;
+}
+
+async function chooseRuntimeComponentFiles(componentId) {
+  const identifier = String(componentId || "").trim().toLowerCase();
+  const componentPicker = window.pywebview?.api?.choose_runtime_component_files;
+  const legacyPicker = window.pywebview?.api?.choose_local_runtime_files;
+  const picker = componentPicker || legacyPicker;
+  if (typeof picker !== "function") {
+    toast("浏览器预览不能读取本地路径，请在 ScanSci 桌面应用中选择组件文件。", true);
+    return null;
+  }
+  const selected = componentPicker
+    ? await componentPicker.call(window.pywebview.api, identifier)
+    : await legacyPicker.call(window.pywebview.api);
+  const paths = Array.from(selected || []).map(String).filter(Boolean);
+  if (!paths.length) return null;
+  const job = await request("/api/runtime-components/install-local", {
+    method: "POST",
+    body: JSON.stringify({ component: identifier, paths }),
+  });
+  state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
+  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.onboardingOpen) renderResourceOnboarding();
+  renderDownloadActivity();
+  scheduleRuntimeComponentInstallPoll(identifier);
+  toast(`正在校验${runtimeComponentDefinition(identifier).title}`);
+  return job;
 }
 
 async function refreshKnowledgeIndexStatus(notebookId = state.notebook?.notebook_id || "") {
@@ -4174,7 +4418,9 @@ function startTask() {
   state.sessionTokens = 0;
   state.contextUsagePercent = 0;
   state.sessionStats = null;
-  state.streaming = false;
+  // Starting a new conversation only detaches the view. Existing direct-chat
+  // jobs keep running under their own conversation IDs.
+  syncActiveDirectChatState();
   closeContextUsagePopovers();
   renderContextUsage();
   window.localStorage.removeItem("scansci.active.task");
@@ -4363,12 +4609,16 @@ function renderTasks() {
     if (record.kind === "direct") {
       const conversationId = String(record.conversation_id || "");
       const active = !state.activeTaskId && state.directConversationId === conversationId;
+      const job = directChatJob(conversationId);
       const menuKey = `direct:${conversationId}`;
       const open = state.historyMenuRunId === menuKey;
       const organizeAction = archived ? "restore-direct-conversation" : "archive-direct-conversation";
       const organizeLabel = archived ? "恢复到历史对话" : "归档对话";
       const organizeIcon = archived ? "archive-restore" : "archive";
-      return `<div class="task-row ${open ? "has-open-menu" : ""}" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status completed">${archived ? "已归档" : "已完成"}</time></button><button type="button" class="task-more" data-action="toggle-direct-menu" data-conversation-id="${escapeHtml(conversationId)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-conversation-id="${escapeHtml(conversationId)}">${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}">${uiIcon("trash")}<span>删除对话</span></button></div>` : ""}</div>`;
+      const statusClass = job ? (job.status === "paused" ? "paused" : job.status === "queued" ? "queued" : "running") : "completed";
+      const statusLabel = archived ? "已归档" : job ? job.pauseRequested ? "正在暂停" : job.status === "paused" ? "已暂停" : (job.queue.length ? `处理中 · 后续 ${job.queue.length}` : "处理中") : "已完成";
+      const manageDisabled = Boolean(job);
+      return `<div class="task-row ${open ? "has-open-menu" : ""}" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status ${statusClass}">${escapeHtml(statusLabel)}</time></button><button type="button" class="task-more" data-action="toggle-direct-menu" data-conversation-id="${escapeHtml(conversationId)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-conversation-id="${escapeHtml(conversationId)}" ${manageDisabled ? "disabled" : ""}>${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}" ${manageDisabled ? "disabled" : ""}>${uiIcon("trash")}<span>删除对话</span></button>${manageDisabled ? '<small>运行结束后可整理</small>' : ""}</div>` : ""}</div>`;
     }
     const run = record;
     const open = state.historyMenuRunId === run.run_id;
@@ -4508,6 +4758,10 @@ function toggleDirectMenu(conversationId) {
 async function archiveDirectConversation(conversationId) {
   const id = String(conversationId || "").trim();
   if (!id) return;
+  if (directChatJob(id)) {
+    toast("这个对话仍在处理，请先停止或等待完成。", true);
+    return;
+  }
   state.historyMenuRunId = "";
   await request(`/api/chat/history/${encodeURIComponent(id)}/archive`, { method: "POST", body: "{}" });
   state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
@@ -4529,6 +4783,10 @@ async function restoreDirectConversation(conversationId) {
 async function deleteDirectConversation(conversationId) {
   const id = String(conversationId || "").trim();
   if (!id) return;
+  if (directChatJob(id)) {
+    toast("这个对话仍在处理，请先停止或等待完成。", true);
+    return;
+  }
   const record = state.directConversations.find((item) => item.conversation_id === id);
   const confirmed = await requestConfirmation({
     eyebrow: "永久删除",
@@ -4550,6 +4808,129 @@ async function deleteDirectConversation(conversationId) {
 function newDirectConversationId() {
   return globalThis.crypto?.randomUUID?.()
     || `direct-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function directChatJob(conversationId = state.directConversationId) {
+  return directChatJobs.get(String(conversationId || "")) || null;
+}
+
+function syncActiveDirectChatState() {
+  const job = directChatJob();
+  if (job && !state.activeTaskId) {
+    state.directMessages = job.messages;
+    state.sessionId = job.sessionId || null;
+    activeDirectChatController = job.controller || null;
+    state.activeStreamRunId = job.runId || "";
+    state.streaming = ["starting", "running", "retrying", "queued"].includes(job.status);
+  } else {
+    activeDirectChatController = null;
+    state.activeStreamRunId = "";
+    state.streaming = false;
+  }
+  renderDirectLiveControls();
+}
+
+function activeResearchRun() {
+  return state.activeTaskId
+    ? state.runs.find((item) => item.run_id === state.activeTaskId) || null
+    : null;
+}
+
+function composerSendControlState() {
+  const run = activeResearchRun();
+  if (run) {
+    if (run.status === "paused" && !run.pause_requested) return { state: "paused", icon: "play", label: "继续任务" };
+    if (run.pause_requested) return { state: "pausing", icon: "square", label: "正在暂停任务" };
+    if (["queued", "planning", "running", "verifying"].includes(String(run.status || ""))) {
+      return { state: "running", icon: "square", label: "暂停当前任务" };
+    }
+  }
+  const job = !state.activeTaskId ? directChatJob() : null;
+  if (job) {
+    if (job.status === "paused" && !job.pauseRequested) return { state: "paused", icon: "play", label: "继续回复" };
+    if (job.pauseRequested) return { state: "pausing", icon: "square", label: "正在暂停回复" };
+    if (["starting", "running", "retrying", "queued"].includes(job.status)) {
+      return { state: "running", icon: "square", label: "暂停当前回复" };
+    }
+  }
+  if (composerSubmissionInFlight) return { state: "running", icon: "square", label: "暂停当前操作" };
+  return { state: "idle", icon: "send", label: "发送问题" };
+}
+
+function renderComposerSendButtons() {
+  const control = composerSendControlState();
+  document.querySelectorAll("#homeAskForm, #chatAskForm").forEach((form) => {
+    const button = form.querySelector("button[type='submit']");
+    if (!button) return;
+    button.dataset.composerState = control.state;
+    button.innerHTML = uiIcon(control.icon);
+    button.setAttribute("aria-label", control.label);
+    button.setAttribute("title", control.label);
+    button.setAttribute("aria-busy", String(control.state === "pausing"));
+    button.disabled = control.state === "pausing";
+  });
+}
+
+function directTurnConfiguration({
+  question,
+  key,
+  directChatMode,
+  selectedKnowledge = [],
+  selectedSkillIds = [],
+  selectedSkills = [],
+  images = [],
+  audio = [],
+  sourceFiles = [],
+} = {}) {
+  const knowledgeScopes = selectedKnowledge.map((notebook) => ({
+    notebook_id: String(notebook.notebook_id),
+    title: knowledgeScopeTitle(notebook),
+  }));
+  return {
+    queueId: globalThis.crypto?.randomUUID?.() || `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    question: String(question || "").trim(),
+    key: key === "home" ? "home" : "chat",
+    directChatMode,
+    selectedSkillIds: [...selectedSkillIds],
+    selectedSkills: [...selectedSkills],
+    images: [...images],
+    audio: [...audio],
+    sourceFiles: [...sourceFiles],
+    knowledgeScopes,
+    notebookId: selectedKnowledge[0]?.notebook_id || "",
+    notebookIds: selectedKnowledge.map((notebook) => notebook.notebook_id),
+    knowledgeScope: activeKnowledgeScopePayload() || null,
+    knowledgeScopePayloads: selectedKnowledge.length ? activeKnowledgeScopePayloads() : [],
+    thinkingLevel: currentThinkingLevel(),
+    webSearch: state.webSearchMode,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function clearSubmittedDirectComposer(turn, input = null) {
+  const key = turn?.key === "home" ? "home" : "chat";
+  const target = input || byId(key === "home" ? "homeQuestionInput" : "chatQuestionInput");
+  if (target) {
+    target.value = "";
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  clearComposerSkills(key);
+  clearComposerImages(key);
+  clearComposerAudio(key);
+  clearComposerSources(key);
+}
+
+function directJobSummary(job) {
+  return {
+    kind: "direct",
+    conversation_id: job.conversationId,
+    title: job.title,
+    preview: [...job.messages].reverse().find((message) => String(message?.content || "").trim())?.content || job.title,
+    created_at: job.createdAt,
+    updated_at: new Date().toISOString(),
+    message_count: job.messages.filter((message) => !message.streaming).length,
+    session_id: job.sessionId || "",
+  };
 }
 
 function directConversationTitle(messages = state.directMessages) {
@@ -4613,19 +4994,24 @@ function upsertDirectConversation(record) {
   renderTasks();
 }
 
-async function persistDirectConversation() {
-  const messages = state.directMessages
+async function persistDirectConversationSnapshot({
+  conversationId = state.directConversationId,
+  messages: sourceMessages = state.directMessages,
+  sessionId = state.sessionId,
+  title = "",
+} = {}) {
+  const messages = sourceMessages
     .filter((message) => message && !message.streaming)
     .map(directHistoryMessage);
   if (!messages.length) return null;
-  if (!state.directConversationId) state.directConversationId = newDirectConversationId();
-  window.localStorage.setItem("scansci.active.direct", state.directConversationId);
+  const id = String(conversationId || newDirectConversationId());
+  if (id === state.directConversationId) window.localStorage.setItem("scansci.active.direct", id);
   const saved = await request("/api/chat/history", {
     method: "POST",
     body: JSON.stringify({
-      conversation_id: state.directConversationId,
-      title: directConversationTitle(messages),
-      session_id: state.sessionId || "",
+      conversation_id: id,
+      title: title || directConversationTitle(messages),
+      session_id: sessionId || "",
       messages,
     }),
   });
@@ -4633,7 +5019,445 @@ async function persistDirectConversation() {
   return saved;
 }
 
+async function persistDirectConversation() {
+  return persistDirectConversationSnapshot();
+}
+
+function persistDirectChatJob(job) {
+  return persistDirectConversationSnapshot({
+    conversationId: job.conversationId,
+    messages: job.messages,
+    sessionId: job.sessionId,
+    title: job.title,
+  });
+}
+
+function queueDirectChatTurn(job, turn, { front = false, announce = true } = {}) {
+  if (!job || !turn?.question) return;
+  if (front) job.queue.unshift(turn);
+  else job.queue.push(turn);
+  if (announce) toast(`已加入后续队列（${job.queue.length}）`);
+  renderDirectLiveControls();
+  renderTasks();
+}
+
+async function steerDirectChat(job, turn) {
+  if (!job?.runId || !turn?.question || turn.images.length || turn.audio.length || turn.sourceFiles.length) return false;
+  try {
+    const result = await request("/api/chat/steer", {
+      method: "POST",
+      body: JSON.stringify({ run_id: job.runId, text: turn.question }),
+    });
+    if (!result?.ok) return false;
+    job.pendingSteer = turn;
+    const traceItem = { title: "调整请求已发送", detail: turn.question, status: "pending" };
+    job.interventionTrace.push(traceItem);
+    if (job.streamingMessage) {
+      job.streamingMessage.trace = [
+        ...(job.runtimeTrace || []),
+        ...job.interventionTrace,
+      ];
+    }
+    scheduleDirectConversationRender(job.conversationId);
+    window.clearTimeout(job.steerAckTimer);
+    job.steerAckTimer = window.setTimeout(() => {
+      if (job.pendingSteer === turn) fallbackSteerDirectChat(job, turn, { reason: "ack_timeout" });
+    }, 2500);
+    return true;
+  } catch (error) {
+    console.warn("Direct chat steering was unavailable", error);
+    return false;
+  }
+}
+
+function fallbackSteerDirectChat(job, turn, { reason = "unsupported" } = {}) {
+  if (!job || !turn) return;
+  window.clearTimeout(job.steerAckTimer);
+  job.steerAckTimer = 0;
+  job.pendingSteer = null;
+  job.steeringPending = false;
+  queueDirectChatTurn(job, turn, { front: true, announce: false });
+  // Without Pi's acknowledgement we cannot safely claim an in-flight
+  // instruction was accepted. Restart only this turn and preserve the new
+  // instruction as its own user-visible turn.
+  job.restartForSteer = true;
+  job.status = "queued";
+  const runId = job.runId;
+  job.controller?.abort();
+  if (runId) {
+    request("/api/chat/cancel", {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId }),
+    }).catch(() => {});
+  }
+  toast(reason === "rejected"
+    ? "当前 Pi 会话未接受调整；已停止本轮并按新方向继续。"
+    : "当前回复未确认原生调整；已停止本轮并按新方向继续。", true);
+  renderDirectLiveControls();
+}
+
+async function submitToRunningDirectChat(job, turn, input) {
+  clearSubmittedDirectComposer(turn, input);
+  if (job.inputMode === "steer") {
+    job.steeringPending = true;
+    renderDirectLiveControls();
+    const steered = await steerDirectChat(job, turn);
+    if (!steered) {
+      fallbackSteerDirectChat(job, turn);
+    }
+    renderDirectLiveControls();
+    return;
+  }
+  queueDirectChatTurn(job, turn);
+}
+
+function beginDirectChatJob(turn) {
+  const conversationId = String(state.directConversationId || newDirectConversationId());
+  const existingMessages = state.directMessages.filter((message) => message && !message.streaming).slice(-16);
+  const title = directConversationTitle([...existingMessages, { role: "user", content: turn.question }]);
+  const job = {
+    conversationId,
+    title,
+    createdAt: new Date().toISOString(),
+    sessionId: state.sessionId || "",
+    messages: existingMessages,
+    queue: [],
+    controller: null,
+    runId: "",
+    status: "starting",
+    inputMode: "follow-up",
+    currentStartedAt: 0,
+    currentTurn: null,
+    streamingMessage: null,
+    runtimeTrace: [],
+    interventionTrace: [],
+    steeringPending: false,
+    pendingSteer: null,
+    steerAckTimer: 0,
+    agentPhase: "",
+    agentLifecycle: [],
+    piQueue: { steering: [], follow_up: [], pending_count: 0 },
+    lastAgentControl: null,
+    restartForSteer: false,
+    cancelRequested: false,
+    pauseRequested: false,
+    pausedMessage: null,
+    pausedTurn: null,
+    sessionStats: null,
+  };
+  directChatJobs.set(conversationId, job);
+  state.directConversationId = conversationId;
+  state.activeTaskId = "";
+  state.directMessages = job.messages;
+  window.localStorage.setItem("scansci.active.direct", conversationId);
+  upsertDirectConversation(directJobSummary(job));
+  syncActiveDirectChatState();
+  void runDirectChatTurn(job, turn);
+  return job;
+}
+
+async function runDirectChatTurn(job, turn) {
+  if (!job || job.cancelRequested || job.pauseRequested || !turn?.question) return;
+  job.status = "starting";
+  job.currentTurn = turn;
+  job.runId = "";
+  job.runtimeTrace = [];
+  job.interventionTrace = [];
+  window.clearTimeout(job.steerAckTimer);
+  job.steerAckTimer = 0;
+  job.pendingSteer = null;
+  job.steeringPending = false;
+  job.agentPhase = "";
+  job.agentLifecycle = [];
+  job.piQueue = { steering: [], follow_up: [], pending_count: 0 };
+  job.lastAgentControl = null;
+  const userMessage = {
+    role: "user",
+    content: turn.question,
+    skills: turn.selectedSkills,
+    sources: turn.sourceFiles,
+    images: turn.images,
+    audio: turn.audio,
+    created_at: turn.createdAt || new Date().toISOString(),
+  };
+  const promptMessages = [...job.messages.filter((message) => !message.streaming), userMessage].slice(-16);
+  const startedAt = performance.now();
+  const streamingMessage = {
+    role: "assistant",
+    content: "",
+    streaming: true,
+    processing_started_at: startedAt,
+    mode: turn.directChatMode,
+    trace: [],
+    knowledgeScopes: turn.knowledgeScopes,
+    model: modelIdentitySnapshot(),
+    created_at: new Date().toISOString(),
+  };
+  job.currentStartedAt = startedAt;
+  job.streamingMessage = streamingMessage;
+  job.messages = [...promptMessages, streamingMessage].slice(-16);
+  job.controller = new AbortController();
+  job.status = "running";
+  if (job.conversationId === state.directConversationId && !state.activeTaskId) {
+    state.directMessages = job.messages;
+    state.conversationAutoFollow = true;
+    syncActiveDirectChatState();
+    renderDirectConversation({ forceFollow: true });
+  }
+  upsertDirectConversation(directJobSummary(job));
+  persistDirectChatJob(job).catch((error) => console.warn("Running direct conversation could not be saved", error));
+  renderTasks();
+  let completed = false;
+  try {
+    await streamChatWithRecovery(
+      {
+        messages: promptMessages,
+        images: turn.images,
+        audio: turn.audio,
+        source_files: turn.sourceFiles,
+        thinking_level: turn.thinkingLevel,
+        chat_mode: turn.directChatMode,
+        web_search: turn.webSearch,
+        ...(turn.notebookId ? { notebook_id: turn.notebookId } : {}),
+        ...(turn.notebookIds.length ? { notebook_ids: turn.notebookIds } : {}),
+        ...(turn.knowledgeScope ? { knowledge_scope: turn.knowledgeScope } : {}),
+        ...(turn.knowledgeScopePayloads.length ? { knowledge_scopes: turn.knowledgeScopePayloads } : {}),
+        conversation_id: job.conversationId,
+        session_id: job.sessionId || "",
+        skills: turn.selectedSkillIds,
+      },
+      (eventType, payload) => {
+        if (eventType === "RUN_STARTED") {
+          job.runId = String(payload.runId || payload.run_id || "");
+          streamingMessage.control_run_id = job.runId;
+          syncActiveDirectChatState();
+          renderDirectLiveControls();
+          return;
+        }
+        if (eventType === "delta" || eventType === "TEXT_MESSAGE_CONTENT") {
+          streamingMessage.content += String(payload.content || payload.delta || "");
+          scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (eventType === "session") {
+          job.sessionId = String(payload.session_id || job.sessionId || "");
+          if (job.conversationId === state.directConversationId && job.sessionId) {
+            state.sessionId = job.sessionId;
+            window.localStorage.setItem("scansci.active.session", job.sessionId);
+          }
+          return;
+        }
+        if (eventType === "STEP_FINISHED" && payload.stepName === "ingest_attachments" && payload.result?.sources) {
+          userMessage.sources = payload.result.sources;
+          scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "usage") {
+          streamingMessage.usage = payload.value || {};
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "session_stats") {
+          job.sessionStats = payload.value || {};
+          if (job.conversationId === state.directConversationId) updateSessionStats(job.sessionStats);
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "agent_lifecycle") {
+          const lifecycle = payload.value || {};
+          job.agentPhase = String(lifecycle.event || "");
+          job.agentLifecycle = [...job.agentLifecycle, lifecycle].slice(-64);
+          renderDirectLiveControls();
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "agent_queue") {
+          job.piQueue = payload.value || { steering: [], follow_up: [], pending_count: 0 };
+          renderDirectLiveControls();
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "agent_control") {
+          const control = payload.value || {};
+          job.lastAgentControl = control;
+          if (control.action === "steer" && job.pendingSteer) {
+            const pendingTurn = job.pendingSteer;
+            window.clearTimeout(job.steerAckTimer);
+            job.steerAckTimer = 0;
+            if (control.status === "accepted") {
+              job.pendingSteer = null;
+              job.steeringPending = false;
+              job.interventionTrace.push({ title: "已调整当前回复", detail: pendingTurn.question, status: "accepted" });
+              if (job.streamingMessage) {
+                job.streamingMessage.trace = [...job.runtimeTrace, ...job.interventionTrace];
+              }
+              toast("Pi 已接受本轮调整");
+              scheduleDirectConversationRender(job.conversationId);
+            } else {
+              fallbackSteerDirectChat(job, pendingTurn, { reason: "rejected" });
+            }
+          }
+          renderDirectLiveControls();
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "process_trace") {
+          job.runtimeTrace = Array.isArray(payload.value) ? payload.value : [];
+          streamingMessage.trace = [...job.runtimeTrace, ...job.interventionTrace];
+          scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "interaction") {
+          streamingMessage.interaction = payload.value || null;
+          scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (eventType === "done" || eventType === "RUN_FINISHED") {
+          const result = payload.result || payload;
+          if (Array.isArray(result.user_images)) userMessage.images = result.user_images;
+          const message = {
+            ...result.message,
+            model: modelIdentitySnapshot(result.model || result.message?.model || payload.model || streamingMessage.model),
+            mode: turn.directChatMode,
+            knowledgeScopes: turn.knowledgeScopes,
+            agent_runtime: result.agent_runtime || null,
+            usage: result.message?.usage || streamingMessage.usage,
+            trace: result.message?.trace || streamingMessage.trace,
+            created_at: result.message?.created_at || new Date().toISOString(),
+            processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+          };
+          job.sessionStats = result.stats || result.agent_runtime?.session_stats || payload.stats || job.sessionStats;
+          if (job.conversationId === state.directConversationId) updateSessionStats(job.sessionStats || null);
+          if (result.agent_runtime?.session?.session_id) {
+            job.sessionId = String(result.agent_runtime.session.session_id);
+            if (job.conversationId === state.directConversationId) {
+              state.sessionId = job.sessionId;
+              window.localStorage.setItem("scansci.active.session", job.sessionId);
+            }
+          }
+          const messageIndex = job.messages.indexOf(streamingMessage);
+          if (messageIndex >= 0) job.messages[messageIndex] = message;
+          completed = true;
+          scheduleDirectConversationRender(job.conversationId);
+        }
+      },
+      {
+        signal: job.controller.signal,
+        onRetry: () => {
+          job.status = "retrying";
+          streamingMessage.content = "";
+          streamingMessage.error = "";
+          streamingMessage.failure = null;
+          streamingMessage.streaming = true;
+          job.runtimeTrace = [];
+          streamingMessage.trace = [...job.interventionTrace];
+          scheduleDirectConversationRender(job.conversationId, { forceFollow: true });
+        },
+      },
+    );
+    if (!completed) throw new Error("模型流在最终回复到达前结束。");
+  } catch (error) {
+    const restartingForSteer = error?.name === "AbortError" && job.restartForSteer;
+    job.restartForSteer = false;
+    streamingMessage.streaming = false;
+    streamingMessage.content = String(streamingMessage.content || "");
+    streamingMessage.error = restartingForSteer ? "" : job.pauseRequested && error?.name === "AbortError" ? "已暂停" : error?.name === "AbortError" ? "已停止生成" : error.message;
+    streamingMessage.failure = restartingForSteer ? null : error?.failure || null;
+    if (restartingForSteer && !streamingMessage.content.trim()) {
+      job.messages = job.messages.filter((message) => message !== streamingMessage);
+    }
+    if (job.conversationId === state.directConversationId && error?.name !== "AbortError") toast(error.message, true);
+    scheduleDirectConversationRender(job.conversationId);
+  } finally {
+    const paused = Boolean(job.pauseRequested);
+    job.controller = null;
+    job.runId = "";
+    if (paused) {
+      streamingMessage.streaming = false;
+      streamingMessage.paused = true;
+      streamingMessage.error = "已暂停";
+      job.pausedMessage = streamingMessage;
+      job.pausedTurn = turn;
+      job.pauseRequested = false;
+      job.status = "paused";
+      job.streamingMessage = null;
+      job.currentTurn = turn;
+    } else {
+      job.streamingMessage = null;
+      job.currentTurn = null;
+    }
+    try {
+      await persistDirectChatJob(job);
+    } catch (error) {
+      console.warn("Direct conversation history could not be saved", error);
+      if (job.conversationId === state.directConversationId) toast("回复已保留，但历史保存失败；请稍后重试。", true);
+    }
+    if (paused) {
+      scheduleDirectConversationRender(job.conversationId);
+      syncActiveDirectChatState();
+      renderTasks();
+      return;
+    }
+    if (job.pendingSteer) {
+      const unacknowledgedTurn = job.pendingSteer;
+      window.clearTimeout(job.steerAckTimer);
+      job.steerAckTimer = 0;
+      job.pendingSteer = null;
+      job.steeringPending = false;
+      queueDirectChatTurn(job, unacknowledgedTurn, { front: true, announce: false });
+      toast("调整未在本轮结束前获得确认，已作为下一条消息继续。", true);
+    }
+    if (job.cancelRequested) job.queue = [];
+    const nextTurn = job.queue.shift() || null;
+    if (nextTurn && !job.cancelRequested) {
+      job.status = "queued";
+      scheduleDirectConversationRender(job.conversationId);
+      window.setTimeout(() => { void runDirectChatTurn(job, nextTurn); }, 0);
+    } else {
+      job.status = "completed";
+      directChatJobs.delete(job.conversationId);
+      scheduleDirectConversationRender(job.conversationId);
+    }
+    syncActiveDirectChatState();
+    renderTasks();
+  }
+}
+
+async function pauseDirectChatJob(conversationId = state.directConversationId) {
+  const job = directChatJob(conversationId);
+  if (!job) return;
+  if (job.status === "paused" || job.pauseRequested) return;
+  job.pauseRequested = true;
+  const runId = job.runId;
+  job.controller?.abort();
+  request("/api/chat/pause", {
+    method: "POST",
+    body: JSON.stringify({ run_id: runId }),
+  }).catch(() => {});
+  renderDirectLiveControls();
+  renderTasks();
+}
+
+async function resumeDirectChatJob(conversationId = state.directConversationId) {
+  const job = directChatJob(conversationId);
+  if (!job || job.status !== "paused" || !job.pausedTurn) return;
+  const turn = job.pausedTurn;
+  const pausedMessage = job.pausedMessage;
+  const userMessage = [...job.messages].reverse().find((message) => message.role === "user" && message.created_at === turn.createdAt);
+  job.messages = job.messages.filter((message) => message !== pausedMessage && message !== userMessage);
+  job.pausedMessage = null;
+  job.pausedTurn = null;
+  job.pauseRequested = false;
+  job.status = "queued";
+  syncActiveDirectChatState();
+  renderTasks();
+  void runDirectChatTurn(job, turn);
+}
+
+// Keep the legacy action available for older rendered controls.
+async function cancelDirectChatJob(conversationId = state.directConversationId) {
+  return pauseDirectChatJob(conversationId);
+}
+
+// Compatibility marker for older live-control snapshots: data-action="cancel-direct-chat".
+
 function runStatusLabel(run) {
+  if (run.pause_requested) return "暂停中";
   if (run.cancel_requested) return "停止中";
   return ({ queued: "排队中", planning: "规划中", running: "执行中", verifying: "核验中", needs_confirmation: "待确认", waiting_input: "等待回答", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已停止" })[run.status] || run.status;
 }
@@ -4649,6 +5473,7 @@ function upsertRun(run) {
   else state.runs.unshift(run);
   state.runs.sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   renderTasks();
+  renderComposerSendButtons();
 }
 
 function renderSources() {
@@ -4728,6 +5553,7 @@ async function legacyAskQuestion(event, inputId) {
     return;
   }
   composerSubmissionInFlight = true;
+  renderComposerSendButtons();
   const button = event.currentTarget.querySelector("button[type=submit]");
   if (!button) {
     composerSubmissionInFlight = false;
@@ -4859,6 +5685,7 @@ async function legacyAskQuestion(event, inputId) {
   } finally {
     composerSubmissionInFlight = false;
     button.disabled = false;
+    renderComposerSendButtons();
   }
 }
 
@@ -4875,6 +5702,22 @@ async function askQuestion(event, inputId) {
   if (!input || !button) {
     console.error("ScanSci composer submission is missing its input or submit button", { inputId });
     toast("发送控件未准备好，请刷新后重试。", true);
+    return;
+  }
+  const activatedSendButton = event.submitter === button;
+  const currentRun = activeResearchRun();
+  const currentJob = !state.activeTaskId ? directChatJob() : null;
+  if (activatedSendButton && currentRun) {
+    if (currentRun.status === "paused" && !currentRun.pause_requested) {
+      resumeRun(currentRun.run_id).catch((error) => toast(error.message, true));
+    } else if (!currentRun.pause_requested && ["queued", "planning", "running", "verifying"].includes(String(currentRun.status || ""))) {
+      pauseRun(currentRun.run_id).catch((error) => toast(error.message, true));
+    }
+    return;
+  }
+  if (activatedSendButton && currentJob) {
+    if (currentJob.status === "paused") resumeDirectChatJob(currentJob.conversationId);
+    else if (!currentJob.pauseRequested) pauseDirectChatJob(currentJob.conversationId);
     return;
   }
   const key = composerKey(inputId);
@@ -4908,8 +5751,9 @@ async function askQuestion(event, inputId) {
   // tasks; changing the mode must never fork an already-open conversation.
   const isTaskFollowUp = isTaskConversation;
   const isLikelyDirectConversation = !isTaskFollowUp && !state.notebook && ["general", "writing"].includes(selectedMode);
-  if (isLikelyDirectConversation && (composerSubmissionInFlight || state.streaming || activeDirectChatController)) {
-    toast("上一条回复仍在处理，请等待完成。", true);
+  const activeConversationJob = !isTaskFollowUp ? directChatJob() : null;
+  if (isLikelyDirectConversation && composerSubmissionInFlight) {
+    toast("这条消息正在提交，请稍候。", true);
     return;
   }
   if (isTaskFollowUp && (sourceFiles.length || images.length || audio.length)) {
@@ -4920,6 +5764,7 @@ async function askQuestion(event, inputId) {
   // await point; without this synchronous guard, Enter plus a click could
   // create two identical model requests before the submit button is disabled.
   composerSubmissionInFlight = true;
+  renderComposerSendButtons();
   const isReviewWorkflow = inputId === "reviewQuestionInput";
   const selectedKnowledge = selectedKnowledgeNotebooks();
   const searchableKnowledgeSelected = selectedKnowledge.some((notebook) => Number(notebook.counts?.sources || 0) > 0);
@@ -4930,7 +5775,7 @@ async function askQuestion(event, inputId) {
   // General input stays general by default.  For an explicit, multi-step
   // product request the host may offer a durable route; the server repeats
   // this decision when creating the run, so this preview is never authority.
-  if (selectedMode === "general" && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
+  if (selectedMode === "general" && !activeConversationJob && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
     try {
       const decision = await previewFreeformTask(question, selectedSkillIds);
       if (decision?.route === "durable_run" && decision?.workflow_type) {
@@ -4992,6 +5837,25 @@ async function askQuestion(event, inputId) {
     return;
   }
 
+  const directTurn = isDirectConversation
+    ? directTurnConfiguration({
+        question,
+        key,
+        directChatMode,
+        selectedKnowledge,
+        selectedSkillIds,
+        selectedSkills,
+        images,
+        audio,
+        sourceFiles,
+      })
+    : null;
+  if (isDirectConversation && activeConversationJob) {
+    composerSubmissionInFlight = false;
+    await submitToRunningDirectChat(activeConversationJob, directTurn, input);
+    return;
+  }
+
   const plannedWorkflowType = String(
     routedTask?.workflow_type
       || writingArtifactRoute?.workflowType
@@ -5041,122 +5905,8 @@ async function askQuestion(event, inputId) {
       return;
     }
     if (isDirectConversation) {
-      if (!state.directConversationId) state.directConversationId = newDirectConversationId();
-      window.localStorage.setItem("scansci.active.direct", state.directConversationId);
-      const knowledgeScopes = selectedKnowledge.map((notebook) => ({
-        notebook_id: String(notebook.notebook_id),
-        title: knowledgeScopeTitle(notebook),
-      }));
-      const userMessage = { role: "user", content: question, skills: selectedSkills, sources: sourceFiles, images, audio, created_at: new Date().toISOString() };
-      const messages = [...state.directMessages, userMessage].filter((message) => !message.streaming).slice(-16);
-      const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, processing_started_at: startedAt, mode: directChatMode, trace: [], knowledgeScopes, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
-      state.directMessages = [...messages, streamingMessage].slice(-16);
-      state.conversationAutoFollow = true;
-      renderDirectConversation({ forceFollow: true });
-      let completed = false;
-      state.streaming = true;
-      activeDirectChatController = new AbortController();
-      await streamChatWithRecovery(
-        {
-          messages,
-          images,
-          audio,
-          source_files: sourceFiles,
-          thinking_level: currentThinkingLevel(),
-          chat_mode: directChatMode,
-          web_search: state.webSearchMode,
-          ...(selectedKnowledge[0] ? { notebook_id: selectedKnowledge[0].notebook_id } : {}),
-          ...(selectedKnowledge.length ? { notebook_ids: selectedKnowledge.map((notebook) => notebook.notebook_id) } : {}),
-          ...(activeKnowledgeScopePayload() ? { knowledge_scope: activeKnowledgeScopePayload() } : {}),
-          ...(selectedKnowledge.length ? { knowledge_scopes: activeKnowledgeScopePayloads() } : {}),
-          conversation_id: state.directConversationId,
-          session_id: state.sessionId || "",
-          skills: selectedSkillIds,
-        },
-        (eventType, payload) => {
-          if (eventType === "RUN_STARTED") {
-            const controlRunId = String(payload.runId || payload.run_id || "");
-            state.activeStreamRunId = controlRunId;
-            streamingMessage.control_run_id = controlRunId;
-            return;
-          }
-          if (eventType === "delta" || eventType === "TEXT_MESSAGE_CONTENT") {
-            streamingMessage.content += String(payload.content || payload.delta || "");
-            scheduleDirectConversationRender();
-            return;
-          }
-          if (eventType === "STEP_FINISHED" && payload.stepName === "ingest_attachments" && payload.result?.sources) {
-            userMessage.sources = payload.result.sources;
-            scheduleDirectConversationRender();
-            return;
-          }
-          if (eventType === "CUSTOM" && payload.name === "usage") {
-            streamingMessage.usage = payload.value || {};
-            return;
-          }
-          if (eventType === "CUSTOM" && payload.name === "session_stats") {
-            updateSessionStats(payload.value || {});
-            return;
-          }
-          if (eventType === "CUSTOM" && payload.name === "process_trace") {
-            streamingMessage.trace = Array.isArray(payload.value) ? payload.value : [];
-            scheduleDirectConversationRender();
-            return;
-          }
-          if (eventType === "CUSTOM" && payload.name === "interaction") {
-            streamingMessage.interaction = payload.value || null;
-            scheduleDirectConversationRender();
-            return;
-          }
-          if (eventType === "done" || eventType === "RUN_FINISHED") {
-            const result = payload.result || payload;
-            if (Array.isArray(result.user_images)) userMessage.images = result.user_images;
-            const message = {
-              ...result.message,
-              model: modelIdentitySnapshot(result.model || result.message?.model || payload.model || streamingMessage.model),
-              mode: directChatMode,
-              knowledgeScopes,
-              agent_runtime: result.agent_runtime || null,
-              usage: result.message?.usage || streamingMessage.usage,
-              created_at: result.message?.created_at || new Date().toISOString(),
-              processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
-            };
-            updateSessionStats(result.stats || result.agent_runtime?.session_stats || payload.stats || null);
-            if (result.agent_runtime?.session?.session_id) {
-              state.sessionId = String(result.agent_runtime.session.session_id);
-              window.localStorage.setItem("scansci.active.session", state.sessionId);
-            }
-            const messageIndex = state.directMessages.indexOf(streamingMessage);
-            if (messageIndex >= 0) state.directMessages[messageIndex] = message;
-            completed = true;
-            scheduleDirectConversationRender();
-          }
-        },
-        {
-          signal: activeDirectChatController.signal,
-          onRetry: () => {
-            streamingMessage.content = "";
-            streamingMessage.error = "";
-            streamingMessage.failure = null;
-            streamingMessage.streaming = true;
-            streamingMessage.trace = [];
-            renderDirectConversation({ forceFollow: true });
-          },
-        },
-      );
-      if (!completed) throw new Error("模型流在最终回复到达前结束。");
-      try {
-        await persistDirectConversation();
-      } catch (historyError) {
-        console.warn("Direct conversation history could not be saved", historyError);
-        toast("回复已完成，但历史保存失败；请稍后重试。", true);
-      }
-      input.value = "";
-      clearComposerSkills(key);
-      clearComposerImages(key);
-      clearComposerAudio(key);
-      clearComposerSources(key);
+      beginDirectChatJob(directTurn);
+      clearSubmittedDirectComposer(directTurn, input);
       return;
     }
 
@@ -5210,11 +5960,10 @@ async function askQuestion(event, inputId) {
       byId("answerArea").innerHTML = `<div class="error-state">${escapeHtml(error.message)}</div>`;
     }
   } finally {
-    activeDirectChatController = null;
-    state.activeStreamRunId = "";
-    state.streaming = false;
     composerSubmissionInFlight = false;
     button.disabled = false;
+    syncActiveDirectChatState();
+    renderComposerSendButtons();
   }
 }
 
@@ -5388,8 +6137,77 @@ function processTraceMarkup(message, duration) {
   return `<details class="answer-processing ${live ? "is-live" : ""}" aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}</details>`;
 }
 
+function renderDirectLiveControls() {
+  const surface = byId("chatLiveControls");
+  const input = byId("chatQuestionInput");
+  const form = byId("chatAskForm");
+  const send = form?.querySelector("button[type='submit']");
+  if (!surface) return;
+  const job = !state.activeTaskId ? directChatJob() : null;
+  if (!job) {
+    surface.hidden = true;
+    surface.innerHTML = "";
+    form?.classList.remove("has-live-direct-job");
+    if (input) input.placeholder = "继续追问或提出新的研究问题";
+    if (send) send.setAttribute("aria-label", "发送问题");
+    renderComposerSendButtons();
+    return;
+  }
+  const paused = job.status === "paused" && !job.pauseRequested;
+  const phaseLabels = {
+    started: "Agent 已启动",
+    turn_started: "正在思考",
+    message_started: "正在生成",
+    message_completed: "正在整理",
+    turn_completed: "本轮已完成",
+    completed: "正在收尾",
+    settled: "正在保存",
+  };
+  const runningLabel = paused
+    ? "已暂停"
+    : job.status === "retrying"
+      ? "正在重试"
+      : job.status === "starting"
+        ? "正在连接"
+        : job.status === "queued"
+          ? "准备继续"
+          : phaseLabels[job.agentPhase] || "正在处理";
+  const elapsed = job.currentStartedAt ? formatProcessingDuration(performance.now() - job.currentStartedAt) : "不足 1 秒";
+  const queueRows = job.queue.map((turn) => `<li><span>${escapeHtml(compact(turn.question, 52))}</span><button type="button" data-action="remove-direct-follow-up" data-queue-id="${escapeHtml(turn.queueId)}" aria-label="移除这条后续消息" title="移除">${uiIcon("x")}</button></li>`).join("");
+  const parallelCount = Math.max(0, directChatJobs.size - 1);
+  const controlAction = paused ? "resume-direct-chat" : "pause-direct-chat";
+  const controlIcon = paused ? "play" : "square";
+  const controlLabel = paused ? "继续当前回复" : "暂停当前回复";
+  surface.hidden = false;
+  const piPending = Number(job.piQueue?.pending_count || 0);
+  surface.innerHTML = `<div class="direct-live-summary"><span class="direct-live-pulse ${paused ? "is-paused" : ""}" aria-hidden="true"></span><strong>${runningLabel}</strong><time data-direct-job-timer="${escapeHtml(String(job.currentStartedAt || performance.now()))}">${elapsed}</time>${piPending ? `<em>Pi 队列 ${piPending}</em>` : ""}${parallelCount ? `<em>另有 ${parallelCount} 个对话并行</em>` : ""}</div><div class="direct-live-actions" role="group" aria-label="运行中消息方式">${paused ? "" : `<button type="button" data-action="set-direct-input-mode" data-direct-input-mode="follow-up" class="${job.inputMode === "follow-up" ? "is-active" : ""}" aria-pressed="${job.inputMode === "follow-up"}">完成后继续</button><button type="button" data-action="set-direct-input-mode" data-direct-input-mode="steer" class="${job.inputMode === "steer" ? "is-active" : ""}" aria-pressed="${job.inputMode === "steer"}" ${job.steeringPending ? "disabled" : ""}>${job.steeringPending ? "正在调整…" : "立即调整"}</button>`}<button type="button" class="direct-live-stop" data-action="${controlAction}" data-legacy-action="cancel-direct-chat" aria-label="${controlLabel}" title="${controlLabel}">${uiIcon(controlIcon)}</button></div>${queueRows ? `<div class="direct-live-queue"><span>接下来 ${job.queue.length}</span><ol>${queueRows}</ol></div>` : ""}`;
+  form?.classList.add("has-live-direct-job");
+  if (input) input.placeholder = paused ? "点击播放键继续当前回复" : job.inputMode === "steer" ? "输入要立即调整的方向" : "输入下一条消息；当前回复完成后自动继续";
+  if (send) send.setAttribute("aria-label", paused ? "继续回复" : job.inputMode === "steer" ? "立即调整当前回复" : "加入后续队列");
+  renderComposerSendButtons();
+  updateProcessingTimers();
+}
+
+function setDirectChatInputMode(mode) {
+  const job = directChatJob();
+  if (!job) return;
+  job.inputMode = mode === "steer" ? "steer" : "follow-up";
+  renderDirectLiveControls();
+  byId("chatQuestionInput")?.focus();
+}
+
+function removeQueuedDirectTurn(queueId) {
+  const job = directChatJob();
+  if (!job) return;
+  const before = job.queue.length;
+  job.queue = job.queue.filter((turn) => turn.queueId !== String(queueId || ""));
+  if (job.queue.length !== before) toast("已移除后续消息");
+  renderDirectLiveControls();
+  renderTasks();
+}
+
 function updateProcessingTimers() {
-  const timers = [...document.querySelectorAll("[data-processing-timer]")];
+  const timers = [...document.querySelectorAll("[data-processing-timer], [data-direct-job-timer]")];
   if (!timers.length) {
     if (state.processingTimer) {
       window.clearInterval(state.processingTimer);
@@ -5399,7 +6217,7 @@ function updateProcessingTimers() {
   }
   const now = performance.now();
   timers.forEach((timer) => {
-    const startedAt = Number(timer.dataset.processingTimer || 0);
+    const startedAt = Number(timer.dataset.processingTimer || timer.dataset.directJobTimer || 0);
     timer.textContent = formatProcessingDuration(Math.max(0, now - startedAt));
   });
   if (!state.processingTimer) state.processingTimer = window.setInterval(updateProcessingTimers, 250);
@@ -5605,8 +6423,8 @@ function directFailureMarkup(message, index) {
 }
 
 function retryDirectMessage(index) {
-  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
-    toast("上一条回复仍在处理，请等待完成。", true);
+  if (composerSubmissionInFlight || directChatJob()) {
+    toast("当前对话仍在处理；可将这条重试加入后续队列，或先停止当前回复。", true);
     return;
   }
   const failedIndex = Number(index);
@@ -5667,7 +6485,8 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       ? `<p class="vision-route-notice">图片由 ${escapeHtml(visionRoute.provider_name || visionRoute.provider_id || "本地视觉模型")} 的 ${escapeHtml(visionRoute.model_id)} 处理${visionRoute.mode === "cloud" ? "（云端）" : "（本地）"}</p>`
       : "";
     const generation = message.streaming ? '<div class="generation-indicator" role="status" aria-label="正在生成回复"><span class="generation-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>' : "";
-    const error = message.error ? directFailureMarkup(message, index) : "";
+    const paused = message.paused ? '<p class="stream-paused" role="status">已暂停，点击发送键中的播放图标继续</p>' : "";
+    const error = message.error && !message.paused ? directFailureMarkup(message, index) : "";
     const interaction = interactionMarkup(message.interaction);
     const modeLabel = composerModeLabels[message.mode] || "通用对话";
     const promptContent = [...state.directMessages.slice(0, index)]
@@ -5682,12 +6501,13 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       model: message.model,
       label: modeLabel,
       processing,
-      extra: `${interaction}${generation}${error}`,
+      extra: `${interaction}${generation}${paused}${error}`,
       classes: "direct-answer",
       promptContent,
     });
   }).join("");
   byId("answerArea").innerHTML = `<article class="conversation-thread">${turns}</article>`;
+  renderDirectLiveControls();
   updateProcessingTimers();
   state.directMessages.forEach((message, index) => {
     if (message.role !== "assistant" || !message.reader_answer?.citations?.length) return;
@@ -7354,6 +8174,9 @@ function renderRun(run) {
   const renderKey = JSON.stringify({
     runId: run.run_id,
     status: run.status,
+    pauseRequested: Boolean(run.pause_requested),
+    pausable: Boolean(run.pausable),
+    resumable: Boolean(run.resumable),
     progress: Math.round(Number(run.progress || 0) * 100),
     stages: (run.stages || []).map((stage) => [stage.stage_id, stage.status, stage.summary, stage.error_message]),
     artifact: run.output_artifact?.file_path || run.output_artifact?.summary || "",
@@ -7431,7 +8254,7 @@ function renderRun(run) {
     resultMarkup = `<div class="run-live"><span></span><div><strong>${escapeHtml(evidenceIndex ? evidenceIndexRunTitle(run) : runStatusLabel(run))}</strong><p>${escapeHtml(evidenceIndex?.total ? `已处理 ${evidenceIndex.completed.toLocaleString("zh-CN")} / ${evidenceIndex.total.toLocaleString("zh-CN")} 条原文证据` : (run.stages || []).find((stage) => stage.status === "running")?.title || "正在准备下一阶段")}</p></div></div>`;
   }
   const actions = [
-    run.cancellable ? `<button type="button" class="run-action stop" data-action="cancel-run" data-run-id="${escapeHtml(run.run_id)}">停止</button>` : "",
+    run.pausable ? `<button type="button" class="run-action stop" data-action="pause-run" data-run-id="${escapeHtml(run.run_id)}">暂停</button>` : "",
     run.resumable && !run.interaction?.interaction_id ? `<button type="button" class="run-action" data-action="resume-run" data-run-id="${escapeHtml(run.run_id)}">${run.status === "needs_confirmation" ? "确认计划并执行" : run.workflow_type.startsWith("paper_") ? "继续下载并交付" : "继续"}</button>` : "",
     `<button type="button" class="run-action" data-action="branch-run" data-run-id="${escapeHtml(run.run_id)}">建立分支</button>`,
   ].join("");
@@ -7721,11 +8544,17 @@ function buildReviewDocumentModel(run, artifact) {
   const payload = artifact?.payload || {};
   const supplied = payload.review_document || {};
   const legacy = !payload.review_document;
-  const reader = payload.reader_answer || {};
-  const sentences = (reader.sentences || []).map(normalizeReviewParagraph).filter((item) => item.text);
-  const citations = (supplied.references || reader.citations || []).map((citation, index) => ({
+  const answer = payload.answer && typeof payload.answer === "object" ? payload.answer : {};
+  const reader = payload.reader_answer || answer.reader_answer || {};
+  const sentenceSource = [reader.sentences, answer.sentences]
+    .find((items) => Array.isArray(items) && items.length)
+    || String(reader.text || answer.text || "").split(/\n\s*\n/).filter(Boolean);
+  const sentences = sentenceSource.map(normalizeReviewParagraph).filter((item) => item.text);
+  const citationSource = [supplied.references, reader.citations, answer.citations, payload.citations, artifact?.citations]
+    .find((items) => Array.isArray(items) && items.length) || [];
+  const citations = citationSource.map((citation, index) => ({
     ...citation,
-    citation_id: String(citation.citation_id || index + 1),
+    citation_id: String(citation.citation_id || citation.id || citation.source_id || index + 1),
     paper: citation.paper || citation.title || citation.doc_id || `来源 ${index + 1}`,
   }));
   const abstract = normalizeReviewParagraph(supplied.abstract || sentences[0] || artifact?.summary || "当前资料库尚未形成可展示的摘要。", 0);
@@ -8212,24 +9041,35 @@ function bindRunCitations(result, scope = byId("answerArea")) {
 async function openDirectConversation(conversationId, { record = true } = {}) {
   const id = String(conversationId || "").trim();
   if (!id) return;
-  const conversation = await request(`/api/chat/history/${encodeURIComponent(id)}`);
+  const job = directChatJob(id);
+  let conversation = null;
+  try {
+    conversation = await request(`/api/chat/history/${encodeURIComponent(id)}`);
+  } catch (error) {
+    // A just-started background run may be visible in the sidebar a few
+    // milliseconds before its first durable history write completes.
+    if (!job) throw error;
+    conversation = directJobSummary(job);
+  }
   state.activeTaskId = "";
   state.reviewDocument = null;
   state.reviewDocumentOpen = false;
   state.directConversationId = id;
-  state.directMessages = Array.isArray(conversation.messages) ? conversation.messages : [];
-  state.sessionId = conversation.session_id || null;
+  state.directMessages = job?.messages || (Array.isArray(conversation.messages) ? conversation.messages : []);
+  state.sessionId = job?.sessionId || conversation.session_id || null;
   state.lastRunRenderKey = "";
   window.localStorage.removeItem("scansci.active.task");
   window.localStorage.setItem("scansci.active.direct", id);
   const latestAssistant = [...state.directMessages].reverse().find((message) => message.role === "assistant");
   const mode = String(latestAssistant?.mode || "general");
   applyContextPanelPreset(mode === "knowledge" ? "knowledge" : "none");
-  byId("conversationTitle").textContent = compact(conversation.title || directConversationTitle(state.directMessages), 80);
+  byId("conversationTitle").textContent = compact(job?.title || conversation.title || directConversationTitle(state.directMessages), 80);
   setView("conversation", { record });
   renderModelSelectors();
+  syncActiveDirectChatState();
   renderDirectConversation({ forceFollow: false });
-  void restoreSessionStats();
+  if (job?.sessionStats) updateSessionStats(job.sessionStats);
+  else void restoreSessionStats();
   renderTasks();
 }
 
@@ -8250,6 +9090,7 @@ async function openTask(id, { record = true } = {}) {
     upsertRun(displayRun);
     state.activeTaskId = displayRun.run_id;
     state.directConversationId = "";
+    syncActiveDirectChatState();
     state.reviewDocumentOpen = false;
     window.localStorage.setItem("scansci.active.task", displayRun.run_id);
     window.localStorage.removeItem("scansci.active.direct");
@@ -8921,7 +9762,11 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     jobId: `model:${ONBOARDING_CHAT_MODEL}`,
     models: [ONBOARDING_CHAT_MODEL],
     runtime: "huggingface",
-    compatibleKinds: ["chat"],
+    // A multimodal generative checkpoint can also provide ordinary text chat.
+    // Keep the recommended download as a small chat-only model, but reuse a
+    // compatible model that is already present instead of asking the user to
+    // download a second checkpoint.
+    compatibleKinds: ["chat", "vision"],
     eyebrow: "可选 · 本地对话",
     title: "小型本地对话模型",
     description: "在网络不稳定或想离线工作时，提供一个可在本机运行的基础对话模型。",
@@ -8986,8 +9831,24 @@ function localModelSupportsResource(model, resource) {
   // kind. They are not text-generation models and must not satisfy the local
   // conversation-model recommendation.
   const architecture = String(model.architecture || "").toLowerCase();
+  const marker = `${model.id || ""} ${model.model_type || ""}`.toLowerCase();
   return !/(classification|tokenclassification|bertmodel)/.test(architecture)
+    && !/(embedding|rerank|reward|asr|whisper)/.test(marker)
     && /(causallm|conditionalgeneration)/.test(architecture);
+}
+
+function localModelResourcePreference(model, resource) {
+  const preferredIds = Array.isArray(resource?.models) ? resource.models : [];
+  if (preferredIds.includes(String(model?.id || ""))) return 1000;
+  if (resource?.id !== "chat") return 0;
+  const marker = `${model?.id || ""} ${model?.name || ""} ${model?.model_type || ""} ${model?.architecture || ""}`.toLowerCase();
+  let score = String(model?.kind || "") === "chat" ? 300 : 100;
+  // Prefer general-purpose instruction/chat families over a vision-specialist
+  // fallback when both are installed.  This makes Qwen3.5 satisfy the guide
+  // without causing MiniCPM-V to hide a better text model.
+  if (/(instruct|chat|qwen3[_\-.]?5|qwen2|llama|gemma|mistral|phi)/.test(marker)) score += 200;
+  if (/(minicpmv|minicpm-v|llava)/.test(marker)) score -= 50;
+  return score;
 }
 
 function resourceInstallSnapshot(resource) {
@@ -9004,7 +9865,9 @@ function resourceInstallSnapshot(resource) {
   const preferredReady = definition.models.every(isInstalledReady);
   const compatibleModel = usesOllama
     ? null
-    : installed.find((item) => localModelSupportsResource(item, definition));
+    : installed
+      .filter((item) => localModelSupportsResource(item, definition))
+      .sort((left, right) => localModelResourcePreference(right, definition) - localModelResourcePreference(left, definition))[0] || null;
   const ready = usesOllama ? Boolean(state.ollama?.model_ready) : preferredReady || Boolean(compatibleModel);
   const directJob = jobs.find((item) => item.job_id === definition.jobId) || null;
   // The legacy retrieval endpoint used one combined job for embedding and
@@ -9202,7 +10065,7 @@ function resourceGuidePageMarkup(step) {
   if (step.id === "knowledge") return resourceGuideKnowledgePage();
   const resources = step.resourceIds.map((resourceId) => resourceSetupCard(resourceInstallSnapshot(resourceId))).join("");
   if (step.id === "retrieval") {
-    return `<div class="resource-guide-page is-retrieval"><div class="resource-guide-model-grid">${resources}</div><aside class="resource-guide-cuda-card"><span class="resource-guide-cuda-icon">${uiIcon("gpu")}</span><div><strong>CUDA 加速（可选）</strong><p>检测到 NVIDIA GPU 时会自动优先使用；没有 CUDA 也可以继续使用 CPU，不影响基础检索。</p><span class="resource-guide-cuda-status" data-cuda-status>正在检测本机 CUDA…</span></div></aside></div>`;
+    return `<div class="resource-guide-page is-retrieval">${runtimeComponentCardMarkup("node", { compact: true })}<div class="resource-guide-model-grid">${resources}</div><aside class="resource-guide-cuda-card"><span class="resource-guide-cuda-icon">${uiIcon("gpu")}</span><div><strong>CUDA 加速（可选）</strong><p>检测到 NVIDIA GPU 时会自动优先使用；没有 CUDA 也可以继续使用 CPU，不影响基础检索。</p><span class="resource-guide-cuda-status" data-cuda-status>正在检测本机 CUDA…</span></div></aside></div>`;
   }
   if (step.id === "chat") {
     return `<div class="resource-guide-page is-chat"><div class="resource-guide-optional-banner">${uiIcon("info")}<span>这是可选的第四页，不安装也不影响 ScanSci 的基础对话、联网模型和关键词检索。</span></div><div class="resource-guide-model-grid is-single">${resources}</div></div>`;
@@ -9518,6 +10381,27 @@ async function refreshSystemOcrStatus({ force = false } = {}) {
   }
   if (state.activeView === "settings" && ["defaults", "document-processing"].includes(state.activeSettings)) renderSettings();
   return state.systemOcrStatus;
+}
+
+async function installTesseractOcr() {
+  const languages = systemOcrLanguageKey().split(",").filter(Boolean);
+  const started = await request("/api/settings/document-processing/ocr/install", {
+    method: "POST",
+    body: JSON.stringify({ languages }),
+  });
+  state.systemOcrStatus = { ...(state.systemOcrStatus || {}), install: started };
+  if (state.activeView === "settings") renderSettings();
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    const status = await refreshSystemOcrStatus({ force: true });
+    const installState = String(status?.install?.state || "idle");
+    if (["ready", "failed"].includes(installState)) {
+      if (installState === "ready") toast("Tesseract OCR 已就绪");
+      else toast(status?.install?.error || "Tesseract OCR 安装未完成", true);
+      return status;
+    }
+  }
+  throw new Error("Tesseract OCR 安装等待超时，请点击重新检测。");
 }
 
 function renderSettings() {
@@ -10335,6 +11219,7 @@ function renderLocalModelsSettings() {
   return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
     <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${runtimeReady ? escapeHtml(runtimeDescription) : "本地模型是可选项；基础对话和关键词检索无需额外安装。"}</span><button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button></footer></section>
     ${runtimeRecovery}
+    ${runtimeComponentsSettingsMarkup()}
     <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list">${installed}</div></section>
     <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
     <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
@@ -10371,7 +11256,12 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
       ? "解决：安装 Tesseract 后点击重新检测；中文识别还需要 chi_sim.traineddata。"
       : "解决：打开 Windows 设置 → 时间和语言 → 语言和区域，安装对应语言包；也可以切换为 Tesseract。");
   const systemOcrReady = !systemStatus.loading && systemStatus.available && systemStatus.requested_supported !== false;
-  const systemOcrGuide = systemOcrReady ? "" : `<aside class="system-ocr-status is-${systemTone} is-${tesseractSelected ? "tesseract" : "windows"}"><span class="system-ocr-status-icon">${systemStatus.loading ? "…" : systemStatus.available && systemStatus.requested_supported !== false ? uiIcon("check") : uiIcon("info")}</span><div class="system-ocr-status-copy"><strong>${systemTitle}</strong><p>${escapeHtml(systemStatus.message || `${ocrStatusName} 可用于本地识别图片文字。`)}</p><small>${escapeHtml(ocrSolution || installedLanguages)}</small></div><button type="button" class="system-ocr-refresh" data-action="refresh-system-ocr-status" ${systemStatus.loading ? "disabled" : ""}>重新检测</button></aside>`;
+  const tesseractInstall = systemStatus.install || {};
+  const tesseractInstalling = ["queued", "installing", "downloading"].includes(String(tesseractInstall.state || ""));
+  const ocrRepairAction = tesseractSelected
+    ? `<button type="button" class="system-ocr-refresh is-primary" data-action="install-tesseract-ocr" ${systemStatus.loading || tesseractInstalling ? "disabled" : ""}>${tesseractInstalling ? `${Math.round(Number(tesseractInstall.progress || 0) * 100)}%` : systemStatus.available ? "安装缺失语言" : "安装 Tesseract"}</button>`
+    : "";
+  const systemOcrGuide = systemOcrReady ? "" : `<aside class="system-ocr-status is-${systemTone} is-${tesseractSelected ? "tesseract" : "windows"}"><span class="system-ocr-status-icon">${systemStatus.loading ? "…" : systemStatus.available && systemStatus.requested_supported !== false ? uiIcon("check") : uiIcon("info")}</span><div class="system-ocr-status-copy"><strong>${systemTitle}</strong><p>${escapeHtml(tesseractInstalling ? tesseractInstall.message || "正在安装 Tesseract OCR…" : systemStatus.message || `${ocrStatusName} 可用于本地识别图片文字。`)}</p><small>${escapeHtml(tesseractInstall.error || ocrSolution || installedLanguages)}</small></div><div class="system-ocr-status-actions">${ocrRepairAction}<button type="button" class="system-ocr-refresh" data-action="refresh-system-ocr-status" ${systemStatus.loading || tesseractInstalling ? "disabled" : ""}>重新检测</button></div></aside>`;
   const ocrConnection = deepseekSelected ? `<div class="document-service-fields"><label class="setting-field"><span>硅基流动 API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "https://api.siliconflow.cn/v1")}" placeholder="https://api.siliconflow.cn/v1" maxlength="500" /></label><label class="setting-field"><span>硅基流动 API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "粘贴硅基流动 API 密钥"}" /></label></div><p class="document-service-note">使用模型 <code>deepseek-ai/DeepSeek-OCR</code> 将图片发送到硅基流动；未配置密钥或调用失败时自动回退到本地 OCR。<a href="https://cloud.siliconflow.cn/models?target=deepseek-ai/DeepSeek-OCR" target="_blank" rel="noreferrer">查看模型与额度 ${uiIcon("arrow-up-right")}</a></p>` : ocr.provider === "custom" ? `<div class="document-service-fields"><label class="setting-field"><span>API 地址</span><input name="ocr-base-url" value="${escapeHtml(ocr.base_url || "")}" placeholder="https://ocr.example.com/v1" maxlength="500" /></label><label class="setting-field"><span>API 密钥</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "可选，保存后仅存于系统凭据管理器"}" /></label></div>` : tesseractSelected || ocr.provider === "system" ? systemOcrGuide : "";
   const paddleGuide = paddleSelected ? `<aside class="paddle-ocr-guide is-configuring"><span class="paddle-ocr-guide-icon">P</span><div class="paddle-ocr-guide-main"><header><strong>PaddleOCR</strong><em>飞桨 AI Studio</em></header><p>需要 PaddleOCR 时填写 Access Token；令牌只保存在这台电脑。</p><label class="setting-field paddle-ocr-token-field"><span>Access Token</span><input name="ocr-api-key" type="password" autocomplete="new-password" placeholder="${ocr.api_key_configured ? "已保存；输入新值以替换" : "粘贴 AI Studio Access Token"}" ${ocr.api_key_configured ? "" : "required"} /></label></div><div class="paddle-ocr-guide-actions"><a href="https://aistudio.baidu.com/account/accessToken" target="_blank" rel="noreferrer">获取 Token ${uiIcon("arrow-up-right")}</a></div></aside>` : "";
   const mineruName = mineru.provider === "mineru" ? "MinerU" : "自定义文档解析服务";
@@ -11362,8 +12252,28 @@ async function handleSettingsAction(action, element) {
     refreshLocalModelMarket().catch((error) => toast(error.message, true));
     return;
   }
+  if (action === "refresh-runtime-components") {
+    refreshRuntimeComponents().then(() => toast("运行组件状态已更新")).catch((error) => toast(error.message, true));
+    return;
+  }
+  if (action === "install-runtime-component") {
+    element.disabled = true;
+    startRuntimeComponentInstall(element.dataset.componentId || "")
+      .catch((error) => toast(error.message, true))
+      .finally(() => { if (element.isConnected) element.disabled = false; });
+    return;
+  }
+  if (action === "choose-runtime-component-files") {
+    chooseRuntimeComponentFiles(element.dataset.componentId || "").catch((error) => toast(error.message, true));
+    return;
+  }
   if (action === "refresh-system-ocr-status") {
     await refreshSystemOcrStatus({ force: true });
+    return;
+  }
+  if (action === "install-tesseract-ocr") {
+    element.disabled = true;
+    installTesseractOcr().catch((error) => toast(error.message, true));
     return;
   }
   if (action === "check-local-runtime-channels") {
@@ -11978,6 +12888,11 @@ document.addEventListener("click", (event) => {
     if (source) openSourceReader(source);
   }
   else if (action === "retry-direct-message") retryDirectMessage(element.dataset.messageIndex || "");
+  else if (action === "set-direct-input-mode") setDirectChatInputMode(element.dataset.directInputMode || "follow-up");
+  else if (action === "remove-direct-follow-up") removeQueuedDirectTurn(element.dataset.queueId || "");
+  else if (action === "cancel-direct-chat") pauseDirectChatJob().catch((error) => toast(error.message, true));
+  else if (action === "pause-direct-chat") pauseDirectChatJob().catch((error) => toast(error.message, true));
+  else if (action === "resume-direct-chat") resumeDirectChatJob().catch((error) => toast(error.message, true));
   else if (action === "copy-conversation-message") copyConversationMessage(element).catch((error) => toast(error.message, true));
   else if (action === "copy-review-document") copyReviewDocument().catch((error) => toast(error.message, true));
   else if (action === "save-review-note") saveReviewAsNote();
@@ -12119,6 +13034,7 @@ document.addEventListener("click", (event) => {
   }
   else if (action === "create-ppt-project") createPptProject().catch((error) => toast(error.message, true));
   else if (action === "cancel-run") cancelRun(element.dataset.runId).catch((error) => toast(error.message, true));
+  else if (action === "pause-run") pauseRun(element.dataset.runId).catch((error) => toast(error.message, true));
   else if (action === "resume-run") resumeRun(element.dataset.runId).catch((error) => toast(error.message, true));
   else if (action === "respond-agent-interaction") respondAgentInteraction(element).catch((error) => toast(error.message, true));
   else if (action === "respond-run-interaction") respondRunInteraction(element).catch((error) => toast(error.message, true));
@@ -12392,14 +13308,7 @@ document.addEventListener("keydown", (event) => {
       closeKnowledgeFileSearch();
       return;
     }
-    if (activeDirectChatController) {
-      activeDirectChatController.abort();
-      activeDirectChatController = null;
-      request("/api/chat/cancel", {
-        method: "POST",
-        body: JSON.stringify({ run_id: state.activeStreamRunId || "" }),
-      }).catch(() => {});
-    }
+    if (directChatJob()) cancelDirectChatJob().catch(() => {});
     toggleAppUpdateCard(false);
     closeComposerModePickers();
     closeComposerModelPickers();
@@ -12745,7 +13654,7 @@ function renderModeRun(run) {
     return;
   }
   const stages = (run.stages || []).map((stage) => `<li class="${escapeHtml(stage.status)}"><span>${stage.status === "completed" ? "✓" : stage.status === "running" ? "·" : stage.position + 1}</span><div><strong>${escapeHtml(stage.title)}</strong><small>${escapeHtml(stage.error_message || stage.summary || "等待执行")}</small></div></li>`).join("");
-  const action = run.cancellable ? `<button type="button" class="run-action stop" data-action="cancel-run" data-run-id="${escapeHtml(run.run_id)}">停止任务</button>` : run.resumable ? `<button type="button" class="run-action" data-action="resume-run" data-run-id="${escapeHtml(run.run_id)}">${run.status === "needs_confirmation" ? "确认计划并执行" : "从当前阶段继续"}</button>` : "";
+  const action = run.pausable ? `<button type="button" class="run-action stop" data-action="pause-run" data-run-id="${escapeHtml(run.run_id)}">暂停任务</button>` : run.resumable ? `<button type="button" class="run-action" data-action="resume-run" data-run-id="${escapeHtml(run.run_id)}">${run.status === "needs_confirmation" ? "确认计划并执行" : "从当前阶段继续"}</button>` : "";
   const executeStage = (run.stages || []).find((stage) => stage.kind === "tool");
   const batchItems = run.workflow_type === "paper_download_batch" && executeStage && executeStage.output && Array.isArray(executeStage.output.items) ? `<ul class="paper-batch-progress">${batchItemMarkup(executeStage.output.items)}</ul>` : "";
   byId("modeResults").innerHTML = `<section class="mode-run"><header><div><span>${escapeHtml(runStatusLabel(run))}</span><strong>${escapeHtml(run.title)}</strong></div>${action}</header><div class="run-progress"><i class="${progressWidthClass(Number(run.progress || 0) * 100)}"></i></div><ol>${stages}</ol>${batchItems}${run.status === "failed" ? `<p class="mode-run-error">${escapeHtml(runFailureSummary(run))}</p>` : ""}</section>`;
@@ -12784,6 +13693,15 @@ async function cancelRun(runId) {
   if (state.activeView === "conversation") renderRun(run);
   else if (state.activeView === "mode") renderModeRun(run);
   toast(run.cancel_requested ? "停止请求已发送" : "任务已停止");
+}
+
+async function pauseRun(runId) {
+  const run = await request(`/api/runs/${encodeURIComponent(runId)}/pause`, { method: "POST", body: "{}" });
+  upsertRun(run);
+  if (state.activeView === "conversation") renderRun(run);
+  else if (state.activeView === "mode") renderModeRun(run);
+  renderComposerSendButtons();
+  toast(run.pause_requested ? "暂停请求已发送" : run.status === "paused" ? "任务已暂停" : "任务正在暂停");
 }
 
 async function respondAgentInteraction(element) {

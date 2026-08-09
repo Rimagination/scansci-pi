@@ -1,0 +1,18 @@
+{
+  "schema_version": "easyslides.template_status.v1",
+  "template_id": "nsfc_purple_semantic",
+  "status": "production",
+  "production_eligible": true,
+  "source_template_id": "nsfc_defense_distilled",
+  "promotion_policy": "fail_closed",
+  "required_gates": [
+    "contract",
+    "svg_quality",
+    "pptx_export",
+    "pptx_text_layout",
+    "placeholder_scan",
+    "human_visual_review"
+  ],
+  "last_gate_schema": "easyslides.template_production_gate.v1",
+  "last_gate_status": "pass"
+}

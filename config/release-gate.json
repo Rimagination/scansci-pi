@@ -22,6 +22,7 @@
         "tests/test_verify_scansci_knowledge.py",
         "tests/test_build_profiles.py",
         "tests/test_archive_runtime_component.py",
+        "tests/test_archive_binary_component.py",
         "tests/test_prepare_runtime_release_manifest.py",
         "tests/test_local_runtime_component.py",
         "tests/test_local_transformers_compat.py",
@@ -172,6 +173,8 @@
     "signature_required": false,
     "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
     "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
+    "node_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
+    "tectonic_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     "exclude_runtimes": true,
     "max_package_bytes": 450000000,
     "forbidden_top_level_resources": [

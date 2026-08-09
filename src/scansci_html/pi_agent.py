@@ -1474,6 +1474,50 @@ class PiAgentClient:
                         "duration_ms": event.get("duration_ms"),
                         "details": dict(event.get("details", {}) or {}),
                     }
+                elif event_type == "agent.queue_updated":
+                    steering = [str(item) for item in list(event.get("steering", []) or [])]
+                    follow_up = [str(item) for item in list(event.get("follow_up", []) or [])]
+                    yield {
+                        "type": "queue",
+                        "steering": steering,
+                        "follow_up": follow_up,
+                        "pending_count": int(
+                            event.get("pending_count", len(steering) + len(follow_up)) or 0
+                        ),
+                    }
+                elif event_type in {
+                    "agent.started",
+                    "agent.turn_started",
+                    "agent.message_started",
+                    "agent.message_completed",
+                    "agent.turn_completed",
+                    "agent.completed",
+                    "agent.settled",
+                }:
+                    yield {
+                        "type": "lifecycle",
+                        "event": event_type.removeprefix("agent."),
+                        "role": str(event.get("role", "")),
+                        "tool_result_count": int(event.get("tool_result_count", 0) or 0),
+                        "will_retry": bool(event.get("will_retry", False)),
+                    }
+                elif event_type in {
+                    "run.steer_ack",
+                    "run.steer_rejected",
+                    "run.follow_up_ack",
+                    "run.follow_up_rejected",
+                    "run.cancel_ack",
+                    "run.cancel_rejected",
+                }:
+                    action = event_type.split(".", 1)[1].rsplit("_", 1)[0]
+                    accepted = event_type.endswith("_ack")
+                    yield {
+                        "type": "control",
+                        "action": action,
+                        "status": "accepted" if accepted else "rejected",
+                        "error": str(event.get("error", "")),
+                        "queued": int(event.get("queued", 0) or 0),
+                    }
                 elif event_type == "interaction.requested":
                     yield {
                         "type": "interaction",
@@ -1557,6 +1601,17 @@ class PiAgentClient:
         self._cancel_requested.set()
         self._write({"type": "run.cancel", "request_id": target})
         return True
+
+    def pause(self, request_id: str | None = None) -> bool:
+        """Pause the current turn while keeping its durable session resumable.
+
+        The Pi sidecar currently exposes the same cooperative interruption
+        primitive as ``run.cancel``.  At this layer it is a pause operation:
+        the session and prior turn history remain intact, and the caller may
+        resume by starting the unfinished turn again.
+        """
+
+        return self.cancel(request_id)
 
     def steer(self, text: str, request_id: str | None = None) -> bool:
         """Queue steering text into the active Pi tool loop."""

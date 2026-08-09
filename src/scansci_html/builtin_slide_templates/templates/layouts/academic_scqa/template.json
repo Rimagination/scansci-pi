@@ -1,0 +1,17 @@
+{
+  "schema_version": "easyslides.template.v1",
+  "template_id": "academic_scqa",
+  "name": "Academic SCQA",
+  "mode": "classic",
+  "source_template": "academic_report_html_slot_templates",
+  "distillation_model": "five_shells_plus_scqa_body_variants",
+  "description": "Blue-cyan academic report template distilled from HTML data-slot patterns with Audience-State-Transfer and SCQA matching rules.",
+  "files": {
+    "design_spec": "design_spec.md",
+    "layouts": "layouts.json",
+    "body_variants": "body_variants.json",
+    "story_structure": "story_structure.json",
+    "rules": "rules.md"
+  }
+}
+

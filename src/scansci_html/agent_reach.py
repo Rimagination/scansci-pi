@@ -24,6 +24,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import requests
+from bs4 import BeautifulSoup
 
 from .web_search import search_public_web
 
@@ -379,6 +380,62 @@ def _search_domain(channel: str) -> str:
 
 
 def _read_web(url: str, *, channel: str, timeout: float) -> dict[str, Any]:
+    # Prefer the actual public endpoint.  Apart from avoiding an unnecessary
+    # third-party hop, this is essential for scholarly JSON APIs (OpenAlex,
+    # Crossref, etc.): sending an encoded API URL through a reader service can
+    # fail even while the API itself is healthy.  Every direct redirect is
+    # still validated by ``_validated_get`` before any body is returned.
+    direct_errors: list[str] = []
+    direct_headers = {
+        "Accept": "application/json, text/html;q=0.9, text/plain;q=0.8, */*;q=0.5",
+        "User-Agent": _USER_AGENT,
+    }
+    # Public scholarly APIs occasionally reset a keep-alive connection on
+    # Windows. Retry transient transport failures inside this tool call so the
+    # agent does not need another model/tool round just to repeat the same URL.
+    # Policy and content-safety errors are deliberately not retried.
+    for _attempt in range(3):
+        try:
+            body, hops = _validated_get(
+                url,
+                headers=direct_headers,
+                timeout=timeout,
+            )
+            direct = _public_body_payload(body)
+            content = str(direct.get("content", "") or "")
+            sample = content[:4_096].casefold()
+            if content and not _looks_like_block_page(sample):
+                return {
+                    "ok": True,
+                    "operation": "read",
+                    "channel": channel,
+                    "backend": "direct public HTTP",
+                    "source": "agent-reach:direct",
+                    "evidence_level": "page-content",
+                    "url": url,
+                    "final_url": hops[-1],
+                    "redirect_chain": hops,
+                    **direct,
+                    "content": content[:_MAX_CONTENT_CHARS],
+                    "truncated": len(content) > _MAX_CONTENT_CHARS,
+                }
+            direct_errors.append("direct response was empty or an anti-bot page")
+            break
+        except AgentReachError as error:
+            message = str(error)
+            if "private" in message or "credentials" in message:
+                raise
+            direct_errors.append(f"{type(error).__name__}: {error}"[:500])
+            break
+        except (requests.ConnectionError, requests.Timeout, OSError) as error:
+            direct_errors.append(f"{type(error).__name__}: {error}"[:500])
+            continue
+        except requests.RequestException as error:
+            direct_errors.append(f"{type(error).__name__}: {error}"[:500])
+            break
+
+    direct_error = "; ".join(direct_errors)[-1_000:]
+
     # The reader endpoint receives the target as a single path segment.  The
     # target's own query string must be percent-encoded; otherwise it would be
     # parsed as the reader's query and the page fetched without its query.
@@ -390,7 +447,7 @@ def _read_web(url: str, *, channel: str, timeout: float) -> dict[str, Any]:
     )
     text = body.decode("utf-8", errors="replace")
     sample = text[:4_096].casefold()
-    if ("requiring captcha" in sample and "just a moment" in sample) or "attention required! | cloudflare" in sample:
+    if _looks_like_block_page(sample):
         raise AgentReachError("reader returned an anti-bot page; use a permitted browser session or another source")
     return {
         "ok": True,
@@ -403,7 +460,54 @@ def _read_web(url: str, *, channel: str, timeout: float) -> dict[str, Any]:
         "reader_url": jina_url,
         "content": text[:_MAX_CONTENT_CHARS],
         "truncated": len(text) > _MAX_CONTENT_CHARS,
+        "fallback_reason": direct_error,
     }
+
+
+def _public_body_payload(body: bytes) -> dict[str, Any]:
+    """Turn a bounded public response into model-readable text and metadata."""
+
+    text = body.decode("utf-8", errors="replace").lstrip("\ufeff").strip()
+    if not text:
+        return {"content": "", "content_type": "empty"}
+    if text[:1] in {"{", "["}:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        else:
+            rendered = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            return {
+                "content": rendered,
+                "content_type": "application/json",
+                "data": data,
+            }
+    lowered = text[:1_000].casefold()
+    if "<html" in lowered or "<!doctype html" in lowered or "<body" in lowered:
+        soup = BeautifulSoup(text, "html.parser")
+        for node in soup(["script", "style", "noscript", "template"]):
+            node.decompose()
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        readable = "\n".join(
+            line.strip()
+            for line in soup.get_text("\n", strip=True).splitlines()
+            if line.strip()
+        )
+        return {
+            "content": readable,
+            "content_type": "text/html",
+            "title": title,
+        }
+    return {"content": text, "content_type": "text/plain"}
+
+
+def _looks_like_block_page(sample: str) -> bool:
+    normalized = str(sample or "").casefold()
+    return bool(
+        ("requiring captcha" in normalized and "just a moment" in normalized)
+        or "attention required! | cloudflare" in normalized
+        or ("verify you are human" in normalized and "cloudflare" in normalized)
+    )
 
 
 def _read_json_endpoint(url: str, *, channel: str, timeout: float) -> dict[str, Any]:

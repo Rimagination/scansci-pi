@@ -66,6 +66,19 @@ def test_desktop_release_preserves_multipart_runtime_contract(tmp_path: Path) ->
     )
 
     stable = json.loads((output / "stable.json").read_text(encoding="utf-8-sig"))
+    archive = output / "ScanSci-0.2.0-beta.1-windows-x64.zip"
+    blockmap_path = output / "ScanSci-0.2.0-beta.1-windows-x64.zip.blockmap"
+    blockmap = json.loads(blockmap_path.read_text(encoding="utf-8-sig"))
+    windows = stable["windows"]
+    assert archive.exists()
+    assert blockmap["schema_version"] == 1
+    assert blockmap["algorithm"] == "sha256"
+    assert blockmap["block_size"] == 65536
+    assert blockmap["size"] == archive.stat().st_size
+    assert len(blockmap["blocks"]) == (archive.stat().st_size + 65535) // 65536
+    assert windows["blockmap"]["url"] == "https://example.test/ScanSci.zip.blockmap"
+    assert windows["blockmap"]["size"] == blockmap_path.stat().st_size
+    assert windows["blockmap"]["sha256"]
     windows = stable["components"]["local-transformers"]["windows"]
     assert windows["sha256"] == "a" * 64
     assert windows["size"] == 12

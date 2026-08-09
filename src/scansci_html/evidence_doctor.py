@@ -153,14 +153,20 @@ def assess_evidence_structure(
                 message="Stored evidence text is not found in the parsed source document",
             )
 
-    passed = missing_structure == 0 and oversized == 0 and unverifiable == 0 and orphan_sections == 0
+    claim_ready = missing_structure == 0 and unverifiable == 0 and orphan_sections == 0
+    passed = claim_ready and oversized == 0
     warnings: list[str] = []
+    if oversized:
+        warnings.append(
+            f"{oversized} oversized spans should be split for better retrieval precision; source fidelity and claim traceability remain intact."
+        )
     if tiny:
         warnings.append(
             f"{tiny} short spans are retained for source fidelity; rank them below substantive evidence during retrieval."
         )
     return {
         "passed": passed,
+        "claim_ready": claim_ready,
         "documents": len(documents),
         "spans": len(rows),
         "sections": section_count,

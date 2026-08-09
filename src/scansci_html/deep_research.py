@@ -11,7 +11,18 @@ import re
 from typing import Any, Callable, Sequence
 
 from .academic_search import FederatedAcademicSearch
+from .deep_research_evidence import task_evidence_claim_ready
 from .text_tokenization import lexical_tokens
+
+
+_DISCOVERY_STOPWORDS = {
+    "about", "after", "among", "analysis", "article", "articles", "assess", "assesses", "assessing",
+    "before", "between", "can", "does", "evaluate", "evaluates", "evaluating", "evaluation", "evidence",
+    "findings", "from", "have", "how", "into", "latest", "methods", "paper", "papers", "published",
+    "recent", "research", "review", "reviews", "since", "studies", "study", "system", "systems", "that",
+    "the", "their", "this", "using", "what", "when", "where", "which", "with",
+    "研究", "文献", "论文", "证据", "综述", "评估", "方法", "系统", "最新", "关于",
+}
 
 
 def plan_deep_research(topic: str, *, chat_client: Any | None = None, max_queries: int = 5) -> dict[str, Any]:
@@ -67,7 +78,7 @@ def run_discovery_loop(
     # Provider APIs expect compact scholarly queries, not an entire
     # conversational question. Long natural-language questions can be
     # rejected even when the planned keyword queries are valid.
-    planned_queries = _unique_strings(list(plan.get("search_queries", []) or []) or [question])[:6]
+    planned_queries = _unique_strings(_string_values(plan.get("search_queries")) or [question])[:6]
     rounds: list[dict[str, Any]] = []
     all_items: list[dict[str, Any]] = []
     provider_errors: dict[str, str] = {}
@@ -82,17 +93,31 @@ def run_discovery_loop(
         for query in current_queries:
             if cancelled():
                 raise InterruptedError("deep research discovery cancelled")
+            outbound_query = _normalize_scholarly_query(str(query), year_from=year_from)
             result = searcher.search(
-                str(query),
+                outbound_query,
                 limit=max(12, min(60, int(result_limit))),
                 per_source=max(3, min(25, int(per_source))),
                 year_from=year_from,
                 cancel_requested=cancelled,
             )
-            all_items.extend(list(result.get("items", []) or []))
+            all_items.extend(
+                {
+                    **dict(item),
+                    "deep_research_queries": _unique_strings(
+                        [*list(dict(item).get("deep_research_queries", []) or []), str(query)]
+                    ),
+                    "deep_research_outbound_queries": _unique_strings(
+                        [*list(dict(item).get("deep_research_outbound_queries", []) or []), outbound_query]
+                    ),
+                }
+                for item in list(result.get("items", []) or [])
+                if isinstance(item, dict)
+            )
             provider_errors.update(dict(result.get("provider_errors", {}) or {}))
             query_record = {
                 "query": str(query),
+                "outbound_query": outbound_query,
                 "count": int(result.get("count", 0) or 0),
                 "providers_succeeded": list(result.get("providers_succeeded", []) or []),
                 "latency_ms": int(result.get("latency_ms", 0) or 0),
@@ -102,19 +127,19 @@ def run_discovery_loop(
             if progress_callback:
                 progress_callback(completed_queries, max(completed_queries, total_queries), query_record)
         rounds.append(round_record)
-        merged = _merge_query_results(all_items)
+        merged = _rerank_for_question(question, plan, _merge_query_results(all_items))
         coverage = _perspective_coverage(plan, merged)
         gaps = [item for item in coverage if int(item.get("matching_papers", 0) or 0) < 2]
         if not gaps or round_index + 1 >= max_rounds:
             break
         current_queries = _unique_strings(
             [
-                f"{question} {gap.get('title', '')} {' '.join(gap.get('keywords', []))}".strip()
+                f"{question} {gap.get('title', '')} {' '.join(_string_values(gap.get('keywords')))}".strip()
                 for gap in gaps
             ]
         )[:3]
 
-    merged = _merge_query_results(all_items)
+    merged = _rerank_for_question(question, plan, _merge_query_results(all_items))
     coverage = _perspective_coverage(plan, merged)
     unresolved = [item for item in coverage if int(item.get("matching_papers", 0) or 0) < 2]
     return {
@@ -155,7 +180,8 @@ def enrich_deep_research_result(
         "fulltext_failed": int(acquisition.get("failed_count", 0) or 0),
         "fulltext_indexed_documents": int(task_index.get("documents", 0) or 0),
         "fulltext_evidence_spans": int(task_index.get("spans", 0) or 0),
-        "fulltext_structure_verified": bool(task_quality.get("passed", False)),
+        "fulltext_structure_verified": task_evidence_claim_ready(task_quality),
+        "fulltext_quality_passed": bool(task_quality.get("passed", False)),
         "unresolved_gap_count": len(list(discovery.get("unresolved_gaps", []) or [])),
     }
     return enriched
@@ -268,10 +294,10 @@ def _normalize_plan(
             continue
         title = " ".join(str(value.get("title", "")).split())
         prompt = " ".join(str(value.get("question", "")).split())
-        keywords = _unique_strings(list(value.get("keywords", []) or []))[:8]
+        keywords = _unique_strings(_string_values(value.get("keywords")))[:8]
         if title and (prompt or keywords):
             perspectives.append({"title": title, "question": prompt or title, "keywords": keywords})
-    queries = _unique_strings(list(raw.get("search_queries", []) or []))[: max(2, int(max_queries))]
+    queries = _unique_strings(_string_values(raw.get("search_queries")))[: max(2, int(max_queries))]
     if len(perspectives) < 2 or len(queries) < 2:
         return fallback
     return {
@@ -279,19 +305,24 @@ def _normalize_plan(
         "objective": " ".join(str(raw.get("objective") or question).split()),
         "perspectives": perspectives,
         "search_queries": queries,
-        "inclusion_criteria": _unique_strings(list(raw.get("inclusion_criteria", []) or []))[:8],
-        "exclusion_criteria": _unique_strings(list(raw.get("exclusion_criteria", []) or []))[:8],
+        "inclusion_criteria": _unique_strings(_string_values(raw.get("inclusion_criteria")))[:8],
+        "exclusion_criteria": _unique_strings(_string_values(raw.get("exclusion_criteria")))[:8],
         "planner": "llm",
     }
 
 
 def _merge_query_results(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
+    title_aliases: dict[str, str] = {}
     for item in items:
         candidate = dict(item)
         doi = str(candidate.get("doi", "")).casefold().strip()
         title_key = "".join(character for character in str(candidate.get("title", "")).casefold() if character.isalnum())
-        key = f"doi:{doi}" if doi else f"title:{title_key}:{candidate.get('year') or ''}"
+        key = title_aliases.get(title_key, "") if title_key else ""
+        if not key:
+            key = f"doi:{doi}" if doi else f"title:{title_key}:{candidate.get('year') or ''}"
+        if title_key:
+            title_aliases[title_key] = key
         if key not in merged:
             candidate["query_hit_count"] = 1
             merged[key] = candidate
@@ -301,6 +332,15 @@ def _merge_query_results(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]
         current["score"] = max(float(current.get("score", 0.0) or 0.0), float(candidate.get("score", 0.0) or 0.0))
         current["sources"] = _unique_strings([*current.get("sources", []), *candidate.get("sources", [])])
         current["source_records"] = [*list(current.get("source_records", []) or []), *list(candidate.get("source_records", []) or [])]
+        current["deep_research_queries"] = _unique_strings(
+            [*list(current.get("deep_research_queries", []) or []), *list(candidate.get("deep_research_queries", []) or [])]
+        )
+        current["deep_research_outbound_queries"] = _unique_strings(
+            [
+                *list(current.get("deep_research_outbound_queries", []) or []),
+                *list(candidate.get("deep_research_outbound_queries", []) or []),
+            ]
+        )
         if len(str(candidate.get("abstract", ""))) > len(str(current.get("abstract", ""))):
             current["abstract"] = candidate["abstract"]
         for field_name in ("doi", "url", "oa_url", "arxiv_id", "year", "venue"):
@@ -314,10 +354,149 @@ def _merge_query_results(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]
     )
 
 
+def _normalize_scholarly_query(query: str, *, year_from: int | None = None) -> str:
+    """Translate planner-friendly Boolean syntax into provider-safe keywords.
+
+    The research plan remains unchanged for auditability.  Academic APIs,
+    however, differ widely in their support for quotes, Boolean operators and
+    inline year filters.  Sending the raw plan used to produce broad or empty
+    result sets, so each outbound call receives a compact equivalent while the
+    run trace records both forms.
+    """
+
+    clean = str(query or "")
+    clean = re.sub(r"[\"'`“”‘’]", " ", clean)
+    clean = re.sub(r"\b(?:AND|OR|NOT)\b", " ", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"[(){}\[\]]", " ", clean)
+    if year_from is not None:
+        clean = re.sub(r"\b(?:19|20)\d{2}\b", " ", clean)
+    clean = re.sub(r"\bRAG\b", "retrieval augmented generation", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\bretrieval[\s-]+augmented\b", "retrieval augmented", clean, flags=re.IGNORECASE)
+    words = re.findall(r"[\w\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", clean, flags=re.UNICODE)
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        key = word.casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(word)
+    normalized = " ".join(deduplicated).strip()
+    return normalized or " ".join(str(query or "").split())
+
+
+def _rerank_for_question(
+    question: str,
+    plan: dict[str, Any],
+    items: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Re-rank provider results against the canonical research question.
+
+    Provider citation counts and reciprocal ranks are useful tie-breakers, but
+    they must not let a popular paper from another field outrank a directly
+    relevant study.  This pass is deterministic and only reorders records that
+    the scholarly providers actually returned.
+    """
+
+    canonical = _normalize_scholarly_query(
+        " ".join(
+            part
+            for part in (
+                str(question or ""),
+                str(plan.get("objective", "") or ""),
+                str(plan.get("title", "") or ""),
+            )
+            if part
+        )
+    )
+    question_terms = {
+        token
+        for token in lexical_tokens(canonical)
+        if len(token) > 1 and token not in _DISCOVERY_STOPWORDS and not re.fullmatch(r"(?:19|20)\d{2}", token)
+    }
+    phrases = _research_key_phrases(question, plan)
+    reranked: list[dict[str, Any]] = []
+    for raw_item in items:
+        item = dict(raw_item)
+        title = str(item.get("title", "") or "")
+        document = " ".join(
+            [
+                title,
+                str(item.get("abstract", "") or ""),
+                " ".join(str(value) for value in list(item.get("keywords", []) or [])),
+            ]
+        )
+        title_terms = set(lexical_tokens(title))
+        document_terms = set(lexical_tokens(document))
+        title_coverage = len(question_terms & title_terms) / max(1, len(question_terms))
+        document_coverage = len(question_terms & document_terms) / max(1, len(question_terms))
+        compact_title = _compact_match_text(title)
+        compact_document = _compact_match_text(document)
+        title_phrase_matches = [phrase for phrase in phrases if _compact_match_text(phrase) in compact_title]
+        document_phrase_matches = [phrase for phrase in phrases if _compact_match_text(phrase) in compact_document]
+        phrase_title_score = min(1.0, len(title_phrase_matches) / 2.0)
+        phrase_document_score = min(1.0, len(document_phrase_matches) / 3.0)
+        provider_score = float(item.get("score", 0.0) or 0.0)
+        provider_tiebreaker = min(1.0, max(0.0, provider_score) / 3.0)
+        hit_tiebreaker = min(1.0, max(0, int(item.get("query_hit_count", 1) or 1) - 1) / 4.0)
+        relevance_score = (
+            title_coverage * 3.2
+            + document_coverage * 1.6
+            + phrase_title_score * 2.0
+            + phrase_document_score * 0.9
+            + provider_tiebreaker * 0.18
+            + hit_tiebreaker * 0.12
+        )
+        item["provider_score"] = round(provider_score, 6)
+        item["question_relevance"] = {
+            "score": round(relevance_score, 6),
+            "title_coverage": round(title_coverage, 6),
+            "document_coverage": round(document_coverage, 6),
+            "title_phrase_matches": title_phrase_matches[:8],
+            "document_phrase_matches": document_phrase_matches[:8],
+        }
+        item["score"] = round(relevance_score, 6)
+        reranked.append(item)
+    return sorted(
+        reranked,
+        key=lambda item: (
+            -float(dict(item.get("question_relevance", {}) or {}).get("score", 0.0)),
+            -float(item.get("provider_score", 0.0) or 0.0),
+            str(item.get("title", "")),
+        ),
+    )
+
+
+def _research_key_phrases(question: str, plan: dict[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+    candidates.extend(
+        re.findall(
+            r"\b(?:retrieval[\s-]+augmented generation|citation faithfulness|source attribution|grounded generation)\b",
+            str(question or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+    for perspective in list(plan.get("perspectives", []) or []):
+        if not isinstance(perspective, dict):
+            continue
+        candidates.extend(_string_values(perspective.get("keywords")))
+    result: list[str] = []
+    for phrase in _unique_strings(candidates):
+        normalized = _normalize_scholarly_query(phrase)
+        terms = [token for token in lexical_tokens(normalized) if len(token) > 1 and token not in _DISCOVERY_STOPWORDS]
+        if len(terms) >= 2:
+            result.append(normalized)
+    return result[:32]
+
+
+def _compact_match_text(value: Any) -> str:
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
 def _perspective_coverage(plan: dict[str, Any], items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     coverage: list[dict[str, Any]] = []
     for perspective in list(plan.get("perspectives", []) or []):
-        keywords = _unique_strings([*list(perspective.get("keywords", []) or []), str(perspective.get("title", ""))])
+        keywords = _unique_strings([*_string_values(perspective.get("keywords")), str(perspective.get("title", ""))])
         terms = set(token for keyword in keywords for token in lexical_tokens(keyword) if len(token) > 1)
         matched: list[str] = []
         for item in items:
@@ -355,3 +534,13 @@ def _unique_strings(values: Sequence[Any]) -> list[str]:
         seen.add(clean.casefold())
         result.append(clean)
     return result
+
+
+def _string_values(value: Any) -> list[Any]:
+    """Coerce model JSON fields without turning one string into characters."""
+
+    if isinstance(value, str):
+        return [part for part in re.split(r"[\n,;，；]+", value) if part.strip()]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return list(value)
+    return []

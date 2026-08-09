@@ -35,7 +35,7 @@
 
 - **Windows 原生窗口**：无边框设计、最大化任务栏可见、自适应窄屏（≥800px）。
 - **本地语音转写**：Qwen3-ASR 在本机运行，音频不上传。
-- **本地视觉模型**：通过 Ollama 运行 MiniCPM-V 4.6，图片理解完全离线。
+- **本地视觉模型**：默认通过 ScanSci 的 Transformers 本地运行组件运行 MiniCPM-V 4.6，图片理解完全离线；Ollama 作为可选外部连接。
 - **主题与字体**：浅色 / 深色 / 跟随系统、字体缩放、强调色自定义。
 
 ### 安全与可控
@@ -53,6 +53,8 @@
 ### Windows 安装包
 
 从 [GitHub Releases](https://github.com/Rimagination/scansci-pi/releases) 下载测试版安装包。安装前请核对发布页的 SHA-256；当前测试版可能显示"未知发布者"或 SmartScreen 提示。
+
+桌面版更新支持 blockmap 差分下载：有可用的上一版缓存且下载服务支持 HTTP `Range` 时，只下载变化区块；否则自动回退到经过 SHA-256 校验的完整 ZIP。主程序更新不会重新下载独立的 `local-transformers` 运行组件。
 
 ### 从源码运行
 
@@ -114,4 +116,4 @@ scansci doctor capabilities --root . --json
 - **可选 Harness**：PydanticAI、OpenAI Agents SDK、LangGraph 按需安装，不影响默认启动路径。
 - **托管运行时**：Node.js 和 Tectonic 作为组件化管理，无需用户手动安装。
 
-更多文档见 `docs/` 目录：架构设计、证据 RAG 方案、研究 Agent 架构、PaperQA2 对比、错误账本等。
+更多文档见 `docs/` 目录：先读根目录 [`AGENTS.md`](AGENTS.md) 和[多 Agent 启动规范](docs/agent-startup.zh.md)，再按需阅读架构设计、证据 RAG 方案、研究 Agent 架构、PaperQA2 对比和错误账本。

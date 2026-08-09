@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import scansci_html.research_agent as research_agent
-from scansci_html.deep_research_evidence import build_task_fulltext_evidence
+from scansci_html.deep_research_evidence import _evidence_level, build_task_fulltext_evidence
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.pi_agent import PiAgentRunError
 from scansci_html.research_agent import ResearchAgentRuntime, _is_restart_request
@@ -759,13 +759,13 @@ def test_academic_search_inherits_the_year_and_aliases_inferred_from_the_request
     ]
 
 
-def test_academic_discovery_uses_precision_models_independent_of_local_library_size(tmp_path: Path, monkeypatch):
+def test_academic_discovery_keeps_neural_inference_out_of_desktop_process(tmp_path: Path, monkeypatch):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     observed: list[dict] = []
     fixture = SimpleNamespace(
-        embedding_provider="semantic-fixture",
-        reranker="precision-reranker-fixture",
-        metadata={"selection_reason": "academic-discovery", "fallback": False},
+        embedding_provider="hash-fixture",
+        reranker="lexical-fixture",
+        metadata={"fallback": False},
     )
 
     def fake_stack(**kwargs):
@@ -774,9 +774,18 @@ def test_academic_discovery_uses_precision_models_independent_of_local_library_s
 
     monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
 
-    assert runtime._academic_discovery_stack() is fixture
-    assert runtime._academic_discovery_stack() is fixture
-    assert observed == [{"quality_profile": "precision"}]
+    first = runtime._academic_discovery_stack()
+    second = runtime._academic_discovery_stack()
+    assert first is second
+    assert first.embedding_provider == "hash-fixture"
+    assert first.reranker == "lexical-fixture"
+    assert first.metadata["selection_reason"] == "public-discovery-process-isolation"
+    assert first.metadata["in_process_neural_disabled"] is True
+    assert observed == [{
+        "embedding_model": "__builtin__",
+        "reranker_model": "__builtin__",
+        "quality_profile": "balanced",
+    }]
 
 
 def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path, monkeypatch):
@@ -1089,8 +1098,8 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
     )
     monkeypatch.setattr(
         runtime,
-        "_local_evidence_stack",
-        lambda _db, **_kwargs: SimpleNamespace(
+        "_task_fulltext_evidence_stack",
+        lambda: SimpleNamespace(
             embedding_provider="embedding-fixture",
             reranker="reranker-fixture",
             metadata={"embedding": "fixture", "reranker": "fixture"},
@@ -1119,6 +1128,33 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
     assert captured["writing_brief"]["tone"] == "academic"
     assert "Compare audit frameworks." in captured["writing_brief"]["focus"]
     assert "Prioritize claims supported by the acquired full text" in captured["writing_brief"]["focus"]
+
+
+def test_task_fulltext_quality_warning_does_not_discard_traceable_claim_evidence() -> None:
+    assert _evidence_level(
+        {"documents": 2, "spans": 850},
+        {
+            "passed": False,
+            "claim_ready": True,
+            "oversized_spans": 1,
+            "missing_structure_spans": 0,
+            "source_text_mismatches": 0,
+            "orphan_sections": 0,
+        },
+    ) == "fulltext"
+
+
+def test_deep_research_stage_summary_uses_task_index_before_final_trace_exists() -> None:
+    summary = ResearchAgentRuntime._tool_summary(
+        {"workflow_type": "deep_research"},
+        {
+            "evidence_status": "task_acquired_fulltext",
+            "task_evidence": {"index": {"documents": 4, "spans": 2339}},
+        },
+    )
+
+    assert "基于 4 篇任务获取的全文" in summary
+    assert "建立 2339 个可回跳证据片段" in summary
 
 
 def test_deep_research_auto_runs_past_planning_and_completes_honest_discovery_only_report(tmp_path: Path, monkeypatch):
@@ -1456,6 +1492,46 @@ def test_research_run_cancel_and_resume_preserves_completed_stages(tmp_path: Pat
     assert resumed["current_stage"] == "retrieve"
     assert resumed["stages"][0]["status"] == "completed"
     assert resumed["stages"][1]["status"] == "pending"
+
+
+def test_research_run_pause_and_resume_preserves_completed_stages(tmp_path: Path):
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(
+        notebook_id="review",
+        workflow_type="ask",
+        title="Pause me",
+        input_payload={"question": "Pause me"},
+        stages=_stages(),
+    )
+    run_id = run["run_id"]
+    store.begin_run(run_id)
+    store.start_stage(run_id, "plan")
+    store.complete_stage(run_id, "plan", summary="done")
+    store.start_stage(run_id, "retrieve")
+
+    requested = store.request_pause(run_id)
+    assert requested["pause_requested"] is True
+    assert requested["cancel_requested"] is False
+    assert store.pause_requested(run_id) is True
+    assert store.stop_requested(run_id) is True
+
+    paused = store.mark_paused(run_id, summary="Paused by user")
+    assert paused["status"] == "paused"
+    assert paused["resumable"] is True
+    assert paused["pause_requested"] is False
+    assert paused["stages"][0]["status"] == "completed"
+    assert paused["stages"][1]["status"] == "paused"
+    assert [event["type"] for event in paused["events"]][-2:] == [
+        "run.pause_requested",
+        "task.paused",
+    ]
+
+    resumed = store.prepare_resume(run_id)
+    assert resumed["status"] == "queued"
+    assert resumed["current_stage"] == "retrieve"
+    assert resumed["stages"][0]["status"] == "completed"
+    assert resumed["stages"][1]["status"] == "pending"
+    assert resumed["pause_requested"] is False
 
 
 def test_research_run_persists_partial_stage_progress_and_cancelled_tool(tmp_path: Path):

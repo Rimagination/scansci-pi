@@ -1,0 +1,77 @@
+{
+  "schema_version": "easyslides.navigation_states.v1",
+  "template_id": "defense_topnav",
+  "source_shell": "03_content.svg",
+  "reference_pptx": "external://template-sources/academic-blue-top-navigation-defense.pptx",
+  "style_ref": "component_styles.navigation_styles.top_navigation",
+  "active_section_slot": "ACTIVE_SECTION_LABEL",
+  "render_rule": "The content shell ships with section 1 active. To activate another section, move nav-active-tab to that section's x/width, set data-active-index, update nav-active-label/nav-active-subtitle, and switch label fills so only the active section uses blue text on white.",
+  "theme_color_roles": {
+    "primary": "#183A6A",
+    "primary_dark": "#10284A",
+    "soft_surface": "#E7E6E6",
+    "border": "#C8D4E3",
+    "emphasis_text": "#081B33"
+  },
+  "variant_model": {
+    "mode": "single_svg_six_active_section_variants",
+    "shape_policy": "preserve_source_top_navigation_switch_active_tab",
+    "base_shell": "templates/layouts/defense_topnav/03_content.svg",
+    "variant_count": 6,
+    "selection_key": "ACTIVE_SECTION",
+    "immutable_elements": ["top-nav-surface", "nav-logo-frame", "nav-logo-mark", "nav-items", "content-header", "body-region", "page-footer"],
+    "mutable_elements": ["nav-active-tab", "nav-active-label", "nav-active-subtitle", "nav-item-label-fill", "data-active-index"]
+  },
+  "sections": [
+    {
+      "index": 1,
+      "title": "研究背景及现状",
+      "subtitle": "Background and Current Situation",
+      "active_tab": {"x": 112.4, "y": 0, "width": 205.85, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 215.33, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    },
+    {
+      "index": 2,
+      "title": "研究目标和内容",
+      "subtitle": "Goals and Content",
+      "active_tab": {"x": 331.08, "y": 0, "width": 190.97, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 426.57, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    },
+    {
+      "index": 3,
+      "title": "研究方法与思路",
+      "subtitle": "Methods and Approaches",
+      "active_tab": {"x": 546.88, "y": 0, "width": 191.82, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 642.79, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    },
+    {
+      "index": 4,
+      "title": "关键技术与创新",
+      "subtitle": "Key Technologies and Innovation",
+      "active_tab": {"x": 763.37, "y": 0, "width": 190.67, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 858.7, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    },
+    {
+      "index": 5,
+      "title": "已开展工作",
+      "subtitle": "Work already carried out",
+      "active_tab": {"x": 979.01, "y": 0, "width": 139.81, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 1048.92, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    },
+    {
+      "index": 6,
+      "title": "预期成果",
+      "subtitle": "Expected Outcomes",
+      "active_tab": {"x": 1143.65, "y": 0, "width": 121.21, "height": 101.15, "fill": "#FFFFFF"},
+      "label": {"x": 1204.25, "title_y": 50.1, "subtitle_y": 69.57, "anchor": "middle"}
+    }
+  ],
+  "navigation_variants": [
+    {"variant_id": "D02-NAV-01", "active_section_index": 1, "section_ref": "sections[0]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"},
+    {"variant_id": "D02-NAV-02", "active_section_index": 2, "section_ref": "sections[1]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"},
+    {"variant_id": "D02-NAV-03", "active_section_index": 3, "section_ref": "sections[2]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"},
+    {"variant_id": "D02-NAV-04", "active_section_index": 4, "section_ref": "sections[3]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"},
+    {"variant_id": "D02-NAV-05", "active_section_index": 5, "section_ref": "sections[4]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"},
+    {"variant_id": "D02-NAV-06", "active_section_index": 6, "section_ref": "sections[5]", "svg_path": "templates/layouts/defense_topnav/03_content.svg"}
+  ]
+}

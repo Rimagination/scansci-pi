@@ -199,10 +199,18 @@ _RUNTIME = LocalTransformersRuntime()
 def ensure_local_transformers_runtime(model_id: str) -> str:
     """Return a ready loopback OpenAI-compatible base URL for an installed model."""
 
-    # Core releases exclude the heavy inference stack.  In that case the
-    # versioned component is not merely a download artifact: launch it as the
-    # loopback runtime so the same model-selection contract works in released
-    # lightweight builds and in source/full builds.
+    # Prefer the independently versioned component whenever it is installed,
+    # including in a source checkout.  Importing PyTorch in the desktop web
+    # process makes a native inference crash fatal to the entire application;
+    # the component keeps that failure behind a loopback process boundary and
+    # is also the runtime users expect to be reused across app upgrades.
+    component = default_local_runtime_component()
+    if component.executable() is not None:
+        return component.ensure_process(model_id)
+
+    # Full/source developer environments may intentionally run without the
+    # optional component. Keep the in-process implementation as a development
+    # fallback only; lightweight core releases still require the component.
     try:
         has_in_process_runtime = find_spec("torch") is not None and find_spec("transformers") is not None
     except (ImportError, ModuleNotFoundError, ValueError):

@@ -16,6 +16,12 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
+from .update_blockmap import (
+    DifferentialDownloadUnavailable,
+    download_differential,
+    load_blockmap,
+)
+
 
 APP_VERSION = "0.2.3"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
@@ -103,7 +109,34 @@ class AppUpdateService:
         update_dir = self.updates_root / _safe_segment(version)
         update_dir.mkdir(parents=True, exist_ok=True)
         archive = update_dir / "ScanSci-update.zip"
-        self._download(package_url, archive)
+        blockmap_path = update_dir / "ScanSci-update.zip.blockmap"
+        update_result: dict[str, Any] = {
+            "used_differential": False,
+            "bytes_downloaded": 0,
+            "total_size": 0,
+        }
+        blockmap = self._prepare_blockmap(package, blockmap_path)
+        if blockmap is not None:
+            cached_base = self._cached_base_package()
+            if cached_base is not None:
+                old_archive, old_blockmap_path = cached_base
+                try:
+                    update_result = download_differential(
+                        old_archive,
+                        load_blockmap(old_blockmap_path),
+                        package_url,
+                        blockmap,
+                        archive,
+                    )
+                except (DifferentialDownloadUnavailable, OSError, ValueError):
+                    archive.unlink(missing_ok=True)
+        if not update_result["used_differential"]:
+            self._download(package_url, archive)
+            update_result = {
+                "used_differential": False,
+                "bytes_downloaded": archive.stat().st_size,
+                "total_size": archive.stat().st_size,
+            }
         actual_sha256 = _sha256(archive)
         if actual_sha256 != expected_sha256:
             archive.unlink(missing_ok=True)
@@ -144,6 +177,9 @@ class AppUpdateService:
             "state": "restarting",
             "message": "更新已验证，ScanSci 即将重新启动",
             "archive": str(archive),
+            "update_mode": "differential" if update_result["used_differential"] else "full",
+            "bytes_downloaded": int(update_result["bytes_downloaded"]),
+            "total_size": int(update_result["total_size"]),
         }
 
     def _current_status(self, *, checked: bool = False) -> dict[str, Any]:
@@ -159,6 +195,8 @@ class AppUpdateService:
             "channel": "稳定版",
             "message": f"当前版本 v{self.current_version}" if not self.manifest_url else "当前已是最新版本",
             "checked_at": _now_iso() if checked else "",
+            "update_mode": "full",
+            "blockmap_size": 0,
         }
 
     def _status_from_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +206,7 @@ class AppUpdateService:
         available = _version_key(latest) > _version_key(self.current_version)
         package = self._windows_package(manifest)
         notes = _normalise_release_notes(manifest.get("notes")) or _DEFAULT_RELEASE_NOTES
+        blockmap = self._blockmap_info(package)
         return {
             "state": "available" if available else "current",
             "available": available,
@@ -180,12 +219,55 @@ class AppUpdateService:
             "channel": str(manifest.get("channel", "稳定版")).strip() or "稳定版",
             "message": "有可用更新" if available else "当前已是最新版本",
             "checked_at": _now_iso(),
+            "update_mode": "differential-capable" if blockmap else "full",
+            "blockmap_size": int(blockmap.get("size", 0) or 0) if blockmap else 0,
         }
 
     @staticmethod
     def _windows_package(manifest: dict[str, Any]) -> dict[str, Any]:
         package = manifest.get("windows", {})
         return package if isinstance(package, dict) else {}
+
+    @staticmethod
+    def _blockmap_info(package: dict[str, Any]) -> dict[str, Any] | None:
+        blockmap = package.get("blockmap")
+        if not isinstance(blockmap, dict):
+            return None
+        url = str(blockmap.get("url", "")).strip()
+        checksum = str(blockmap.get("sha256", "")).strip().lower()
+        size = blockmap.get("size")
+        if not url or not re.fullmatch(r"[0-9a-f]{64}", checksum) or not isinstance(size, int) or size <= 0:
+            return None
+        return {"url": url, "sha256": checksum, "size": size}
+
+    def _prepare_blockmap(self, package: dict[str, Any], destination: Path) -> dict[str, Any] | None:
+        blockmap_info = self._blockmap_info(package)
+        if blockmap_info is None:
+            destination.unlink(missing_ok=True)
+            return None
+        try:
+            self._download_verified(
+                str(blockmap_info["url"]),
+                destination,
+                str(blockmap_info["sha256"]),
+            )
+            if destination.stat().st_size != int(blockmap_info["size"]):
+                raise ValueError("更新 blockmap 大小校验失败。")
+            blockmap = load_blockmap(destination)
+            if int(blockmap["size"]) <= 0:
+                raise ValueError("更新 blockmap 为空。")
+            return blockmap
+        except (OSError, ValueError, RuntimeError):
+            destination.unlink(missing_ok=True)
+            return None
+
+    def _cached_base_package(self) -> tuple[Path, Path] | None:
+        base_dir = self.updates_root / _safe_segment(self.current_version)
+        archive = base_dir / "ScanSci-update.zip"
+        blockmap = base_dir / "ScanSci-update.zip.blockmap"
+        if archive.is_file() and blockmap.is_file():
+            return archive, blockmap
+        return None
 
     @staticmethod
     def _read_manifest(url: str) -> dict[str, Any]:
@@ -195,7 +277,7 @@ class AppUpdateService:
             payload = response.read(1_000_001)
         if len(payload) > 1_000_000:
             raise ValueError("更新清单过大。")
-        parsed = json.loads(payload.decode("utf-8"))
+        parsed = json.loads(payload.decode("utf-8-sig"))
         if not isinstance(parsed, dict):
             raise ValueError("更新清单必须是 JSON 对象。")
         return parsed
@@ -209,6 +291,14 @@ class AppUpdateService:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
         temporary.replace(destination)
+
+    def _download_verified(self, url: str, destination: Path, expected_sha256: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise RuntimeError("更新清单缺少有效的 blockmap SHA256。")
+        self._download(url, destination)
+        if _sha256(destination) != expected_sha256:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("更新 blockmap 校验失败。")
 
 
 def _normalise_release_notes(value: Any) -> list[dict[str, Any]]:

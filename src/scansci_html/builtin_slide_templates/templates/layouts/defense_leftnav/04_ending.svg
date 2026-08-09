@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="1280" height="720" viewBox="0 0 1280 720"><rect x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>
+<g id="shape-4" data-name="矩形 3">
+<rect x="0" y="191.71" width="1280" height="259.07" fill="#8B0012" stroke="none" stroke-width="1"/>
+</g>
+<g id="shape-45" data-name="文本框 44">
+<rect x="252.65" y="277.62" width="774.69" height="87.24" fill="none"/>
+<text x="640" y="336.82" text-anchor="middle" xml:space="preserve" font-family="&quot;微软雅黑&quot;, sans-serif" font-size="64" fill="#FFFFFF" font-weight="bold" letter-spacing="4" data-slot="CLOSING_TITLE" data-pptx-textbox="true" data-pptx-valign="middle" data-pptx-box-x="250" data-pptx-box-y="269.62" data-pptx-box-w="780" data-pptx-box-h="99.2"><tspan fill="#FFFFFF" font-size="64" font-weight="bold" letter-spacing="4">{{CLOSING_TITLE}}</tspan></text>
+</g>
+<g id="shape-214" data-name="组合 213">
+<g id="shape-106" data-name="任意多边形: 形状 105">
+<path d="M 16.72 18.95 C 18.68 18.95 20.28 17.36 20.28 15.38 C 20.28 13.42 18.69 11.82 16.72 11.82 C 14.76 11.82 13.15 13.41 13.15 15.38 C 13.15 17.36 14.76 18.95 16.72 18.95 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-107" data-name="任意多边形: 形状 106">
+<path d="M 32.77 19.74 C 35.18 19.74 37.13 17.79 37.13 15.38 C 37.13 12.97 35.18 11.02 32.77 11.02 C 30.36 11.02 28.41 12.97 28.41 15.38 C 28.4 17.79 30.36 19.74 32.77 19.74 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-108" data-name="任意多边形: 形状 107">
+<path d="M 48.81 20.1 C 51.42 20.1 53.53 17.99 53.53 15.38 C 53.53 12.77 51.42 10.67 48.81 10.67 C 46.2 10.67 44.1 12.77 44.1 15.38 C 44.1 17.99 46.22 20.1 48.81 20.1 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-109" data-name="任意多边形: 形状 108">
+<path d="M 69.32 15.38 C 69.32 17.84 67.33 19.83 64.87 19.83 C 62.41 19.83 60.42 17.84 60.42 15.38 C 60.42 12.92 62.41 10.93 64.87 10.93 C 67.33 10.93 69.32 12.92 69.32 15.38 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-110" data-name="任意多边形: 形状 109">
+<path d="M 80.91 19.04 C 82.93 19.04 84.55 17.41 84.55 15.4 C 84.55 13.38 82.93 11.75 80.91 11.75 C 78.9 11.75 77.27 13.38 77.27 15.4 C 77.27 17.41 78.9 19.04 80.91 19.04 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-117" data-name="任意多边形: 形状 116">
+<path d="M 21.07 31.44 C 21.07 33.85 19.12 35.8 16.72 35.8 C 14.31 35.8 12.36 33.85 12.36 31.44 C 12.36 29.03 14.31 27.08 16.72 27.08 C 19.12 27.08 21.07 29.03 21.07 31.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-118" data-name="任意多边形: 形状 117">
+<path d="M 32.77 36.87 C 35.77 36.87 38.2 34.45 38.2 31.44 C 38.2 28.43 35.78 26.01 32.77 26.01 C 29.78 26.01 27.34 28.44 27.34 31.44 C 27.34 34.43 29.76 36.87 32.77 36.87 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-119" data-name="任意多边形: 形状 118">
+<path d="M 54.83 31.44 C 54.83 34.76 52.14 37.45 48.81 37.45 C 45.49 37.45 42.8 34.76 42.8 31.44 C 42.8 28.12 45.49 25.42 48.81 25.42 C 52.14 25.42 54.83 28.12 54.83 31.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-120" data-name="任意多边形: 形状 119">
+<path d="M 70.39 31.44 C 70.39 34.49 67.92 36.96 64.87 36.96 C 61.82 36.96 59.35 34.49 59.35 31.44 C 59.35 28.39 61.82 25.91 64.87 25.91 C 67.92 25.91 70.39 28.39 70.39 31.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-121" data-name="任意多边形: 形状 120">
+<path d="M 85.36 31.44 C 85.36 33.9 83.37 35.89 80.91 35.89 C 78.45 35.89 76.46 33.9 76.46 31.44 C 76.46 28.98 78.45 26.99 80.91 26.99 C 83.37 26.99 85.36 28.98 85.36 31.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-128" data-name="任意多边形: 形状 127">
+<path d="M 16.72 52.2 C 19.33 52.2 21.43 50.09 21.43 47.48 C 21.43 44.87 19.33 42.76 16.72 42.76 C 14.11 42.76 12 44.87 12 47.48 C 12 50.09 14.12 52.2 16.72 52.2 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-129" data-name="任意多边形: 形状 128">
+<path d="M 38.79 47.48 C 38.79 50.8 36.09 53.49 32.77 53.49 C 29.45 53.49 26.76 50.8 26.76 47.48 C 26.76 44.16 29.45 41.47 32.77 41.47 C 36.09 41.47 38.79 44.16 38.79 47.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-130" data-name="任意多边形: 形状 129">
+<path d="M 55.76 47.48 C 55.76 51.31 52.65 54.42 48.81 54.42 C 44.98 54.42 41.87 51.31 41.87 47.48 C 41.87 43.65 44.98 40.54 48.81 40.54 C 52.65 40.54 55.76 43.65 55.76 47.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-131" data-name="任意多边形: 形状 130">
+<path d="M 70.96 47.48 C 70.96 50.85 68.23 53.57 64.87 53.57 C 61.5 53.57 58.78 50.85 58.78 47.48 C 58.78 44.12 61.5 41.39 64.87 41.39 C 68.23 41.39 70.96 44.12 70.96 47.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-132" data-name="任意多边形: 形状 131">
+<path d="M 80.91 52.29 C 83.56 52.29 85.72 50.14 85.72 47.48 C 85.72 44.83 83.57 42.67 80.91 42.67 C 78.26 42.67 76.1 44.82 76.1 47.48 C 76.1 50.14 78.26 52.29 80.91 52.29 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-139" data-name="任意多边形: 形状 138">
+<path d="M 21.17 63.54 C 21.17 65.99 19.17 67.99 16.72 67.99 C 14.26 67.99 12.27 65.99 12.27 63.54 C 12.27 61.08 14.26 59.09 16.72 59.09 C 19.17 59.09 21.17 61.08 21.17 63.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-140" data-name="任意多边形: 形状 139">
+<path d="M 32.77 69.05 C 35.82 69.05 38.3 66.57 38.3 63.52 C 38.3 60.48 35.82 58 32.77 58 C 29.72 58 27.25 60.48 27.25 63.52 C 27.25 66.58 29.72 69.05 32.77 69.05 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-141" data-name="任意多边形: 形状 140">
+<path d="M 54.91 63.54 C 54.91 66.9 52.18 69.63 48.81 69.63 C 45.45 69.63 42.72 66.9 42.72 63.54 C 42.72 60.17 45.45 57.44 48.81 57.44 C 52.18 57.44 54.91 60.17 54.91 63.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-142" data-name="任意多边形: 形状 141">
+<path d="M 64.87 69.14 C 67.97 69.14 70.47 66.62 70.47 63.54 C 70.47 60.44 67.96 57.93 64.87 57.93 C 61.78 57.93 59.27 60.45 59.27 63.54 C 59.25 66.62 61.77 69.14 64.87 69.14 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-143" data-name="任意多边形: 形状 142">
+<path d="M 85.46 63.54 C 85.46 66.05 83.42 68.08 80.91 68.08 C 78.4 68.08 76.37 66.05 76.37 63.54 C 76.37 61.03 78.4 58.99 80.91 58.99 C 83.42 58.99 85.46 61.03 85.46 63.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-150" data-name="任意多边形: 形状 149">
+<path d="M 20.36 79.58 C 20.36 81.59 18.73 83.22 16.72 83.22 C 14.7 83.22 13.07 81.59 13.07 79.58 C 13.07 77.57 14.7 75.94 16.72 75.94 C 18.73 75.94 20.36 77.57 20.36 79.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-151" data-name="任意多边形: 形状 150">
+<path d="M 32.77 84.03 C 35.24 84.03 37.22 82.04 37.22 79.58 C 37.22 77.11 35.24 75.13 32.77 75.13 C 30.31 75.13 28.32 77.11 28.32 79.58 C 28.32 82.04 30.31 84.03 32.77 84.03 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-152" data-name="任意多边形: 形状 151">
+<path d="M 48.81 84.39 C 51.46 84.39 53.62 82.24 53.62 79.58 C 53.62 76.92 51.48 74.77 48.81 74.77 C 46.15 74.77 44.01 76.92 44.01 79.58 C 44.01 82.24 46.16 84.39 48.81 84.39 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-153" data-name="任意多边形: 形状 152">
+<path d="M 69.41 79.58 C 69.41 82.09 67.38 84.12 64.87 84.12 C 62.36 84.12 60.33 82.09 60.33 79.58 C 60.33 77.07 62.36 75.03 64.87 75.03 C 67.38 75.03 69.41 77.07 69.41 79.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-154" data-name="任意多边形: 形状 153">
+<path d="M 84.65 79.58 C 84.65 81.64 82.98 83.31 80.91 83.31 C 78.85 83.31 77.18 81.64 77.18 79.58 C 77.18 77.52 78.85 75.84 80.91 75.84 C 82.98 75.84 84.65 77.52 84.65 79.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+</g>
+<g id="shape-215" data-name="组合 214">
+<g id="shape-188" data-name="任意多边形: 形状 187">
+<path d="M 1199.38 642.95 C 1201.34 642.95 1202.95 641.36 1202.95 639.38 C 1202.95 637.42 1201.36 635.82 1199.38 635.82 C 1197.42 635.82 1195.82 637.41 1195.82 639.38 C 1195.82 641.36 1197.42 642.95 1199.38 642.95 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-189" data-name="任意多边形: 形状 188">
+<path d="M 1215.44 643.74 C 1217.85 643.74 1219.8 641.79 1219.8 639.38 C 1219.8 636.97 1217.85 635.02 1215.44 635.02 C 1213.03 635.02 1211.08 636.97 1211.08 639.38 C 1211.07 641.79 1213.03 643.74 1215.44 643.74 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-190" data-name="任意多边形: 形状 189">
+<path d="M 1231.48 644.1 C 1234.09 644.1 1236.2 641.99 1236.2 639.38 C 1236.2 636.77 1234.09 634.67 1231.48 634.67 C 1228.87 634.67 1226.76 636.77 1226.76 639.38 C 1226.76 641.99 1228.88 644.1 1231.48 644.1 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-191" data-name="任意多边形: 形状 190">
+<path d="M 1251.99 639.38 C 1251.99 641.84 1249.99 643.83 1247.54 643.83 C 1245.08 643.83 1243.09 641.84 1243.09 639.38 C 1243.09 636.92 1245.08 634.93 1247.54 634.93 C 1249.99 634.93 1251.99 636.92 1251.99 639.38 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-192" data-name="任意多边形: 形状 191">
+<path d="M 1263.58 643.04 C 1265.59 643.04 1267.22 641.41 1267.22 639.4 C 1267.22 637.38 1265.59 635.75 1263.58 635.75 C 1261.57 635.75 1259.94 637.38 1259.94 639.4 C 1259.94 641.41 1261.57 643.04 1263.58 643.04 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-193" data-name="任意多边形: 形状 192">
+<path d="M 1203.74 655.44 C 1203.74 657.85 1201.79 659.8 1199.38 659.8 C 1196.98 659.8 1195.02 657.85 1195.02 655.44 C 1195.02 653.03 1196.98 651.08 1199.38 651.08 C 1201.79 651.08 1203.74 653.03 1203.74 655.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-194" data-name="任意多边形: 形状 193">
+<path d="M 1215.44 660.87 C 1218.43 660.87 1220.87 658.45 1220.87 655.44 C 1220.87 652.43 1218.45 650.01 1215.44 650.01 C 1212.44 650.01 1210.01 652.44 1210.01 655.44 C 1210.01 658.43 1212.43 660.87 1215.44 660.87 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-195" data-name="任意多边形: 形状 194">
+<path d="M 1237.49 655.44 C 1237.49 658.76 1234.8 661.45 1231.48 661.45 C 1228.16 661.45 1225.47 658.76 1225.47 655.44 C 1225.47 652.12 1228.16 649.42 1231.48 649.42 C 1234.8 649.42 1237.49 652.12 1237.49 655.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-196" data-name="任意多边形: 形状 195">
+<path d="M 1253.06 655.44 C 1253.06 658.49 1250.59 660.96 1247.54 660.96 C 1244.49 660.96 1242.01 658.49 1242.01 655.44 C 1242.01 652.39 1244.49 649.91 1247.54 649.91 C 1250.59 649.91 1253.06 652.39 1253.06 655.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-197" data-name="任意多边形: 形状 196">
+<path d="M 1268.03 655.44 C 1268.03 657.9 1266.04 659.89 1263.58 659.89 C 1261.12 659.89 1259.13 657.9 1259.13 655.44 C 1259.13 652.98 1261.12 650.99 1263.58 650.99 C 1266.04 650.99 1268.03 652.98 1268.03 655.44 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-198" data-name="任意多边形: 形状 197">
+<path d="M 1199.38 676.2 C 1201.99 676.2 1204.1 674.09 1204.1 671.48 C 1204.1 668.87 1201.99 666.76 1199.38 666.76 C 1196.77 666.76 1194.67 668.87 1194.67 671.48 C 1194.67 674.09 1196.79 676.2 1199.38 676.2 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-199" data-name="任意多边形: 形状 198">
+<path d="M 1221.45 671.48 C 1221.45 674.8 1218.76 677.49 1215.44 677.49 C 1212.12 677.49 1209.42 674.8 1209.42 671.48 C 1209.42 668.16 1212.12 665.47 1215.44 665.47 C 1218.76 665.47 1221.45 668.16 1221.45 671.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-200" data-name="任意多边形: 形状 199">
+<path d="M 1238.42 671.48 C 1238.42 675.31 1235.31 678.42 1231.48 678.42 C 1227.65 678.42 1224.54 675.31 1224.54 671.48 C 1224.54 667.65 1227.65 664.54 1231.48 664.54 C 1235.31 664.54 1238.42 667.65 1238.42 671.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-201" data-name="任意多边形: 形状 200">
+<path d="M 1253.63 671.48 C 1253.63 674.85 1250.9 677.57 1247.54 677.57 C 1244.17 677.57 1241.44 674.85 1241.44 671.48 C 1241.44 668.12 1244.17 665.39 1247.54 665.39 C 1250.9 665.39 1253.63 668.12 1253.63 671.48 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-202" data-name="任意多边形: 形状 201">
+<path d="M 1263.58 676.29 C 1266.23 676.29 1268.39 674.14 1268.39 671.48 C 1268.39 668.83 1266.24 666.67 1263.58 666.67 C 1260.93 666.67 1258.77 668.82 1258.77 671.48 C 1258.77 674.14 1260.93 676.29 1263.58 676.29 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-203" data-name="任意多边形: 形状 202">
+<path d="M 1203.83 687.54 C 1203.83 689.99 1201.84 691.99 1199.38 691.99 C 1196.92 691.99 1194.93 689.99 1194.93 687.54 C 1194.93 685.08 1196.92 683.09 1199.38 683.09 C 1201.84 683.09 1203.83 685.08 1203.83 687.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-204" data-name="任意多边形: 形状 203">
+<path d="M 1215.44 693.05 C 1218.49 693.05 1220.96 690.57 1220.96 687.52 C 1220.96 684.48 1218.49 682 1215.44 682 C 1212.39 682 1209.91 684.48 1209.91 687.52 C 1209.91 690.58 1212.39 693.05 1215.44 693.05 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-205" data-name="任意多边形: 形状 204">
+<path d="M 1237.57 687.54 C 1237.57 690.9 1234.85 693.63 1231.48 693.63 C 1228.12 693.63 1225.39 690.9 1225.39 687.54 C 1225.39 684.17 1228.12 681.44 1231.48 681.44 C 1234.85 681.44 1237.57 684.17 1237.57 687.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-206" data-name="任意多边形: 形状 205">
+<path d="M 1247.54 693.14 C 1250.64 693.14 1253.14 690.62 1253.14 687.54 C 1253.14 684.44 1250.62 681.93 1247.54 681.93 C 1244.45 681.93 1241.93 684.45 1241.93 687.54 C 1241.92 690.62 1244.44 693.14 1247.54 693.14 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-207" data-name="任意多边形: 形状 206">
+<path d="M 1268.12 687.54 C 1268.12 690.05 1266.09 692.08 1263.58 692.08 C 1261.07 692.08 1259.03 690.05 1259.03 687.54 C 1259.03 685.03 1261.07 682.99 1263.58 682.99 C 1266.09 682.99 1268.12 685.03 1268.12 687.54 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-208" data-name="任意多边形: 形状 207">
+<path d="M 1203.03 703.58 C 1203.03 705.59 1201.39 707.22 1199.38 707.22 C 1197.37 707.22 1195.74 705.59 1195.74 703.58 C 1195.74 701.57 1197.37 699.94 1199.38 699.94 C 1201.39 699.94 1203.03 701.57 1203.03 703.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-209" data-name="任意多边形: 形状 208">
+<path d="M 1215.44 708.03 C 1217.9 708.03 1219.89 706.04 1219.89 703.58 C 1219.89 701.11 1217.9 699.13 1215.44 699.13 C 1212.97 699.13 1210.99 701.11 1210.99 703.58 C 1210.99 706.04 1212.97 708.03 1215.44 708.03 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-210" data-name="任意多边形: 形状 209">
+<path d="M 1231.48 708.39 C 1234.13 708.39 1236.29 706.24 1236.29 703.58 C 1236.29 700.92 1234.14 698.77 1231.48 698.77 C 1228.82 698.77 1226.67 700.92 1226.67 703.58 C 1226.67 706.24 1228.83 708.39 1231.48 708.39 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-211" data-name="任意多边形: 形状 210">
+<path d="M 1252.08 703.58 C 1252.08 706.09 1250.05 708.12 1247.54 708.12 C 1245.03 708.12 1242.99 706.09 1242.99 703.58 C 1242.99 701.07 1245.03 699.03 1247.54 699.03 C 1250.05 699.03 1252.08 701.07 1252.08 703.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-212" data-name="任意多边形: 形状 211">
+<path d="M 1267.31 703.58 C 1267.31 705.64 1265.64 707.31 1263.58 707.31 C 1261.52 707.31 1259.84 705.64 1259.84 703.58 C 1259.84 701.52 1261.52 699.84 1263.58 699.84 C 1265.64 699.84 1267.31 701.52 1267.31 703.58 Z" fill="#8B0012" fill-opacity="0.15" stroke-width="1" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+</g>
+<g id="shape-2" data-name="组合 1">
+<g id="shape-3" data-name="图形 10">
+<path d="M 560.36 587.39 L 523.76 587.39 C 523.43 587.39 523.16 587.13 523.16 586.81 L 523.16 562.12 C 523.16 561.8 523.43 561.54 523.76 561.54 L 526.76 561.54 C 527.09 561.54 527.36 561.8 527.36 562.12 C 527.36 562.44 527.09 562.7 526.76 562.7 L 524.35 562.7 L 524.35 586.23 L 559.77 586.23 L 559.77 562.7 L 557.03 562.7 C 556.7 562.7 556.44 562.44 556.44 562.12 C 556.44 561.8 556.7 561.54 557.03 561.54 L 560.36 561.54 C 560.69 561.54 560.96 561.8 560.96 562.12 L 560.96 586.81 C 560.96 587.13 560.69 587.39 560.36 587.39" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-5" data-name="任意多边形: 形状 4">
+<path d="M 549.37 558.41 C 547.05 558.44 544.78 558.84 542.69 559.29 L 542.69 582.59 C 544.86 582.09 547.18 581.72 549.62 581.72 C 551.85 581.72 554.14 582.04 556.46 582.96 L 556.46 559.75 C 554.1 558.72 551.7 558.38 549.37 558.41 Z M 549.31 557.22 C 551.9 557.19 554.59 557.59 557.27 558.82 C 557.48 558.91 557.6 559.11 557.6 559.34 L 557.6 583.83 C 557.6 584.03 557.48 584.21 557.33 584.32 C 557.27 584.38 557.15 584.41 557.03 584.41 C 556.94 584.41 556.85 584.38 556.76 584.35 C 551.73 582.04 546.58 582.87 542.15 583.83 C 541.97 583.86 541.79 583.83 541.64 583.71 C 541.5 583.6 541.44 583.42 541.44 583.25 L 541.44 558.79 C 541.44 558.53 541.64 558.3 541.91 558.22 C 544.22 557.71 546.72 557.25 549.31 557.22 Z" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-6" data-name="图形 10">
+<path d="M 554.92 564.09 C 554.89 564.09 554.83 564.09 554.8 564.06 C 551.17 562.38 547.45 562.99 544.23 563.69 C 544.08 563.71 543.91 563.63 543.88 563.45 C 543.85 563.31 543.94 563.14 544.11 563.11 C 547.42 562.38 551.26 561.78 555.07 563.54 C 555.21 563.6 555.27 563.77 555.21 563.92 C 555.16 564.03 555.04 564.09 554.92 564.09" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-7" data-name="图形 10">
+<path d="M 554.92 567.88 C 554.89 567.88 554.83 567.88 554.8 567.85 C 551.17 566.18 547.45 566.78 544.23 567.48 C 544.08 567.51 543.91 567.42 543.88 567.25 C 543.85 567.1 543.94 566.93 544.11 566.9 C 547.42 566.18 551.26 565.57 555.07 567.33 C 555.21 567.39 555.27 567.56 555.21 567.71 C 555.16 567.82 555.04 567.88 554.92 567.88" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-8" data-name="图形 10">
+<path d="M 554.92 571.67 C 554.89 571.67 554.83 571.67 554.8 571.65 C 551.17 569.97 547.45 570.57 544.23 571.27 C 544.08 571.3 543.91 571.21 543.88 571.04 C 543.85 570.89 543.94 570.72 544.11 570.69 C 547.42 569.97 551.26 569.36 555.07 571.12 C 555.21 571.18 555.27 571.36 555.21 571.5 C 555.16 571.62 555.04 571.67 554.92 571.67" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-9" data-name="图形 10">
+<path d="M 554.92 575.47 C 554.89 575.47 554.83 575.47 554.8 575.44 C 551.17 573.76 547.45 574.34 544.23 575.03 C 544.08 575.06 543.91 574.97 543.88 574.8 C 543.85 574.66 543.94 574.48 544.11 574.45 C 547.42 573.73 551.26 573.12 555.07 574.89 C 555.21 574.94 555.27 575.12 555.21 575.26 C 555.16 575.41 555.04 575.47 554.92 575.47" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-10" data-name="图形 10">
+<path d="M 554.92 579.23 C 554.89 579.23 554.83 579.23 554.8 579.2 C 551.17 577.52 547.45 578.13 544.23 578.82 C 544.08 578.85 543.91 578.77 543.88 578.59 C 543.85 578.45 543.94 578.27 544.11 578.24 C 547.42 577.52 551.26 576.91 555.07 578.68 C 555.21 578.74 555.27 578.91 555.21 579.05 C 555.16 579.17 555.04 579.23 554.92 579.23" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-11" data-name="任意多边形: 形状 10">
+<path d="M 534.77 558.4 C 532.44 558.38 530.05 558.72 527.69 559.75 L 527.69 582.96 C 532.48 581.05 537.27 581.69 541.47 582.56 L 541.47 559.26 C 539.35 558.81 537.09 558.42 534.77 558.4 Z M 534.78 557.25 C 537.37 557.28 539.87 557.74 542.18 558.24 C 542.45 558.3 542.66 558.53 542.66 558.82 L 542.66 583.31 C 542.66 583.48 542.57 583.66 542.45 583.77 C 542.3 583.89 542.12 583.92 541.94 583.89 C 537.51 582.93 532.36 582.09 527.33 584.41 L 527.09 584.41 C 526.97 584.41 526.88 584.38 526.76 584.32 C 526.59 584.21 526.5 584.03 526.5 583.83 L 526.5 559.37 C 526.5 559.14 526.62 558.94 526.82 558.85 C 529.5 557.62 532.19 557.22 534.78 557.25 Z" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+<g id="shape-12" data-name="图形 10">
+<path d="M 532.03 568.81 C 531.97 568.81 531.94 568.81 531.88 568.78 C 531.79 568.72 531.73 568.64 531.73 568.52 L 531.73 557.96 C 531.73 557.78 531.85 557.67 532.03 557.67 C 532.21 557.67 532.33 557.78 532.33 557.96 L 532.33 567.94 L 534.38 566.55 C 534.47 566.49 534.62 566.49 534.71 566.55 L 536.76 567.94 L 536.76 557.96 C 536.76 557.78 536.88 557.67 537.06 557.67 C 537.24 557.67 537.36 557.78 537.36 557.96 L 537.36 568.52 C 537.36 568.64 537.3 568.72 537.21 568.78 C 537.12 568.84 537 568.81 536.91 568.75 L 534.56 567.16 L 532.21 568.75 C 532.15 568.78 532.09 568.81 532.03 568.81" stroke-width="0.333" stroke-linecap="butt" stroke="none" stroke-linejoin="miter" fill="none"/>
+</g>
+</g>
+<g id="shape-13" data-name="图形 1">
+<path d="M 207.47 587.22 L 206.19 587.22 C 205.37 580.49 198.92 575.06 192.09 575.06 C 185.27 575.06 178.82 580.49 177.99 587.22 L 176.71 587.22 C 177.38 581.02 181.78 575.93 187.51 574.21 C 184.57 572.64 182.48 569.72 182.48 566.1 C 182.48 560.92 187.01 556.51 192.09 556.51 C 197.17 556.51 201.71 560.92 201.71 566.1 C 201.71 569.72 199.61 572.64 196.68 574.21 C 202.4 575.93 206.8 581.02 207.47 587.22 Z M 200.42 566.1 C 200.42 561.86 196.25 557.79 192.09 557.79 C 187.93 557.79 183.76 561.86 183.76 566.1 C 183.76 570.35 187.93 573.78 192.09 573.78 C 196.25 573.78 200.42 570.35 200.42 566.1 Z" fill="#8B0012" stroke-width="0.033" stroke-linecap="butt" stroke="none" stroke-linejoin="miter"/>
+</g>
+<g id="shape-17" data-name="Freeform 21">
+<path d="M 907.58 554.83 C 916.99 554.83 924.56 562.43 924.56 571.84 C 924.56 581.25 916.99 588.85 907.58 588.85 C 898.18 588.85 890.55 581.25 890.55 571.84 C 890.55 562.43 898.18 554.83 907.58 554.83 Z M 909.36 572.89 C 908.96 573.65 908.1 574.12 907.24 573.94 C 906.09 573.71 905.35 572.6 905.58 571.49 C 905.81 570.32 906.84 569.56 907.99 569.73 C 908.16 569.79 908.39 569.85 908.5 569.97 C 908.56 569.97 908.62 569.97 908.67 569.91 C 910.68 567.98 912.75 565.99 914.81 564.07 C 915.44 563.42 916.36 564.42 915.73 565 C 913.66 566.99 911.6 568.97 909.53 570.9 C 909.48 570.96 909.48 571.02 909.53 571.08 C 909.59 571.2 909.59 571.37 909.65 571.55 C 909.65 571.6 909.65 571.6 909.71 571.6 C 911.48 571.9 913.32 572.31 915.1 572.6 C 916.07 572.77 915.84 574 914.87 573.83 C 913.09 573.48 911.26 573.18 909.53 572.83 C 909.48 572.83 909.42 572.83 909.36 572.89 Z M 907.41 572.89 C 906.09 572.66 906.44 570.55 907.76 570.79 C 909.13 571.02 908.73 573.12 907.41 572.89 Z M 907.58 557.11 C 915.73 557.11 922.33 563.71 922.33 571.84 C 922.33 579.96 915.73 586.63 907.58 586.63 C 899.44 586.63 892.84 579.96 892.84 571.84 C 892.84 563.71 899.44 557.11 907.58 557.11 Z M 907.58 581.19 C 908.5 581.19 909.25 581.89 909.25 582.83 C 909.25 583.76 908.5 584.52 907.58 584.52 C 906.67 584.52 905.92 583.76 905.92 582.83 C 905.92 581.89 906.67 581.19 907.58 581.19 Z M 907.58 559.16 C 908.85 559.16 909.88 560.21 909.88 561.49 C 909.88 562.78 908.85 563.83 907.58 563.83 C 906.26 563.83 905.23 562.78 905.23 561.49 C 905.23 560.21 906.26 559.16 907.58 559.16 Z" fill="#8B0012" stroke="none"/>
+</g>
+<g id="ending-metadata-clean-footer">
+<rect x="90" y="540" width="1160" height="68" fill="#FFFFFF" stroke="none"/>
+<use data-icon="lucide/user-round" x="122" y="556" width="30" height="30" fill="#8B0012" stroke-width="2.25"/>
+<use data-icon="lucide/graduation-cap" x="488" y="556" width="30" height="30" fill="#8B0012" stroke-width="2.25"/>
+<use data-icon="tabler-filled/mail" x="862" y="556" width="30" height="30" fill="#8B0012" stroke-width="2.25"/>
+<text x="164" y="578" text-anchor="start" xml:space="preserve" font-family="&quot;微软雅黑&quot;, sans-serif" font-size="22" fill="#000000" data-pptx-textbox="true" data-pptx-box-x="164" data-pptx-box-y="552" data-pptx-box-w="270" data-pptx-box-h="38" data-pptx-valign="middle"><tspan fill="#000000" font-size="22">答辩人：</tspan><tspan fill="#000000" font-size="22" data-slot="PRESENTER">{{PRESENTER}}</tspan></text>
+<text x="530" y="578" text-anchor="start" xml:space="preserve" font-family="&quot;微软雅黑&quot;, sans-serif" font-size="22" fill="#000000" data-pptx-textbox="true" data-pptx-box-x="530" data-pptx-box-y="552" data-pptx-box-w="315" data-pptx-box-h="38" data-pptx-valign="middle"><tspan fill="#000000" font-size="22">指导老师：</tspan><tspan fill="#000000" font-size="22" data-slot="ADVISOR">{{ADVISOR}}</tspan></text>
+<text x="904" y="578" text-anchor="start" xml:space="preserve" font-family="&quot;微软雅黑&quot;, sans-serif" font-size="22" fill="#000000" data-pptx-textbox="true" data-pptx-box-x="904" data-pptx-box-y="552" data-pptx-box-w="315" data-pptx-box-h="38" data-pptx-valign="middle"><tspan fill="#000000" font-size="22">专业：</tspan><tspan fill="#000000" font-size="22" data-slot="CONTACT">{{CONTACT}}</tspan></text>
+</g></svg>

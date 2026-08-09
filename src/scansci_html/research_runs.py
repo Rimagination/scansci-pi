@@ -39,7 +39,7 @@ ACTIVE_RUN_STATUSES = {"queued", "planning", "running", "verifying"}
 RESUMABLE_RUN_STATUSES = {"paused", "failed", "cancelled", "needs_confirmation", "waiting_input"}
 SCIENTIFIC_EVENT_SCHEMA_VERSION = "scientific_event.v1"
 RESEARCH_SCHEMA_NAME = "research_runs"
-RESEARCH_SCHEMA_VERSION = 2
+RESEARCH_SCHEMA_VERSION = 3
 
 _CANONICAL_EVENT_TYPES = {
     "task.created": "run.created",
@@ -259,6 +259,7 @@ def _research_migrations() -> tuple[Migration, ...]:
     return (
         Migration(1, "research baseline registry", lambda _connection: None),
         Migration(2, "scientific event v1 and recovery primitives", _apply_research_event_migration),
+        Migration(3, "cooperative user pause requests", lambda connection: _add_column_if_missing(connection, "research_runs", "pause_requested", "integer not null default 0")),
     )
 
 
@@ -319,12 +320,12 @@ class ResearchRunStore:
                 insert into research_runs (
                   run_id, notebook_id, workflow_type, title, status,
                   current_stage, progress, input_json, output_artifact_id,
-                  cancel_requested, error_code, error_message,
+                  cancel_requested, pause_requested, error_code, error_message,
                   model_provider_id, model_id, created_at, updated_at,
                   started_at, completed_at, metadata_json, parent_run_id,
                   branch_from_message_id, background, idempotency_key, interaction_json, recovery_json,
                   task_contract_json
-                ) values (?, ?, ?, ?, 'queued', ?, 0, ?, '', 0, '', '', ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, '{}', '{}', ?)
+                ) values (?, ?, ?, ?, 'queued', ?, 0, ?, '', 0, 0, '', '', ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, '{}', '{}', ?)
                 """,
                 (
                     run_id,
@@ -838,7 +839,7 @@ class ResearchRunStore:
             updated = connection.execute(
                 """
                 update research_runs
-                set status = 'running', cancel_requested = 0, error_code = '', error_message = '',
+                set status = 'running', cancel_requested = 0, pause_requested = 0, error_code = '', error_message = '',
                     started_at = case when started_at = '' then ? else started_at end,
                     completed_at = '', updated_at = ?
                 where run_id = ? and status in ('queued', 'paused', 'failed', 'cancelled')
@@ -865,7 +866,7 @@ class ResearchRunStore:
             if status in {"completed", "failed", "cancelled"}:
                 return self.get_run(run_id)
             connection.execute(
-                "update research_runs set cancel_requested = 1, updated_at = ? where run_id = ?",
+                "update research_runs set cancel_requested = 1, pause_requested = 0, updated_at = ? where run_id = ?",
                 (now, run_id),
             )
             self._append_event(
@@ -880,10 +881,77 @@ class ResearchRunStore:
             connection.commit()
         return self.get_run(run_id)
 
+    def request_pause(self, run_id: str) -> dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            row = self._require_run(connection, run_id)
+            status = str(row["status"])
+            if status in {"completed", "failed", "cancelled", "paused"}:
+                return self.get_run(run_id)
+            connection.execute(
+                "update research_runs set pause_requested = 1, cancel_requested = 0, updated_at = ? where run_id = ?",
+                (now, run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="run.pause_requested",
+                summary="已请求暂停任务",
+                payload={"status": status},
+                created_at=now,
+                idempotency_key="run.pause_requested",
+            )
+            connection.commit()
+        return self.get_run(run_id)
+
     def cancel_requested(self, run_id: str) -> bool:
         with self._connect() as connection:
             row = self._require_run(connection, run_id)
             return bool(row["cancel_requested"])
+
+    def pause_requested(self, run_id: str) -> bool:
+        with self._connect() as connection:
+            row = self._require_run(connection, run_id)
+            return bool(row["pause_requested"])
+
+    def stop_requested(self, run_id: str) -> bool:
+        with self._connect() as connection:
+            row = self._require_run(connection, run_id)
+            return bool(row["cancel_requested"] or row["pause_requested"])
+
+    def mark_paused(self, run_id: str, *, summary: str = "任务已暂停") -> dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            row = self._require_run(connection, run_id)
+            if str(row["status"]) in {"completed", "failed", "cancelled"}:
+                connection.commit()
+                return self.get_run(run_id)
+            connection.execute(
+                """
+                update research_stages set status = 'paused', summary = ?
+                where run_id = ? and status = 'running'
+                """,
+                (summary, run_id),
+            )
+            connection.execute(
+                """
+                update research_runs
+                set status = 'paused', cancel_requested = 0, pause_requested = 0,
+                    completed_at = '', updated_at = ?, error_code = '', error_message = ?
+                where run_id = ?
+                """,
+                (now, summary, run_id),
+            )
+            self._append_event(
+                connection,
+                run_id,
+                event_type="task.paused",
+                summary=summary,
+                payload={"reason": "user_paused", "resume_available": True},
+                created_at=now,
+            )
+            connection.commit()
+        return self.get_run(run_id)
 
     def mark_cancelled(self, run_id: str, *, summary: str = "任务已停止") -> dict[str, Any]:
         now = _utc_now()
@@ -905,7 +973,7 @@ class ResearchRunStore:
             connection.execute(
                 """
                 update research_runs
-                set status = 'cancelled', cancel_requested = 0, completed_at = ?, updated_at = ?,
+                set status = 'cancelled', cancel_requested = 0, pause_requested = 0, completed_at = ?, updated_at = ?,
                     error_code = '', error_message = ?
                 where run_id = ?
                 """,
@@ -998,7 +1066,7 @@ class ResearchRunStore:
             connection.execute(
                 """
                 update research_runs
-                set status = 'queued', current_stage = ?, cancel_requested = 0,
+                set status = 'queued', current_stage = ?, cancel_requested = 0, pause_requested = 0,
                     completed_at = '', error_code = '', error_message = '',
                     interaction_json = '{}', recovery_json = '{}', updated_at = ?
                 where run_id = ?
@@ -1240,7 +1308,7 @@ class ResearchRunStore:
                 """
                 update research_runs
                 set status = 'completed', progress = 1, current_stage = '', output_artifact_id = ?,
-                    cancel_requested = 0, error_code = '', error_message = '', completed_at = ?, updated_at = ?
+                    cancel_requested = 0, pause_requested = 0, error_code = '', error_message = '', completed_at = ?, updated_at = ?
                 where run_id = ?
                 """,
                 (str(output_artifact_id), now, now, run_id),
@@ -1855,6 +1923,7 @@ class ResearchRunStore:
               input_json text not null,
               output_artifact_id text not null,
               cancel_requested integer not null,
+              pause_requested integer not null default 0,
               error_code text not null,
               error_message text not null,
               model_provider_id text not null,
@@ -1976,6 +2045,8 @@ class ResearchRunStore:
             connection.execute("alter table research_runs add column recovery_json text not null default '{}'")
         if "task_contract_json" not in columns:
             connection.execute("alter table research_runs add column task_contract_json text not null default '{}'")
+        if "pause_requested" not in columns:
+            connection.execute("alter table research_runs add column pause_requested integer not null default 0")
         connection.execute(
             "create index if not exists idx_research_runs_archived on research_runs(archived_at, updated_at)"
         )
@@ -2010,6 +2081,7 @@ class ResearchRunStore:
             "progress": float(row["progress"]),
             "output_artifact_id": str(row["output_artifact_id"]),
             "cancel_requested": bool(row["cancel_requested"]),
+            "pause_requested": bool(row["pause_requested"]),
             "error": {
                 "code": str(row["error_code"]),
                 "message": str(row["error_message"]),
@@ -2039,6 +2111,7 @@ class ResearchRunStore:
             "last_event_sequence": int(last_sequence or 0),
             "resumable": str(row["status"]) in RESUMABLE_RUN_STATUSES,
             "cancellable": str(row["status"]) in ACTIVE_RUN_STATUSES,
+            "pausable": str(row["status"]) in ACTIVE_RUN_STATUSES or bool(row["pause_requested"]),
         }
 
     @staticmethod

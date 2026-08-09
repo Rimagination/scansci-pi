@@ -12,6 +12,7 @@ from .easyslides_plugin import easyslides_plugin_status, find_easyslides_root
 
 
 _SAFE_TEMPLATE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
+_BUILTIN_SLIDES_ROOT = Path(__file__).with_name("builtin_slide_templates")
 _FORMAL_TEMPLATE_SOURCES = (
     ("academic_general", "academic_general"),
     ("academic_scqa", "academic_scqa"),
@@ -69,11 +70,32 @@ def easyslides_root(root: str | Path | None = None) -> Path:
     return find_easyslides_root(root)
 
 
+def _catalog_location(root: str | Path | None = None) -> tuple[Path, bool]:
+    """Return the active catalog root and whether it is ScanSci's fallback.
+
+    A complete EasySlides installation remains preferred.  The small built-in
+    catalog only supplies previews and themes, while deck generation is routed
+    through ScanSci's editable python-pptx renderer.
+    """
+
+    if root is not None:
+        repository = Path(root).expanduser().resolve()
+        index_path = repository / "templates" / "layouts" / "layouts_index.json"
+        return (repository, False) if index_path.is_file() else (_BUILTIN_SLIDES_ROOT, True)
+
+    repository = easyslides_root()
+    index_path = repository / "templates" / "layouts" / "layouts_index.json"
+    if index_path.is_file():
+        return repository, False
+    return _BUILTIN_SLIDES_ROOT, True
+
+
 def list_slide_templates(root: str | Path | None = None) -> dict[str, Any]:
     """Return active EasySlides academic templates and SVG preview pages."""
 
-    repository = easyslides_root(root)
-    plugin = easyslides_plugin_status(repository)
+    repository, built_in = _catalog_location(root)
+    plugin_root = easyslides_root(root)
+    plugin = easyslides_plugin_status(plugin_root)
     public_plugin = {key: value for key, value in plugin.items() if key != "root"}
     layouts_root = repository / "templates" / "layouts"
     index_path = layouts_root / "layouts_index.json"
@@ -96,18 +118,26 @@ def list_slide_templates(root: str | Path | None = None) -> dict[str, Any]:
     for template_id, source_template_id in _FORMAL_TEMPLATE_SOURCES:
         if not _SAFE_TEMPLATE_ID.fullmatch(template_id) or not _SAFE_TEMPLATE_ID.fullmatch(source_template_id):
             continue
-        index_record = index.get(source_template_id)
-        if not isinstance(index_record, dict):
-            continue
         template_dir = layouts_root / source_template_id
         if not template_dir.is_dir():
             continue
-        record = _template_record(template_id, source_template_id, template_dir, dict(index_record))
+        index_record = index.get(source_template_id) or index.get(template_id)
+        if not isinstance(index_record, dict):
+            continue
+        record = _template_record(
+            template_id,
+            source_template_id,
+            template_dir,
+            dict(index_record),
+            native_generation=not built_in,
+        )
         if record["pages"]:
             templates.append(record)
     return {
         "available": bool(templates),
-        "provider": "EasySlides",
+        "provider": "ScanSci 内置模板" if built_in else "EasySlides",
+        "catalog_source": "builtin" if built_in else "easyslides",
+        "built_in": built_in,
         "templates": templates,
         "count": len(templates),
         "plugin": public_plugin,
@@ -126,7 +156,8 @@ def get_slide_template(template_id: str, root: str | Path | None = None) -> dict
 
 def resolve_slide_template_dir(template_id: str, root: str | Path | None = None) -> Path:
     template = get_slide_template(template_id, root)
-    directory = easyslides_root(root) / "templates" / "layouts" / str(template["source_template_id"])
+    repository, _ = _catalog_location(root)
+    directory = repository / "templates" / "layouts" / str(template["source_template_id"])
     if not directory.is_dir():
         raise FileNotFoundError(f"EasySlides 模板目录不存在：{template_id}")
     return directory.resolve()
@@ -158,6 +189,8 @@ def _template_record(
     source_template_id: str,
     template_dir: Path,
     index_record: dict[str, Any],
+    *,
+    native_generation: bool = True,
 ) -> dict[str, Any]:
     metadata = _read_front_matter(template_dir / "design_spec.md")
     localized = _TEMPLATE_LOCALIZATION.get(template_id, {})
@@ -190,13 +223,15 @@ def _template_record(
     classic_eligible = _classic_template_eligible(layout_pack)
     route = str(template_pack.get("recommended_template_route") or "compatibility")
     output_contract = str(template_pack.get("output_contract") or "editable-pptx")
-    if semantic_eligible and route == "semantic_named_slots":
+    if not native_generation:
+        generation_mode = "compatibility"
+    elif semantic_eligible and route == "semantic_named_slots":
         generation_mode = "easyslides-semantic"
     elif classic_eligible:
         generation_mode = "easyslides-classic"
     else:
         generation_mode = "compatibility"
-    production_eligible = bool(semantic_eligible or classic_eligible)
+    production_eligible = bool(native_generation and (semantic_eligible or classic_eligible))
     return {
         "id": template_id,
         "source_template_id": source_template_id,
@@ -213,7 +248,7 @@ def _template_record(
         "status": str(status.get("status") or "compatibility"),
         "production_eligible": production_eligible,
         "generation_mode": generation_mode,
-        "renderer_label": "EasySlides 原生" if production_eligible else "兼容模板",
+        "renderer_label": "EasySlides 原生" if production_eligible else "ScanSci 内置可编辑模板" if not native_generation else "兼容模板",
         "quality_label": (
             "已通过生产门禁"
             if generation_mode == "easyslides-semantic"

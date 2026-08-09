@@ -11,10 +11,32 @@ from zipfile import ZipFile
 import pytest
 
 from scansci_html import local_runtime_component
+import scansci_html.local_transformers_runtime as local_transformers_runtime
 from scansci_html.app_update import AppUpdateService
 from scansci_html.local_runtime_component import LocalRuntimeComponent
 from scansci_html.local_runtime_server import LocalRuntimeServer
 from scansci_html.webapp import NotebookWebApp
+
+
+def test_installed_component_is_preferred_even_when_source_has_torch(tmp_path: Path, monkeypatch) -> None:
+    class InstalledComponent:
+        def executable(self):
+            return tmp_path / "ScanSciLocalRuntime.exe"
+
+        def ensure_process(self, model_id: str) -> str:
+            assert model_id == "Qwen/Qwen3.5-2B"
+            return "http://127.0.0.1:17863/v1"
+
+    monkeypatch.setattr(local_transformers_runtime, "default_local_runtime_component", InstalledComponent)
+    monkeypatch.setattr(
+        local_transformers_runtime._RUNTIME,
+        "ensure",
+        lambda _model_id: (_ for _ in ()).throw(AssertionError("in-process runtime must not start")),
+    )
+
+    assert local_transformers_runtime.ensure_local_transformers_runtime("Qwen/Qwen3.5-2B") == (
+        "http://127.0.0.1:17863/v1"
+    )
 
 
 def _component_manifest(tmp_path: Path) -> Path:
@@ -428,6 +450,54 @@ def test_runtime_component_restores_interrupted_install_with_download_details(
     assert persisted["state"] == "interrupted"
 
 
+def test_interrupted_replacement_does_not_hide_the_active_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    root = tmp_path / "installed"
+    executable = root / "versions" / "1.2.0" / "ScanSciLocalRuntime.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"stable-runtime")
+    (root / "active.json").write_text(
+        json.dumps(
+            {
+                "id": "local-transformers",
+                "version": "1.2.0",
+                "executable": str(executable.relative_to(root)),
+                "sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "install-job.json").write_text(
+        json.dumps(
+            {
+                "job_id": "local-runtime",
+                "state": "installing",
+                "phase": "download",
+                "progress": 0.37,
+                "message": "正在下载替换版本",
+                "updated_at": int(time.time()) - 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    component = LocalRuntimeComponent(root=root, manifest_url="")
+    status = component.status()
+
+    assert status["installed"] is True
+    assert status["mode"] == "component"
+    assert status["version"] == "1.2.0"
+    assert Path(status["executable"]) == executable.resolve()
+    assert status["install_job"]["state"] == "interrupted"
+
+
 def test_runtime_component_rejects_corrupt_part(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         local_runtime_component,
@@ -480,7 +550,7 @@ def test_core_runtime_never_installs_from_a_manifest_while_only_checking_readine
     component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url=_component_manifest(tmp_path).as_uri())
     monkeypatch.setattr(component, "install", lambda: (_ for _ in ()).throw(AssertionError("must not download")))
 
-    with pytest.raises(RuntimeError, match="设置中确认安装"):
+    with pytest.raises(RuntimeError, match="设置 → 本地模型确认安装"):
         component.ensure_installed()
 
 
@@ -491,7 +561,7 @@ def test_source_runtime_is_not_marked_ready_without_its_actual_inference_depende
 
     assert component.status()["installed"] is False
     assert component.status()["mode"] == "missing"
-    with pytest.raises(RuntimeError, match="缺少本地 AI 运行依赖"):
+    with pytest.raises(RuntimeError, match="设置 → 本地模型查看组件状态"):
         component.ensure_installed()
 
 

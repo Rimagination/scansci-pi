@@ -71,6 +71,7 @@ from .local_model_market import (
     market_catalog,
 )
 from .local_runtime_component import LocalRuntimeComponent
+from .runtime_components import default_node_component, default_tectonic_component
 from .model_health import build_model_health
 from .ollama_runtime import OLLAMA_VISION_MODEL, OllamaInstallManager, ollama_status
 from .mcp_marketplace import (
@@ -108,6 +109,7 @@ from .skill_manager import (
 )
 from .slides_templates import list_slide_templates, slide_template_asset
 from .slide_studio import save_browser_rendered_deck
+from .tesseract_installer import TesseractInstallManager
 from .telemetry import diagnostic_span, diagnostics_summary, export_diagnostics_bundle
 from .vector_index import vector_cache_status
 from .vision_routing import system_ocr_status, tesseract_status
@@ -375,6 +377,11 @@ class NotebookWebApp:
         self.local_runtime = LocalRuntimeComponent(
             fallback_manifest_url=self.update_service.manifest_url or None
         )
+        self.runtime_components = {
+            "node": default_node_component(),
+            "tectonic": default_tectonic_component(),
+        }
+        self.tesseract_installs = TesseractInstallManager()
         self.model_installs = create_install_manager()
         self.ollama_installs = OllamaInstallManager(
             state_path=self.workspace.parent / ".scansci-ollama-download-jobs.json",
@@ -390,6 +397,21 @@ class NotebookWebApp:
             evidence_db=self.evidence_db,
             runtime_facts_provider=self._local_resource_facts,
         )
+
+    def _runtime_component(self, component_id: str) -> LocalRuntimeComponent:
+        identifier = str(component_id or "").strip().lower()
+        component = self.runtime_components.get(identifier)
+        if component is None:
+            raise ValueError("运行组件 id 必须是 node 或 tectonic")
+        return component
+
+    def _runtime_components_status(self) -> dict[str, Any]:
+        return {
+            "components": {
+                identifier: component.status()
+                for identifier, component in self.runtime_components.items()
+            }
+        }
 
     def _local_resource_facts(self) -> dict[str, Any]:
         """Return a lazy, read-only snapshot for deterministic chat answers."""
@@ -676,6 +698,8 @@ class NotebookWebApp:
             provider = str(parse_qs(query).get("provider", ["system"])[0] or "system").strip().lower()
             status = tesseract_status(requested) if provider == "tesseract" else system_ocr_status(requested)
             status["provider"] = provider
+            if provider == "tesseract":
+                status["install"] = self.tesseract_installs.status()
             return self._json(HTTPStatus.OK, status)
         if path == "/api/settings":
             return self._json(HTTPStatus.OK, load_settings(self.workspace))
@@ -712,6 +736,14 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, self.local_runtime.check_manifest_channels())
         if path == "/api/local-runtime/install-status":
             return self._json(HTTPStatus.OK, self.local_runtime.install_status())
+        if path == "/api/runtime-components":
+            return self._json(HTTPStatus.OK, self._runtime_components_status())
+        if path == "/api/runtime-components/install-status":
+            component_id = str(parse_qs(query).get("component", [""])[0] or "")
+            return self._json(HTTPStatus.OK, self._runtime_component(component_id).install_status())
+        if path == "/api/runtime-components/channels":
+            component_id = str(parse_qs(query).get("component", [""])[0] or "")
+            return self._json(HTTPStatus.OK, self._runtime_component(component_id).check_manifest_channels())
         if path == "/api/cuda-status":
             from .local_retrieval_runtime import cuda_status
 
@@ -866,6 +898,8 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, self.research_agent.compact_chat(payload))
         if path == "/api/chat/cancel":
             return self._json(HTTPStatus.OK, {"ok": self.research_agent.cancel_chat(payload)})
+        if path == "/api/chat/pause":
+            return self._json(HTTPStatus.OK, {"ok": self.research_agent.pause_chat(payload)})
         if path == "/api/chat/steer":
             return self._json(HTTPStatus.OK, self.research_agent.steer_chat(payload))
         if path == "/api/chat/follow-up":
@@ -1317,6 +1351,11 @@ class NotebookWebApp:
                 on_complete=on_complete,
             )
             return self._json(HTTPStatus.ACCEPTED, install)
+        if path == "/api/settings/document-processing/ocr/install":
+            languages = payload.get("languages")
+            if not isinstance(languages, list):
+                languages = ["zh", "en"]
+            return self._json(HTTPStatus.ACCEPTED, self.tesseract_installs.start(languages))
         if path == "/api/local-models/install-control":
             job_id = str(payload.get("job_id", "") or "").strip()
             action = str(payload.get("action", "") or "").strip().lower()
@@ -1367,6 +1406,27 @@ class NotebookWebApp:
             if not isinstance(paths, list) or not paths:
                 raise ValueError("请选择本地运行组件 ZIP，以及可选的 JSON 清单或分片文件。")
             return self._json(HTTPStatus.ACCEPTED, self.local_runtime.start_local_install(paths))
+        if path == "/api/runtime-components/install":
+            component = self._runtime_component(str(payload.get("component", "")))
+            return self._json(HTTPStatus.ACCEPTED, component.start_install())
+        if path == "/api/runtime-components/install-control":
+            component = self._runtime_component(str(payload.get("component", "")))
+            action = str(payload.get("action", "") or "").strip().lower()
+            actions = {
+                "pause": component.pause_install,
+                "resume": component.resume_install,
+                "retry": component.retry_install,
+                "cancel": component.cancel_install,
+            }
+            if action not in actions:
+                raise ValueError("运行组件控制 action 必须是 pause、resume、retry 或 cancel")
+            return self._json(HTTPStatus.ACCEPTED, actions[action]())
+        if path == "/api/runtime-components/install-local":
+            component = self._runtime_component(str(payload.get("component", "")))
+            paths = payload.get("paths")
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("请选择运行组件 ZIP，以及可选的 JSON 清单或分片文件。")
+            return self._json(HTTPStatus.ACCEPTED, component.start_local_install(paths))
         if path == "/api/tools/paper-atlas/search":
             return self._json(HTTPStatus.OK, search_paper_atlas(str(payload.get("query", ""))))
         if path == "/api/tools/papers/download":
@@ -1432,6 +1492,8 @@ class NotebookWebApp:
             return self._record_audit(parts[2], payload)
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "cancel":
             return self._json(HTTPStatus.ACCEPTED, self.research_agent.cancel(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "pause":
+            return self._json(HTTPStatus.ACCEPTED, self.research_agent.pause(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "resume":
             return self._json(HTTPStatus.ACCEPTED, self.research_agent.resume(parts[2]))
         return self._json_error(HTTPStatus.NOT_FOUND, "not_found", "No route matches this path.")

@@ -1,0 +1,120 @@
+{
+  "schema_version": "easyslides.academic_scqa.body_variants.v1",
+  "template_id": "academic_scqa",
+  "content_area": {"x": 70, "y": 176, "width": 1140, "height": 452},
+  "primary_variant": "flexible_canvas",
+  "selection_policy": {
+    "default": "match_SCQA_phase_and_evidence_shape",
+    "rules": [
+      {
+        "when": "strategic background, policy motivation, or two grouped context blocks",
+        "prefer": "intro_policy",
+        "guidance": "Use two balanced evidence groups with an optional bottom synthesis line."
+      },
+      {
+        "when": "methods, technical route details, or one/two explanatory figures",
+        "prefer": "research_method",
+        "guidance": "Use compact method blocks and keep figure labels factual."
+      },
+      {
+        "when": "three headline numbers carry the argument",
+        "prefer": "data_stats",
+        "guidance": "Show 3 metrics with short labels and one synthesis sentence."
+      },
+      {
+        "when": "technical route has four phases or grouped pipeline steps",
+        "prefer": "workflow_four_phase",
+        "guidance": "Use four numbered phases with concise action verbs."
+      },
+      {
+        "when": "technical route is a simple 3-step sequence",
+        "prefer": "workflow_linear",
+        "guidance": "Use horizontal 3-step progression from left to right."
+      },
+      {
+        "when": "before/after, traditional/new, A/B, or鏂规瀵规瘮",
+        "prefer": "comparison",
+        "guidance": "Use paired columns and end with a short synthesis."
+      },
+      {
+        "when": "six related images or experiment panels are the main evidence",
+        "prefer": "image_grid",
+        "guidance": "Use 3x2 image rhythm; captions should be short."
+      },
+      {
+        "when": "one strong result should dominate the slide",
+        "prefer": "key_finding",
+        "guidance": "Use one large finding plus optional context and source."
+      }
+    ]
+  },
+  "variants": [
+    {
+      "variant_id": "flexible_canvas",
+      "source_template_ids": [],
+      "best_for": "default mixed text, figure, or custom academic composition",
+      "layout": "open CONTENT_AREA with PAGE_TITLE and KEY_MESSAGE supplied by the shell",
+      "slots": ["CONTENT_BODY"],
+      "text_capacity": {"font_size_px": 22, "max_lines": 12}
+    },
+    {
+      "variant_id": "intro_policy",
+      "source_template_ids": ["intro-policy"],
+      "best_for": "Situation background, policy context, strategic need, or challenge framing",
+      "layout": "two columns, each with a label, heading, 2-3 bullets, optional image, and a bottom slogan",
+      "slots": ["BADGE_1_LABEL", "BADGE_1_HEADING", "BADGE_1_BULLETS", "BADGE_2_LABEL", "BADGE_2_HEADING", "BADGE_2_BULLETS", "SLOGAN", "FOOTNOTE"],
+      "text_capacity": {"bullets_per_column": "2-3", "bullet_max_chars": 48}
+    },
+    {
+      "variant_id": "research_method",
+      "source_template_ids": ["research-method"],
+      "best_for": "method details, model architecture, experiment setup, or one/two method figures",
+      "layout": "left and right method blocks, each pairing a concise heading, copy, and figure well",
+      "slots": ["BLOCK_1_HEADING", "BLOCK_1_COPY", "IMAGE_1", "BLOCK_2_HEADING", "BLOCK_2_COPY", "IMAGE_2"]
+    },
+    {
+      "variant_id": "data_stats",
+      "source_template_ids": ["data-stats"],
+      "best_for": "research scale, dataset summary, benchmark results, or three KPI-like metrics",
+      "layout": "dominant figure or description area plus three metric cards",
+      "slots": ["DESCRIPTION", "IMAGE", "DATA_1_NUM", "DATA_1_DESC", "DATA_2_NUM", "DATA_2_DESC", "DATA_3_NUM", "DATA_3_DESC", "SLOGAN"]
+    },
+    {
+      "variant_id": "workflow_four_phase",
+      "source_template_ids": ["4-workflow", "workflow"],
+      "best_for": "four phase pipeline, grouped technical route, or implementation path",
+      "layout": "four numbered phases with optional icons and a top or bottom summary bar",
+      "slots": ["SUMMARY", "STEP_1_HEADING", "STEP_1_COPY", "STEP_2_HEADING", "STEP_2_COPY", "STEP_3_HEADING", "STEP_3_COPY", "STEP_4_HEADING", "STEP_4_COPY"]
+    },
+    {
+      "variant_id": "workflow_linear",
+      "source_template_ids": ["3-workflow", "linear-workflow"],
+      "best_for": "three step method, experiment process, or temporal flow",
+      "layout": "three horizontal steps with academic-blue number badges and teal connectors",
+      "slots": ["SUMMARY", "STEP_1_HEADING", "STEP_1_COPY", "STEP_2_HEADING", "STEP_2_COPY", "STEP_3_HEADING", "STEP_3_COPY"]
+    },
+    {
+      "variant_id": "comparison",
+      "source_template_ids": ["comparison"],
+      "best_for": "traditional versus proposed, baseline versus model, problem versus solution",
+      "layout": "two balanced columns with left/right labels, up to four points each, and a synthesis line",
+      "slots": ["LEFT_LABEL", "LEFT_ITEMS", "RIGHT_LABEL", "RIGHT_ITEMS", "SLOGAN"]
+    },
+    {
+      "variant_id": "image_grid",
+      "source_template_ids": ["image-grid"],
+      "best_for": "3x2 experiment panels, visual results, microscopy groups, or image comparisons",
+      "layout": "six equal image cells with captions and optional summary",
+      "slots": ["SUMMARY", "IMAGE_1", "CAPTION_1", "IMAGE_2", "CAPTION_2", "IMAGE_3", "CAPTION_3", "IMAGE_4", "CAPTION_4", "IMAGE_5", "CAPTION_5", "IMAGE_6", "CAPTION_6"],
+      "image_policy": "preserve aspect ratio; crop only when the user asks"
+    },
+    {
+      "variant_id": "key_finding",
+      "source_template_ids": ["key-finding"],
+      "best_for": "core finding, key conclusion, one headline result, or transition into Answer",
+      "layout": "large declarative finding, teal accent bar, short context, optional source/figure",
+      "slots": ["FINDING_LABEL", "FINDING", "CONTEXT", "SOURCE", "IMAGE"]
+    }
+  ]
+}
+

@@ -421,8 +421,18 @@ class OpenAICompatibleChatJsonClient:
             # would turn otherwise useful RAG output into invalid JSON.
             "max_tokens": (
                 768
-                if schema_name in {"answer_claims", "claim_verification", "retrieval_queries"}
-                else 2048 if schema_name == "literature_review_section"
+                if schema_name in {
+                    "answer_claims",
+                    "claim_verification",
+                    "retrieval_queries",
+                    "literature_review_citation_attribution",
+                }
+                # Reasoning-capable compatible models can spend several
+                # thousand completion tokens before emitting the visible JSON.
+                # A review section is still bounded by its schema and length
+                # validator, so the larger ceiling prevents empty responses
+                # without permitting unbounded prose.
+                else 8192 if schema_name == "literature_review_section"
                 else 1024 if schema_name == "literature_review_overview"
                 else 3072 if schema_name == "evidence_grounded_literature_review" else 4096
             ),
@@ -432,6 +442,7 @@ class OpenAICompatibleChatJsonClient:
                     "evidence_grounded_literature_review",
                     "literature_review_section",
                     "literature_review_overview",
+                    "literature_review_citation_attribution",
                 }
                 else 0.2
             ),
@@ -1862,6 +1873,12 @@ def _with_structured_output_instruction(
             "support that sentence. Do not collect citations at paragraph end, do not add other keys, and stop "
             "immediately after the closing brace."
         ),
+        "literature_review_citation_attribution": (
+            'Return only JSON in this exact shape: {"assignments":[{"sentence_id":"s1",'
+            '"citation_ids":["1"]}]}. Include every supplied sentence_id exactly once, keep each '
+            "citation_ids list to one or two supplied IDs that directly support the complete sentence, "
+            "return an empty list when unsupported, do not repeat sentence text, and stop after the closing brace."
+        ),
         "literature_review_overview": (
             'Return only JSON with keys "title", "abstract", "comparison_table", "controversies", '
             '"open_questions", and "limitations". Use abstract {"text":"...","citation_ids":["1"]}; '
@@ -1887,6 +1904,8 @@ def _recover_structured_content(content: object, *, schema_name: str) -> dict[st
 
     if schema_name == "literature_review_section":
         return _recover_known_object_keys(content, ("sentences", "text", "citation_ids"))
+    if schema_name == "literature_review_citation_attribution":
+        return _recover_known_object_keys(content, ("assignments",))
     if schema_name == "literature_review_overview":
         return _recover_known_object_keys(
             content,

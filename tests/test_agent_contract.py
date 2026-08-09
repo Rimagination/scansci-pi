@@ -34,7 +34,8 @@ def test_research_download_is_reversible_and_progress_budgeted() -> None:
     assert "download_and_index" in contract["allowed_tools"]
     assert contract["initial_tool_budget"] == 6
     assert contract["max_tool_budget"] == 12
-    assert contract["model_token_budget"] == 48_000
+    assert contract["model_token_budget"] == 192_000
+    assert contract["max_model_token_budget"] == 768_000
     assert contract["required_tool_groups"] == [
         ["download_and_index"],
         ["summarize_documents"],
@@ -89,6 +90,33 @@ def test_auto_web_toggle_grants_read_only_web_tools_to_ordinary_turn() -> None:
     # decide whether to search — without tools, it would report "I cannot
     # search" even when the user has the toggle set to "auto".
     assert set(contract["allowed_tools"]) == {"agent_reach", "browser_access", "discover_papers", "search_web", "self_assess", "verify_doi"}
+    assert contract["initial_tool_budget"] == 4
+    assert contract["max_tool_budget"] == 8
+    assert contract["model_token_budget"] == 96_000
+    assert contract["max_model_token_budget"] == 384_000
+
+
+def test_explicit_web_toggle_keeps_scholarly_discovery_tools() -> None:
+    contract = compile_task_contract(
+        task_mode="web",
+        user_text="联网检索近期的 RAG 论文",
+        required_tool_groups=[{"search_web", "agent_reach", "browser_access", "discover_papers"}],
+    )
+
+    assert set(contract["allowed_tools"]) == {
+        "agent_reach",
+        "browser_access",
+        "discover_papers",
+        "search_web",
+        "self_assess",
+        "verify_doi",
+    }
+    assert contract["required_tool_groups"] == [[
+        "agent_reach",
+        "browser_access",
+        "discover_papers",
+        "search_web",
+    ]]
 
 
 def test_explicit_current_search_is_a_bounded_tool_turn() -> None:

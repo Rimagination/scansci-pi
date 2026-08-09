@@ -22,7 +22,8 @@ from scansci_html.runtime_components import (
 )
 
 
-def test_node_component_uses_its_own_identity_and_root(tmp_path: Path) -> None:
+def test_node_component_uses_its_own_identity_and_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("scansci_html.local_runtime_component.shutil.which", lambda _name: None)
     component = NodeRuntimeComponent(root=tmp_path / "node")
 
     assert component.component_id == NODE_COMPONENT_ID
@@ -33,13 +34,68 @@ def test_node_component_uses_its_own_identity_and_root(tmp_path: Path) -> None:
     assert component.status()["id"] == NODE_COMPONENT_ID
 
 
-def test_tectonic_component_uses_its_own_identity_and_root(tmp_path: Path) -> None:
+def test_tectonic_component_uses_its_own_identity_and_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("scansci_html.local_runtime_component.shutil.which", lambda _name: None)
     component = TectonicRuntimeComponent(root=tmp_path / "tectonic")
 
     assert component.component_id == TECTONIC_COMPONENT_ID
     assert component.executable_name == TECTONIC_EXECUTABLE_NAME
     assert component.root == (tmp_path / "tectonic").resolve()
     assert component.status()["id"] == TECTONIC_COMPONENT_ID
+
+
+def test_runtime_components_use_distinct_persisted_install_jobs(tmp_path: Path) -> None:
+    node = NodeRuntimeComponent(root=tmp_path / "node")
+    tectonic = TectonicRuntimeComponent(root=tmp_path / "tectonic")
+
+    assert node.install_job_id == "runtime:node"
+    assert tectonic.install_job_id == "runtime:tectonic"
+    assert node.install_status()["job_id"] != tectonic.install_status()["job_id"]
+
+
+def test_packaged_components_use_their_own_manifest_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scansci_html.local_runtime_component.shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        "scansci_html.local_runtime_component.current_build_info",
+        lambda: {
+            "frozen": True,
+            "package_profile": "core",
+            "runtime_manifest_url": "https://downloads.example.com/local-transformers.json",
+            "node_component_manifest_url": "https://downloads.example.com/node.json",
+            "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
+        },
+    )
+
+    node = NodeRuntimeComponent(root=tmp_path / "node")
+    tectonic = TectonicRuntimeComponent(root=tmp_path / "tectonic")
+
+    assert node.manifest_url == "https://downloads.example.com/node.json"
+    assert tectonic.manifest_url == "https://downloads.example.com/tectonic.json"
+    assert "local-transformers.json" not in " ".join(node.manifest_urls + tectonic.manifest_urls)
+
+
+def test_node_component_reuses_an_existing_system_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    system_node = tmp_path / "system" / NODE_EXECUTABLE_NAME
+    system_node.parent.mkdir()
+    system_node.write_bytes(b"MZ")
+    monkeypatch.setattr(
+        "scansci_html.local_runtime_component.shutil.which",
+        lambda name: str(system_node) if name in {"node", "node.exe"} else None,
+    )
+
+    component = NodeRuntimeComponent(root=tmp_path / "managed-node")
+    status = component.status()
+
+    assert component.executable() == system_node.resolve()
+    assert status["installed"] is True
+    assert status["mode"] == "system"
+    assert status["version"] == "external"
 
 
 def test_component_executable_resolves_through_active_json(tmp_path: Path) -> None:
@@ -155,7 +211,11 @@ def test_find_tectonic_prefers_managed_component_over_bundled(tmp_path: Path, mo
     assert found == managed_exe.resolve()
 
 
-def test_component_install_requires_user_initiated_download(tmp_path: Path) -> None:
+def test_component_install_requires_user_initiated_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scansci_html.local_runtime_component.shutil.which", lambda _name: None)
     component = NodeRuntimeComponent(root=tmp_path / "node")
     # ensure_installed must never silently fetch the runtime: it raises until
     # the user confirms an install through start_install()/install().

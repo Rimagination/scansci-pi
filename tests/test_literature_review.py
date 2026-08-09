@@ -57,6 +57,15 @@ class FakeReviewClient:
                 "text": "当前证据显示，不同研究从作用机制、疗效指标、局限与转化条件三个层面描述干预结果；这些结论需要结合具体研究对象、方法设计和证据边界进行比较。",
                 "citation_ids": [citation],
             }
+        if schema_name == "literature_review_citation_attribution":
+            payload = json.loads(messages[1]["content"])
+            citation_id = payload["evidence"][0]["citation_id"]
+            return {
+                "assignments": [
+                    {"sentence_id": item["sentence_id"], "citation_ids": [citation_id]}
+                    for item in payload["sentences"]
+                ]
+            }
         if schema_name == "answer_claims":
             payload = json.loads(messages[1]["content"])
             quote_id = "99" if self.bad_citation else payload["evidence_table"][0]["quote_id"]
@@ -277,6 +286,50 @@ def test_synthesis_preserves_sentence_level_citation_placement():
     ]
 
 
+def test_plain_text_fallback_does_not_repeat_the_whole_citation_batch_per_sentence():
+    class PlainOnlyClient:
+        def complete_json(self, _messages, *, schema_name):
+            assert schema_name == "literature_review_section"
+            raise ValueError("provider returned invalid structured output")
+
+        def complete_text(self, _messages, *, max_tokens=700):
+            raise AssertionError("direct evidence should run before the plain paragraph fallback")
+
+    plan = {
+        "title": "Evidence-bounded review",
+        "scope": "Only indexed evidence.",
+        "sections": [
+            {"id": "s1", "title": "Retrieval architecture", "objective": "Describe retrieval architecture", "citation_ids": ["1", "2"]},
+            {"id": "s2", "title": "Evaluation design", "objective": "Describe evaluation design", "citation_ids": ["2", "3"]},
+            {"id": "s3", "title": "Reliability limitations", "objective": "Describe limitations and factual risks", "citation_ids": ["3", "4"]},
+        ],
+    }
+    evidence = [
+        {"citation_id": "1", "doc_id": "d1", "exact_quote": "The retrieval architecture indexes documents and supplies selected passages to the generator."},
+        {"citation_id": "2", "doc_id": "d2", "exact_quote": "The evaluation reports accuracy and citation-quality scores on a held-out benchmark."},
+        {"citation_id": "3", "doc_id": "d3", "exact_quote": "A central limitation is citation hallucination and the risk of factual inaccuracy."},
+        {"citation_id": "4", "doc_id": "d4", "exact_quote": "The study warns that retrieval bias can limit coverage of the scientific literature."},
+    ]
+    result = _synthesize_review_in_parts(
+        "How should evidence-grounded scientific reviews be designed and audited?",
+        plan,
+        evidence,
+        chat_client=PlainOnlyClient(),
+    )
+
+    sentences = [
+        sentence
+        for section in result["sections"]
+        for sentence in section["sentences"]
+    ]
+    assert sentences
+    assert all(len(sentence["citation_ids"]) == 1 for sentence in sentences)
+
+
+def test_model_authored_grouped_numeric_citations_are_removed_before_verified_markers():
+    assert _strip_inline_citation_markers("结论已得到支持[7, 8,9]。") == "结论已得到支持。"
+
+
 def test_synthesis_discards_hallucinated_citation_ids_before_safe_fallback():
     result = synthesize_literature_review(_research_payload(), chat_client=FakeReviewClient(bad_citation=True))
 
@@ -288,6 +341,12 @@ def test_synthesis_discards_hallucinated_citation_ids_before_safe_fallback():
     }
     assert "99" not in used
     assert used <= {"1", "2", "3", "4"}
+    assert all(
+        len(sentence["citation_ids"]) <= 2
+        for section in result["review_document"]["sections"]
+        for paragraph in section["paragraphs"]
+        for sentence in paragraph["sentences"]
+    )
 
 
 def test_synthesis_falls_back_to_bounded_section_calls_when_nested_json_is_invalid():
@@ -966,7 +1025,7 @@ def test_review_skips_one_unsupported_section_instead_of_discarding_supported_re
 
     assert [section["id"] for section in result["sections"]] == ["limitations", "retrieval"]
     assert result["writing_runtime"]["skipped_sections"] == ["Performance benchmarks"]
-    assert "未通过严格证据校验" in result["limitations"][-1]
+    assert "did not pass strict evidence validation" in result["limitations"][-1]
 
     full = synthesize_literature_review(
         {
@@ -979,3 +1038,104 @@ def test_review_skips_one_unsupported_section_instead_of_discarding_supported_re
         chat_client=OfflineClient(),
     )
     assert [section["id"] for section in full["review_document"]["sections"]] == ["limitations", "retrieval"]
+
+
+def test_generic_english_deep_research_uses_traceable_excerpts_when_writer_is_offline() -> None:
+    class OfflineClient:
+        def complete_json(self, _messages, *, schema_name):
+            raise RuntimeError(f"offline: {schema_name}")
+
+        def complete_text(self, _messages, *, max_tokens=700):
+            raise RuntimeError(f"offline: {max_tokens}")
+
+    question = "What evidence since 2023 evaluates citation faithfulness in retrieval-augmented generation systems?"
+    plan = {
+        "title": "Citation faithfulness in RAG",
+        "scope": "Public full-text evidence published since 2023.",
+        "sections": [
+            {
+                "id": "1",
+                "title": "Defining Citation Faithfulness and Related Constructs",
+                "objective": "Distinguish citation faithfulness from attribution, factuality, and verifiability.",
+                "citation_ids": ["1", "2"],
+            },
+            {
+                "id": "2",
+                "title": "Evaluation Metrics and Benchmarks for Citation Faithfulness",
+                "objective": "Compare automated metrics, human evaluation, and task-specific benchmarks.",
+                "citation_ids": ["2", "3"],
+            },
+            {
+                "id": "3",
+                "title": "Empirical Evidence on Citation Faithfulness",
+                "objective": "Synthesize measured citation quality and observed attribution failures.",
+                "citation_ids": ["3", "4"],
+            },
+            {
+                "id": "4",
+                "title": "Techniques for Improving Citation Faithfulness",
+                "objective": "Review training and verification methods for improving citations.",
+                "citation_ids": ["4", "1"],
+            },
+        ],
+    }
+    evidence = [
+        {
+            "citation_id": "1",
+            "doc_id": "mirage",
+            "paper": "MIRAGE",
+            "evidence_id": "mirage.s1",
+            "html_path": "mirage.md",
+            "html_anchor": "s1",
+            "exact_quote": "The qualitative evaluation highlights the faithfulness of MIRAGE attributions and the use of model internals for answer attribution.",
+        },
+        {
+            "citation_id": "2",
+            "doc_id": "vericite",
+            "paper": "VeriCite",
+            "evidence_id": "vericite.s1",
+            "html_path": "vericite.md",
+            "html_anchor": "s1",
+            "exact_quote": "Citation F1 is used to evaluate citation quality across multiple question answering datasets.",
+        },
+        {
+            "citation_id": "3",
+            "doc_id": "mirage",
+            "paper": "MIRAGE",
+            "evidence_id": "mirage.s2",
+            "html_path": "mirage.md",
+            "html_anchor": "s2",
+            "exact_quote": "Self-generated citation attributions may appear plausible while failing to align with the model's internal reasoning process.",
+        },
+        {
+            "citation_id": "4",
+            "doc_id": "vericite",
+            "paper": "VeriCite",
+            "evidence_id": "vericite.s2",
+            "html_path": "vericite.md",
+            "html_anchor": "s2",
+            "exact_quote": "Supervised fine-tuning on citation-annotated question answering data yielded robust attribution capabilities.",
+        },
+    ]
+
+    result = synthesize_literature_review(
+        {
+            "question": question,
+            "review_plan": plan,
+            "evidence": evidence,
+            "retrieval_summary": {"document_count": 2, "evidence_count": 4},
+        },
+        chat_client=OfflineClient(),
+    )
+
+    assert len(result["review_document"]["sections"]) >= 2
+    assert result["citation_verification"]["passed"] is True
+    assert result["adequacy"]["is_sufficient"] is True
+    assert result["adequacy"]["document_count"] == 2
+    assert all(
+        sentence["citation_ids"]
+        for section in result["review_document"]["sections"]
+        for paragraph in section["paragraphs"]
+        for sentence in paragraph["sentences"]
+    )
+    assert result["review_document"]["limitations"][0].startswith("This review covers only evidence")

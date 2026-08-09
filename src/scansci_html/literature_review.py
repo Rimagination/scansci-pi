@@ -556,20 +556,38 @@ def _synthesize_review_in_parts(
                 section_evidence,
             )
         if not raw_section:
+            # Prefer one-source-at-a-time evidence sentences before asking for
+            # an unstructured paragraph.  The direct path keeps each sentence
+            # bound to the exact quote that supports it, whereas a plain-text
+            # paragraph can only be validated against the evidence batch as a
+            # whole and would otherwise repeat every citation after every
+            # sentence.
+            direct_section = _direct_evidence_section(
+                question,
+                dict(planned),
+                section_evidence,
+                text_completion=text_completion if callable(text_completion) else None,
+            )
+            if (
+                direct_section
+                and re.search(r"[\u3400-\u9fff]", question)
+                and len(re.findall(r"[\u3400-\u9fff]", str(direct_section.get("text", "")))) < 45
+            ):
+                # Selecting an English quote is not enough for a Chinese
+                # review.  If its faithful-translation call failed, continue
+                # to the bounded Chinese paragraph fallback instead of later
+                # discarding the whole section as a language mismatch.
+                direct_section = {}
+            raw_section = direct_section
+        if not raw_section:
             if callable(text_completion):
                 raw_section = _synthesize_plain_review_section(
                     question,
                     dict(planned),
                     section_evidence,
                     text_completion=text_completion,
+                    citation_client=chat_client,
                 )
-        if not raw_section:
-            raw_section = _direct_evidence_section(
-                question,
-                dict(planned),
-                section_evidence,
-                text_completion=text_completion if callable(text_completion) else None,
-            )
         if (
             (not raw_section or len(re.findall(r"[\u3400-\u9fff]", str(raw_section.get("text", "")))) < 45)
             and re.search(r"[\u3400-\u9fff]", question)
@@ -676,28 +694,41 @@ def _synthesize_review_in_parts(
         text_completion=text_completion if callable(text_completion) else None,
     )
     overview = _deterministic_review_overview(question, plan, sections)
+    chinese_output = bool(re.search(r"[\u3400-\u9fff]", question))
+    title_separator = "、" if chinese_output else "; "
     if fallback_titles:
         limitations = list(overview.get("limitations", []) or [])
-        limitations.append(f"章节“{'、'.join(fallback_titles)}”采用原文摘录或忠实直译，未作扩展推断。")
+        joined = title_separator.join(fallback_titles)
+        limitations.append(
+            f"章节“{joined}”采用原文摘录或忠实直译，未作扩展推断。"
+            if chinese_output
+            else f"Sections “{joined}” use literal source excerpts because model synthesis was unavailable; no unsupported inference was added."
+        )
         overview["limitations"] = limitations
     if coverage_gap_titles:
         limitations = list(overview.get("limitations", []) or [])
+        joined = title_separator.join(coverage_gap_titles)
         limitations.append(
-            f"章节“{'、'.join(coverage_gap_titles)}”没有覆盖计划中全部比较对象；"
-            "正文只保留已有来源直接支持的部分。"
+            (f"章节“{joined}”没有覆盖计划中全部比较对象；正文只保留已有来源直接支持的部分。")
+            if chinese_output
+            else f"Sections “{joined}” do not cover every planned comparison target; only directly supported material was retained."
         )
         overview["limitations"] = limitations
     if uncovered_documents:
         limitations = list(overview.get("limitations", []) or [])
         limitations.append(
-            f"最终正文仍有 {len(uncovered_documents)} 个检索来源未形成与章节目标直接匹配的陈述，"
-            "这些来源不计入综述充分性。"
+            (f"最终正文仍有 {len(uncovered_documents)} 个检索来源未形成与章节目标直接匹配的陈述，这些来源不计入综述充分性。")
+            if chinese_output
+            else f"{len(uncovered_documents)} retrieved sources did not yield statements that directly matched a section objective and were excluded from the adequacy count."
         )
         overview["limitations"] = limitations
     if skipped_section_titles:
         limitations = list(overview.get("limitations", []) or [])
+        joined = title_separator.join(skipped_section_titles)
         limitations.append(
-            f"计划章节“{'、'.join(skipped_section_titles)}”未通过严格证据校验，已从正文移除。"
+            f"计划章节“{joined}”未通过严格证据校验，已从正文移除。"
+            if chinese_output
+            else f"Planned sections “{joined}” did not pass strict evidence validation and were omitted."
         )
         overview["limitations"] = limitations
     return {
@@ -738,26 +769,48 @@ def _synthesize_structured_review_section(
         raise ValueError("review section has no evidence")
     required_subjects = _required_review_subjects(question, planned)
     brief = _normalize_writing_brief(writing_brief)
-    length_ranges = {"short": "200 到 400", "standard": "400 到 800", "long": "600 到 1200"}
-    audience_labels = {"researcher": "科研人员", "general": "跨学科读者", "student": "研究生"}
-    tone_labels = {"academic": "严谨学术", "concise": "简洁直接", "teaching": "解释清楚"}
+    chinese_output = bool(re.search(r"[\u3400-\u9fff]", question))
+    if chinese_output:
+        length_ranges = {"short": "200 到 400 字", "standard": "400 到 800 字", "long": "600 到 1200 字"}
+        audience_labels = {"researcher": "科研人员", "general": "跨学科读者", "student": "研究生"}
+        tone_labels = {"academic": "严谨学术", "concise": "简洁直接", "teaching": "解释清楚"}
+        system_prompt = (
+            "你是证据约束的中文文献综述写作者。只使用给定 exact_quote 直接支持的事实，"
+            f"围绕指定章节写一个 {length_ranges[brief['length']]}的连贯中文段落。"
+            f"目标读者是{audience_labels[brief['audience']]}，采用{tone_labels[brief['tone']]}的表达。"
+            "写作偏好只影响表述，绝不能降低证据约束。不得引入外部知识、因果推断或证据中没有的评价。"
+        )
+    else:
+        length_ranges = {"short": "120 to 240 words", "standard": "220 to 420 words", "long": "350 to 650 words"}
+        audience_labels = {"researcher": "researchers", "general": "cross-disciplinary readers", "student": "graduate students"}
+        tone_labels = {"academic": "a rigorous academic", "concise": "a concise", "teaching": "an explanatory"}
+        system_prompt = (
+            "You are an evidence-constrained literature-review writer. Use only facts directly supported by the supplied exact_quote values. "
+            f"Write one coherent {length_ranges[brief['length']]} section for {audience_labels[brief['audience']]} in {tone_labels[brief['tone']]} style. "
+            "Writing preferences affect presentation only and never relax the evidence constraint. Do not add outside knowledge, causal claims, or evaluations absent from the evidence. "
+        )
+    comparison_rules = (
+        "必须明确写出章节讨论的模型或方法名称；比较并行路线时不得改写成先后替代关系。"
+        "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
+        "若证据指标是人类识别机器文本的准确率，必须明确写出识别者和识别任务，不得改写成模型生成准确率。"
+        if _is_transformer_bert_gpt3_comparison(question)
+        else ""
+    )
+    shared_rules = (
+        "如果输入给出 required_subjects，正文必须逐一明确讨论其中每个对象。"
+        "把段落拆成若干完整句子；长篇模式优先写出比较、分歧和适用边界，而不是重复摘录。"
+        "每个句子的 citation_ids 只能使用输入中的编号，且只列直接支持该句的证据。"
+        "禁止把多句话共用的引用统一堆在段落末尾。返回 JSON：{sentences:[{text, citation_ids:[...]}]}。"
+        if chinese_output
+        else (
+            "If required_subjects are supplied, explicitly address each one. Split the paragraph into complete sentences; for long mode prioritize comparisons, disagreements, and applicability limits instead of repeating quotations. "
+            "Each sentence must use only citation_ids that directly support that complete sentence. Never collect all citations at paragraph end. Return JSON as {sentences:[{text, citation_ids:[...]}]}."
+        )
+    )
     messages = [
         {
             "role": "system",
-            "content": (
-                "你是证据约束的中文文献综述写作者。只使用给定 exact_quote 直接支持的事实，"
-                f"围绕指定章节写一个 {length_ranges[brief['length']]} 字的连贯中文段落。"
-                f"目标读者是{audience_labels[brief['audience']]}，采用{tone_labels[brief['tone']]}的表达。"
-                "写作偏好只影响表述，绝不能降低证据约束。必须明确写出章节讨论的模型或方法名称；"
-                "比较并行路线时不得改写成先后替代关系。不得引入外部知识、因果推断或证据中没有的评价。"
-                "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
-                "若证据指标是人类识别机器文本的准确率，必须明确写出识别者和识别任务，不得改写成模型生成准确率。"
-                "如果输入给出 required_subjects，正文必须逐一明确讨论其中每个对象；聚焦比较这些对象，不要用 T5、ELMo 或 OpenAI GPT 等旁支模型替代。"
-                "把段落拆成若干完整句子；长篇模式优先写出比较、分歧和适用边界，而不是重复摘录。"
-                "每个句子的 citation_ids 只能使用输入中的编号，且只列直接支持该句的证据。"
-                "禁止把多句话共用的引用统一堆在段落末尾。"
-                "返回 JSON：{sentences:[{text, citation_ids:[...]}]}。"
-            ),
+            "content": system_prompt + comparison_rules + shared_rules,
         },
         {
             "role": "user",
@@ -1206,6 +1259,7 @@ def _synthesize_plain_review_section(
     evidence: list[dict[str, str]],
     *,
     text_completion: Callable[..., str],
+    citation_client: ChatJsonClient | None = None,
 ) -> dict[str, Any]:
     """Use one plain-text model call before falling back to source-language excerpts."""
 
@@ -1267,19 +1321,93 @@ def _synthesize_plain_review_section(
         return {}
     if not _claim_addresses_review_section({"text": text}, planned):
         return {}
-    citation_ids = [str(row["citation_id"]) for row in rows]
-    quote_text_by_id = {str(row["citation_id"]): str(row["exact_quote"]) for row in rows}
-    if not _semantic_cues_are_grounded(
-        {"text": text, "quote_ids": citation_ids},
-        quote_text_by_id,
-    ):
-        return {}
-    return _cited_text_from_sentences(
-        [
-            {"text": sentence, "citation_ids": citation_ids}
-            for sentence in _split_review_sentences(text)
-        ]
+    attributed_sentences = _attribute_plain_review_sentence_citations(
+        _split_review_sentences(text),
+        rows,
+        chat_client=citation_client,
     )
+    return _cited_text_from_sentences(attributed_sentences) if attributed_sentences else {}
+
+
+def _attribute_plain_review_sentence_citations(
+    sentences: list[str],
+    evidence: list[dict[str, str]],
+    *,
+    chat_client: ChatJsonClient | None,
+) -> list[dict[str, Any]]:
+    """Bind fixed prose to a small, validated evidence set sentence by sentence."""
+
+    clean_sentences = [" ".join(str(sentence).split()).strip() for sentence in sentences if str(sentence).strip()]
+    rows = [
+        {
+            "citation_id": str(row.get("citation_id", "")),
+            "paper": str(row.get("paper", "")),
+            "exact_quote": str(row.get("exact_quote", "")),
+        }
+        for row in evidence
+        if str(row.get("citation_id", "")) and str(row.get("exact_quote", ""))
+    ]
+    if not clean_sentences or not rows:
+        return []
+    if len(rows) == 1:
+        citation_id = rows[0]["citation_id"]
+        return [{"text": sentence, "citation_ids": [citation_id]} for sentence in clean_sentences]
+    if chat_client is None:
+        return []
+    sentence_payload = [
+        {"sentence_id": f"s{index}", "text": sentence}
+        for index, sentence in enumerate(clean_sentences, start=1)
+    ]
+    try:
+        raw = chat_client.complete_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是严格的句级引用归因器。不得改写输入句子，不得增加事实。"
+                        "对每个 sentence_id 只选择 1 到 2 个能够直接支持整句的 citation_id；"
+                        "如果没有直接支持，返回空列表。不得使用输入之外的编号。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"sentences": sentence_payload, "evidence": rows},
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            schema_name="literature_review_citation_attribution",
+        ) or {}
+    except Exception:
+        return []
+    assignments = raw.get("assignments") if isinstance(raw, dict) else None
+    if not isinstance(assignments, list):
+        return []
+    known_ids = {row["citation_id"] for row in rows}
+    quote_text_by_id = {row["citation_id"]: row["exact_quote"] for row in rows}
+    assigned_by_sentence: dict[str, list[str]] = {}
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        sentence_id = str(item.get("sentence_id", "")).strip()
+        citation_ids = list(
+            dict.fromkeys(
+                str(value).strip().strip("[]")
+                for value in list(item.get("citation_ids", []) or [])
+                if str(value).strip().strip("[]") in known_ids
+            )
+        )
+        if sentence_id and 1 <= len(citation_ids) <= 2:
+            assigned_by_sentence[sentence_id] = citation_ids
+    attributed: list[dict[str, Any]] = []
+    for item in sentence_payload:
+        citation_ids = assigned_by_sentence.get(str(item["sentence_id"]), [])
+        claim = {"text": str(item["text"]), "quote_ids": citation_ids}
+        if not citation_ids or not _semantic_cues_are_grounded(claim, quote_text_by_id):
+            return []
+        attributed.append({"text": str(item["text"]), "citation_ids": citation_ids})
+    return attributed
 
 
 def _supplement_review_subject_coverage(
@@ -1317,19 +1445,20 @@ def _supplement_review_subject_coverage(
         except Exception:
             extension = {}
         text_completion = getattr(chat_client, "complete_text", None)
-        if not extension and callable(text_completion):
-            extension = _synthesize_plain_review_section(
-                question,
-                targeted,
-                subject_evidence[:4],
-                text_completion=text_completion,
-            )
         if not extension:
             extension = _direct_evidence_section(
                 question,
                 targeted,
                 subject_evidence[:4],
                 text_completion=text_completion if callable(text_completion) else None,
+            )
+        if not extension and callable(text_completion):
+            extension = _synthesize_plain_review_section(
+                question,
+                targeted,
+                subject_evidence[:4],
+                text_completion=text_completion,
+                citation_client=chat_client,
             )
         if not extension or not _review_text_is_readable(str(extension.get("text", ""))):
             extension = _deterministic_grounded_subject_sentence(
@@ -1364,13 +1493,26 @@ def _deterministic_grounded_review_section(
     """Build a concise Chinese fallback only from recognized source cues."""
 
     sentences: list[dict[str, Any]] = []
-    for subject in _required_review_subjects(question, planned):
+    required_subjects = _required_review_subjects(question, planned)
+    for subject in required_subjects:
         subject_evidence = [row for row in evidence if _evidence_matches_review_subject(subject, row)]
         grounded = _deterministic_grounded_subject_sentence(subject, planned, subject_evidence)
         text = str(grounded.get("text", "")).strip()
         if not text:
             continue
         sentences.extend(_cited_sentence_items(grounded))
+    # Generic English research questions do not have the three hard-coded
+    # comparison subjects above.  They still deserve a safe offline fallback:
+    # select literal, section-relevant source sentences instead of returning
+    # an empty section after a provider/schema failure.  Chinese questions
+    # continue through the translation-aware direct path in the caller.
+    if not required_subjects and not re.search(r"[\u3400-\u9fff]", question):
+        return _direct_evidence_section(
+            question,
+            planned,
+            evidence,
+            text_completion=None,
+        )
     result = _cited_text_from_sentences(sentences)
     output = str(result.get("text", "")).strip()
     if not output or not _review_text_is_readable(output):
@@ -1637,7 +1779,11 @@ def _review_text_is_readable(text: str) -> bool:
     """Reject visibly corrupted, runaway, or excerpt-heading prose."""
 
     value = " ".join(str(text or "").split()).strip()
-    if not value or len(value) > 700:
+    # Long-form review sections are explicitly allowed to reach 1,200 Chinese
+    # characters.  The former 700-character ceiling silently rejected valid
+    # model output and even two bounded evidence excerpts.  Keep a generous
+    # corruption guard while allowing the configured long-form profile.
+    if not value or len(value) > 2000:
         return False
     if any(marker in value for marker in ("�", "nâ", "â€", "ï¬")):
         return False
@@ -1825,6 +1971,17 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
     if section_id in section_cues and not any(cue in text for cue in section_cues[section_id]):
         return False
     concept_groups = [
+        (
+            (
+                "citation faithfulness", "citation reliability", "citation quality",
+                "faithfulness", "attribution", "grounding", "verifiability",
+                "引用忠实", "引用可靠", "引用质量", "归因", "可验证",
+            ),
+            (
+                "citation", "faithful", "attribution", "ground", "verifiab",
+                "引用", "忠实", "可靠", "归因", "支撑",
+            ),
+        ),
         (("自注意力", "self-attention", "self attention"), ("自注意力", "self-attention", "self attention")),
         (("位置编码", "positional encoding"), ("位置编码", "positional encoding")),
         (("掩码", "mlm", "masked language"), ("掩码", "mlm", "masked language")),
@@ -1833,12 +1990,19 @@ def _claim_addresses_review_section(claim: dict[str, Any], planned: dict[str, An
         (("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot"), ("提示", "少样本", "零样本", "上下文学习", "in-context", "few-shot", "zero-shot", "one-shot")),
         (("规模", "scaling", "model size", "compute"), ("规模", "参数", "计算量", "scaling", "model size", "compute")),
         (("实验", "性能", "基准", "benchmark", "performance"), ("实验", "性能", "准确", "得分", "损失", "基准", "benchmark", "accuracy", "score", "loss", "f1", "bleu")),
-        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual", "bias"), ("局限", "挑战", "困难", "很难", "难以", "不足", "受限", "弱点", "风险", "错误", "事实", "不准确", "准确性", "失败", "挣扎", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias", "struggl", "fail", "difficult", "inaccur")),
+        (("局限", "挑战", "幻觉", "长文本", "limitation", "weakness", "factual inaccuracy", "factual error", "bias"), ("局限", "挑战", "困难", "很难", "难以", "不足", "受限", "弱点", "风险", "错误", "事实", "不准确", "准确性", "失败", "挣扎", "幻觉", "长文本", "不一致", "恶意", "limitation", "weakness", "risk", "factual", "bias", "struggl", "fail", "difficult", "inaccur", "do not align", "does not align", "misalign")),
     ]
     required = [claim_cues for target_cues, claim_cues in concept_groups if any(cue in target for cue in target_cues)]
     if not required:
         return True
-    if any(cue in target for cue in ("局限", "挑战", "幻觉", "limitation", "weakness", "factual", "bias")):
+    limitation_focus = section_id in {"limits", "limitations"} or any(
+        cue in title
+        for cue in (
+            "局限", "挑战", "幻觉", "风险", "limitation", "weakness",
+            "failure", "factual inaccuracy", "factual risk", "bias",
+        )
+    )
+    if limitation_focus:
         limitation_cues = concept_groups[-1][1]
         return any(cue in text for cue in limitation_cues)
     return any(any(cue in text for cue in claim_cues) for claim_cues in required)
@@ -1857,6 +2021,17 @@ def _direct_evidence_section(
         quote = " ".join(str(row.get("_full_exact_quote", row.get("exact_quote", ""))).split()).strip()
         if not citation_id or not quote:
             continue
+        # Repair PDF line-wrap hyphenation and separate a sentence from a
+        # following numbered section heading (for example ".1 1 Introduction").
+        # This prevents one useful sentence plus a whole introduction from
+        # becoming an overlong, unreadable fallback paragraph.
+        quote = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", quote)
+        quote = re.sub(
+            r"(?<=[.!?])\d*\s+\d+(?:\.\d+)*\s+(?=(?:abstract|introduction|background|methods?|results?|discussion|conclusion)\b)",
+            " ",
+            quote,
+            flags=re.I,
+        )
         candidates = [
             part.strip()
             for part in re.split(r"(?<=[.!?])\s+", quote)
@@ -1865,9 +2040,12 @@ def _direct_evidence_section(
             and "arxiv:" not in part.casefold()
             and not re.match(r"^\(\d{4}\)", part.strip())
             and not re.match(r"^\d+(?:\.\d+)+\s+", part.strip())
+            and not re.match(r"^(?:proceedings of|acm,|https?://doi\.org/)", part.strip(), flags=re.I)
+            and not re.match(r"^(?:table|表)\s*\d+\s*[:：]", part.strip(), flags=re.I)
             and part.casefold() != "attention is all you need."
         ]
         for sentence_index, candidate in enumerate(candidates):
+            candidate = candidate.lstrip("•·- ")
             if not _claim_addresses_review_section({"text": candidate}, planned):
                 continue
             numeric_characters = sum(character.isdigit() for character in candidate)
@@ -1892,7 +2070,7 @@ def _direct_evidence_section(
         normalized_sentence = " ".join(sentence.split()).casefold()
         if citation_id in used_citations or normalized_sentence in used_sentences or document in used_documents:
             continue
-        selected.append((citation_id, _truncate_utf8(sentence, 540)))
+        selected.append((citation_id, _truncate_utf8(sentence, 420)))
         used_citations.add(citation_id)
         used_sentences.add(normalized_sentence)
         used_documents.add(document)
@@ -1905,7 +2083,7 @@ def _direct_evidence_section(
             normalized_sentence = " ".join(sentence.split()).casefold()
             if citation_id in used_citations or normalized_sentence in used_sentences:
                 continue
-            selected.append((citation_id, _truncate_utf8(sentence, 540)))
+            selected.append((citation_id, _truncate_utf8(sentence, 420)))
             used_citations.add(citation_id)
             used_sentences.add(normalized_sentence)
             if len(selected) >= max_items:
@@ -1977,6 +2155,7 @@ def _deterministic_review_overview(
 ) -> dict[str, Any]:
     """Assemble a valid evidence-linked overview from model-written sections."""
 
+    chinese_output = bool(re.search(r"[\u3400-\u9fff]", question))
     citation_ids = list(
         dict.fromkeys(
             str(item)
@@ -1993,7 +2172,7 @@ def _deterministic_review_overview(
     selected_abstract_parts: list[dict[str, Any]] = []
     selected_abstract_keys: set[str] = set()
     for item in abstract_parts:
-        sentence = _sentence_text(str(item.get("text", "")), chinese=True)
+        sentence = _sentence_text(str(item.get("text", "")), chinese=chinese_output)
         sentence_key = re.sub(r"\s+", "", sentence).casefold()
         if not sentence_key or sentence_key in selected_abstract_keys:
             continue
@@ -2008,7 +2187,11 @@ def _deterministic_review_overview(
         abstract = _cited_text_from_sentences(
             [
                 {
-                    "text": "当前资料库已形成带引用的分章节证据摘要。",
+                    "text": (
+                        "当前资料库已形成带引用的分章节证据摘要。"
+                        if chinese_output
+                        else "The available source set supports the following evidence-linked sections."
+                    ),
                     "citation_ids": citation_ids[:1],
                 }
             ]
@@ -2026,7 +2209,11 @@ def _deterministic_review_overview(
                     str(section.get("title", "")),
                     str(planned.get("objective", "")),
                     str(section.get("text", "")),
-                    "结论范围受当前资料库与带锚点证据覆盖限制。",
+                    (
+                        "结论范围受当前资料库与带锚点证据覆盖限制。"
+                        if chinese_output
+                        else "The conclusion is bounded by the retrieved, anchorable evidence."
+                    ),
                 ],
                 "citation_ids": list(section.get("citation_ids", []) or []),
             }
@@ -2036,23 +2223,49 @@ def _deterministic_review_overview(
         "title": str(plan.get("title", "")).strip() or question,
         "abstract": abstract,
         "comparison_table": {
-            "columns": ["研究主题", "综合目标", "主要发现", "证据边界"],
+            "columns": (
+                ["研究主题", "综合目标", "主要发现", "证据边界"]
+                if chinese_output
+                else ["Research topic", "Synthesis objective", "Main finding", "Evidence boundary"]
+            ),
             "rows": rows,
         },
         "controversies": [],
         "open_questions": [
             {
-                "text": "这些结论能否在不同任务、数据和模型规模下稳定复现？",
-                "basis": "当前章节显示研究对象、训练目标与评估设置存在差异。",
+                "text": (
+                    "这些结论能否在不同任务、数据和模型规模下稳定复现？"
+                    if chinese_output
+                    else "Can these findings be reproduced across different tasks, datasets, and model scales?"
+                ),
+                "basis": (
+                    "当前章节显示研究对象、训练目标与评估设置存在差异。"
+                    if chinese_output
+                    else "The included studies use different research objects, training targets, and evaluation settings."
+                ),
                 "citation_ids": question_ids,
             },
             {
-                "text": "如何在性能收益、数据效率、计算成本与偏见风险之间取得可验证的平衡？",
-                "basis": "当前证据同时涉及性能改进与方法局限。",
+                "text": (
+                    "如何在性能收益、数据效率、计算成本与偏见风险之间取得可验证的平衡？"
+                    if chinese_output
+                    else "How should future work balance measured gains against data, computation, and reliability costs?"
+                ),
+                "basis": (
+                    "当前证据同时涉及性能改进与方法局限。"
+                    if chinese_output
+                    else "The available evidence reports both performance gains and methodological constraints."
+                ),
                 "citation_ids": citation_ids[:2] or question_ids,
             },
         ],
-        "limitations": ["本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"],
+        "limitations": [
+            (
+                "本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"
+                if chinese_output
+                else "This review covers only evidence with traceable source anchors acquired for the current ScanSci task."
+            )
+        ],
     }
 
 
@@ -2344,7 +2557,11 @@ def _strip_inline_citation_markers(value: str) -> str:
     """Remove model-authored citation labels; verified IDs are rendered separately."""
 
     text = re.sub(r"[（(]\s*citation[_ ]?id\s*[:：]\s*\d+\s*[)）]", "", str(value), flags=re.I)
-    text = re.sub(r"(?:\[\s*\d+\s*\]|【\s*\d+\s*】)+", "", text)
+    text = re.sub(
+        r"(?:\[\s*\d+(?:\s*[,，;；-]\s*\d+)*\s*\]|【\s*\d+(?:\s*[,，;；-]\s*\d+)*\s*】)+",
+        "",
+        text,
+    )
     text = re.sub(r"(?<![A-Za-z0-9])[（(]\s*\d{1,3}\s*[)）]", "", text)
     text = re.sub(r"[ \t]+(?=[。！？；，,.!?;])", "", text)
     return " ".join(text.split()).strip()
@@ -2403,7 +2620,20 @@ def _compact_document_citations(
         source["citation_id"] = mapping[old]
         doc_id = str(source.get("doc_id", ""))
         anchor = str(source.get("html_anchor", ""))
-        source["reader_url"] = reader_url_builder(doc_id, anchor) if reader_url_builder and doc_id else ""
+        source["reader_url"] = (
+            reader_url_builder(doc_id, anchor)
+            if reader_url_builder and doc_id
+            else str(source.get("reader_url", "")).strip()
+        )
+        public_source = str(
+            source.get("source_href")
+            or source.get("original_url")
+            or source.get("source_url")
+            or ""
+        ).strip()
+        source["source_href"] = public_source
+        if not str(source.get("original_url", "")).strip() and re.match(r"^https?://", public_source, flags=re.I):
+            source["original_url"] = public_source
         references.append(source)
     return document, references
 
@@ -2543,6 +2773,8 @@ def _normalize_evidence_row(value: object) -> dict[str, Any]:
         "context_text": str(row.get("context_text", "")),
         "html_path": str(row.get("html_path", "")),
         "html_anchor": str(row.get("html_anchor", "")),
+        "source_url": str(row.get("source_url", "")),
+        "source_href": str(row.get("source_href", "") or row.get("source_url", "")),
         "original_url": str(row.get("original_url", "")),
         "confidence": row.get("confidence", 0.0),
     }

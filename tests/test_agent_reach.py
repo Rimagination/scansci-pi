@@ -175,3 +175,67 @@ def test_agent_reach_jina_reader_url_keeps_target_query() -> None:
     assert agent_reach._read_web.__globals__["quote"](url, safe="") == (
         "https%3A%2F%2Fexample.com%2Fsearch%3Fq%3Dfoo%26page%3D2"
     )
+
+
+def test_agent_reach_reads_public_json_api_directly_without_jina(monkeypatch) -> None:
+    calls: list[str] = []
+    payload = {
+        "results": [
+            {
+                "id": "https://openalex.org/W123",
+                "title": "A real scholarly result",
+                "doi": "https://doi.org/10.1000/example",
+            }
+        ]
+    }
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.startswith("https://r.jina.ai/"):
+            raise AssertionError("healthy public JSON endpoints must not be sent through Jina")
+        return _Response(payload)
+
+    monkeypatch.setattr(agent_reach.requests, "get", fake_get)
+    result = agent_reach.agent_reach_read(
+        "https://api.openalex.org/works?search=climate%20change&per-page=1"
+    )
+
+    assert result["backend"] == "direct public HTTP"
+    assert result["content_type"] == "application/json"
+    assert result["data"]["results"][0]["id"] == "https://openalex.org/W123"
+    assert calls == ["https://api.openalex.org/works?search=climate%20change&per-page=1"]
+
+
+def test_agent_reach_extracts_readable_text_from_direct_html(monkeypatch) -> None:
+    html = b"""<!doctype html><html><head><title>Paper page</title>
+    <style>.hidden { display:none }</style><script>secret()</script></head>
+    <body><main><h1>Evidence title</h1><p>Evidence paragraph.</p></main></body></html>"""
+    monkeypatch.setattr(agent_reach.requests, "get", lambda *args, **kwargs: _Response({}, content=html))
+
+    result = agent_reach.agent_reach_read("https://example.com/paper")
+
+    assert result["backend"] == "direct public HTTP"
+    assert result["title"] == "Paper page"
+    assert "Evidence paragraph." in result["content"]
+    assert "secret()" not in result["content"]
+
+
+def test_agent_reach_retries_transient_direct_connection_failure(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def flaky_get(url, **kwargs):
+        calls.append(url)
+        if len(calls) < 3:
+            raise agent_reach.requests.ConnectionError("connection reset")
+        return _Response({"title": "Recovered public response"})
+
+    monkeypatch.setattr(agent_reach.requests, "get", flaky_get)
+    result = agent_reach.agent_reach_read("https://api.example.com/works/1")
+
+    assert result["backend"] == "direct public HTTP"
+    assert result["data"]["title"] == "Recovered public response"
+    assert calls == [
+        "https://api.example.com/works/1",
+        "https://api.example.com/works/1",
+        "https://api.example.com/works/1",
+    ]

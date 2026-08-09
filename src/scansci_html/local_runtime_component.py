@@ -72,6 +72,11 @@ class LocalRuntimeComponent:
         default_release_url: str = DEFAULT_RUNTIME_RELEASE_URL,
         manifest_env: str = RUNTIME_MANIFEST_ENV,
         fallbacks_env: str = RUNTIME_MANIFEST_FALLBACKS_ENV,
+        executable_env: str = RUNTIME_EXECUTABLE_ENV,
+        build_manifest_key: str = "runtime_manifest_url",
+        install_job_id: str | None = None,
+        display_name: str = "ScanSci 本地运行能力",
+        system_executable_names: tuple[str, ...] = (),
         embedded_profiles: frozenset[str] = frozenset({"full"}),
         source_dependency_modules: tuple[str, ...] = ("torch", "transformers", "sentence_transformers"),
     ) -> None:
@@ -80,6 +85,14 @@ class LocalRuntimeComponent:
         self.component_version = str(component_version or COMPONENT_VERSION)
         self.default_manifest_url = str(default_manifest_url or DEFAULT_RUNTIME_MANIFEST_URL)
         self.default_release_url = str(default_release_url or DEFAULT_RUNTIME_RELEASE_URL)
+        self.executable_env = str(executable_env or RUNTIME_EXECUTABLE_ENV)
+        self.build_manifest_key = str(build_manifest_key or "runtime_manifest_url")
+        self.install_job_id = str(
+            install_job_id
+            or ("local-runtime" if self.component_id == COMPONENT_ID else f"runtime:{self.component_id}")
+        )
+        self.display_name = str(display_name or "ScanSci 本地运行能力")
+        self._system_executable_names = tuple(system_executable_names or ())
         self._embedded_profiles = frozenset(embedded_profiles or ())
         self._source_dependency_modules = tuple(source_dependency_modules or ())
         local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -98,7 +111,7 @@ class LocalRuntimeComponent:
         else:
             configured_urls = [
                 os.getenv(manifest_env),
-                build.get("runtime_manifest_url"),
+                build.get(self.build_manifest_key),
                 packaged_core_fallback,
                 fallback_manifest_url,
                 os.getenv(UPDATE_MANIFEST_ENV),
@@ -112,7 +125,7 @@ class LocalRuntimeComponent:
         self.manifest_url = self.manifest_urls[0] if self.manifest_urls else ""
         self._install_lock = threading.RLock()
         self._install_job: dict[str, Any] = {
-            "job_id": "local-runtime",
+            "job_id": self.install_job_id,
             "state": "idle",
             "phase": "",
             "progress": 0.0,
@@ -142,25 +155,32 @@ class LocalRuntimeComponent:
         return self.root / "active.json"
 
     def executable(self) -> Path | None:
-        override = os.getenv(RUNTIME_EXECUTABLE_ENV, "").strip()
+        override = os.getenv(self.executable_env, "").strip()
         if override:
             candidate = Path(override).expanduser().resolve()
-            return candidate if candidate.is_file() else None
+            if candidate.is_file():
+                return candidate
         try:
             active = json.loads(self.active_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(active, dict):
-            return None
-        relative = str(active.get("executable", "")).strip()
-        if not relative:
-            return None
-        candidate = (self.root / relative).resolve()
-        try:
-            candidate.relative_to(self.root)
-        except ValueError:
-            return None
-        return candidate if candidate.is_file() else None
+            active = {}
+        if isinstance(active, dict):
+            relative = str(active.get("executable", "")).strip()
+            if relative:
+                candidate = (self.root / relative).resolve()
+                try:
+                    candidate.relative_to(self.root)
+                except ValueError:
+                    candidate = None
+                if candidate is not None and candidate.is_file():
+                    return candidate
+        for name in self._system_executable_names:
+            resolved = shutil.which(name)
+            if resolved:
+                system_candidate = Path(resolved).resolve()
+                if system_candidate.is_file():
+                    return system_candidate
+        return None
 
     def ensure_process(self, model_id: str) -> str:
         """Start the installed runtime sidecar and return its local ``/v1`` URL.
@@ -281,16 +301,38 @@ class LocalRuntimeComponent:
             for module in self._source_dependency_modules
         )
         installed = executable is not None
+        managed_component = False
+        if executable is not None:
+            try:
+                executable.relative_to(self.root)
+                managed_component = True
+            except ValueError:
+                managed_component = False
         version = ""
-        if installed:
+        if managed_component:
             try:
                 active = json.loads(self.active_path.read_text(encoding="utf-8"))
                 version = str(active.get("version", ""))
             except (OSError, json.JSONDecodeError):
-                version = "external"
-        mode = "component" if installed else "embedded" if embedded_runtime else "source" if source_dependencies_ready else "missing"
+                version = ""
+        elif installed:
+            version = "external"
+        mode = (
+            "component"
+            if managed_component
+            else "system"
+            if installed and self._system_executable_names
+            else "external"
+            if installed
+            else "embedded"
+            if embedded_runtime
+            else "source"
+            if source_dependencies_ready
+            else "missing"
+        )
         return {
             "id": self.component_id,
+            "name": self.display_name,
             "version": version or (self.component_version if source_runtime or embedded_runtime else ""),
             "installed": bool(installed or source_dependencies_ready or embedded_runtime),
             "mode": mode,
@@ -324,12 +366,12 @@ class LocalRuntimeComponent:
             if not self.manifest_urls:
                 now = int(time.time())
                 self._install_job = {
-                    "job_id": "local-runtime",
+                    "job_id": self.install_job_id,
                     "state": "failed",
                     "phase": "unavailable",
                     "progress": 0.0,
                     "message": "自动下载清单不可用，可选择本地组件安装",
-                    "error": "本地 AI 组件尚未安装；自动下载清单不可用。请从官方发布页下载 ZIP 后选择“从本地文件安装”。",
+                    "error": f"{self.display_name}尚未安装；自动下载清单不可用。请选择官方 ZIP 后从本地文件安装。",
                     "current_file": "",
                     "completed_bytes": 0,
                     "total_bytes": 0,
@@ -340,11 +382,11 @@ class LocalRuntimeComponent:
                 self._persist_install_job(force=True)
                 return dict(self._install_job)
             self._install_job = {
-                "job_id": "local-runtime",
+                "job_id": self.install_job_id,
                 "state": "queued",
                 "phase": "preparing",
                 "progress": 0.0,
-                "message": "准备 ScanSci 官方本地运行能力",
+                "message": f"准备安装{self.display_name}",
                 "error": "",
                 "started_at": time.time(),
                 "updated_at": int(time.time()),
@@ -362,7 +404,7 @@ class LocalRuntimeComponent:
             self._install_thread = threading.Thread(
                 target=self._install_in_background,
                 daemon=True,
-                name="scansci-local-runtime-install",
+                name=f"scansci-{self.component_id}-install",
             )
             self._install_thread.start()
             return dict(self._install_job)
@@ -382,11 +424,11 @@ class LocalRuntimeComponent:
                 return dict(self._install_job)
             self._manual_install_paths = tuple(str(path) for path in normalized)
             self._install_job = {
-                "job_id": "local-runtime",
+                "job_id": self.install_job_id,
                 "state": "queued",
                 "phase": "preparing",
                 "progress": 0.0,
-                "message": "准备校验本地运行组件",
+                "message": f"准备校验{self.display_name}",
                 "error": "",
                 "started_at": time.time(),
                 "updated_at": int(time.time()),
@@ -403,7 +445,7 @@ class LocalRuntimeComponent:
             self._install_thread = threading.Thread(
                 target=self._install_in_background,
                 daemon=True,
-                name="scansci-local-runtime-manual-install",
+                name=f"scansci-{self.component_id}-manual-install",
             )
             self._install_thread.start()
             return dict(self._install_job)
@@ -494,7 +536,7 @@ class LocalRuntimeComponent:
                         "state": "ready",
                         "phase": "ready",
                         "progress": 1.0,
-                        "message": "ScanSci 本地运行能力已就绪",
+                        "message": f"{self.display_name}已就绪",
                         "error": "",
                         "result": result,
                         "finished_at": time.time(),
@@ -589,7 +631,7 @@ class LocalRuntimeComponent:
             payload = json.loads(self.install_job_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        if not isinstance(payload, dict) or payload.get("job_id") != "local-runtime":
+        if not isinstance(payload, dict) or payload.get("job_id") != self.install_job_id:
             return
         if payload.get("state") in {"queued", "installing"}:
             payload.update(
@@ -637,18 +679,18 @@ class LocalRuntimeComponent:
         if not bool(build.get("frozen")):
             if self.status().get("installed"):
                 return None
-            raise RuntimeError("当前源代码环境缺少本地 AI 运行依赖。请安装运行组件或配置外部本地运行时。")
+            raise RuntimeError(f"{self.display_name}不可用。请前往设置 → 本地模型查看组件状态。")
         if build.get("package_profile") == "full":
             return None
         if not self.manifest_url:
-            raise RuntimeError("本地 AI 组件尚未安装，当前发行渠道也没有提供组件下载清单。")
-        raise RuntimeError("本地 AI 组件尚未安装。请在设置中确认安装后再下载本地模型。")
+            raise RuntimeError(f"{self.display_name}尚未安装，当前发行渠道也没有提供组件下载清单。")
+        raise RuntimeError(f"{self.display_name}尚未安装。请前往设置 → 本地模型确认安装。")
 
     def install(self, progress_callback=None) -> dict[str, Any]:
         """Download, verify, and atomically activate one runtime version."""
 
         if not self.manifest_urls:
-            raise RuntimeError("当前发行渠道没有配置本地 AI 组件下载清单。")
+            raise RuntimeError(f"当前发行渠道没有配置{self.display_name}下载清单。")
         with self._process_install_lock():
             return self._install_component(progress_callback=progress_callback)
 
@@ -672,7 +714,7 @@ class LocalRuntimeComponent:
         self._last_manifest_failures = failures
         package = component.get("windows", {})
         if not isinstance(package, dict):
-            raise RuntimeError("本地 AI 组件清单缺少 Windows 包")
+            raise RuntimeError(f"{self.display_name}清单缺少 Windows 包")
         return self._install_component_package(
             component,
             dict(package),
@@ -692,10 +734,10 @@ class LocalRuntimeComponent:
     ) -> dict[str, Any]:
         version = str(component.get("version", "")).strip()
         if not version or not isinstance(package, dict):
-            raise RuntimeError("本地 AI 组件清单缺少版本或 Windows 包。")
+            raise RuntimeError(f"{self.display_name}清单缺少版本或 Windows 包。")
         expected = str(package.get("sha256", "")).strip().lower()
         if not self._is_sha256(expected):
-            raise RuntimeError("本地 AI 组件清单缺少有效的 SHA256。")
+            raise RuntimeError(f"{self.display_name}清单缺少有效的 SHA256。")
 
         self.root.mkdir(parents=True, exist_ok=True)
         downloads = self.root / "downloads"
@@ -716,7 +758,7 @@ class LocalRuntimeComponent:
             try:
                 matches = self._extract_verified(archive, staging)
                 if len(matches) != 1:
-                    raise RuntimeError(f"本地 AI 组件包必须只包含一个 {self.executable_name}。")
+                    raise RuntimeError(f"{self.display_name}包必须只包含一个 {self.executable_name}。")
                 payload = matches[0].parent
                 if target.exists():
                     invalid = versions / f"{target.name}.invalid-{uuid4().hex[:8]}"
@@ -738,7 +780,7 @@ class LocalRuntimeComponent:
         temporary = self.active_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(active_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.active_path)
-        self._emit_progress(progress_callback, "ready", 1.0, "ScanSci 本地运行能力已就绪")
+        self._emit_progress(progress_callback, "ready", 1.0, f"{self.display_name}已就绪")
         result = {**self.status(), "installed": True, "source": manifest_source or "manual"}
         if manifest_failures:
             result["manifest_failures"] = list(manifest_failures)
@@ -820,8 +862,8 @@ class LocalRuntimeComponent:
                 )
         detail = "；".join(f"{item['label']}：{item['error']}" for item in failures)
         if not failures:
-            raise RuntimeError("当前发行渠道没有配置本地 AI 组件下载清单。")
-        raise RuntimeError(f"本地 AI 组件清单的所有自动通道均不可用。{detail}")
+            raise RuntimeError(f"当前发行渠道没有配置{self.display_name}下载清单。")
+        raise RuntimeError(f"{self.display_name}清单的所有自动通道均不可用。{detail}")
 
     @classmethod
     def _normalize_manual_paths(cls, paths: list[str] | tuple[str, ...]) -> list[Path]:

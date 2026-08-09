@@ -155,8 +155,25 @@ def task_evidence_reader_path(
 def _evidence_level(index: dict[str, Any], quality: dict[str, Any]) -> str:
     documents = int(index.get("documents", 0) or 0)
     spans = int(index.get("spans", 0) or 0)
-    healthy = bool(quality.get("passed", False))
-    return "fulltext" if documents >= 2 and spans >= 3 and healthy else "partial_fulltext" if documents and spans else "none"
+    claim_ready = task_evidence_claim_ready(quality)
+    return "fulltext" if documents >= 2 and spans >= 3 and claim_ready else "partial_fulltext" if documents and spans else "none"
+
+
+def task_evidence_claim_ready(quality: dict[str, Any]) -> bool:
+    """Return whether indexed text is safe for claim-level citation.
+
+    Oversized spans are a retrieval-precision warning, not evidence
+    fabrication.  Missing structure, orphan sections, or source-text
+    mismatches remain hard failures.  The fallback calculation keeps older
+    task artifacts usable after upgrading.
+    """
+
+    if "claim_ready" in quality:
+        return bool(quality.get("claim_ready"))
+    critical_fields = ("missing_structure_spans", "source_text_mismatches", "orphan_sections")
+    if any(field in quality for field in critical_fields):
+        return all(int(quality.get(field, 0) or 0) == 0 for field in critical_fields)
+    return bool(quality.get("passed", False))
 
 
 def _canonical_source_url(*, doi: str, arxiv_id: str) -> str:

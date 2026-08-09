@@ -1,0 +1,18 @@
+{
+  "schema_version": "easyslides.template.v1",
+  "template_id": "defense_topnav",
+  "name": "Defense Topnav",
+  "mode": "classic",
+  "source_template": "academic_blue_top_navigation_defense_pptx",
+  "distillation_model": "five_core_shells_plus_six_state_source_navigation",
+  "description": "Source-faithful academic-blue thesis defense template with six-state dynamic top navigation and a flexible open content canvas.",
+  "files": {
+    "design_spec": "design_spec.md",
+    "layouts": "layouts.json",
+    "navigation_states": "navigation_states.json",
+    "body_variants": "body_variants.json",
+    "component_styles": "component_styles.json",
+    "theme_palettes": "theme_palettes.json",
+    "rules": "rules.md"
+  }
+}

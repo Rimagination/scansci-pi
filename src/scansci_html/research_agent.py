@@ -34,7 +34,11 @@ from .deep_research import (
     plan_deep_research,
     run_discovery_loop,
 )
-from .deep_research_evidence import build_task_fulltext_evidence, task_evidence_root
+from .deep_research_evidence import (
+    build_task_fulltext_evidence,
+    task_evidence_claim_ready,
+    task_evidence_root,
+)
 from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
 from .evidence_store import ensure_library_overview, knowledge_base_snapshot
 from .image_attachments import persist_image_attachments, vision_image_blocks
@@ -44,6 +48,7 @@ from .ingestion import ingest_sources, ingestion_context
 from .library_manager import import_library_files, notebook_evidence_db
 from .literature_review import _concise_review_title, retrieve_review_evidence, synthesize_literature_review
 from .local_evidence_runtime import (
+    BUILTIN_MODEL_MARKER,
     LocalEvidenceStack,
     build_local_evidence_stack,
     default_vector_cache_identity,
@@ -108,6 +113,7 @@ from .research_tools import (
 from .slide_studio import create_source_slide_deck, persist_slide_sources
 from .task_routing import route_freeform_task
 from .skill_runtime import resolve_skill_selection
+from .text_tokenization import lexical_tokens
 from .workspace import load_workspace_summary
 from .vision_routing import ocr_image_blocks, select_text_route, select_vision_route
 from .zotero_integration import zotero_status
@@ -778,14 +784,17 @@ def _required_pi_tool_groups(task_mode: str | None, user_text: str = "") -> list
     if "zotero-search" in parts:
         groups.append({"zotero_search"})
     if "web" in parts:
-        groups.append({"search_web", "discover_papers"})
+        # Any successful read-only web route satisfies explicit web access.
+        # Requiring only discovery search made direct-URL reads call an extra,
+        # irrelevant search after the requested page had already been read.
+        groups.append({"search_web", "agent_reach", "browser_access", "discover_papers"})
     if "web-auto" in parts and re.search(
         r"(?:web|internet|online|联网|网上|网络).{0,24}(?:search|find|look\s*up|检索|搜索|查找|查询|看看)"
         r"|(?:search|find|look\s*up|检索|搜索|查找|查询).{0,24}(?:recent|latest|current|today|news|近期|最新|当前|今天)",
         str(user_text or ""),
         re.IGNORECASE,
     ):
-        groups.append({"search_web", "discover_papers"})
+        groups.append({"search_web", "agent_reach", "browser_access", "discover_papers"})
     if "task-documents" in parts:
         groups.append({"read_task_documents", "summarize_documents"})
     explicit_knowledge = bool(
@@ -1545,6 +1554,7 @@ class ResearchAgentRuntime:
         self._managed_writing_clients: dict[tuple[str, str, str], Any] = {}
         self._local_evidence_models: dict[str, LocalEvidenceStack] = {}
         self._academic_discovery_models: dict[str, LocalEvidenceStack] = {}
+        self._task_evidence_models: dict[str, LocalEvidenceStack] = {}
         self._zotero_tag_sync_cache: set[str] = set()
         self._background_warm_lock = threading.Lock()
         self._background_warming: set[str] = set()
@@ -2387,6 +2397,17 @@ class ResearchAgentRuntime:
             active_pi.cancel()
         if run["status"] in {"queued", "paused"}:
             return self.store.mark_cancelled(run_id)
+        return run
+
+    def pause(self, run_id: str) -> dict[str, Any]:
+        """Cooperatively pause a durable run so its completed stages remain resumable."""
+        run = self.store.request_pause(run_id)
+        with self._active_pi_lock:
+            active_pi = self._active_pi_clients.get(str(run_id))
+        if active_pi is not None:
+            active_pi.pause()
+        if run["status"] == "queued":
+            return self.store.mark_paused(run_id)
         return run
 
     def answer_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3785,13 +3806,45 @@ class ResearchAgentRuntime:
             )
         return bool(client is not None and client.active_request_id and client.cancel(client.active_request_id))
 
+    def pause_chat(self, payload: dict[str, Any] | None = None) -> bool:
+        """Interrupt a direct-chat request without discarding its persisted session."""
+        control_id = str(dict(payload or {}).get("run_id", "") or "").strip()
+        with self._active_pi_lock:
+            client = self._active_pi_clients.get(control_id) if control_id else next(
+                iter(self._active_pi_clients.values()),
+                None,
+            )
+        return bool(client is not None and client.active_request_id and client.pause(client.active_request_id))
+
     def pi_status(self) -> dict[str, Any]:
         """Return Pi runtime health (ready, version, paths)."""
         from .pi_agent import PiAgentClient
+        from .runtime_components import default_node_component
+
+        node = default_node_component().status()
         try:
-            return PiAgentClient.runtime_status()
-        except Exception:  # noqa: BLE001
-            return {"ready": False}
+            return {**PiAgentClient.runtime_status(), "node_component": node}
+        except Exception as error:  # noqa: BLE001
+            detail = str(error).strip() or type(error).__name__
+            node_missing = "node runtime" in detail.casefold() or not bool(node.get("installed"))
+            return {
+                "ready": False,
+                "reason": "node_missing" if node_missing else "sidecar_unavailable",
+                "error": detail,
+                "node_component": node,
+                "next_action": (
+                    "install_agent_runtime"
+                    if node_missing and node.get("install_available")
+                    else "select_agent_runtime_files"
+                    if node_missing
+                    else "retry_pi_status"
+                ),
+                "message": (
+                    "Agent 运行组件尚未就绪；安装后可使用联网、工具调用和持续任务。"
+                    if node_missing
+                    else "Pi Agent 启动未完成；请重试，或在诊断信息中查看具体原因。"
+                ),
+            }
 
     def list_chat_sessions(self) -> dict[str, Any]:
         """List durable Pi chat sessions from the on-disk registry."""
@@ -4725,6 +4778,9 @@ class ResearchAgentRuntime:
                 "session": {},
                 "compactions": [],
                 "interactions": [],
+                "lifecycle": [],
+                "queue": {"steering": [], "follow_up": [], "pending_count": 0},
+                "controls": [],
                 "compatibility_fallback": False,
                 "compatibility_error": "",
                 "model_fallback": None,
@@ -4854,6 +4910,51 @@ class ResearchAgentRuntime:
                             "details": details,
                         })
                         yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                elif model_event.get("type") == "lifecycle":
+                    lifecycle_event = {
+                        "event": str(model_event.get("event", "")),
+                        "role": str(model_event.get("role", "")),
+                        "tool_result_count": int(model_event.get("tool_result_count", 0) or 0),
+                        "will_retry": bool(model_event.get("will_retry", False)),
+                    }
+                    agent_runtime["lifecycle"].append(lifecycle_event)
+                    yield run_event(
+                        CUSTOM,
+                        run_id=run_id,
+                        name="agent_lifecycle",
+                        value=lifecycle_event,
+                    )
+                elif model_event.get("type") == "queue":
+                    queue_state = {
+                        "steering": [
+                            str(item) for item in list(model_event.get("steering", []) or [])
+                        ],
+                        "follow_up": [
+                            str(item) for item in list(model_event.get("follow_up", []) or [])
+                        ],
+                        "pending_count": int(model_event.get("pending_count", 0) or 0),
+                    }
+                    agent_runtime["queue"] = queue_state
+                    yield run_event(
+                        CUSTOM,
+                        run_id=run_id,
+                        name="agent_queue",
+                        value=queue_state,
+                    )
+                elif model_event.get("type") == "control":
+                    control_event = {
+                        "action": str(model_event.get("action", "")),
+                        "status": str(model_event.get("status", "")),
+                        "error": str(model_event.get("error", "")),
+                        "queued": int(model_event.get("queued", 0) or 0),
+                    }
+                    agent_runtime["controls"].append(control_event)
+                    yield run_event(
+                        CUSTOM,
+                        run_id=run_id,
+                        name="agent_control",
+                        value=control_event,
+                    )
                 elif model_event.get("type") == "tool.completed":
                     tool_name = str(model_event.get("name", ""))
                     agent_runtime["tool_calls"].append({"name": tool_name, "status": "completed"})
@@ -7064,8 +7165,11 @@ class ResearchAgentRuntime:
                 if stage["status"] == "completed":
                     output_artifact_id = str(stage.get("output", {}).get("artifact_id", output_artifact_id))
                     continue
-                if self.store.cancel_requested(run_id):
-                    self.store.mark_cancelled(run_id)
+                if self.store.stop_requested(run_id):
+                    if self.store.pause_requested(run_id):
+                        self.store.mark_paused(run_id)
+                    else:
+                        self.store.mark_cancelled(run_id)
                     return
                 stage_key = str(stage["key"])
                 self.store.start_stage(run_id, stage_key)
@@ -7112,7 +7216,10 @@ class ResearchAgentRuntime:
                         summary = str(artifact["summary"] or "研究产物已保存")
                         self.store.complete_stage(run_id, stage_key, summary=summary, output=output)
                 except _RunCancelled:
-                    self.store.mark_cancelled(run_id, summary="本地语义索引已停止；已完成的批次会在恢复时复用")
+                    if self.store.pause_requested(run_id):
+                        self.store.mark_paused(run_id, summary="任务已暂停；已完成的批次会在继续时复用")
+                    else:
+                        self.store.mark_cancelled(run_id, summary="本地语义索引已停止；已完成的批次会在恢复时复用")
                     return
                 except Exception as error:  # noqa: BLE001 - persisted for resume and UI inspection
                     # L3: auto-retry recoverable stage failures once with a
@@ -7128,11 +7235,14 @@ class ResearchAgentRuntime:
                     return
                 finally:
                     self._model_event_context.value = None
-                if self.store.cancel_requested(run_id):
+                if self.store.stop_requested(run_id):
                     latest = self.store.get_run(run_id)
                     remaining = [item for item in latest["stages"] if item["status"] != "completed"]
                     if remaining:
-                        self.store.mark_cancelled(run_id)
+                        if self.store.pause_requested(run_id):
+                            self.store.mark_paused(run_id)
+                        else:
+                            self.store.mark_cancelled(run_id)
                         return
             self.store.complete_run(run_id, output_artifact_id=output_artifact_id)
             # The advisor is read-only: it records gaps and outcome metrics
@@ -7226,7 +7336,7 @@ class ResearchAgentRuntime:
                     provider=local_evidence.embedding_provider,
                     cache_batch_size=2048,
                     progress_callback=report_progress,
-                    cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
+                    cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                 )
                 output = {
                     "message": f"本地语义索引已就绪：{int(cache.get('completed', 0))}/{int(cache.get('total', 0))} 条证据",
@@ -7277,7 +7387,7 @@ class ResearchAgentRuntime:
                     ),
                     embedding_provider=local_evidence.embedding_provider,
                     reranker=local_evidence.reranker,
-                    cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
+                    cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                 )
                 output["retrieval_runtime"] = dict(local_evidence.metadata)
                 output["search_plan"] = plan
@@ -7311,7 +7421,7 @@ class ResearchAgentRuntime:
                         per_source=int(payload.get("per_source", 10) or 10),
                         year_from=self._optional_year(payload.get("year_from")),
                         max_rounds=int(payload.get("max_search_rounds", 2) or 2),
-                        cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
+                        cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                         progress_callback=report_discovery_progress,
                     )
                 except InterruptedError as error:
@@ -7348,7 +7458,7 @@ class ResearchAgentRuntime:
                         per_source=int(payload.get("per_source", 10) or 10),
                         year_from=self._optional_year(payload.get("year_from")),
                         max_rounds=int(payload.get("max_search_rounds", 2) or 2),
-                        cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
+                        cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                         progress_callback=report_novelty_progress,
                     )
                 except InterruptedError as error:
@@ -7384,7 +7494,7 @@ class ResearchAgentRuntime:
                         per_source=int(payload.get("per_source", 10) or 10),
                         year_from=self._optional_year(payload.get("year_from")),
                         max_rounds=int(payload.get("max_search_rounds", 2) or 2),
-                        cancel_requested=lambda: self.store.cancel_requested(str(run["run_id"])),
+                        cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                         progress_callback=report_idea_progress,
                     )
                 except InterruptedError as error:
@@ -7633,7 +7743,7 @@ class ResearchAgentRuntime:
                         strategy=str(payload.get("strategy", "oa_first")),
                         timeout=float(payload.get("download_timeout", 180) or 180),
                         on_progress=report_search_download_progress,
-                        cancel_check=lambda: self.store.cancel_requested(run_id),
+                        cancel_check=lambda: self.store.stop_requested(run_id),
                     )
                 except _BatchCancelled:
                     raise _RunCancelled("检索后文献下载已取消")
@@ -7739,7 +7849,7 @@ class ResearchAgentRuntime:
                         strategy=str(payload.get("strategy", "oa_first")),
                         timeout=float(payload.get("download_timeout", 180) or 180),
                         on_progress=report_batch_progress,
-                        cancel_check=lambda: self.store.cancel_requested(run_id),
+                        cancel_check=lambda: self.store.stop_requested(run_id),
                         env_overrides=env_overrides,
                         rotate_circuit=rotate_circuit,
                         rotate_every=rotate_every,
@@ -7884,7 +7994,7 @@ class ResearchAgentRuntime:
             if doi and doi.casefold() in known_dois:
                 existing.append({"doi": doi, "title": str(item.get("title", ""))})
                 continue
-            if self.store.cancel_requested(str(run["run_id"])):
+            if self.store.stop_requested(str(run["run_id"])):
                 partial = {
                     "cancelled": True,
                     "attempted": attempted,
@@ -7993,10 +8103,7 @@ class ResearchAgentRuntime:
                 "task_evidence": task_evidence,
             }
         try:
-            local_evidence = self._local_evidence_stack(
-                evidence_db,
-                quality_profile=self._retrieval_quality(payload, default="precision"),
-            )
+            local_evidence = self._task_fulltext_evidence_stack()
             output = retrieve_review_evidence(
                 evidence_db,
                 question,
@@ -8081,6 +8188,7 @@ class ResearchAgentRuntime:
                     "html_path": f"external://academic-source/{index}",
                     "html_anchor": "abstract",
                     "original_url": source_url,
+                    "source_href": source_url,
                     "confidence": float(record.get("score", 0.0) or 0.0),
                 }
             )
@@ -8096,7 +8204,6 @@ class ResearchAgentRuntime:
                 "evidence_status": "discovery_leads",
             }
 
-        citation_ids = [str(row["citation_id"]) for row in evidence]
         perspectives = [dict(item) for item in list(plan.get("perspectives", []) or []) if isinstance(item, dict)]
         sections = [
             {
@@ -8104,7 +8211,7 @@ class ResearchAgentRuntime:
                 "title": str(item.get("title") or f"Research perspective {index + 1}"),
                 "objective": str(item.get("question") or question),
                 "keywords": list(item.get("keywords", []) or []),
-                "citation_ids": citation_ids,
+                "citation_ids": self._external_perspective_citation_ids(item, evidence),
             }
             for index, item in enumerate(perspectives[:4])
         ]
@@ -8115,7 +8222,7 @@ class ResearchAgentRuntime:
                     "title": "Research evidence overview",
                     "objective": question,
                     "keywords": [],
-                    "citation_ids": citation_ids,
+                    "citation_ids": [str(row["citation_id"]) for row in evidence[:8]],
                 }
             ]
         return {
@@ -8140,6 +8247,44 @@ class ResearchAgentRuntime:
             "evidence_status": "external_source_abstracts",
             "evidence_notice": "本次深度研究使用公开学术来源摘要，不读取或写入任何个人知识库。",
         }
+
+    @staticmethod
+    def _external_perspective_citation_ids(
+        perspective: dict[str, Any],
+        evidence: list[dict[str, Any]],
+        *,
+        limit: int = 8,
+    ) -> list[str]:
+        """Bind each report section to the public abstracts that match it."""
+
+        query = " ".join(
+            [
+                str(perspective.get("title", "") or ""),
+                str(perspective.get("question", "") or ""),
+                " ".join(str(value) for value in list(perspective.get("keywords", []) or [])),
+            ]
+        )
+        stopwords = {
+            "about", "and", "are", "evidence", "for", "from", "how", "methods", "research",
+            "study", "system", "systems", "that", "the", "this", "what", "which", "with",
+        }
+        terms = {token for token in lexical_tokens(query) if len(token) > 1 and token not in stopwords}
+        ranked: list[tuple[float, int, str]] = []
+        for position, row in enumerate(evidence):
+            title_terms = set(lexical_tokens(str(row.get("paper", "") or "")))
+            quote_terms = set(lexical_tokens(str(row.get("exact_quote", "") or "")))
+            score = len(terms & title_terms) * 2.0 + len(terms & quote_terms) * 0.5
+            if score > 0:
+                ranked.append((score, -position, str(row.get("citation_id", ""))))
+        ranked.sort(reverse=True)
+        selected = [citation_id for _score, _position, citation_id in ranked[: max(1, int(limit))] if citation_id]
+        if selected:
+            return selected
+        return [
+            str(row.get("citation_id", ""))
+            for row in evidence[: min(4, max(1, int(limit)))]
+            if row.get("citation_id")
+        ]
 
     def _plan(self, run: dict[str, Any]) -> dict[str, Any]:
         spec = _WORKFLOWS[str(run["workflow_type"])]
@@ -8268,7 +8413,7 @@ class ResearchAgentRuntime:
                 str(task_evidence.get("evidence_level", "")) == "fulltext"
                 and int(index.get("documents", 0) or 0) >= 2
                 and int(index.get("spans", 0) or 0) >= 3
-                and bool(quality.get("passed", False))
+                and task_evidence_claim_ready(quality)
             )
             verification_details = {**verification, "task_fulltext_ready": task_fulltext_ready}
         return {
@@ -8299,6 +8444,12 @@ class ResearchAgentRuntime:
             evidence_links = [
                 {
                     **dict(item),
+                    "source_href": str(
+                        dict(item).get("source_href")
+                        or dict(item).get("reader_url")
+                        or dict(item).get("original_url")
+                        or ""
+                    ),
                     "relationship": "supports",
                 }
                 for item in list(dict(result.get("reader_answer", {}) or {}).get("citations", []) or [])
@@ -8361,9 +8512,16 @@ class ResearchAgentRuntime:
             return f"已从 {int(result.get('source_count', 0) or 0)} 份材料生成 {slide_count} 页可编辑 PPTX"
         if workflow == "deep_research" and result.get("evidence_status") == "task_acquired_fulltext":
             trace = dict(result.get("research_trace", {}) or {})
+            task_index = dict(dict(result.get("task_evidence", {}) or {}).get("index", {}) or {})
+            document_count = int(
+                trace.get("fulltext_indexed_documents", task_index.get("documents", 0)) or 0
+            )
+            evidence_span_count = int(
+                trace.get("fulltext_evidence_spans", task_index.get("spans", 0)) or 0
+            )
             return (
-                f"已完成外部深度研究：基于 {int(trace.get('fulltext_indexed_documents', 0) or 0)} 篇任务获取的全文，"
-                f"建立 {int(trace.get('fulltext_evidence_spans', 0) or 0)} 个可回跳证据片段"
+                f"已完成外部深度研究：基于 {document_count} 篇任务获取的全文，"
+                f"建立 {evidence_span_count} 个可回跳证据片段"
             )
         if workflow == "deep_research" and result.get("evidence_status") == "external_source_abstracts":
             references = list(dict(result.get("reader_answer", {}) or {}).get("citations", []) or [])
@@ -9096,22 +9254,71 @@ class ResearchAgentRuntime:
         return self._local_evidence_models[stack_kind]
 
     def _academic_discovery_stack(self) -> LocalEvidenceStack:
-        """Return a precision stack for public academic discovery.
+        """Return a process-safe stack for public academic discovery.
 
         Discovery is independent of the selected notebook's size.  In
         particular, an empty or tiny local library must not silently downgrade
-        a public multi-source literature search to hashing plus lexical
-        reranking.  The runtime still exposes an explicit fallback in metadata
-        when the local neural models are unavailable.
+        public multi-source literature search.  Public providers already return
+        titles, abstracts, keywords, citation counts, and provider rankings, so
+        the in-process fusion can safely use deterministic hashing and lexical
+        ranking.
+
+        Heavy neural inference must stay outside the desktop web process.  A
+        native ``torch_cpu.dll`` access violation cannot be caught by Python
+        and previously killed the whole app during a background Deep Research
+        run.  The task artifact records this routing decision explicitly; the
+        independently installed local runtime remains available for generation,
+        vision, and speech inference.
         """
 
-        stack_kind = "academic-discovery:precision"
+        stack_kind = "academic-discovery:process-safe"
         with self._model_lock:
             if stack_kind not in self._academic_discovery_models:
-                self._academic_discovery_models[stack_kind] = build_local_evidence_stack(
-                    quality_profile="precision",
+                stack = build_local_evidence_stack(
+                    embedding_model=BUILTIN_MODEL_MARKER,
+                    reranker_model=BUILTIN_MODEL_MARKER,
+                    quality_profile="balanced",
+                )
+                self._academic_discovery_models[stack_kind] = LocalEvidenceStack(
+                    embedding_provider=stack.embedding_provider,
+                    reranker=stack.reranker,
+                    metadata={
+                        **dict(stack.metadata),
+                        "selection_reason": "public-discovery-process-isolation",
+                        "in_process_neural_disabled": True,
+                    },
                 )
         return self._academic_discovery_models[stack_kind]
+
+    def _task_fulltext_evidence_stack(self) -> LocalEvidenceStack:
+        """Return a process-safe stack for task-acquired full-text evidence.
+
+        The desktop process must never import a heavyweight native Torch stack:
+        a DLL access violation terminates the whole application before Python
+        can report an error.  Hashing plus lexical reranking still retrieves
+        from the real, task-scoped PDFs and records the exact fallback in the
+        artifact.  Neural generation, vision, and ASR remain isolated in the
+        separately installed local runtime component.
+        """
+
+        stack_kind = "task-fulltext:process-safe"
+        with self._model_lock:
+            if stack_kind not in self._task_evidence_models:
+                stack = build_local_evidence_stack(
+                    embedding_model=BUILTIN_MODEL_MARKER,
+                    reranker_model=BUILTIN_MODEL_MARKER,
+                    quality_profile="precision",
+                )
+                self._task_evidence_models[stack_kind] = LocalEvidenceStack(
+                    embedding_provider=stack.embedding_provider,
+                    reranker=stack.reranker,
+                    metadata={
+                        **dict(stack.metadata),
+                        "selection_reason": "task-fulltext-process-isolation",
+                        "in_process_neural_disabled": True,
+                    },
+                )
+        return self._task_evidence_models[stack_kind]
 
     def _slides_chat_client(self) -> Any:
         """Return the model dedicated to presentation planning, when configured."""

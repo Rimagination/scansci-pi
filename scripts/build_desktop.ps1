@@ -18,6 +18,8 @@ param(
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
     [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
+    [string]$NodeComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
+    [string]$TectonicComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     # Slim channel: do not embed node.exe or tectonic.exe in the bundle.
     # The Pi sidecar and slide LaTeX engine then resolve them through the
     # managed runtime components (see runtime_components.py) after one
@@ -34,10 +36,20 @@ $runtimeUri = [Uri]$RuntimeManifestUrl
 if (-not $runtimeUri.IsAbsoluteUri -or $runtimeUri.Scheme -ne "https") {
     throw "RuntimeManifestUrl must be an absolute HTTPS URL."
 }
+foreach ($componentManifest in @(
+    @{ Name = "NodeComponentManifestUrl"; Value = $NodeComponentManifestUrl },
+    @{ Name = "TectonicComponentManifestUrl"; Value = $TectonicComponentManifestUrl }
+)) {
+    $componentUri = [Uri]$componentManifest.Value
+    if (-not $componentUri.IsAbsoluteUri -or $componentUri.Scheme -ne "https") {
+        throw "$($componentManifest.Name) must be an absolute HTTPS URL."
+    }
+}
 $entryPoint = Join-Path $projectRoot "scripts\scansci_desktop_entry.py"
 $pyInstallerHooks = Join-Path $projectRoot "scripts\pyinstaller_hooks"
 $assetSource = Join-Path $projectRoot "src\scansci_html\web"
 $skillAssetSource = Join-Path $projectRoot "src\scansci_html\builtin_skill_assets"
+$slideTemplateSource = Join-Path $projectRoot "src\scansci_html\builtin_slide_templates"
 $packagedTectonicSource = Join-Path $projectRoot "src\scansci_html\runtime\latex\tectonic.exe"
 $codexTectonicSource = Get-ChildItem -Path (Join-Path $HOME ".codex\plugins\cache\openai-bundled\latex\*\bin\tectonic.exe") -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 $tectonicSource = if (Test-Path -LiteralPath $packagedTectonicSource -PathType Leaf) { $packagedTectonicSource } elseif ($codexTectonicSource) { $codexTectonicSource } else { "" }
@@ -102,7 +114,7 @@ $dependencyFiles = @(
 $dependencyHashes = $dependencyFiles | ForEach-Object {
     if (Test-Path -LiteralPath $_ -PathType Leaf) { (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash } else { "missing" }
 }
-$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$RuntimeManifestUrl|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
+$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
 if (-not $CacheKey) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($cacheMaterial)
     $digest = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
@@ -134,6 +146,8 @@ $buildInfo = [ordered]@{
     package_profile = $PackageProfile
     exclude_runtimes = [bool]$ExcludeRuntimes
     runtime_manifest_url = $RuntimeManifestUrl
+    node_component_manifest_url = $NodeComponentManifestUrl
+    tectonic_component_manifest_url = $TectonicComponentManifestUrl
     cache_key = $CacheKey
     source_tree_sha256 = $sourceTreeHash
     release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()
@@ -154,6 +168,7 @@ $pyInstallerArgs = @(
     "--additional-hooks-dir", $pyInstallerHooks,
     "--add-data", "$assetSource;scansci_html\web",
     "--add-data", "$skillAssetSource;scansci_html\builtin_skill_assets",
+    "--add-data", "$slideTemplateSource;scansci_html\builtin_slide_templates",
     "--add-data", "$piBundle;pi_runtime",
     $(if (-not $ExcludeRuntimes) { @("--add-binary", "$nodeExe;pi_runtime") } else { @() }),
     # python-pptx loads its default blank deck from package data at runtime;

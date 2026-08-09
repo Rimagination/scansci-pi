@@ -351,6 +351,7 @@ def test_review_section_contract_requires_citations_on_each_sentence():
     )
 
     assert result["sentences"][0]["citation_ids"] == ["1"]
+    assert calls[0]["max_tokens"] == 8192
     contract = calls[0]["messages"][0]["content"]
     assert '"sentences"' in contract
     assert "Every sentence must carry" in contract

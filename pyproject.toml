@@ -88,7 +88,7 @@ scansci-desktop = "scansci_html.desktop:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-scansci_html = ["web/*", "web/**/*", "builtin_skill_assets/*", "builtin_skill_assets/**/*", "runtime/latex/*"]
+scansci_html = ["web/*", "web/**/*", "builtin_skill_assets/*", "builtin_skill_assets/**/*", "builtin_slide_templates/*", "builtin_slide_templates/**/*", "runtime/latex/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

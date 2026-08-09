@@ -85,7 +85,8 @@ def test_real_release_contract_defaults_to_a_lightweight_core_package() -> None:
     contract = json.loads((Path(__file__).parents[1] / "config" / "release-gate.json").read_text(encoding="utf-8"))
 
     assert contract["package"]["profile"] == "core"
-    assert int(contract["package"]["max_package_bytes"]) <= 1_500_000_000
+    assert contract["package"]["exclude_runtimes"] is True
+    assert int(contract["package"]["max_package_bytes"]) <= 450_000_000
 
 
 def test_release_contract_accepts_only_https_runtime_component_manifests() -> None:
@@ -96,6 +97,135 @@ def test_release_contract_accepts_only_https_runtime_component_manifests() -> No
     contract["package"]["runtime_manifest_url"] = "file:///C:/runtime.json"
     with pytest.raises(release_gate.GateFailure, match="runtime_manifest_url must use HTTPS"):
         release_gate.validate_release_inputs(contract, _scope())
+
+    contract = _contract()
+    contract["package"].update(
+        {
+            "profile": "core",
+            "exclude_runtimes": True,
+            "node_component_manifest_url": "http://downloads.example.com/node.json",
+            "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
+        }
+    )
+    with pytest.raises(release_gate.GateFailure, match="node_component_manifest_url must use HTTPS"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+    contract["package"]["node_component_manifest_url"] = "https://downloads.example.com/node.json"
+    del contract["package"]["tectonic_component_manifest_url"]
+    with pytest.raises(release_gate.GateFailure, match="separately downloadable runtime components"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+
+def test_release_gate_probes_external_runtime_manifests_and_assets(tmp_path: Path, monkeypatch) -> None:
+    contract = _contract()
+    contract["package"].update(
+        {
+            "profile": "core",
+            "exclude_runtimes": True,
+            "node_component_manifest_url": "https://downloads.example.com/node.json",
+            "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
+        }
+    )
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="beta",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="component-channels",
+    )
+    requested: list[tuple[str, str]] = []
+
+    class _Response:
+        def __init__(self, payload: bytes = b"", status: int = 200) -> None:
+            self.payload = payload
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.payload
+
+        def getcode(self) -> int:
+            return self.status
+
+    def fake_urlopen(request, timeout: int):
+        del timeout
+        url = request.full_url
+        method = request.get_method()
+        requested.append((method, url))
+        if method == "HEAD":
+            return _Response()
+        component_id = "node" if url.endswith("node.json") else "tectonic"
+        payload = {
+            "id": component_id,
+            "version": "1.0.0",
+            "windows": {
+                "url": f"https://downloads.example.com/{component_id}.zip",
+                "sha256": "a" * 64,
+                "size": 42,
+            },
+        }
+        return _Response(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(release_gate, "urlopen", fake_urlopen)
+
+    result = gate.verify_runtime_component_channels()
+
+    assert set(result["components"]) == {"node", "tectonic"}
+    assert requested == [
+        ("GET", "https://downloads.example.com/node.json"),
+        ("HEAD", "https://downloads.example.com/node.zip"),
+        ("GET", "https://downloads.example.com/tectonic.json"),
+        ("HEAD", "https://downloads.example.com/tectonic.zip"),
+    ]
+
+
+def test_release_gate_rejects_a_missing_external_runtime_manifest(tmp_path: Path, monkeypatch) -> None:
+    contract = _contract()
+    contract["package"].update(
+        {
+            "profile": "core",
+            "exclude_runtimes": True,
+            "node_component_manifest_url": "https://downloads.example.com/node.json",
+            "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
+        }
+    )
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="beta",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="missing-component-channel",
+    )
+    monkeypatch.setattr(release_gate, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("404")))
+
+    with pytest.raises(release_gate.GateFailure, match="manifest is unavailable for node"):
+        gate.verify_runtime_component_channels()
+
+
+def test_release_gate_requires_an_overall_checksum_for_multipart_components() -> None:
+    with pytest.raises(release_gate.GateFailure, match="package is missing SHA256 or size"):
+        release_gate.ReleaseGate._validate_component_asset(
+            "node",
+            {
+                "version": "22.14.0",
+                "windows": {
+                    "parts": [
+                        {
+                            "url": "https://downloads.example.com/node.zip.part001",
+                            "sha256": "b" * 64,
+                            "size": 42,
+                        }
+                    ]
+                },
+            },
+        )
 
 
 def test_plan_only_writes_machine_readable_report_without_running_commands(tmp_path: Path) -> None:
@@ -360,7 +490,19 @@ def test_release_package_is_bound_to_the_source_fingerprint_that_passed_the_gate
         gate.verify_package()
 
 
-def test_core_package_rejects_bundled_model_runtime_or_huggingface_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "forbidden_relative_path",
+    [
+        Path("torch/lib/torch_cpu.dll"),
+        Path("third-party/node.exe"),
+        Path("latex/bin/tectonic.exe"),
+        Path("cache/models--openbmb--MiniCPM/config.json"),
+    ],
+)
+def test_core_package_rejects_bundled_model_runtime_or_huggingface_snapshot(
+    tmp_path: Path,
+    forbidden_relative_path: Path,
+) -> None:
     contract_path = _write_json(tmp_path / "contract.json", _contract())
     scope_path = _write_json(tmp_path / "scope.json", _scope())
     gate = release_gate.ReleaseGate(
@@ -379,9 +521,9 @@ def test_core_package_rejects_bundled_model_runtime_or_huggingface_snapshot(tmp_
         "package_profile": "core",
         "release_source_sha256": gate.source_sha256,
     })
-    bundled_torch = gate.package_dir / "_internal" / "torch" / "lib"
-    bundled_torch.mkdir(parents=True)
-    (bundled_torch / "torch_cpu.dll").write_bytes(b"not-a-runtime")
+    forbidden = gate.package_dir / "_internal" / forbidden_relative_path
+    forbidden.parent.mkdir(parents=True)
+    forbidden.write_bytes(b"not-a-runtime")
 
     with pytest.raises(release_gate.GateFailure, match="optional runtime resources"):
         gate.verify_package()

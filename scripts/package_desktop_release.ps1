@@ -8,7 +8,8 @@ param(
     [string]$PackageUrl,
     [string]$OutputDir = "",
     [string]$Channel = "stable",
-    [string]$LocalRuntimeManifest = ""
+    [string]$LocalRuntimeManifest = "",
+    [string]$BlockmapUrl = ""
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -25,6 +26,39 @@ $archive = Join-Path $releaseRoot "ScanSci-$Version-windows-x64.zip"
 $manifest = Join-Path $releaseRoot "stable.json"
 Compress-Archive -Path (Join-Path $source "*") -DestinationPath $archive -CompressionLevel Optimal -Force
 $sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+$blockSize = 64 * 1024
+$blockmapPath = $archive + ".blockmap"
+$blockHashes = [System.Collections.Generic.List[string]]::new()
+$blockStream = [System.IO.File]::OpenRead($archive)
+$blockHasher = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $buffer = New-Object byte[] $blockSize
+    while (($read = $blockStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $chunk = New-Object byte[] $read
+        [System.Array]::Copy($buffer, $chunk, $read)
+        $blockHash = $blockHasher.ComputeHash($chunk)
+        $blockHashes.Add(([System.BitConverter]::ToString($blockHash).Replace("-", "").ToLowerInvariant()))
+    }
+}
+finally {
+    $blockHasher.Dispose()
+    $blockStream.Dispose()
+}
+$blockmapPayload = [ordered]@{
+    schema_version = 1
+    algorithm = "sha256"
+    block_size = $blockSize
+    size = [long](Get-Item -LiteralPath $archive).Length
+    sha256 = $sha256
+    blocks = @($blockHashes.ToArray())
+}
+$blockmapPayload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $blockmapPath -Encoding utf8
+$blockmapSha256 = (Get-FileHash -LiteralPath $blockmapPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$blockmapSize = [long](Get-Item -LiteralPath $blockmapPath).Length
+$resolvedBlockmapUrl = [string]$BlockmapUrl
+if (-not $resolvedBlockmapUrl) {
+    $resolvedBlockmapUrl = $PackageUrl + ".blockmap"
+}
 $payload = [ordered]@{
     version = $Version
     title = "ScanSci $Version"
@@ -37,6 +71,12 @@ $payload = [ordered]@{
         url = $PackageUrl
         sha256 = $sha256
         archive = [System.IO.Path]::GetFileName($archive)
+        blockmap = [ordered]@{
+            url = $resolvedBlockmapUrl
+            sha256 = $blockmapSha256
+            size = $blockmapSize
+            block_size = $blockSize
+        }
     }
 }
 if ($LocalRuntimeManifest) {
@@ -81,4 +121,5 @@ if ($LocalRuntimeManifest) {
 }
 $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8
 Write-Output $archive
+Write-Output $blockmapPath
 Write-Output $manifest

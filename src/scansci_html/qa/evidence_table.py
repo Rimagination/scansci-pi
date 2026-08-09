@@ -23,6 +23,7 @@ def build_evidence_table(
                 "section": str(evidence.get("section", "")),
                 "section_kind": str(evidence.get("section_kind", "")),
                 "doi": str(evidence.get("doi", "")),
+                "source_url": str(evidence.get("source_url", "")),
                 "evidence_id": evidence_id,
                 "html_path": str(evidence.get("html_path", "")),
                 "html_anchor": str(evidence.get("html_anchor", "")),

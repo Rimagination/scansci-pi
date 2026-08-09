@@ -193,6 +193,26 @@ def test_desktop_local_runtime_file_picker_allows_manifest_and_parts(tmp_path: P
     assert selected == [str(archive), str(manifest)]
 
 
+def test_desktop_managed_component_picker_is_shared_by_node_and_tectonic(tmp_path: Path) -> None:
+    archive = tmp_path / "node-runtime.zip"
+    manifest = tmp_path / "node.json"
+    archive.write_bytes(b"zip")
+    manifest.write_text("{}", encoding="utf-8")
+    webview = _FakeSaveWindowModule(archive)
+    captured: dict[str, object] = {}
+
+    def pick(_dialog_type, **kwargs):
+        captured.update(kwargs)
+        return str(archive), str(manifest)
+
+    webview.window.create_file_dialog = pick
+
+    selected = ScanSciDesktopApi(webview, workspace=tmp_path / "workspace.sqlite").choose_runtime_component_files("node")
+
+    assert selected == [str(archive), str(manifest)]
+    assert "Agent 运行组件" in str(captured["file_types"][0])
+
+
 def test_desktop_local_artifact_bridge_opens_and_reveals_existing_file(monkeypatch, tmp_path: Path) -> None:
     artifact = tmp_path / "paper.pdf"
     artifact.write_bytes(b"%PDF-1.7")

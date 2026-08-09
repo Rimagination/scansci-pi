@@ -1,0 +1,78 @@
+{
+  "schema_version": "easyslides.academic_scqa.story_structure.v1",
+  "template_id": "academic_scqa",
+  "narrative_model": "AST_SCQA",
+  "default_order": ["cover", "toc", "hook", "S", "C", "Q", "A", "takeaway", "ending"],
+  "ast_questions": [
+    "Who is the audience?",
+    "What is their initial state?",
+    "What desired state should the deck create?",
+    "What core tension makes the report worth hearing?",
+    "How does each slide move the audience forward?"
+  ],
+  "transfer_path": [
+    {
+      "role": "hook",
+      "purpose": "Make the academic or technical stakes legible before details.",
+      "preferred_shell": "01_cover"
+    },
+    {
+      "role": "conflict",
+      "purpose": "Surface the gap, limitation, contradiction, or bottleneck.",
+      "preferred_shell": "03_content"
+    },
+    {
+      "role": "method",
+      "purpose": "Explain the approach, dataset, workflow, or model as the response to the question.",
+      "preferred_shell": "03_content"
+    },
+    {
+      "role": "proof",
+      "purpose": "Build trust with source-faithful figures, data, comparisons, or visual results.",
+      "preferred_shell": "03_content"
+    },
+    {
+      "role": "takeaway",
+      "purpose": "Leave the audience with a portable implication or decision.",
+      "preferred_shell": "04_ending"
+    }
+  ],
+  "phases": [
+    {
+      "phase": "S",
+      "name": "Situation",
+      "purpose": "Frame the academic or strategic context.",
+      "preferred_variants": ["intro_policy", "data_stats", "research_method"],
+      "title_policy": "state the current situation as a conclusion, not as 'background'"
+    },
+    {
+      "phase": "C",
+      "name": "Complication",
+      "purpose": "Expose the gap, limitation, conflict, or challenge.",
+      "preferred_variants": ["comparison", "intro_policy", "key_finding"],
+      "title_policy": "make the tension explicit"
+    },
+    {
+      "phase": "Q",
+      "name": "Question",
+      "purpose": "Condense the scientific or technical question.",
+      "preferred_variants": ["key_finding", "data_stats", "chapter"],
+      "title_policy": "write the research question as a testable claim or decision point"
+    },
+    {
+      "phase": "A",
+      "name": "Answer",
+      "purpose": "Show method, evidence, result, and implication.",
+      "preferred_variants": ["workflow_four_phase", "workflow_linear", "research_method", "data_stats", "image_grid", "key_finding"],
+      "title_policy": "lead with the answer and support it with one main exhibit"
+    }
+  ],
+  "deck_rules": [
+    "Use cover first and ending last.",
+    "Use contents when the deck has at least two sections.",
+    "Use chapter slides for major SCQA phase boundaries when the deck exceeds 8 slides.",
+    "One SCQA phase may span multiple slides; split Answer before overcrowding.",
+    "Every content slide should carry one defensible claim plus one evidence shape."
+  ]
+}
+

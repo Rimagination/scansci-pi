@@ -63,7 +63,10 @@ _MODE_TOOLS = {
         "check_task_completion",
         "self_assess",
     },
-    "web": {"search_web", "agent_reach", "browser_access", "self_assess"},
+    # Explicit web access also covers scholarly discovery.  A user should not
+    # lose ``discover_papers`` merely because the web toggle is ON instead of
+    # AUTO; the host still keeps this lease read-only.
+    "web": {"search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"},
     "web-auto": {"search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"},
     "knowledge": {
         "inspect_workspace",
@@ -214,6 +217,7 @@ class TaskContract:
     max_tool_budget: int
     recovery_budget: int
     model_token_budget: int
+    max_model_token_budget: int
     allow_external_write: bool
     task_profile: TaskProfile
     unavailable_tools: tuple[str, ...] = ()
@@ -250,14 +254,23 @@ def _budgets(parts: set[str], *, risk_level: str) -> tuple[int, int, int]:
     return initial, maximum, 3 if maximum > initial else 2
 
 
-def _model_token_budget(parts: set[str]) -> int:
+def _model_token_budgets(parts: set[str]) -> tuple[int, int]:
+    """Return a soft token lease and a generous runaway guard.
+
+    Pi already compacts sessions against the active model context window.
+    Counting every repeated prompt token against a small hard per-turn ceiling
+    made healthy multi-step research fail even when the visible answer was
+    tiny.  The first value may be extended automatically; the second only
+    protects against a genuinely runaway run.
+    """
+
     if parts & {"research", "slides"}:
-        return 48_000
+        return 192_000, 768_000
     if parts & {"knowledge", "task-documents"}:
-        return 32_000
+        return 128_000, 512_000
     if parts & {"web", "web-auto"}:
-        return 32_000
-    return 12_000
+        return 96_000, 384_000
+    return 48_000, 192_000
 
 
 def _goal_text(user_text: str, workflow_type: str) -> str:
@@ -504,6 +517,7 @@ def compile_task_contract(
         success.append("Report any capability unavailable in this workspace instead of claiming it was used")
 
     initial_budget, max_budget, recovery_budget = _budgets(parts, risk_level=risk_level)
+    model_token_budget, max_model_token_budget = _model_token_budgets(parts)
     requires_plan = task_profile.requires_plan
     return TaskContract(
         contract_id=f"contract-{uuid4().hex}",
@@ -521,7 +535,8 @@ def compile_task_contract(
         initial_tool_budget=initial_budget,
         max_tool_budget=max_budget,
         recovery_budget=recovery_budget,
-        model_token_budget=_model_token_budget(parts),
+        model_token_budget=model_token_budget,
+        max_model_token_budget=max_model_token_budget,
         allow_external_write=high_risk,
         task_profile=task_profile,
         unavailable_tools=unavailable_tools,

@@ -1,0 +1,66 @@
+{
+  "schema_version": "easyslides.body_variants.v1",
+  "template_id": "defense_leftnav",
+  "source_shell": "03_content.svg",
+  "content_area": {"x": 310, "y": 210, "width": 910, "height": 440},
+  "component_spacing": {"min_gap": 32, "scope": "independent body components; internal parts of one table, card, figure, or grouped variant may touch or overlap as designed"},
+  "selection_rule": "Choose one body variant after deciding the slide claim, evidence shape, and density. Do not create new shell SVG files for routine content variation.",
+  "variants": [
+    {
+      "variant_id": "body_text",
+      "density": 3,
+      "slots": ["CONTENT_BODY"],
+      "component_styles": ["open_body"],
+      "best_for": "研究背景、文献脉络、问题提出、综合讨论。",
+      "avoid": "多张图、复杂表格、四个以上平行要点。"
+    },
+    {
+      "variant_id": "figure_with_takeaway",
+      "density": 3,
+      "slots": ["MAIN_IMAGE", "TAKEAWAY", "CAPTION"],
+      "component_styles": ["source_figure_frame", "takeaway_bar"],
+      "best_for": "一张论文原图支撑一个核心判断。",
+      "layout_hint": "Image occupies the left 58-65% of CONTENT_AREA; takeaway sits on the right or below depending on image aspect ratio."
+    },
+    {
+      "variant_id": "figure_with_callouts",
+      "density": 4,
+      "slots": ["MAIN_IMAGE", "CALLOUTS", "CAPTION"],
+      "component_styles": ["annotated_figure", "evidence_card", "hypothesis_dashed"],
+      "best_for": "一张图需要解释两个到四个区域、机制或证据点。",
+      "layout_hint": "Keep the image dominant; callouts stay outside the figure frame unless they are short labels."
+    },
+    {
+      "variant_id": "two_column_compare",
+      "density": 4,
+      "slots": ["LEFT_TITLE", "LEFT_BODY", "RIGHT_TITLE", "RIGHT_BODY"],
+      "component_styles": ["evidence_card"],
+      "best_for": "已有研究 vs 本文工作、现状 vs 问题、方法 A vs 方法 B。",
+      "avoid": "三组以上并列内容。"
+    },
+    {
+      "variant_id": "card_grid",
+      "density": 4,
+      "slots": ["CARDS"],
+      "component_styles": ["evidence_card", "hypothesis_dashed"],
+      "best_for": "三到四个平行发现、意义、贡献、局限。",
+      "constraint": "Use 3 or 4 cards only. Split the slide if more cards are required."
+    },
+    {
+      "variant_id": "process_steps",
+      "density": 4,
+      "slots": ["STEPS"],
+      "component_styles": ["takeaway_bar", "evidence_card"],
+      "best_for": "材料来源、实验流程、算法步骤、技术路线。",
+      "constraint": "Use 3-5 steps; avoid paragraph-length step bodies."
+    },
+    {
+      "variant_id": "table_or_matrix",
+      "density": 5,
+      "slots": ["TABLE", "TAKEAWAY"],
+      "component_styles": ["source_figure_frame", "takeaway_bar"],
+      "best_for": "变量指标、参数体系、样本清单、结果表格。",
+      "constraint": "Table text must remain readable at >=14px; split dense tables."
+    }
+  ]
+}
