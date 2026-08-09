@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$OutputDir = "",
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.3",
     [string]$CacheKey = "",
     [string]$PackageUrl = "",
     [string]$PythonExecutable = "python",
@@ -75,6 +75,7 @@ $pyInstallerArgs = @(
     "--collect-all", "huggingface_hub",
     "--collect-data", "safetensors",
     "--collect-data", "sentence_transformers",
+    "--collect-all", "torchvision",
     "--collect-binaries", "sentencepiece",
     "--hidden-import", "torch",
     "--hidden-import", "torch._C",
@@ -115,6 +116,13 @@ $pyInstallerArgs = @(
     "--hidden-import", "transformers.models.qwen3_asr.configuration_qwen3_asr",
     "--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr",
     "--hidden-import", "transformers.models.qwen3_asr.processing_qwen3_asr",
+    "--hidden-import", "transformers.models.hrm_text",
+    "--hidden-import", "transformers.models.hrm_text.configuration_hrm_text",
+    "--hidden-import", "transformers.models.hrm_text.modeling_hrm_text",
+    "--hidden-import", "transformers.models.minicpmv4_6",
+    "--hidden-import", "transformers.models.minicpmv4_6.configuration_minicpmv4_6",
+    "--hidden-import", "transformers.models.minicpmv4_6.modeling_minicpmv4_6",
+    "--hidden-import", "transformers.models.minicpmv4_6.processing_minicpmv4_6",
     "--hidden-import", "scansci_html.local_asr",
     "--hidden-import", "transformers.models.qwen2.tokenization_qwen2_fast",
     "--hidden-import", "scansci_html.local_runtime_server",
@@ -123,7 +131,7 @@ $pyInstallerArgs = @(
     "--specpath", $specPath,
     $entryPoint
 )
-foreach ($module in @("__main__", "boto3", "botocore", "cv2", "IPython", "jupyter", "keras", "matplotlib", "pandas", "pygame", "pytest", "tensorflow", "torchaudio", "torchvision", "torch.utils.benchmark")) {
+foreach ($module in @("__main__", "boto3", "botocore", "cv2", "IPython", "jupyter", "keras", "matplotlib", "pandas", "pygame", "pytest", "tensorflow", "torchaudio", "torch.utils.benchmark")) {
     $pyInstallerArgs += @("--exclude-module", $module)
 }
 if ($Clean) { $pyInstallerArgs = @("--clean") + $pyInstallerArgs }

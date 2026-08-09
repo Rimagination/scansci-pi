@@ -83,12 +83,13 @@ def _message(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw.get("sources"), list):
         result["sources"] = _bounded_json(raw["sources"])
     if isinstance(raw.get("images"), list):
-        # Keep the attachment name/type for a useful history preview, but not
-        # the potentially multi-megabyte image data URL.
+        # Keep the durable attachment reference for history previews, but not
+        # the potentially multi-megabyte image data URL.  Older versions only
+        # kept name/type/size, which made the thumbnail disappear after reload.
         result["images"] = [
             {
                 key: _bounded_json(item.get(key))
-                for key in ("name", "type", "size")
+                for key in ("id", "name", "mime_type", "type", "size", "preview_url")
                 if isinstance(item, dict) and item.get(key) is not None
             }
             for item in raw["images"][:_MAX_LIST_ITEMS]
@@ -186,14 +187,22 @@ class DirectChatHistoryStore:
             "message_count": len(messages),
             "session_id": str(row.get("session_id", "") or ""),
             "model": deepcopy(row.get("model")),
+            "archived": bool(row.get("archived", False)),
         }
 
-    def list(self, limit: int = 200) -> dict[str, Any]:
+    def list(self, limit: int = 200, *, view: str = "active") -> dict[str, Any]:
+        requested_view = str(view or "active").strip().lower()
+        if requested_view not in {"active", "archived", "all"}:
+            requested_view = "active"
         with self._lock:
             rows = self._read_unlocked()
             rows.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+            if requested_view != "all":
+                wanted_archived = requested_view == "archived"
+                rows = [row for row in rows if bool(row.get("archived", False)) == wanted_archived]
             return {
                 "ok": True,
+                "view": requested_view,
                 "conversations": [self._summary(row) for row in rows[: max(1, min(_MAX_CONVERSATIONS, int(limit or 200)))]],
             }
 
@@ -226,8 +235,32 @@ class DirectChatHistoryStore:
                 "session_id": _text(payload.get("session_id"), 200),
                 "messages": messages,
                 "model": self._model(messages),
+                "archived": False,
             }
             rows = [item for item in rows if str(item.get("conversation_id", "")) != conversation_id]
             rows.insert(0, row)
             self._write_unlocked(rows)
             return {"ok": True, **deepcopy(row)}
+
+    def set_archived(self, conversation_id: str, archived: bool) -> dict[str, Any]:
+        wanted = _text(conversation_id, 160)
+        with self._lock:
+            rows = self._read_unlocked()
+            for row in rows:
+                if str(row.get("conversation_id", "")) != wanted:
+                    continue
+                row["archived"] = bool(archived)
+                row["updated_at"] = _now()
+                self._write_unlocked(rows)
+                return {"ok": True, **deepcopy(row)}
+        raise FileNotFoundError("Direct conversation does not exist")
+
+    def delete(self, conversation_id: str) -> dict[str, Any]:
+        wanted = _text(conversation_id, 160)
+        with self._lock:
+            rows = self._read_unlocked()
+            remaining = [row for row in rows if str(row.get("conversation_id", "")) != wanted]
+            if len(remaining) == len(rows):
+                raise FileNotFoundError("Direct conversation does not exist")
+            self._write_unlocked(remaining)
+            return {"ok": True, "conversation_id": wanted}

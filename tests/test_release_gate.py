@@ -417,6 +417,7 @@ def test_release_build_keeps_long_pyinstaller_output_in_its_artifact_log(tmp_pat
     assert Path(command[output_dir_index]) == gate.package_staging_root
     runtime_manifest_index = command.index("-RuntimeManifestUrl") + 1
     assert command[runtime_manifest_index] == "https://downloads.example.com/runtime.json"
+    assert "-ExcludeRuntimes" not in command
     assert gate.package_dir == gate.package_staging_root / "ScanSci"
     assert len(str(gate.package_dir)) < len(str(gate.release_dir / "ScanSci"))
 

@@ -8,11 +8,14 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     script = (ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8-sig")
 
     assert '[string]$PackageProfile = "core"' in script
-    assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json' in script
+    assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json' in script
+    assert 'Slim channel: do not embed node.exe or tectonic.exe in the bundle.' in script
     assert 'build\\desktop-cache\\$cacheName' in script
+    assert '$ExcludeRuntimes|$RuntimeManifestUrl' in script
     assert '$sourceTreeHash' in script
     assert 'source_tree_sha256 = $sourceTreeHash' in script
     assert 'release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()' in script
+    assert 'exclude_runtimes = [bool]$ExcludeRuntimes' in script
     assert '"--additional-hooks-dir", $pyInstallerHooks' in script
     assert 'scripts\\pyinstaller_hooks' in script
     assert '(Join-Path $pyInstallerHooks "hook-litellm.py")' in script
@@ -35,6 +38,8 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     assert '"--hidden-import", "transformers.generation.streamers"' in script
     assert '"--hidden-import", "transformers.models.qwen3.modeling_qwen3"' in script
     assert '"--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr"' in script
+    assert '"--hidden-import", "transformers.models.hrm_text.modeling_hrm_text"' in script
+    assert '"--hidden-import", "transformers.models.minicpmv4_6.modeling_minicpmv4_6"' in script
     assert '"--hidden-import", "transformers"' not in script
     assert '"--hidden-import", "sentence_transformers"' not in script
     assert '"--hidden-import", "torch.testing._internal.logging_tensor"' in script
@@ -72,6 +77,8 @@ def test_local_runtime_has_an_independent_versioned_build() -> None:
     assert '"--hidden-import", "transformers.generation.streamers"' in script
     assert '"--hidden-import", "transformers.models.qwen3.modeling_qwen3"' in script
     assert '"--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr"' in script
+    assert '"--hidden-import", "transformers.models.hrm_text.modeling_hrm_text"' in script
+    assert '"--hidden-import", "transformers.models.minicpmv4_6.modeling_minicpmv4_6"' in script
     assert '"--hidden-import", "transformers"' not in script
     assert '"--hidden-import", "sentence_transformers"' not in script
     assert '"--hidden-import", "torch.testing._internal.logging_tensor"' in script

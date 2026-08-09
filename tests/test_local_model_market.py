@@ -51,6 +51,45 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
     ]
 
 
+def test_installed_models_reuses_a_manually_copied_model_folder(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    folder = tmp_path / "Qwen3-Embedding-0.6B"
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text(
+        json.dumps(
+            {
+                "_name_or_path": "Qwen/Qwen3-Embedding-0.6B",
+                "model_type": "qwen3",
+                "architectures": ["Qwen3Model"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (folder / "model.safetensors").write_bytes(b"weights")
+
+    rows = local_model_market.installed_models()
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert rows[0]["path"] == str(folder)
+    assert rows[0]["ready"] is True
+    assert rows[0]["kind"] == "embedding"
+
+
+def test_installed_models_does_not_rediscover_huggingface_snapshot_hash(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    snapshot = tmp_path / "HuggingFace" / "hub" / "models--Qwen--Qwen2.5-1.5B-Instruct" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}), encoding="utf-8"
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    rows = local_model_market.installed_models()
+
+    assert [row["id"] for row in rows] == ["Qwen/Qwen2.5-1.5B-Instruct"]
+
+
 def test_market_catalog_marks_cached_model_without_network(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
     snapshot = tmp_path / "HuggingFace" / "hub" / "models--Qwen--Qwen2.5-1.5B-Instruct" / "snapshots" / "abc"

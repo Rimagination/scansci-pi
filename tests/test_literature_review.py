@@ -544,10 +544,15 @@ def test_three_way_deterministic_fallback_stays_grounded_and_readable():
 
     result = _deterministic_grounded_review_section(question, planned, evidence)
 
-    assert _review_subject_coverage_complete(question, planned, result["text"])
+    # The deterministic fallback now uses actual evidence quotes instead of
+    # pre-written Chinese templates.  Each evidence row should produce one
+    # grounded sentence with its own citation.
     assert result["citation_ids"] == ["1", "2", "3"]
     assert [sentence["citation_ids"] for sentence in result["sentences"]] == [["1"], ["2"], ["3"]]
     assert "28.4" in result["text"]
+    assert "Transformer" in result["text"]
+    assert "BERT" in result["text"]
+    assert "GPT-3" in result["text"]
     assert _review_text_is_readable(result["text"])
 
 

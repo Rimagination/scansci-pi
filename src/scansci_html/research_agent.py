@@ -266,6 +266,12 @@ def _pi_should_run(
         return route != "direct_chat"
     if _pi_requires_tools(task_mode, user_text):
         return True
+    # A web toggle ("on" or "auto") must activate Pi so the model receives
+    # the search tools it needs to honour the user's request.  Without Pi,
+    # the model has no tool access and will report that it cannot search.
+    web_parts = {"web", "web-auto"}
+    if _pi_mode_parts(task_mode) & web_parts:
+        return True
     return bool(_pi_mode_parts(task_mode) - {"general", "web-auto"})
 
 
@@ -1365,6 +1371,7 @@ class _DirectChatRequest:
     knowledge_scope: dict[str, Any]
     manifest: RunManifest | None = None
     vision_route: dict[str, Any] = field(default_factory=dict)
+    image_attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 class _DurableModelClient:
@@ -4054,6 +4061,8 @@ class ResearchAgentRuntime:
             "model": {"provider_id": chat_request.provider_id, "model_id": chat_request.model_id},
             "agent_runtime": agent_runtime,
         }
+        if chat_request.image_attachments:
+            result["user_images"] = list(chat_request.image_attachments)
         if ingestion:
             result["ingestion"] = ingestion
             message["sources"] = list(ingestion.get("sources", []) or [])
@@ -5176,6 +5185,7 @@ class ResearchAgentRuntime:
                         "model_id": str(agent_runtime.get("effective_model_id") or chat_request.model_id),
                     },
                     "agent_runtime": agent_runtime,
+                    **({"user_images": list(chat_request.image_attachments)} if chat_request.image_attachments else {}),
                     **({"stats": session_stats} if session_stats else {}),
                     **({"ingestion": ingestion} if ingestion else {}),
                 },
@@ -6475,7 +6485,7 @@ class ResearchAgentRuntime:
                 if source:
                     lines.append(f"  - 当时使用：{source}")
                 lines.append(f"  - 原因：{detail}")
-                lines.append("  - 操作：打开“设置 → 资源配置 → 下载任务”后点击“重试”")
+                lines.append("  - 操作：打开“设置 → 本地模型 → 下载任务”后点击“重试”")
             install_job = dict(runtime.get("install_job", {}) or {})
             if str(install_job.get("state", "idle")) in {"queued", "installing"}:
                 progress = round(float(install_job.get("progress", 0.0) or 0.0) * 100)
@@ -6575,7 +6585,27 @@ class ResearchAgentRuntime:
             parser=str(payload.get("attachment_parser", "auto")),
         )
 
-    def _prepare_direct_audio(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def transcribe_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Transcribe composer audio without starting a chat completion.
+
+        The microphone input is an input method, not a chat attachment.  The
+        UI can therefore show the returned text in the composer immediately
+        and only send the final text to the selected assistant model.
+        """
+
+        _prepared, audio_info = self._prepare_direct_audio(payload, require_message=False)
+        return {
+            "transcripts": list(audio_info.get("transcripts", []) or []),
+            "attachments": list(audio_info.get("attachments", []) or []),
+            "model_id": str(audio_info.get("model_id", "")),
+        }
+
+    def _prepare_direct_audio(
+        self,
+        payload: dict[str, Any],
+        *,
+        require_message: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Persist and transcribe local audio before the chat model is called.
 
         The answer model remains the user's selected chat model.  Audio is a
@@ -6634,6 +6664,13 @@ class ResearchAgentRuntime:
             path, _content_type = audio_attachment_asset(self.workspace, str(attachment.get("id", "")))
             text = transcribe_local_audio(model_id, path, language=language)
             transcripts.append({"name": str(attachment.get("name", "音频")), "text": text})
+
+        if not require_message:
+            return dict(payload), {
+                "model_id": model_id,
+                "attachments": attachments,
+                "transcripts": transcripts,
+            }
 
         messages = [dict(item) for item in list(payload.get("messages", []) or []) if isinstance(item, dict)]
         user_index = next(
@@ -6835,6 +6872,7 @@ class ResearchAgentRuntime:
             "say that a fixed parameter has a 95% probability of lying in the single observed interval."
         )
         messages.insert(0, {"role": "system", "content": system_context})
+        image_attachments: list[dict[str, Any]] = []
         if provider_id == "local-huggingface":
             # Registering the selected snapshot starts only a loopback server;
             # weights are loaded lazily by the first completion request so the
@@ -6843,8 +6881,8 @@ class ResearchAgentRuntime:
             provider = dict(provider)
             provider["base_url"] = ensure_local_transformers_runtime(model_id)
         if raw_images:
-            attachments = persist_image_attachments(self.workspace, raw_images)
-            blocks = vision_image_blocks(self.workspace, attachments)
+            image_attachments = persist_image_attachments(self.workspace, raw_images)
+            blocks = vision_image_blocks(self.workspace, image_attachments)
             text = str(messages[-1].get("content", ""))
             if vision_route.get("mode") == "ocr-fallback":
                 ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
@@ -6916,6 +6954,7 @@ class ResearchAgentRuntime:
             knowledge_scope=dict(payload.get("knowledge_scope", {}) or {}),
             manifest=manifest,
             vision_route=vision_route,
+            image_attachments=image_attachments,
         )
 
     @staticmethod

@@ -16,6 +16,7 @@ _PACKAGED_BUILD_INFO_KEYS = {
     "built_at",
     "commit",
     "package_profile",
+    "exclude_runtimes",
     "runtime_manifest_url",
     "cache_key",
     "source_tree_sha256",

@@ -737,8 +737,10 @@ class NotebookWebApp:
         if path == "/api/pi/status":
             return self._json(HTTPStatus.OK, self.research_agent.pi_status())
         if path == "/api/chat/history":
-            limit = min(200, max(1, int(parse_qs(query).get("limit", [200])[0] or 200)))
-            return self._json(HTTPStatus.OK, self.direct_chat_history.list(limit=limit))
+            params = parse_qs(query)
+            limit = min(200, max(1, int(params.get("limit", [200])[0] or 200)))
+            view = str(params.get("view", ["active"])[0] or "active").strip().lower()
+            return self._json(HTTPStatus.OK, self.direct_chat_history.list(limit=limit, view=view))
         if path == "/api/chat/sessions":
             return self._json(HTTPStatus.OK, self.research_agent.list_chat_sessions())
         if path == "/api/chat/stats":
@@ -846,10 +848,20 @@ class NotebookWebApp:
             return self._json(HTTPStatus.CREATED, self._bind_library_folder(payload))
         if path == "/api/ask":
             return self._ask(payload)
+        if path == "/api/audio/transcribe":
+            return self._json(HTTPStatus.OK, self.research_agent.transcribe_audio(payload))
         if path == "/api/chat":
             return self._json(HTTPStatus.OK, self.research_agent.chat(payload))
         if path == "/api/chat/history":
             return self._json(HTTPStatus.OK, self.direct_chat_history.upsert(payload))
+        if len(parts) == 5 and parts[:3] == ["api", "chat", "history"]:
+            conversation_id, action = parts[3], parts[4]
+            if action == "archive":
+                return self._json(HTTPStatus.OK, self.direct_chat_history.set_archived(conversation_id, True))
+            if action == "restore":
+                return self._json(HTTPStatus.OK, self.direct_chat_history.set_archived(conversation_id, False))
+            if action == "delete":
+                return self._json(HTTPStatus.OK, self.direct_chat_history.delete(conversation_id))
         if path == "/api/chat/compact":
             return self._json(HTTPStatus.OK, self.research_agent.compact_chat(payload))
         if path == "/api/chat/cancel":

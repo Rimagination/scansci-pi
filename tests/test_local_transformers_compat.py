@@ -5,7 +5,7 @@ import sys
 from scansci_html import local_transformers_compat
 
 
-def test_text_only_runtime_disables_frozen_media_backends(monkeypatch) -> None:
+def test_local_runtime_disables_audio_but_keeps_vision_backend(monkeypatch) -> None:
     import_utils = ModuleType("transformers.utils.import_utils")
 
     def package_available(name: str, return_version: bool = False) -> tuple[bool, str]:
@@ -35,8 +35,8 @@ def test_text_only_runtime_disables_frozen_media_backends(monkeypatch) -> None:
 
     local_transformers_compat.configure_text_only_transformers()
 
-    assert import_utils._is_package_available("torchvision") == (False, "N/A")
+    assert import_utils._is_package_available("torchvision") == (True, "1.0.0")
     assert import_utils._is_package_available("torchaudio") == (False, "N/A")
     assert import_utils._is_package_available("torch") == (True, "1.0.0")
-    assert import_utils.is_torchvision_available() is False
+    assert import_utils.is_torchvision_available() is True
     assert import_utils.is_torchaudio_available() is False

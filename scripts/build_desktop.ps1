@@ -17,7 +17,7 @@ param(
     # Keep direct/manual builds aligned with the public release contract. An
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
-    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
+    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
     # Slim channel: do not embed node.exe or tectonic.exe in the bundle.
     # The Pi sidecar and slide LaTeX engine then resolve them through the
     # managed runtime components (see runtime_components.py) after one
@@ -102,7 +102,7 @@ $dependencyFiles = @(
 $dependencyHashes = $dependencyFiles | ForEach-Object {
     if (Test-Path -LiteralPath $_ -PathType Leaf) { (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash } else { "missing" }
 }
-$cacheMaterial = "$PackageProfile|$Mode|$Name|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
+$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$RuntimeManifestUrl|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
 if (-not $CacheKey) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($cacheMaterial)
     $digest = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
@@ -132,6 +132,7 @@ $buildInfo = [ordered]@{
     built_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     commit = $commit
     package_profile = $PackageProfile
+    exclude_runtimes = [bool]$ExcludeRuntimes
     runtime_manifest_url = $RuntimeManifestUrl
     cache_key = $CacheKey
     source_tree_sha256 = $sourceTreeHash
@@ -217,6 +218,7 @@ if ($PackageProfile -eq "full") {
         "--collect-data", "transformers",
         "--collect-data", "safetensors",
         "--collect-data", "sentence_transformers",
+        "--collect-all", "torchvision",
         "--collect-binaries", "sentencepiece",
         "--hidden-import", "torch",
         "--hidden-import", "torch._C",
@@ -260,6 +262,13 @@ if ($PackageProfile -eq "full") {
         "--hidden-import", "transformers.models.qwen3_asr.configuration_qwen3_asr",
         "--hidden-import", "transformers.models.qwen3_asr.modeling_qwen3_asr",
         "--hidden-import", "transformers.models.qwen3_asr.processing_qwen3_asr",
+        "--hidden-import", "transformers.models.hrm_text",
+        "--hidden-import", "transformers.models.hrm_text.configuration_hrm_text",
+        "--hidden-import", "transformers.models.hrm_text.modeling_hrm_text",
+        "--hidden-import", "transformers.models.minicpmv4_6",
+        "--hidden-import", "transformers.models.minicpmv4_6.configuration_minicpmv4_6",
+        "--hidden-import", "transformers.models.minicpmv4_6.modeling_minicpmv4_6",
+        "--hidden-import", "transformers.models.minicpmv4_6.processing_minicpmv4_6",
         "--hidden-import", "scansci_html.local_asr",
         "--hidden-import", "transformers.models.qwen2.tokenization_qwen2_fast",
         "--hidden-import", "scansci_html.local_runtime_server"
@@ -291,7 +300,6 @@ $excludedModules = @(
     "pytest",
     "tensorflow",
     "torchaudio",
-    "torchvision",
     # Never collect the benchmark tree into an end-user runtime. PyTorch's
     # single runtime dependency under torch.testing._internal is declared
     # explicitly above; the custom hook still excludes the rest as data.

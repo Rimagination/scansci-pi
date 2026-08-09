@@ -40,6 +40,7 @@ class _LoadedASR:
     model: Any
     torch: Any
     device: str
+    dtype: Any | None = None
 
 
 class LocalASRRuntime:
@@ -68,7 +69,7 @@ class LocalASRRuntime:
                     audio=str(path),
                     language=str(language or "").strip() or None,
                 )
-                inputs = _move_inputs(request_inputs, loaded.device)
+                inputs = _move_inputs(request_inputs, loaded.device, floating_dtype=loaded.dtype)
                 with loaded.torch.inference_mode():
                     output_ids = loaded.model.generate(**inputs, max_new_tokens=256)
                 if hasattr(output_ids, "sequences"):
@@ -128,7 +129,7 @@ class LocalASRRuntime:
             AutoProcessor = getattr(transformers, "AutoProcessor")
             AutoModelForMultimodalLM = getattr(transformers, "AutoModelForMultimodalLM")
         except (ImportError, AttributeError) as exc:
-            raise RuntimeError("本地 AI 运行组件未安装或版本过旧，请先在设置 → 资源配置中安装") from exc
+            raise RuntimeError("本地 AI 运行组件未安装或版本过旧，请先在设置 → 本地模型中安装") from exc
 
         kwargs: dict[str, Any] = {
             "local_files_only": True,
@@ -156,25 +157,50 @@ class LocalASRRuntime:
             if cuda_available and "out of memory" in str(exc).lower():
                 raise RuntimeError("本地语音模型加载失败：显存不足，请关闭其他 GPU 程序后重试") from exc
             raise RuntimeError(f"无法加载本地语音模型 {model_id}：{exc}") from exc
-        self._loaded = _LoadedASR(processor=processor, model=model, torch=torch, device=device)
+        model_dtype = getattr(next(model.parameters()), "dtype", None)
+        self._loaded = _LoadedASR(
+            processor=processor,
+            model=model,
+            torch=torch,
+            device=device,
+            dtype=model_dtype,
+        )
         self._model_id = model_id
         self._model_path = model_path
 
 
-def _move_inputs(value: Any, device: str) -> Any:
+def _move_inputs(value: Any, device: str, *, floating_dtype: Any | None = None) -> Any:
     """Move a Transformers ``BatchFeature`` or test double to a device."""
 
+    if isinstance(value, dict):
+        return {
+            key: _move_inputs(item, device, floating_dtype=floating_dtype)
+            for key, item in value.items()
+        }
+    if hasattr(value, "items") and not hasattr(value, "dtype"):
+        try:
+            return {
+                key: _move_inputs(item, device, floating_dtype=floating_dtype)
+                for key, item in value.items()
+            }
+        except TypeError:
+            pass
     if hasattr(value, "to"):
         try:
-            return value.to(device)
+            moved = value.to(device)
         except TypeError:
-            return value.to(device=device)
-    if isinstance(value, dict):
-        return {key: _move_inputs(item, device) for key, item in value.items()}
+            moved = value.to(device=device)
+        is_floating = getattr(moved, "is_floating_point", None)
+        if floating_dtype is not None and callable(is_floating) and bool(is_floating()):
+            try:
+                moved = moved.to(dtype=floating_dtype)
+            except TypeError:
+                moved = moved.to(floating_dtype)
+        return moved
     if isinstance(value, list):
-        return [_move_inputs(item, device) for item in value]
+        return [_move_inputs(item, device, floating_dtype=floating_dtype) for item in value]
     if isinstance(value, tuple):
-        return tuple(_move_inputs(item, device) for item in value)
+        return tuple(_move_inputs(item, device, floating_dtype=floating_dtype) for item in value)
     return value
 
 

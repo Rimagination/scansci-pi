@@ -272,6 +272,12 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "settings-select-menu" in script
     assert "resourceInstallGuideGroup" in script
     assert "resource-install-grid" in script
+    assert "refreshInstalledModelInventory" in script
+    assert "已有可用模型" in script
+    assert "usingExistingModel" in script
+    assert "waitingForSharedRuntime" in script
+    assert "const job = directJob;" in script
+    assert "guided flow now starts one" in script
     assert "function mergeProviderCatalogIntoSettings" in script
     assert "state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);" in script
     assert "local-installed-panel" in script
@@ -437,7 +443,7 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert "function conversationMessageMarkup" in script
     assert "function modelIdentitySnapshot" in script
     assert "model: message.model" in script
-    assert "/api/chat/history?limit=200" in script
+    assert "/api/chat/history?view=${state.historyView" in script
     assert "function persistDirectConversation" in script
     assert "function openDirectConversation" in script
     assert 'data-action="open-direct-conversation"' in script
@@ -794,9 +800,58 @@ def test_composer_web_search_control_is_persistent_and_reaches_pi_contract(tmp_p
     assert "<small>${escapeHtml(provider.name)}</small>" not in script
     assert 'window.localStorage.getItem("scansci.web-search.mode")' in script
     assert 'web_search: state.webSearchMode' in script
+    assert 'web_search: state.webSearchMode' in script[script.index("async function legacyAskQuestion"):]
     assert 'function setWebSearchMode(mode, { announce = true } = {})' in script
+    assert page.count('class="composer-record-button"') == 2
+    assert page.count('data-action="toggle-composer-recording"') == 2
+    assert 'data-action="toggle-composer-recording" data-composer-key="home" role="menuitem"' not in page
+    assert 'data-action="toggle-composer-recording" data-composer-key="chat" role="menuitem"' not in page
+    assert 'data-ui-icon="mic"' in page
+    assert 'data-action="close-settings"' in page
+    assert 'class="settings-back-button"' in page
+    assert "function transcribeComposerRecording" in script
+    assert "function renderComposerRecordingControl" in script
+    assert "function normalizedAudioMimeType" in script
+    assert "mime_type: normalizedAudioMimeType(file.type)" in script
+    assert "function browserRecordingToWavFile" in script
+    assert "encodeAudioBufferAsWav" in script
+    assert "new OfflineAudioContextCtor(1, renderedFrames, 16_000)" in script
+    assert "function capabilityOptionKey" in script
+    assert "function isPreferredAudioModel" in script
+    assert "seenCapabilityOptions" in script
+    assert "composerTranscribing" in script
+    assert 'request("/api/audio/transcribe"' in script
+    assert "globalThis.navigator?.mediaDevices" in script
+    assert "processing_started_at" in script
+    assert "data-processing-timer" in script
+    assert "function updateProcessingTimers" in script
+    assert "renderModelSelectors();" in script[script.index("async function openDirectConversation"):]
+    assert ".conversation-layout.is-direct-conversation .chat-composer" in styles
+    assert "scansci-generation-marquee" in styles
+    assert ".composer-record-spinner" in styles
     assert ".composer-settings-section" in styles
     assert ".composer-segmented-control" in styles
+
+
+def test_audio_transcribe_endpoint_returns_text_without_chat_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    observed: dict[str, object] = {}
+
+    def fake_transcribe(payload):
+        observed.update(payload)
+        return {
+            "transcripts": [{"name": "recording.webm", "text": "这是一段录音。"}],
+            "attachments": [],
+            "model_id": "qwen3-asr",
+        }
+
+    monkeypatch.setattr(app.research_agent, "transcribe_audio", fake_transcribe)
+    result = _payload(app.dispatch("POST", "/api/audio/transcribe", json.dumps({
+        "audio": [{"name": "recording.webm", "mime_type": "audio/webm", "data_url": "data:audio/webm;base64,AA=="}],
+    }).encode("utf-8")))
+
+    assert result["transcripts"][0]["text"] == "这是一段录音。"
+    assert observed["audio"][0]["name"] == "recording.webm"
 
 
 def test_home_modes_include_actionable_paper_download_workbench(tmp_path: Path):
@@ -929,7 +984,7 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert "metadata.imported_from_folder" in script
     assert "文件与文件夹已连接" in script
     assert "const taskEntries = downloadTaskEntries().slice(0, 6);" not in script
-    assert "模型下载只有一个入口" in script
+    assert "模型下载和本地组件都从这里管理" in script
     assert 'data-action="open-local-models"' in script
     assert "选择个人知识库后，可在右侧直接链接文件或文件夹。" in script
     assert '["academic", "deep-research"].includes(state.researchWorkflow)' in script
@@ -1551,7 +1606,7 @@ def test_failed_component_download_question_reports_the_actual_failed_job(
     assert "失败模型：Qwen/Qwen3-Reranker-0.6B" in answer
     assert "失败文件：model.safetensors" in answer
     assert "当时使用：modelscope" in answer
-    assert "设置 → 资源配置 → 下载任务" in answer
+    assert "设置 → 本地模型 → 下载任务" in answer
 
 
 def test_notebook_webapp_allows_direct_chat_without_a_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1602,6 +1657,43 @@ def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_pat
     assert reopened["messages"][0]["images"] == [{"name": "brief.png"}]
     assert "data_url" not in json.dumps(reopened, ensure_ascii=False)
     assert reopened["messages"][1]["model"]["model_name"] == "DeepSeek V4 Flash"
+
+
+def test_direct_chat_history_api_preserves_attachment_reference_and_archive_actions(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    payload = {
+        "conversation_id": "direct-history-image-1",
+        "messages": [{
+            "role": "user",
+            "content": "查看图片",
+            "images": [{
+                "id": "image-0123456789abcdef0123456789abcdef",
+                "name": "figure.png",
+                "mime_type": "image/png",
+                "size": 42,
+                "preview_url": "/api/attachments/image-0123456789abcdef0123456789abcdef",
+                "data_url": "data:image/png;base64,should-not-be-stored",
+            }],
+        }],
+    }
+
+    saved = _payload(app.dispatch("POST", "/api/chat/history", json.dumps(payload).encode("utf-8")))
+    assert saved["messages"][0]["images"][0]["preview_url"].startswith("/api/attachments/")
+    archived = _payload(app.dispatch("POST", "/api/chat/history/direct-history-image-1/archive", b"{}"))
+    assert archived["archived"] is True
+    assert _payload(app.dispatch("GET", "/api/chat/history?view=active"))["conversations"] == []
+    assert _payload(app.dispatch("GET", "/api/chat/history?view=archived"))["conversations"][0]["archived"] is True
+    restored = _payload(app.dispatch("POST", "/api/chat/history/direct-history-image-1/restore", b"{}"))
+    assert restored["archived"] is False
+    reopened = _payload(app.dispatch("GET", "/api/chat/history/direct-history-image-1"))
+    assert reopened["messages"][0]["images"] == [{
+        "id": "image-0123456789abcdef0123456789abcdef",
+        "name": "figure.png",
+        "mime_type": "image/png",
+        "size": 42,
+        "preview_url": "/api/attachments/image-0123456789abcdef0123456789abcdef",
+    }]
+    assert "should-not-be-stored" not in json.dumps(reopened, ensure_ascii=False)
 
 
 def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1714,6 +1806,7 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
     assert result["agent_runtime"]["harness"] == "direct-provider"
     assert result["agent_runtime"]["task_mode"] == "general"
     assert result["agent_runtime"]["vision_route"]["model_id"] == "vision-model"
+    assert result["user_images"] == [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}]
     assert isinstance(observed["messages"][-1]["content"], list)
 
 

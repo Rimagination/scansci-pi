@@ -124,6 +124,97 @@ def _snapshot(folder: Path) -> Path | None:
     return max(rows, key=lambda item: item.stat().st_mtime) if rows else None
 
 
+def _read_model_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _model_weight_files(folder: Path) -> list[Path]:
+    """Return weights stored directly in a model directory.
+
+    Hugging Face's cache layout keeps weights in a snapshot, while manually
+    copied models usually put them beside ``config.json``.  Supporting both
+    layouts is important after an app update: a user should not be sent back
+    to a multi-gigabyte download merely because the folder was copied from a
+    different tool.
+    """
+
+    weights: list[Path] = []
+    for pattern in ("*.safetensors", "*.bin", "*.gguf", "*.pt", "*.pth"):
+        try:
+            weights.extend(item for item in folder.glob(pattern) if item.is_file())
+        except OSError:
+            continue
+    return weights
+
+
+def _canonical_model_id(folder: Path, config: dict[str, Any]) -> str:
+    marker = _read_model_json(folder / ".scansci-model.json")
+    candidates = [
+        marker.get("repo_id"),
+        marker.get("model_id"),
+        config.get("_name_or_path"),
+        config.get("name_or_path"),
+        config.get("model_id"),
+        folder.name,
+    ]
+    for value in candidates:
+        value = str(value or "").strip().replace("\\", "/")
+        if _MODEL_ID.fullmatch(value):
+            return value
+    folder_name = folder.name
+    if folder_name.startswith("models--"):
+        decoded = folder_name.removeprefix("models--").replace("--", "/")
+        if _MODEL_ID.fullmatch(decoded):
+            return decoded
+    leaf = folder_name.casefold()
+    for item in _CURATED:
+        repo_id = str(item.get("id", ""))
+        if repo_id.rsplit("/", 1)[-1].casefold() == leaf:
+            return repo_id
+    return folder_name
+
+
+def _direct_model_directories(root: Path, *, max_depth: int = 3) -> Iterable[Path]:
+    """Find manually copied model folders without crawling an entire drive."""
+
+    pending: list[tuple[Path, int]] = [(root, 0)]
+    seen: set[str] = set()
+    while pending:
+        folder, depth = pending.pop()
+        try:
+            resolved = folder.resolve()
+        except OSError:
+            continue
+        key = str(resolved).casefold()
+        if key in seen or not resolved.is_dir():
+            continue
+        seen.add(key)
+        # Hugging Face cache snapshots are handled above by ``_hub_roots``.
+        # Do not rediscover ``models--org--name/snapshots/<hash>`` as a second
+        # model whose ID would otherwise be the opaque snapshot hash.
+        parts = {part.casefold() for part in resolved.parts}
+        if "snapshots" in parts and any(part.casefold().startswith("models--") for part in resolved.parts):
+            continue
+        if (resolved / "config.json").is_file() and _model_weight_files(resolved):
+            yield resolved
+            # A valid model directory is a leaf for discovery.  This avoids
+            # walking its auxiliary cache folders and duplicate snapshots.
+            continue
+        if depth >= max_depth:
+            continue
+        try:
+            children = list(resolved.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if child.is_dir() and not child.name.startswith("."):
+                pending.append((child, depth + 1))
+
+
 def _bytes(path: Path) -> int:
     try:
         return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
@@ -179,6 +270,30 @@ def _audio_runtime_info(identifier: str, config: dict[str, Any]) -> dict[str, An
 def installed_models() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     known: set[str] = set()
+
+    def add_snapshot(repo_id: str, snapshot: Path) -> None:
+        marker = f"{repo_id}|{snapshot}".casefold()
+        if marker in known:
+            return
+        known.add(marker)
+        config = _read_model_json(snapshot / "config.json")
+        weights = _model_weight_files(snapshot)
+        kind = _kind(repo_id, config)
+        row = {
+            "id": repo_id,
+            "name": repo_id,
+            "path": str(snapshot),
+            "size_bytes": _bytes(snapshot),
+            "ready": bool(weights),
+            "kind": kind,
+            "architecture": ", ".join(config.get("architectures", [])[:2]) if isinstance(config.get("architectures"), list) else "",
+            "model_type": str(config.get("model_type", "")),
+            "format": "gguf" if any(item.suffix.lower() == ".gguf" for item in weights) else "transformers",
+        }
+        if kind == "audio":
+            row.update(_audio_runtime_info(repo_id, config))
+        rows.append(row)
+
     for configured_root in discover_model_roots():
         for root in _hub_roots(configured_root):
             if not root.is_dir():
@@ -188,33 +303,13 @@ def installed_models() -> list[dict[str, Any]]:
                 if snapshot is None:
                     continue
                 repo_id = folder.name.removeprefix("models--").replace("--", "/")
-                marker = f"{repo_id}|{snapshot}".casefold()
-                if marker in known:
-                    continue
-                known.add(marker)
-                config_path = snapshot / "config.json"
-                config: dict[str, Any] = {}
-                if config_path.is_file():
-                    try:
-                        config = json.loads(config_path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        pass
-                weights = [*snapshot.glob("*.safetensors"), *snapshot.glob("*.bin"), *snapshot.glob("*.gguf")]
-                kind = _kind(repo_id, config)
-                row = {
-                    "id": repo_id,
-                    "name": repo_id,
-                    "path": str(snapshot),
-                    "size_bytes": _bytes(snapshot),
-                    "ready": bool(weights),
-                    "kind": kind,
-                    "architecture": ", ".join(config.get("architectures", [])[:2]) if isinstance(config.get("architectures"), list) else "",
-                    "model_type": str(config.get("model_type", "")),
-                    "format": "gguf" if any(item.suffix.lower() == ".gguf" for item in weights) else "transformers",
-                }
-                if kind == "audio":
-                    row.update(_audio_runtime_info(repo_id, config))
-                rows.append(row)
+                add_snapshot(repo_id, snapshot)
+        # Also accept a normal model folder selected by another downloader.
+        # This scan is limited to known model roots and three directory levels;
+        # it never recursively walks an arbitrary drive.
+        for folder in _direct_model_directories(configured_root):
+            repo_id = _canonical_model_id(folder, _read_model_json(folder / "config.json"))
+            add_snapshot(repo_id, folder)
     return sorted(rows, key=lambda item: str(item["name"]).casefold())
 
 

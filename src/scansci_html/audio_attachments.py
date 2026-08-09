@@ -38,7 +38,10 @@ _AUDIO_TYPES = {
     "audio/aac": ".aac",
     "audio/webm": ".webm",
 }
-_DATA_URL = re.compile(r"^data:(audio/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$")
+_DATA_URL = re.compile(
+    r"^data:(audio/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9!#$&^_.+-]+=[a-zA-Z0-9!#$&^_.+:-]+)*;base64,([A-Za-z0-9+/=]+)$",
+    re.IGNORECASE,
+)
 _ATTACHMENT_ID = re.compile(r"^audio-[a-f0-9]{32}$")
 
 

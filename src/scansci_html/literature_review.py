@@ -515,7 +515,12 @@ def _synthesize_review_in_parts(
             limit=6,
         )
         if not citation_ids:
-            citation_ids = list(evidence_by_id)[:2]
+            # A section with zero relevant citations cannot be grounded —
+            # force-feeding unrelated evidence produces plausible-looking but
+            # fabricated prose.  Mark the gap explicitly and let the coverage
+            # supplement phase add sentences from any remaining evidence.
+            skipped_section_titles.append(str(planned.get("title", "")))
+            continue
         section_evidence = [evidence_by_id[item] for item in citation_ids]
         raw_section: dict[str, Any] = {}
         try:
@@ -733,7 +738,7 @@ def _synthesize_structured_review_section(
         raise ValueError("review section has no evidence")
     required_subjects = _required_review_subjects(question, planned)
     brief = _normalize_writing_brief(writing_brief)
-    length_ranges = {"short": "80 到 140", "standard": "120 到 240", "long": "220 到 380"}
+    length_ranges = {"short": "200 到 400", "standard": "400 到 800", "long": "600 到 1200"}
     audience_labels = {"researcher": "科研人员", "general": "跨学科读者", "student": "研究生"}
     tone_labels = {"academic": "严谨学术", "concise": "简洁直接", "teaching": "解释清楚"}
     messages = [
@@ -875,7 +880,7 @@ def _synthesize_verified_review_section(
                                 },
                                 {"role": "user", "content": claim_text},
                             ],
-                            max_tokens=420,
+                            max_tokens=2048,
                         )
                     ).strip()
                 except Exception:  # translation is optional; the verified source-language claim remains valid
@@ -1245,7 +1250,7 @@ def _synthesize_plain_review_section(
                         ),
                     },
                 ],
-                max_tokens=420,
+                max_tokens=2048,
             )
         ).strip()
     except Exception:
@@ -1380,166 +1385,30 @@ def _deterministic_grounded_subject_sentence(
 ) -> dict[str, Any]:
     """Express a small set of literal model-paper facts without free inference."""
 
-    target = f"{planned.get('title', '')} {planned.get('objective', '')}".casefold()
-    experimental = any(cue in target for cue in ("实验", "评价", "基准", "适配", "下游", "微调"))
-    limitations = any(cue in target for cue in ("局限", "边界", "不足", "limitation", "weakness"))
     ranked = sorted(
         evidence,
         key=lambda row: _subject_evidence_selection_score(planned, row),
         reverse=True,
     )
-    if not experimental and not limitations:
-        literal_sentences: list[str] = []
-        literal_citations: list[str] = []
-
-        def add_literal(text: str, row: dict[str, str]) -> None:
-            citation_id = str(row.get("citation_id", ""))
-            if text and citation_id and text not in literal_sentences:
-                literal_sentences.append(text)
-                literal_citations.append(citation_id)
-
-        if subject == "原始 Transformer":
-            architecture = next(
-                (
-                    row for row in ranked
-                    if "encoder" in str(row.get("exact_quote", "")).casefold()
-                    and "decoder" in str(row.get("exact_quote", "")).casefold()
-                    and "self-attention" in str(row.get("exact_quote", "")).casefold()
-                ),
-                None,
-            )
-            positional = next(
-                (
-                    row for row in ranked
-                    if "positional encoding" in str(row.get("exact_quote", "")).casefold()
-                    and any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("sine", "cosine", "sinusoid"))
-                ),
-                None,
-            )
-            if architecture:
-                add_literal(
-                    "原始 Transformer 的编码器与解码器都使用自注意力：编码器位置可关注前一层全部位置，解码器位置只关注当前位置及此前位置。",
-                    architecture,
-                )
-            if positional:
-                add_literal(
-                    "原始 Transformer 以不同频率的正弦和余弦函数构造位置编码，并将其加入输入表示，使模型能够利用序列中的位置信息。",
-                    positional,
-                )
-        elif subject == "BERT":
-            masked = next(
-                (row for row in ranked if "masked language model" in str(row.get("exact_quote", "")).casefold()),
-                None,
-            )
-            bidirectional = next(
-                (
-                    row for row in ranked
-                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("bidirectional", "bi-directionality"))
-                ),
-                None,
-            )
-            if masked:
-                add_literal(
-                    "BERT 使用掩码语言模型进行预训练，通过遮蔽输入词并预测被遮蔽内容来学习上下文相关表示。",
-                    masked,
-                )
-            if bidirectional:
-                add_literal(
-                    "BERT 使用多层双向 Transformer 编码器；论文将深层双向性作为其实证改进的重要来源进行评估。",
-                    bidirectional,
-                )
-        elif subject == "GPT-3":
-            autoregressive = next(
-                (
-                    row for row in ranked
-                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("autoregressive", "left-to-right"))
-                ),
-                None,
-            )
-            scaling = next(
-                (
-                    row for row in ranked
-                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("175b", "175 billion", "model capacity", "parameters"))
-                ),
-                None,
-            )
-            context = next(
-                (
-                    row for row in ranked
-                    if any(cue in str(row.get("exact_quote", "")).casefold() for cue in ("zero-shot", "one-shot", "few-shot", "in-context"))
-                ),
-                None,
-            )
-            if autoregressive:
-                add_literal(
-                    "GPT-3 使用自回归、从左到右的语言建模目标进行预训练，并依据已有上下文预测后续标记。",
-                    autoregressive,
-                )
-            if scaling:
-                add_literal(
-                    "GPT-3 论文比较多个参数规模，并将完整模型扩展到 1750 亿参数，以检验模型容量变化下的任务表现。",
-                    scaling,
-                )
-            if context:
-                add_literal(
-                    "GPT-3 论文报告零样本、单样本和少样本设置下的结果，用不同数量的上下文示例比较模型的任务表现。",
-                    context,
-                )
-        literal_text = " ".join(literal_sentences).strip()
-        if literal_text and _review_text_is_readable(literal_text):
-            return _cited_text_from_sentences(
-                [
-                    {"text": text, "citation_ids": [citation_id]}
-                    for text, citation_id in zip(literal_sentences, literal_citations)
-                ]
-            )
-
+    # Instead of hardcoded template sentences that look authoritative but are
+    # not derived from evidence, use the actual quote text from ranked evidence
+    # rows.  Each row produces one grounded sentence with its own citation.
+    sentences: list[dict[str, Any]] = []
+    seen_texts: set[str] = set()
     for row in ranked:
         citation_id = str(row.get("citation_id", ""))
         quote = " ".join(str(row.get("exact_quote", "")).split()).strip()
-        folded = quote.casefold()
         if not citation_id or not quote:
             continue
-        text = ""
-        if subject == "原始 Transformer":
-            if experimental and "wmt" in folded and "bleu" in folded:
-                score = re.search(
-                    r"(?:bleu\s+score\s+of|score\s+of|achieves)\s+(\d+(?:\.\d+)?)(?:\s+bleu)?",
-                    folded,
-                )
-                value = score.group(1) if score else ""
-                suffix = f"，引文报告的 BLEU 为 {value}" if value else ""
-                text = f"原始 Transformer 在 WMT 机器翻译任务上以 BLEU 评价模型表现{suffix}；该引文直接报告了该任务上的实验结果。"
-            elif "encoder" in folded and "decoder" in folded and "self-attention" in folded:
-                text = "原始 Transformer 的编码器与解码器都使用自注意力：编码器位置可关注前一层全部位置，解码器位置只关注当前位置及此前位置。"
-            elif "positional encoding" in folded and ("sine" in folded or "cosine" in folded):
-                text = "原始 Transformer 以不同频率的正弦和余弦函数构造位置编码，并将其加入输入表示，使模型能够利用序列中的位置信息。"
-        elif subject == "BERT":
-            if limitations:
-                continue
-            if experimental and "bert" in folded and "fine-tun" in folded:
-                text = "BERT 采用预训练后微调的下游适配方式；引文说明其会针对具体任务选择微调学习率，并以开发集表现确定相应配置。"
-            elif "bert" in folded and "masked language model" in folded:
-                text = "BERT 使用掩码语言模型进行预训练，通过遮蔽输入词并结合双向上下文预测被遮蔽内容，从而学习深层双向表示。"
-            elif "bert" in folded and ("bidirectional" in folded or "bi-directionality" in folded):
-                text = "BERT 的核心设计包括双向 Transformer 编码与预训练任务；论文将深层双向性作为其实证改进的重要来源进行评估。"
-        elif subject == "GPT-3":
-            if limitations and "factual" in folded and any(cue in folded for cue in ("inaccur", "incorrect", "false")):
-                text = "GPT-3 论文指出，模型生成的文本可能出现事实不准确；因此流畅输出并不等同于对具体事实具有可靠访问或核验能力。"
-            elif limitations and "human accuracy" in folded and any(cue in folded for cue in ("identifying", "detecting", "distinguish")):
-                text = "GPT-3 论文以人类识别者区分模型文本与人类文本的准确率评估可辨识性；接近随机水平的结果意味着生成文本较难被区分。"
-            elif limitations and any(cue in folded for cue in ("misuse", "malicious", "difficult to anticipate")):
-                text = "GPT-3 论文指出，语言模型可能被重新用于研究者原本未预期的环境或目的，因此恶意使用方式难以被事先完整预判。"
-            elif limitations:
-                continue
-            elif experimental and any(cue in folded for cue in ("zero-shot", "one-shot", "few-shot")):
-                text = "GPT-3 论文分别报告零样本、单样本和少样本设置下的基准结果，并以这些不同设置比较模型在任务示例数量变化时的表现。"
-            elif re.search(r"\bgpt-?3\b", folded) and ("autoregressive" in folded or "left-to-right" in folded):
-                text = "GPT-3 使用自回归、从左到右的语言建模目标进行预训练，并在推理时依据已有上下文继续预测后续标记。"
-            elif re.search(r"\bgpt-?3\b", folded) and any(cue in folded for cue in ("175b", "parameters", "model capacity")):
-                text = "GPT-3 论文比较了多个参数规模，并将完整模型扩展到 1750 亿参数；实验同时报告不同规模下的零样本、单样本与少样本表现。"
-        if text and _review_text_is_readable(text):
-            return _cited_text_from_sentences([{"text": text, "citation_ids": [citation_id]}])
+        # Truncate to a readable sentence (up to 300 chars) and avoid duplicates.
+        excerpt = quote[:300]
+        if excerpt in seen_texts:
+            continue
+        seen_texts.add(excerpt)
+        if _review_text_is_readable(excerpt):
+            sentences.append({"text": excerpt, "citation_ids": [citation_id]})
+    if sentences:
+        return _cited_text_from_sentences(sentences)
     return {}
 
 

@@ -422,7 +422,7 @@ class OpenAICompatibleChatJsonClient:
             "max_tokens": (
                 768
                 if schema_name in {"answer_claims", "claim_verification", "retrieval_queries"}
-                else 320 if schema_name == "literature_review_section"
+                else 2048 if schema_name == "literature_review_section"
                 else 1024 if schema_name == "literature_review_overview"
                 else 3072 if schema_name == "evidence_grounded_literature_review" else 4096
             ),
@@ -1598,9 +1598,21 @@ def _completion_marker_reminder(messages: list[dict[str, Any]]) -> str:
 def _public_model_error(error: BaseException, *, prefix: str) -> str:
     """Expose actionable status without reflecting provider secrets or bodies."""
 
+    response = getattr(error, "response", None)
     status = getattr(error, "status_code", None)
     if status is None:
-        status = getattr(getattr(error, "response", None), "status_code", None)
+        status = getattr(response, "status_code", None)
+    response_url = str(getattr(response, "url", "") or "").lower()
+    if response_url.startswith(("http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost", "http://[::1]", "https://[::1]")):
+        payload_reader = getattr(response, "json", None)
+        try:
+            payload = payload_reader() if callable(payload_reader) else {}
+        except (TypeError, ValueError, requests.RequestException):
+            payload = {}
+        details = payload.get("error") if isinstance(payload, dict) else None
+        detail = details.get("message") if isinstance(details, dict) else ""
+        if detail:
+            return f"{prefix}锛圚TTP {status}锛夛細{str(detail)[:1000]}"
     normalized = str(error).lower()
     provider_code = _provider_error_code(error)
     request_id = _provider_request_id(error)

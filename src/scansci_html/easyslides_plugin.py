@@ -258,7 +258,7 @@ def render_semantic_deck(
     if not status["ready"]:
         missing = [name for name, available in status.get("pipeline", {}).items() if not available]
         detail = f"缺少：{', '.join(missing)}" if missing else "插件未就绪"
-        raise RuntimeError(f"EasySlides 最新工作流不可用（{detail}），请在资源配置中修复或更新插件后重试。")
+        raise RuntimeError(f"EasySlides 最新工作流不可用（{detail}），请在插件和技能页修复或更新插件后重试。")
 
     plugin_root = Path(status["root"])
     template_id = str(template.get("id", "")).strip()

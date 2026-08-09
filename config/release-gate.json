@@ -171,8 +171,9 @@
     "profile": "core",
     "signature_required": false,
     "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
-    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
-    "max_package_bytes": 1500000000,
+    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json",
+    "exclude_runtimes": true,
+    "max_package_bytes": 450000000,
     "forbidden_top_level_resources": [
       "torch",
       "transformers",

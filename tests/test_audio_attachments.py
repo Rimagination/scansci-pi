@@ -24,6 +24,25 @@ def test_audio_attachment_is_persisted_and_resolved_with_canonical_mime(tmp_path
     assert mime_type == "audio/wav"
 
 
+def test_browser_recording_accepts_webm_opus_codec_parameter(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    records = persist_audio_attachments(
+        workspace,
+        [
+            {
+                "name": "recording.webm",
+                "mime_type": "audio/webm;codecs=opus",
+                "data_url": _data_url("audio/webm;codecs=opus", b"webm-opus-sample"),
+            }
+        ],
+    )
+
+    path, mime_type = audio_attachment_asset(workspace, records[0]["id"])
+    assert path.suffix == ".webm"
+    assert path.read_bytes() == b"webm-opus-sample"
+    assert mime_type == "audio/webm"
+
+
 def test_audio_attachment_rejects_non_audio_and_traversal(tmp_path: Path):
     with pytest.raises(ValueError, match="仅支持"):
         persist_audio_attachments(

@@ -27,7 +27,18 @@ from urllib.request import urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({"torch", "transformers", "sentence_transformers", "tensorflow", "models--"})
+CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({
+    "torch",
+    "transformers",
+    "sentence_transformers",
+    "tensorflow",
+    "models--",
+    # The public core keeps the Pi sidecar and LaTeX engine as separately
+    # managed components.  Catch a packaging regression even when the files
+    # are placed below an otherwise innocuous directory.
+    "node.exe",
+    "tectonic.exe",
+})
 
 
 class GateFailure(RuntimeError):
@@ -709,6 +720,8 @@ class ReleaseGate:
         runtime_manifest_url = str(package.get("runtime_manifest_url", "")).strip()
         if runtime_manifest_url:
             command.extend(["-RuntimeManifestUrl", runtime_manifest_url])
+        if bool(package.get("exclude_runtimes", False)):
+            command.append("-ExcludeRuntimes")
         # PyInstaller's full profile emits a long analysis log. Keep it in the
         # release artifact instead of streaming it through a caller-owned
         # console pipe: desktop automation and CI runners may detach that pipe
@@ -739,6 +752,8 @@ class ReleaseGate:
         expected_profile = str(self.contract["package"].get("profile", "core"))
         if str(build_info.get("package_profile", "")) != expected_profile:
             raise GateFailure("Packaged build-info.json does not match the package profile")
+        if bool(self.contract["package"].get("exclude_runtimes", False)) and not bool(build_info.get("exclude_runtimes", False)):
+            raise GateFailure("Packaged build-info.json does not record the slim runtime-component build")
         expected_runtime_manifest = str(self.contract["package"].get("runtime_manifest_url", "")).strip()
         if expected_runtime_manifest and str(build_info.get("runtime_manifest_url", "")).strip() != expected_runtime_manifest:
             raise GateFailure("Packaged build-info.json does not match the runtime component manifest")

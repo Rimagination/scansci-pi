@@ -210,7 +210,7 @@ def select_api_surface(
     return value
 
 
-def _public_error(error: BaseException, *, surface: str) -> ModelTransportError:
+def _public_error(error: BaseException, *, surface: str, base_url: str = "") -> ModelTransportError:
     response = getattr(error, "response", None)
     status = getattr(response, "status_code", None)
     try:
@@ -221,6 +221,24 @@ def _public_error(error: BaseException, *, surface: str) -> ModelTransportError:
         error, (requests.Timeout, requests.ConnectionError)
     )
     suffix = f" (HTTP {status_code})" if status_code else ""
+    # Loopback runtimes are shipped by ScanSci, so their structured error is
+    # safe and materially more useful than a generic HTTP 400.  Never expose
+    # response bodies from remote providers because they may contain secrets
+    # or provider-specific request details.
+    normalized_url = str(base_url or "").strip().lower()
+    if normalized_url.startswith(("http://127.0.0.1", "https://127.0.0.1", "http://localhost", "https://localhost", "http://[::1]", "https://[::1]")):
+        try:
+            payload = response.json() if response is not None else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        detail = payload.get("error", {}).get("message") if isinstance(payload, dict) and isinstance(payload.get("error"), dict) else ""
+        if detail:
+            return ModelTransportError(
+                f"Model {surface} request failed{suffix}: {str(detail)[:1000]}",
+                status_code=status_code,
+                retryable=retryable,
+                api_surface=surface,
+            )
     return ModelTransportError(
         f"Model {surface} request failed{suffix}: {type(error).__name__}",
         status_code=status_code,
@@ -271,12 +289,12 @@ def _request_with_retry(
             return response, None
         except requests.RequestException as error:
             last_error = error
-            public = _public_error(error, surface=surface)
+            public = _public_error(error, surface=surface, base_url=request.base_url)
             if not public.retryable or attempt >= limit - 1:
                 raise public from error
             delay = _retry_delay(error, attempt)
             time.sleep(delay)
-    raise _public_error(last_error or RuntimeError("request failed"), surface=surface)
+    raise _public_error(last_error or RuntimeError("request failed"), surface=surface, base_url=request.base_url)
 
 
 def _iter_sse(response: Any) -> Iterator[dict[str, Any]]:

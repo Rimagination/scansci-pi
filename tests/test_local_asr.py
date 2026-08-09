@@ -38,6 +38,18 @@ class _Model:
         return _Tensor()
 
 
+class _FloatingTensor:
+    def __init__(self):
+        self.moves = []
+
+    def to(self, *args, **kwargs):
+        self.moves.append((args, kwargs))
+        return self
+
+    def is_floating_point(self):
+        return True
+
+
 def test_local_asr_transcribes_a_ready_snapshot_without_reloading(monkeypatch, tmp_path: Path):
     audio = tmp_path / "sample.wav"
     audio.write_bytes(b"RIFF")
@@ -59,6 +71,15 @@ def test_local_asr_transcribes_a_ready_snapshot_without_reloading(monkeypatch, t
     )
 
     assert runtime.transcribe(record["id"], audio) == "这是一段本地语音转写"
+
+
+def test_move_inputs_casts_floating_features_to_model_dtype():
+    tensor = _FloatingTensor()
+
+    moved = local_asr._move_inputs({"input_features": tensor}, "cuda:0", floating_dtype="bfloat16")
+
+    assert moved["input_features"] is tensor
+    assert tensor.moves == [(("cuda:0",), {}), ((), {"dtype": "bfloat16"})]
 
 
 def test_local_asr_requires_a_complete_transformers_snapshot(monkeypatch, tmp_path: Path):

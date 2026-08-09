@@ -35,9 +35,13 @@ RUNTIME_MANIFEST_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_URL"
 RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
-DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json"
-DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0"
+DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.3/local-transformers.json"
+DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.3"
 _RUNTIME_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 8.0)
+# Loading a downloaded vision/audio model can take longer than the old fixed
+# 45-second window, especially on the first CUDA initialization.  Do not kill
+# a healthy component merely because the model needs time to load.
+_RUNTIME_START_TIMEOUT_SECONDS = 180.0
 
 
 class LocalRuntimeInstallPaused(RuntimeError):
@@ -172,7 +176,7 @@ class LocalRuntimeComponent:
             raise ValueError("本地运行组件缺少模型 ID")
         executable = self.executable()
         if executable is None:
-            raise RuntimeError("本地运行组件尚未安装，请先在设置 → 资源配置中安装")
+            raise RuntimeError("本地运行组件尚未安装，请先在设置 → 本地模型中安装")
         with self._install_lock:
             base_url = self._component_base_url()
             health_model = self._health_model(base_url)
@@ -214,7 +218,7 @@ class LocalRuntimeComponent:
                 )
             except OSError as error:
                 raise RuntimeError(f"无法启动本地运行组件：{error}") from error
-            deadline = time.monotonic() + 45.0
+            deadline = time.monotonic() + _RUNTIME_START_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
                     code = self._process.returncode
@@ -226,7 +230,10 @@ class LocalRuntimeComponent:
                     return base_url
                 time.sleep(0.25)
             self._stop_process_locked()
-            raise RuntimeError("本地运行组件启动超时，请重试或打开资源配置查看组件状态")
+            raise RuntimeError(
+                f"本地运行组件启动超时（已等待 {int(_RUNTIME_START_TIMEOUT_SECONDS)} 秒），"
+                "请重试或打开本地模型查看组件状态"
+            )
 
     def _component_port(self) -> int:
         try:
@@ -601,10 +608,19 @@ class LocalRuntimeComponent:
         if not force and now - self._last_install_persist_at < 0.75:
             return
         self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.install_job_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(self._install_job, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.install_job_path)
-        self._last_install_persist_at = now
+        # Each installer thread gets its own temporary file.  A shared
+        # ``install-job.json.tmp`` can be replaced or removed by a concurrent
+        # cancellation/status writer on Windows, producing a noisy background
+        # PermissionError even though the install itself is still recoverable.
+        temporary = self.install_job_path.with_name(
+            f"{self.install_job_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(json.dumps(self._install_job, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.install_job_path)
+            self._last_install_persist_at = now
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def ensure_installed(self) -> Path | None:
         """Return an active component without starting a download.

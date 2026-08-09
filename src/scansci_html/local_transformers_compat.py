@@ -1,22 +1,23 @@
-"""Runtime compatibility switches for ScanSci's text-only Transformers sidecar."""
+"""Runtime compatibility switches for ScanSci's local Transformers sidecar."""
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
 
-_DISABLED_OPTIONAL_PACKAGES = frozenset({"torchaudio", "torchvision"})
+_DISABLED_OPTIONAL_PACKAGES = frozenset({"torchaudio"})
 _configured = False
 
 
 def configure_text_only_transformers() -> None:
-    """Prevent frozen text inference from probing excluded media backends.
+    """Prevent frozen inference from probing the unavailable audio backend.
 
     Recent Transformers releases import generic loss and image helpers while
     resolving ``PreTrainedModel``.  In a frozen application, distribution
     metadata for torchvision can remain discoverable even when the package was
-    deliberately excluded.  That makes Transformers try to import a backend
-    the text-only runtime neither needs nor ships.
+    deliberately excluded.  Torchvision is intentionally shipped because
+    MiniCPM-V uses it for image preprocessing; only torchaudio remains
+    disabled because ScanSci routes speech input through its ASR component.
 
     Patch the package-availability probe before Sentence Transformers or model
     classes are imported.  Normal text, embedding, reranking, and causal-LM

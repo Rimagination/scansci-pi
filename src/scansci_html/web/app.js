@@ -23,6 +23,7 @@ const state = {
   activeView: "home",
   activeMode: "tools",
   activeSettings: "general",
+  settingsReturnView: "home",
   activeExtensions: "skills",
   extensionDetail: null,
   skillInstallReview: null,
@@ -30,6 +31,7 @@ const state = {
   composerImages: { home: [], chat: [] },
   composerAudio: { home: [], chat: [] },
   composerRecordings: { home: null, chat: null },
+  composerTranscribing: { home: false, chat: false },
   composerSources: { home: [], chat: [] },
   composerSkills: { home: [], chat: [] },
   selectedProviderId: "",
@@ -54,6 +56,7 @@ const state = {
   sessionStats: null,
   contextStatsOpen: false,
   streaming: false,
+  processingTimer: 0,
   conversationAutoFollow: true,
   activeStreamRunId: "",
   toolProgress: null,
@@ -187,7 +190,7 @@ const applicationCopy = Object.freeze({
     backToWorkspace: "返回工作区",
     general: "常规",
     defaultCapabilities: "默认能力",
-    resources: "资源配置",
+    resources: "本地模型",
     modelServices: "模型服务",
     localModels: "本地模型",
     documentProcessing: "文档处理",
@@ -963,6 +966,7 @@ const uiIconPaths = {
   wrench: '<path d="M14.5 6a4 4 0 0 0-5 5l-5 5a2 2 0 1 0 2.8 2.8l5-5a4 4 0 0 0 5-5L14 12l-2-2 2.5-4Z"></path>',
   code: '<path d="m8.5 7-4 5 4 5M15.5 7l4 5-4 5"></path>',
   audio: '<path d="M4 13h2M8 9v6M12 6v12M16 9v6M20 13h-2"></path>',
+  mic: '<path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path><path d="M19 11.5a7 7 0 0 1-14 0M12 18.5V22M8 22h8"></path>',
   video: '<path d="m16 13 5.223 3.482A.5.5 0 0 0 22 16.066V7.87a.5.5 0 0 0-.752-.432L16 10.5"></path><rect x="2" y="6" width="14" height="12" rx="2"></rect>',
   database: '<ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M3 5V19A9 3 0 0 0 21 19V5"></path><path d="M3 12A9 3 0 0 0 21 12"></path>',
   "grip-vertical": '<path d="M9 7h.01M15 7h.01M9 12h.01M15 12h.01M9 17h.01M15 17h.01"></path>',
@@ -2036,13 +2040,20 @@ async function initialize() {
     state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
     state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed);
+    // The current first-run flow is the four-page local-capability guide.
+    // Older builds left onboardingMode empty and therefore rendered the
+    // retired three-page flow with links to the old resource settings page.
+    if (state.onboardingOpen) {
+      state.onboardingMode = "resources";
+      state.resourceGuideStep = 0;
+    }
     renderWorkspace();
     renderResourceOnboarding();
 
     const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
       request("/api/capabilities").catch(() => ({})),
       request("/api/runs?view=all&limit=200").catch(() => ({ runs: [] })),
-      request("/api/chat/history?limit=200").catch(() => ({ conversations: [] })),
+      request(`/api/chat/history?view=${state.historyView === "archived" ? "archived" : "active"}&limit=200`).catch(() => ({ conversations: [] })),
       request("/api/slides/templates").catch(() => ({ available: false, templates: [] })),
       request("/api/local-models/installed").catch(() => ({ models: [] })),
       request("/api/local-models/market").catch(() => ({ items: [] })),
@@ -3222,7 +3233,9 @@ function composerImagePreviewMarkup(images = []) {
   if (!images.length) return "";
   return `<div class="user-image-preview-list">${images.map((image) => {
     const src = image.preview_url || image.data_url || "";
-    return src ? `<img src="${escapeHtml(src)}" alt="${escapeHtml(image.name || "用户图片")}" />` : "";
+    if (!src) return "";
+    const alt = image.name || "用户图片";
+    return `<button type="button" class="user-image-preview-trigger" data-action="open-image-preview" data-image-src="${escapeHtml(src)}" data-image-alt="${escapeHtml(alt)}" aria-label="查看 ${escapeHtml(alt)}"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" /></button>`;
   }).join("")}</div>`;
 }
 
@@ -3509,25 +3522,137 @@ const COMPOSER_AUDIO_TYPES = new Set([
   "audio/flac", "audio/ogg", "audio/aac", "audio/webm",
 ]);
 
+function normalizedAudioMimeType(value = "") {
+  return String(value || "").split(";", 1)[0].trim().toLowerCase();
+}
+
+function writeWavAscii(view, offset, value) {
+  for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+}
+
+function encodeAudioBufferAsWav(audioBuffer) {
+  const frameCount = Number(audioBuffer.length || 0);
+  const channelCount = Math.max(1, Number(audioBuffer.numberOfChannels || 1));
+  const sampleRate = Math.max(8_000, Number(audioBuffer.sampleRate || 16_000));
+  const output = new ArrayBuffer(44 + (frameCount * 2));
+  const view = new DataView(output);
+  writeWavAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + (frameCount * 2), true);
+  writeWavAscii(view, 8, "WAVE");
+  writeWavAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeWavAscii(view, 36, "data");
+  view.setUint32(40, frameCount * 2, true);
+  const channels = Array.from({ length: channelCount }, (_value, index) => audioBuffer.getChannelData(index));
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    let sample = 0;
+    for (const channel of channels) sample += Number(channel[frame] || 0) / channelCount;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(44 + (frame * 2), clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return new Blob([output], { type: "audio/wav" });
+}
+
+async function browserRecordingToWavFile(recordedBlob, stem) {
+  const AudioContextCtor = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (typeof AudioContextCtor !== "function") throw new Error("当前浏览器无法解码麦克风录音");
+  const context = new AudioContextCtor();
+  try {
+    const decoded = await context.decodeAudioData(await recordedBlob.arrayBuffer());
+    let prepared = decoded;
+    const OfflineAudioContextCtor = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
+    if (typeof OfflineAudioContextCtor === "function" && (decoded.sampleRate !== 16_000 || decoded.numberOfChannels !== 1)) {
+      const renderedFrames = Math.max(1, Math.ceil(decoded.duration * 16_000));
+      const offline = new OfflineAudioContextCtor(1, renderedFrames, 16_000);
+      const source = offline.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offline.destination);
+      source.start(0);
+      prepared = await offline.startRendering();
+    }
+    return new File([encodeAudioBufferAsWav(prepared)], `${stem}.wav`, { type: "audio/wav" });
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
 function composerAudioPreviewMarkup(audio = []) {
   if (!audio.length) return "";
   return `<div class="user-audio-preview-list">${audio.map((item) => `<span class="user-audio-preview"><span>${uiIcon("file-audio")}</span><strong>${escapeHtml(item.name || "语音")}</strong></span>`).join("")}</div>`;
 }
 
+function renderComposerRecordingControl(key) {
+  const recording = state.composerRecordings[key];
+  const processing = Boolean(state.composerTranscribing[key]);
+  document.querySelectorAll(`[data-action="toggle-composer-recording"][data-composer-key="${key}"]`).forEach((button) => {
+    const active = Boolean(recording) && !processing;
+    button.classList.toggle("is-recording", active);
+    button.classList.toggle("is-processing", processing);
+    button.disabled = processing;
+    button.setAttribute("aria-pressed", String(active));
+    button.setAttribute("aria-busy", String(processing));
+    button.setAttribute("aria-label", processing ? "正在识别语音" : active ? "停止录音" : "语音输入");
+    const idle = button.querySelector("[data-recording-idle]");
+    const activeView = button.querySelector("[data-recording-active]");
+    const processingView = button.querySelector("[data-recording-processing]");
+    if (idle) idle.hidden = active || processing;
+    if (activeView) activeView.hidden = !active;
+    if (processingView) processingView.hidden = !processing;
+    const duration = button.querySelector("[data-recording-duration]");
+    if (duration && recording) duration.textContent = formatRecordingDuration(performance.now() - recording.startedAt);
+  });
+}
+
 function renderComposerAudio(key) {
   const target = byId(`${key}AudioAttachments`);
-  if (!target) return;
   const audio = state.composerAudio[key] || [];
-  target.hidden = !audio.length;
-  target.innerHTML = audio.map((item) => `<article class="composer-audio-card"><span class="composer-audio-icon">${uiIcon("file-audio")}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(formatFileSize(item.size))}</small></span><button type="button" data-action="remove-composer-audio" data-composer-key="${escapeHtml(key)}" data-audio-id="${escapeHtml(item.id)}" aria-label="移除 ${escapeHtml(item.name)}">×</button></article>`).join("");
-  const recording = state.composerRecordings[key];
-  document.querySelectorAll(`[data-action="toggle-composer-recording"][data-composer-key="${key}"]`).forEach((button) => {
-    const active = Boolean(recording);
-    button.classList.toggle("is-recording", active);
-    button.setAttribute("aria-pressed", String(active));
-    const label = button.querySelector("span:last-child");
-    if (label) label.textContent = active ? "停止录音" : "录制语音";
-  });
+  if (target) {
+    target.hidden = !audio.length;
+    target.innerHTML = audio.map((item) => `<article class="composer-audio-card"><span class="composer-audio-icon">${uiIcon("file-audio")}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(formatFileSize(item.size))}</small></span><button type="button" data-action="remove-composer-audio" data-composer-key="${escapeHtml(key)}" data-audio-id="${escapeHtml(item.id)}" aria-label="移除 ${escapeHtml(item.name)}">×</button></article>`).join("");
+  }
+  renderComposerRecordingControl(key);
+}
+
+function formatRecordingDuration(milliseconds = 0) {
+  const seconds = Math.max(0, Math.floor(Number(milliseconds || 0) / 1000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+async function transcribeComposerRecording(key, file) {
+  state.composerTranscribing[key] = true;
+  renderComposerRecordingControl(key);
+  try {
+    const input = byId(key === "home" ? "homeQuestionInput" : "chatQuestionInput");
+    const dataUrl = await fileToDataUrl(file, "无法读取录音");
+    const result = await request("/api/audio/transcribe", {
+      method: "POST",
+      body: JSON.stringify({
+        audio: [{ name: file.name, mime_type: normalizedAudioMimeType(file.type) || "audio/webm", size: file.size, data_url: dataUrl }],
+      }),
+    });
+    const text = (result.transcripts || [])
+      .map((item) => String(item?.text || "").trim())
+      .filter(Boolean)
+      .join("\n");
+    if (!text) throw new Error("录音没有识别出可用文字");
+    if (input) {
+      const existing = String(input.value || "").trim();
+      input.value = existing ? `${existing}\n${text}` : text;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+    toast("语音已转换为文字");
+  } finally {
+    state.composerTranscribing[key] = false;
+    renderComposerRecordingControl(key);
+  }
 }
 
 async function toggleComposerRecording(key) {
@@ -3536,44 +3661,46 @@ async function toggleComposerRecording(key) {
     existing.recorder.stop();
     return;
   }
-  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-    toast("当前环境不支持麦克风录音，请使用“添加语音”上传音频文件。", true);
+  const mediaDevices = globalThis.navigator?.mediaDevices;
+  const MediaRecorderCtor = globalThis.MediaRecorder;
+  if (!mediaDevices?.getUserMedia || typeof MediaRecorderCtor === "undefined") {
+    toast("当前环境不支持麦克风录音，请检查桌面端的麦克风权限。", true);
     return;
   }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await mediaDevices.getUserMedia({ audio: true });
     const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"]
-      .find((type) => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(type)) || "";
-    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      .find((type) => !MediaRecorderCtor.isTypeSupported || MediaRecorderCtor.isTypeSupported(type)) || "";
+    const recorder = mimeType ? new MediaRecorderCtor(stream, { mimeType }) : new MediaRecorderCtor(stream);
     const chunks = [];
-    const recording = { recorder, stream, chunks, timer: 0, discard: false };
+    const recording = { recorder, stream, chunks, timer: 0, uiTimer: 0, startedAt: performance.now(), discard: false };
     recorder.addEventListener("dataavailable", (event) => {
       if (event.data?.size) chunks.push(event.data);
     });
     recorder.addEventListener("stop", async () => {
       window.clearTimeout(recording.timer);
+      window.clearInterval(recording.uiTimer);
       stream.getTracks().forEach((track) => track.stop());
       if (state.composerRecordings[key] === recording) state.composerRecordings[key] = null;
       renderComposerAudio(key);
       if (recording.discard) return;
       if (!chunks.length) return;
       const type = recorder.mimeType || mimeType || "audio/webm";
-      const extension = type.includes("ogg") ? "ogg" : "webm";
-      const file = new File(
-        [new Blob(chunks, { type })],
-        `录音-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`,
-        { type },
-      );
+      const stem = `录音-${new Date().toISOString().replace(/[:.]/g, "-")}`;
       try {
-        await addComposerAudio(key, [file]);
-        toast("录音已添加");
+        const file = await browserRecordingToWavFile(new Blob(chunks, { type }), stem);
+        await transcribeComposerRecording(key, file);
       } catch (error) {
-        toast(error.message, true);
+        toast(error?.message || "语音转文字失败，请稍后重试", true);
+        if (/语音模型|ASR|本地模型|转写/.test(String(error?.message || ""))) openSettings("local-models");
       }
     });
     state.composerRecordings[key] = recording;
     recorder.start();
+    recording.uiTimer = window.setInterval(() => {
+      if (state.composerRecordings[key] === recording) renderComposerAudio(key);
+    }, 250);
     recording.timer = window.setTimeout(() => {
       if (state.composerRecordings[key] === recording && recorder.state === "recording") {
         recorder.stop();
@@ -3599,7 +3726,7 @@ async function addComposerAudio(key, files) {
   const accepted = [];
   let totalBytes = existing.reduce((sum, item) => sum + Number(item.size || 0), 0);
   for (const file of incoming) {
-    if (!COMPOSER_AUDIO_TYPES.has(String(file.type || "").toLowerCase())) {
+    if (!COMPOSER_AUDIO_TYPES.has(normalizedAudioMimeType(file.type))) {
       toast("仅支持 WAV、MP3、M4A、FLAC、OGG、AAC 或 WebM 音频", true);
       continue;
     }
@@ -3635,6 +3762,7 @@ function clearComposerAudio(key) {
   if (recording) {
     recording.discard = true;
     window.clearTimeout(recording.timer);
+    window.clearInterval(recording.uiTimer);
     if (recording.recorder.state === "recording") recording.recorder.stop();
     recording.stream.getTracks().forEach((track) => track.stop());
     state.composerRecordings[key] = null;
@@ -3987,6 +4115,7 @@ function openMode(mode) {
 }
 
 function openSettings(panel = "general") {
+  if (state.activeView !== "settings") state.settingsReturnView = state.activeView || "home";
   // Keep old deep links working while moving model roles and document tools
   // into the user-facing default-capabilities page.
   const openResourceGuide = panel === "resources";
@@ -3996,6 +4125,13 @@ function openSettings(panel = "general") {
   }
   setView("settings");
   if (openResourceGuide) openResourceGuideOverlay();
+}
+
+function closeSettings() {
+  const returnView = ["home", "mode", "extensions", "mcp"].includes(state.settingsReturnView)
+    ? state.settingsReturnView
+    : "home";
+  setView(returnView);
 }
 
 function openExtensions(tab = "skills") {
@@ -4206,7 +4342,12 @@ function renderTasks() {
     if (record.kind === "direct") {
       const conversationId = String(record.conversation_id || "");
       const active = !state.activeTaskId && state.directConversationId === conversationId;
-      return `<div class="task-row" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status completed">已完成</time></button></div>`;
+      const menuKey = `direct:${conversationId}`;
+      const open = state.historyMenuRunId === menuKey;
+      const organizeAction = archived ? "restore-direct-conversation" : "archive-direct-conversation";
+      const organizeLabel = archived ? "恢复到历史对话" : "归档对话";
+      const organizeIcon = archived ? "archive-restore" : "archive";
+      return `<div class="task-row ${open ? "has-open-menu" : ""}" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status completed">${archived ? "已归档" : "已完成"}</time></button><button type="button" class="task-more" data-action="toggle-direct-menu" data-conversation-id="${escapeHtml(conversationId)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-conversation-id="${escapeHtml(conversationId)}">${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}">${uiIcon("trash")}<span>删除对话</span></button></div>` : ""}</div>`;
     }
     const run = record;
     const open = state.historyMenuRunId === run.run_id;
@@ -4261,6 +4402,14 @@ function toggleHistoryView() {
   state.historyQuery = "";
   state.historySearchOpen = false;
   window.localStorage.setItem("scansci.history.view", state.historyView);
+  renderTasks();
+  refreshDirectConversations().catch((error) => toast(error.message, true));
+}
+
+async function refreshDirectConversations() {
+  const view = state.historyView === "archived" ? "archived" : "active";
+  const payload = await request(`/api/chat/history?view=${view}&limit=200`);
+  state.directConversations = Array.isArray(payload.conversations) ? payload.conversations : [];
   renderTasks();
 }
 
@@ -4324,6 +4473,59 @@ async function deleteTask(runId) {
   toast("对话已删除");
 }
 
+function toggleDirectMenu(conversationId) {
+  const key = `direct:${String(conversationId || "")}`;
+  state.historyMenuRunId = state.historyMenuRunId === key ? "" : key;
+  renderTasks();
+  if (state.historyMenuRunId) {
+    positionTaskMenu();
+    window.requestAnimationFrame(positionTaskMenu);
+    window.setTimeout(positionTaskMenu, 0);
+  }
+}
+
+async function archiveDirectConversation(conversationId) {
+  const id = String(conversationId || "").trim();
+  if (!id) return;
+  state.historyMenuRunId = "";
+  await request(`/api/chat/history/${encodeURIComponent(id)}/archive`, { method: "POST", body: "{}" });
+  state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
+  if (state.directConversationId === id) startTask();
+  else renderTasks();
+  toast("对话已归档");
+}
+
+async function restoreDirectConversation(conversationId) {
+  const id = String(conversationId || "").trim();
+  if (!id) return;
+  state.historyMenuRunId = "";
+  await request(`/api/chat/history/${encodeURIComponent(id)}/restore`, { method: "POST", body: "{}" });
+  state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
+  renderTasks();
+  toast("对话已恢复");
+}
+
+async function deleteDirectConversation(conversationId) {
+  const id = String(conversationId || "").trim();
+  if (!id) return;
+  const record = state.directConversations.find((item) => item.conversation_id === id);
+  const confirmed = await requestConfirmation({
+    eyebrow: "永久删除",
+    title: "删除这条对话？",
+    subject: compact(record?.title || "直接对话", 36),
+    message: "这会删除对话文本和附件引用，已导出的文件不会受到影响。",
+    confirmLabel: "删除对话",
+    danger: true,
+  });
+  if (!confirmed) return;
+  state.historyMenuRunId = "";
+  await request(`/api/chat/history/${encodeURIComponent(id)}/delete`, { method: "POST", body: "{}" });
+  state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
+  if (state.directConversationId === id) startTask();
+  else renderTasks();
+  toast("对话已删除");
+}
+
 function newDirectConversationId() {
   return globalThis.crypto?.randomUUID?.()
     || `direct-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -4340,9 +4542,12 @@ function directHistoryMessage(message) {
   delete copy.control_run_id;
   if (Array.isArray(copy.images)) {
     copy.images = copy.images.map((image) => ({
+      ...(image?.id ? { id: image.id } : {}),
       name: image?.name || "用户图片",
+      ...(image?.mime_type ? { mime_type: image.mime_type } : {}),
       ...(image?.type ? { type: image.type } : {}),
       ...(image?.size ? { size: image.size } : {}),
+      ...(image?.preview_url ? { preview_url: image.preview_url } : {}),
     }));
   }
   if (Array.isArray(copy.audio)) {
@@ -4461,10 +4666,6 @@ function renderSources() {
 
 async function legacyAskQuestion(event, inputId) {
   event.preventDefault();
-  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
-    toast("上一条回复仍在处理，请等待完成。", true);
-    return;
-  }
   const input = byId(inputId);
   const key = composerKey(inputId);
   const images = imagePayloadForComposer(key);
@@ -4478,6 +4679,10 @@ async function legacyAskQuestion(event, inputId) {
   if (!question) return;
   const mode = composerMode(inputId);
   const isDirectConversation = !state.notebook && mode === "general";
+  if (isDirectConversation && (composerSubmissionInFlight || state.streaming || activeDirectChatController)) {
+    toast("上一条回复仍在处理，请等待完成。", true);
+    return;
+  }
   const isStandaloneSlides = mode === "slides" && sourceFiles.length > 0;
   if (!state.notebook && !isDirectConversation && !isStandaloneSlides) {
     toast("写作需要先打开资料库；制作幻灯片可直接添加 PDF、Word、Markdown、TXT 或 HTML。", true);
@@ -4517,19 +4722,21 @@ async function legacyAskQuestion(event, inputId) {
   if (["writing", "deep-research"].includes(mode)) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
   try {
     if (isDirectConversation) {
-      const messages = [...state.directMessages, { role: "user", content: question, audio, created_at: new Date().toISOString() }].slice(-16);
+      const userMessage = { role: "user", content: question, images, audio, created_at: new Date().toISOString() };
+      const messages = [...state.directMessages, userMessage].slice(-16);
       const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
+      streamingMessage = { role: "assistant", content: "", streaming: true, processing_started_at: startedAt, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
       state.directMessages = [...messages, streamingMessage].slice(-16);
       renderDirectConversation();
       let completed = false;
-      await streamChatWithRecovery({ messages, audio, thinking_level: currentThinkingLevel() }, (eventType, event) => {
+      await streamChatWithRecovery({ messages, audio, thinking_level: currentThinkingLevel(), web_search: state.webSearchMode }, (eventType, event) => {
         if (eventType === "delta") {
           streamingMessage.content += String(event.content || "");
           scheduleDirectConversationRender();
           return;
         }
         if (eventType === "done") {
+          if (Array.isArray(event.user_images)) userMessage.images = event.user_images;
           const message = {
             ...event.message,
             model: modelIdentitySnapshot(event.model || event.message?.model || streamingMessage.model),
@@ -4636,10 +4843,6 @@ async function legacyAskQuestion(event, inputId) {
 
 async function askQuestion(event, inputId) {
   event.preventDefault();
-  if (composerSubmissionInFlight || state.streaming || activeDirectChatController) {
-    toast("上一条回复仍在处理，请等待完成。", true);
-    return;
-  }
   // `Event.currentTarget` is only guaranteed while the synchronous submit
   // handler is running. General mode may await the route preview below; by
   // then browsers reset `currentTarget` to null. Capture the form/button
@@ -4683,6 +4886,11 @@ async function askQuestion(event, inputId) {
   // An open historical task is a chat thread. Composer modes only affect new
   // tasks; changing the mode must never fork an already-open conversation.
   const isTaskFollowUp = isTaskConversation;
+  const isLikelyDirectConversation = !isTaskFollowUp && !state.notebook && ["general", "writing"].includes(selectedMode);
+  if (isLikelyDirectConversation && (composerSubmissionInFlight || state.streaming || activeDirectChatController)) {
+    toast("上一条回复仍在处理，请等待完成。", true);
+    return;
+  }
   if (isTaskFollowUp && (sourceFiles.length || images.length || audio.length)) {
     toast("当前对话暂不支持追加附件，请先发送文字反馈。", true);
     return;
@@ -4809,7 +5017,7 @@ async function askQuestion(event, inputId) {
       const userMessage = { role: "user", content: question, skills: selectedSkills, sources: sourceFiles, images, audio, created_at: new Date().toISOString() };
       const messages = [...state.directMessages, userMessage].filter((message) => !message.streaming).slice(-16);
       const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, mode: directChatMode, trace: [], knowledgeScopes, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
+      streamingMessage = { role: "assistant", content: "", streaming: true, processing_started_at: startedAt, mode: directChatMode, trace: [], knowledgeScopes, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
       state.directMessages = [...messages, streamingMessage].slice(-16);
       state.conversationAutoFollow = true;
       renderDirectConversation({ forceFollow: true });
@@ -4870,6 +5078,7 @@ async function askQuestion(event, inputId) {
           }
           if (eventType === "done" || eventType === "RUN_FINISHED") {
             const result = payload.result || payload;
+            if (Array.isArray(result.user_images)) userMessage.images = result.user_images;
             const message = {
               ...result.message,
               model: modelIdentitySnapshot(result.model || result.message?.model || payload.model || streamingMessage.model),
@@ -5136,10 +5345,31 @@ function conversationMessageMarkup({
 
 function processTraceMarkup(message, duration) {
   const trace = Array.isArray(message.trace) ? message.trace : [];
-  if (!trace.length) return "";
-  const status = duration > 0 ? `已处理 <time>${formatProcessingDuration(duration)}</time>` : "正在处理";
+  const live = Boolean(message.streaming && Number(message.processing_started_at || 0));
+  if (!trace.length && !live && duration <= 0) return "";
+  const liveDuration = live ? Math.max(0, performance.now() - Number(message.processing_started_at)) : duration;
+  const status = live
+    ? `已处理 <time data-processing-timer="${escapeHtml(String(message.processing_started_at))}">${formatProcessingDuration(liveDuration)}</time>`
+    : duration > 0 ? `已处理 <time>${formatProcessingDuration(duration)}</time>` : "正在处理";
   const rows = trace.map((item) => `<li><strong>${escapeHtml(item.title || "处理步骤")}</strong><span>${escapeHtml(item.detail || "")}</span></li>`).join("");
-  return `<details class="answer-processing" aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}</details>`;
+  return `<details class="answer-processing ${live ? "is-live" : ""}" aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}</details>`;
+}
+
+function updateProcessingTimers() {
+  const timers = [...document.querySelectorAll("[data-processing-timer]")];
+  if (!timers.length) {
+    if (state.processingTimer) {
+      window.clearInterval(state.processingTimer);
+      state.processingTimer = 0;
+    }
+    return;
+  }
+  const now = performance.now();
+  timers.forEach((timer) => {
+    const startedAt = Number(timer.dataset.processingTimer || 0);
+    timer.textContent = formatProcessingDuration(Math.max(0, now - startedAt));
+  });
+  if (!state.processingTimer) state.processingTimer = window.setInterval(updateProcessingTimers, 250);
 }
 
 const knowledgeRetrievalToolNames = new Set([
@@ -5425,6 +5655,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     });
   }).join("");
   byId("answerArea").innerHTML = `<article class="conversation-thread">${turns}</article>`;
+  updateProcessingTimers();
   state.directMessages.forEach((message, index) => {
     if (message.role !== "assistant" || !message.reader_answer?.citations?.length) return;
     const scope = byId("answerArea")?.querySelector(`[data-direct-evidence-answer="${index}"]`);
@@ -7833,6 +8064,7 @@ async function openDirectConversation(conversationId, { record = true } = {}) {
   applyContextPanelPreset(mode === "knowledge" ? "knowledge" : "none");
   byId("conversationTitle").textContent = compact(conversation.title || directConversationTitle(state.directMessages), 80);
   setView("conversation", { record });
+  renderModelSelectors();
   renderDirectConversation({ forceFollow: false });
   void restoreSessionStats();
   renderTasks();
@@ -7870,6 +8102,7 @@ async function openTask(id, { record = true } = {}) {
     // including its durable message history, replaces the visible thread.
     state.lastRunRenderKey = "";
     setView("conversation", { record });
+    renderModelSelectors();
     try {
       renderRun(displayRun);
     } catch (error) {
@@ -8499,6 +8732,7 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     legacyJobId: "retrieval-core",
     models: [ONBOARDING_EMBEDDING_MODEL],
     runtime: "huggingface",
+    compatibleKinds: ["embedding"],
     eyebrow: "推荐 · 语义检索",
     title: "嵌入模型",
     description: "把问题和文献内容转换为向量，提升知识库检索的召回率。",
@@ -8511,6 +8745,7 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     legacyJobId: "retrieval-core",
     models: [ONBOARDING_RERANKER_MODEL],
     runtime: "huggingface",
+    compatibleKinds: ["reranking"],
     eyebrow: "推荐 · 结果优化",
     title: "重排模型",
     description: "对候选文献和证据片段再次排序，减少无关结果。",
@@ -8522,6 +8757,7 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     jobId: `model:${ONBOARDING_CHAT_MODEL}`,
     models: [ONBOARDING_CHAT_MODEL],
     runtime: "huggingface",
+    compatibleKinds: ["chat"],
     eyebrow: "可选 · 本地对话",
     title: "小型本地对话模型",
     description: "在网络不稳定或想离线工作时，提供一个可在本机运行的基础对话模型。",
@@ -8533,6 +8769,7 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     jobId: `model:${ONBOARDING_VISION_MODEL}`,
     models: [ONBOARDING_VISION_MODEL],
     runtime: "huggingface",
+    compatibleKinds: ["vision"],
     vision: true,
     eyebrow: "可选 · 视觉理解",
     title: "视觉模型",
@@ -8545,6 +8782,7 @@ const ONBOARDING_RESOURCE_DEFINITIONS = {
     jobId: `model:${ONBOARDING_AUDIO_MODEL}`,
     models: [ONBOARDING_AUDIO_MODEL],
     runtime: "huggingface",
+    compatibleKinds: ["audio"],
     audio: true,
     eyebrow: "可选 · 语音转写",
     title: "语音模型",
@@ -8559,6 +8797,7 @@ const LEGACY_RETRIEVAL_RESOURCE = {
   jobId: "retrieval-core",
   models: ONBOARDING_RETRIEVAL_MODELS,
   runtime: "huggingface",
+  compatibleKinds: ["embedding", "reranking"],
   eyebrow: "推荐 · 知识库能力",
   title: "研究检索组件",
   description: "用于语义检索、知识库问答和证据重排；没有它仍可使用基础关键词检索。",
@@ -8574,6 +8813,19 @@ function onboardingPreferences() {
   };
 }
 
+function localModelSupportsResource(model, resource) {
+  if (!model?.ready || model.runtime_compatible === false) return false;
+  const kinds = Array.isArray(resource?.compatibleKinds) ? resource.compatibleKinds : [];
+  if (!kinds.includes(String(model.kind || ""))) return false;
+  if (resource?.id !== "chat") return true;
+  // The scanner keeps a few classifier checkpoints under the generic chat
+  // kind. They are not text-generation models and must not satisfy the local
+  // conversation-model recommendation.
+  const architecture = String(model.architecture || "").toLowerCase();
+  return !/(classification|tokenclassification|bertmodel)/.test(architecture)
+    && /(causallm|conditionalgeneration)/.test(architecture);
+}
+
 function resourceInstallSnapshot(resource) {
   const installed = state.localModelMarket?.installed || [];
   const jobs = state.localModelInstall?.jobs || [];
@@ -8585,35 +8837,55 @@ function resourceInstallSnapshot(resource) {
     ? Boolean(state.ollama?.reachable)
     : Boolean(state.localRuntime?.installed) && (!definition.audio || ["source", "embedded", "component"].includes(localRuntimeMode));
   const isInstalledReady = (modelId) => installed.some((item) => item.id === modelId && item.ready && item.runtime_compatible !== false);
-  const ready = usesOllama ? Boolean(state.ollama?.model_ready) : definition.models.every(isInstalledReady);
+  const preferredReady = definition.models.every(isInstalledReady);
+  const compatibleModel = usesOllama
+    ? null
+    : installed.find((item) => localModelSupportsResource(item, definition));
+  const ready = usesOllama ? Boolean(state.ollama?.model_ready) : preferredReady || Boolean(compatibleModel);
   const directJob = jobs.find((item) => item.job_id === definition.jobId) || null;
+  // The legacy retrieval endpoint used one combined job for embedding and
+  // reranking.  Keep that job visible in the download center, but do not
+  // project it onto both capability cards: the guided flow now starts one
+  // model job at a time and each card must own its own progress.
   const legacyJob = definition.legacyJobId ? jobs.find((item) => item.job_id === definition.legacyJobId) || null : null;
-  const job = directJob || legacyJob;
+  const job = directJob;
   const runtimeJob = usesOllama ? null : state.localRuntime?.install_job || null;
   const runtimeJobState = String(runtimeJob?.state || "idle");
   const runtimeActive = ["queued", "installing"].includes(runtimeJobState);
   const runtimeFailed = ["failed", "cancelled", "interrupted"].includes(runtimeJobState);
+  const pendingResourceId = String(state.pendingLocalModelResource || "");
+  const ownsRuntimeTask = Boolean(pendingResourceId && pendingResourceId === resourceId);
+  const waitingForSharedRuntime = !runtimeReady && (runtimeActive || runtimeFailed) && !ownsRuntimeTask;
   const jobState = String(job?.state || "idle");
   const active = ["queued", "downloading", "installing"].includes(jobState);
   const failed = ["failed", "cancelled", "interrupted"].includes(jobState);
   const paused = jobState === "paused";
-  const displayJob = !runtimeReady && (runtimeActive || runtimeFailed) ? runtimeJob : job;
+  const displayJob = !runtimeReady && (runtimeActive || runtimeFailed) && ownsRuntimeTask ? runtimeJob : job;
   const progress = ready || (!usesOllama && jobState === "ready")
     ? 100
     : Math.max(0, Math.min(100, Math.round(Number(displayJob?.progress || 0) * 100)));
   return {
     ...definition,
     job: displayJob,
+    legacyJob,
     runtimeReady,
+    ownsRuntimeTask,
+    waitingForSharedRuntime,
+    compatibleModel,
+    usingExistingModel: Boolean(compatibleModel && !preferredReady),
     ollama: usesOllama,
     state: !runtimeReady
-      ? runtimeActive ? "runtime_installing" : runtimeFailed ? "runtime_failed" : "runtime_required"
+      ? ownsRuntimeTask && runtimeActive ? "runtime_installing" : ownsRuntimeTask && runtimeFailed ? "runtime_failed" : "runtime_required"
       : ready || (!usesOllama && jobState === "ready") ? "ready" : active ? jobState : paused ? "paused" : failed ? jobState : "idle",
     progress,
   };
 }
 
 function resourceInstallStatusCopy(resource) {
+  if (resource.state === "runtime_required" && resource.waitingForSharedRuntime) return {
+    label: "等待共享运行组件",
+    hint: "本地运行组件正在准备；这个模型尚未开始下载，完成后可单独启动。",
+  };
   if (resource.state === "runtime_required") return {
     label: "需要准备本地能力",
     hint: state.localRuntime?.install_available
@@ -8628,7 +8900,15 @@ function resourceInstallStatusCopy(resource) {
     label: resource.job?.state === "interrupted" ? "安装已中断" : "安装未完成",
     hint: resource.job?.error || resource.job?.message || "可以重试；已下载内容会自动复用。",
   };
-  if (resource.state === "ready") return { label: "已就绪", hint: "已保存在本机，可随时使用。" };
+  if (resource.state === "ready") {
+    if (resource.usingExistingModel && resource.compatibleModel) {
+      return {
+        label: "已有可用模型",
+        hint: `检测到 ${resource.compatibleModel.name || resource.compatibleModel.id}，ScanSci 会自动使用，无需下载推荐模型。`,
+      };
+    }
+    return { label: "已就绪", hint: "已保存在本机，可随时使用。" };
+  }
   if (resource.state === "queued") return { label: "准备下载", hint: "正在连接可用下载源。" };
   if (resource.state === "installing") return { label: `下载中 ${resource.progress}%`, hint: resource.job?.current_model || resource.detail };
   if (resource.state === "downloading") return { label: `下载中 ${resource.progress}%`, hint: resource.job?.current_model || resource.detail };
@@ -8645,7 +8925,7 @@ function resourceSetupCard(resource) {
   const actionLabel = resource.state === "ready"
     ? "已就绪"
     : resource.state === "runtime_required"
-      ? state.localRuntime?.install_available ? "准备本地能力" : "查看安装选项"
+      ? resource.waitingForSharedRuntime ? "选择此模型" : state.localRuntime?.install_available ? "准备本地能力" : "查看安装选项"
     : ["failed", "runtime_failed", "interrupted", "cancelled"].includes(resource.state)
       ? resource.state === "runtime_failed" ? "继续安装" : "重试下载"
     : resource.state === "paused"
@@ -8785,6 +9065,7 @@ function openResourceGuideOverlay() {
   state.onboardingOpen = true;
   renderResourceOnboarding();
   refreshCudaStatus();
+  void refreshInstalledModelInventory();
 }
 
 async function closeResourceGuideOverlay(result = "skip") {
@@ -8819,7 +9100,7 @@ function renderLegacyResourceOnboarding() {
     return;
   }
   host.hidden = false;
-  host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>资源配置</span><h2>按能力分别添加</h2><p>嵌入和重排负责知识库检索；视觉、语音和本地对话按需开启。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>每项模型都可单独下载。跳过不会影响基础使用，之后可在设置里继续。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
+  host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>本地模型</span><h2>按能力分别添加</h2><p>嵌入和重排负责知识库检索；视觉、语音和本地对话按需开启。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>每项模型都可单独下载。跳过不会影响基础使用，之后可在设置里继续。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
   installResourceOnboardingDragHandle(host);
   hydrateIcons(host);
 }
@@ -8844,6 +9125,12 @@ function renderResourceOnboarding() {
     host.hidden = true;
     host.innerHTML = "";
     return;
+  }
+  // Only the current four-page guide is allowed to appear. Older persisted
+  // state used the retired three-page flow and its obsolete resource route.
+  if (state.onboardingMode !== "resources") {
+    state.onboardingMode = "resources";
+    state.resourceGuideStep = 0;
   }
   if (state.onboardingMode === "resources") {
     host.hidden = false;
@@ -8875,7 +9162,7 @@ function renderResourceSetupSettings() {
     ? `${readyCount}/${snapshots.length} 项已就绪 · ${activeCount} 项正在处理`
     : `${readyCount}/${snapshots.length} 项已就绪 · 其余按需安装`;
   const dataSummary = sourceCount ? `已连接 ${sourceCount} 个资料源` : "尚未接入资料";
-  return `<section class="resource-settings-page resource-install-page"><header class="resource-install-heading"><div><span>RESOURCES</span><h1>资源配置</h1><p>模型下载只有一个入口：资源配置。下载完成后，去“默认能力”选择它们的用途；“本地模型”只负责检测、自动路由和可选手动连接。</p></div><button type="button" class="quiet-text-button" data-action="reopen-resource-onboarding">查看使用引导</button></header>
+  return `<section class="resource-settings-page resource-install-page"><header class="resource-install-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型下载和本地组件都从这里管理。下载完成后，去“默认能力”选择它们的用途。</p></div><button type="button" class="quiet-text-button" data-action="reopen-resource-onboarding">查看使用引导</button></header>
     <section class="resource-install-summary"><div class="resource-install-summary-mark">${uiIcon(readyCount ? "check" : "download")}</div><div><strong>${escapeHtml(summary)}</strong><p>模型只保存在这台电脑上；已完成的资源不会重复显示下载进度。</p></div><button type="button" class="resource-install-summary-action" data-action="open-settings" data-settings-panel="defaults">选择默认能力 ${uiIcon("arrow-right")}</button></section>
     ${resourceInstallGuideGroup(["embedding", "reranking"], "知识库检索", "让文献更容易被找到", "嵌入模型建立语义索引，重排模型帮助 ScanSci 从候选片段中挑出更相关的证据。")}
     ${resourceInstallGuideGroup(["chat", "vision", "audio"], "本地助手与多模态", "按需添加离线能力", "本地对话、图片理解和语音转写彼此独立；不需要的能力可以跳过。")}
@@ -8899,6 +9186,7 @@ async function persistOnboardingPreferences(patch, message, { close = false } = 
 }
 
 async function startOnboardingResource(resourceId) {
+  await refreshInstalledModelInventory({ render: false });
   const resource = resourceInstallSnapshot(resourceId);
   if (["ready", "queued", "downloading", "installing"].includes(resource.state)) return;
   if (["runtime_required", "runtime_installing", "runtime_failed"].includes(resource.state)) {
@@ -9070,6 +9358,7 @@ async function refreshSystemOcrStatus({ force = false } = {}) {
 
 function renderSettings() {
   if (["routing", "document-processing"].includes(state.activeSettings)) state.activeSettings = "defaults";
+  if (state.activeSettings === "resources") state.activeSettings = "local-models";
   applyAppearancePreferences();
   document.querySelectorAll(".settings-nav").forEach((button) => button.classList.toggle("is-active", button.dataset.settingsPanel === state.activeSettings));
   const target = byId("settingsContent");
@@ -9078,8 +9367,9 @@ function renderSettings() {
     return;
   }
   let settingsMarkup = "";
-  if (state.activeSettings === "resources") settingsMarkup = renderResourceSetupSettings();
-  else if (state.activeSettings === "knowledge-preview") settingsMarkup = renderKnowledgeSettingsPreview();
+  // “resources” is a legacy deep-link.  Model installation now lives in the
+  // rebuilt local-models page; never render the retired resource page.
+  if (state.activeSettings === "knowledge-preview") settingsMarkup = renderKnowledgeSettingsPreview();
   else if (state.activeSettings === "defaults") settingsMarkup = renderDefaultCapabilitiesSettings();
   else if (state.activeSettings === "models") settingsMarkup = renderModelsSettings();
   else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettings();
@@ -9787,7 +10077,7 @@ function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
   const channelRows = channels.length
     ? `<div class="local-runtime-channel-list">${channels.map((item) => `<div><span>${escapeHtml(item.label || "下载通道")}</span><b class="${item.valid ? "is-ready" : "is-failed"}">${item.valid ? "可用" : "不可用"}</b></div>`).join("")}</div>`
     : `<p class="local-runtime-channel-empty">点击“检查通道”后，ScanSci 会逐个验证清单是否可读；启动时不会因为网络探测而卡住。</p>`;
-  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0";
+  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.3";
   const checking = Boolean(runtime.channelsChecking);
   return `<section class="local-runtime-recovery"><header><div><span>下载通道</span><strong>${escapeHtml(checking ? "正在检查自动通道…" : summary)}</strong></div><button type="button" class="quiet-text-button" data-action="check-local-runtime-channels" ${checking ? "disabled" : ""}>${uiIcon("refresh")} ${checking ? "检查中…" : checked ? "重新检查" : "检查通道"}</button></header>${channelRows}<div class="local-runtime-manual-fallback"><div><strong>网络仍不可用？可以手动安装</strong><p>从官方发布页下载 ZIP；如果是分片包，请把 JSON 清单和全部分片一起选中，ScanSci 会校验后再安装。</p></div><div class="local-runtime-recovery-actions"><button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地文件</button><a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开官方发布页 ${uiIcon("arrow-up-right")}</a></div></div></section>`;
 }
@@ -10008,9 +10298,28 @@ function settingsModelOptionAttributes(modelName, modelMeta) {
   return `data-model-name="${escapeHtml(modelName)}" data-model-meta="${escapeHtml(modelMeta)}"`;
 }
 
+function capabilityOptionKey(capability, modelName, modelMeta) {
+  if (capability !== "audio") return "";
+  return [modelName, modelMeta]
+    .map((value) => String(value || "").trim().toLocaleLowerCase().replace(/\s+/g, " "))
+    .join("::");
+}
+
+function isPreferredAudioModel(model) {
+  const modelId = String(model?.model_id || model?.id || "").trim().toLocaleLowerCase();
+  return modelId === "qwen/qwen3-asr-0.6b-hf" || modelId === "qwen3-asr-0.6b-hf";
+}
+
 function modelTargetOptions(selected = "", capability = "") {
   const automatic = selected === "auto" || selected === "local:builtin-evidence";
   const options = [`<option value="auto" ${automatic ? "selected" : ""} ${settingsModelOptionAttributes("Agent 自动选择（推荐）", "ScanSci Agent")}>Agent 自动选择（推荐）</option>`];
+  const seenCapabilityOptions = new Set();
+  const addOption = (value, modelName, modelMeta) => {
+    const optionKey = capabilityOptionKey(capability, modelName, modelMeta);
+    if (optionKey && seenCapabilityOptions.has(optionKey)) return;
+    if (optionKey) seenCapabilityOptions.add(optionKey);
+    options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
+  };
   for (const provider of (state.settings.providers || []).filter(isProviderUsable)) {
     if (provider.id === "local-evidence") continue;
     for (const model of provider.models || []) {
@@ -10019,10 +10328,14 @@ function modelTargetOptions(selected = "", capability = "") {
       const source = provider.kind === "local" ? "本地" : provider.auth_mode === "managed" ? "ScanSci" : "API";
       const modelName = String(model.name || model.id);
       const modelMeta = modelOptionMeta(provider, source);
-      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
+      addOption(value, modelName, modelMeta);
     }
   }
-  for (const model of state.settings.local_models || []) {
+  const localModels = [...(state.settings.local_models || [])].sort((left, right) => {
+    if (capability !== "audio") return 0;
+    return Number(isPreferredAudioModel(right)) - Number(isPreferredAudioModel(left));
+  });
+  for (const model of localModels) {
     if (model.enabled === false || model.runtime_compatible === false) continue;
     const capabilities = new Set(model.capabilities || []);
     const builtinRetrieval = model.runtime === "builtin" && ["embedding", "reranking", "retrieval"].includes(capability);
@@ -10031,7 +10344,7 @@ function modelTargetOptions(selected = "", capability = "") {
     const value = `local:${model.id}`;
     const modelName = String(model.name || model.id);
     const modelMeta = localModelOptionMeta(model);
-    options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
+    addOption(value, modelName, modelMeta);
   }
   return options.join("");
 }
@@ -10385,6 +10698,23 @@ async function refreshLocalModelMarket() {
   if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
 }
 
+async function refreshInstalledModelInventory({ render = true } = {}) {
+  try {
+    // A cache-busting query is intentional here: opening the guide is an
+    // explicit request to re-scan the shared model directory after an app
+    // update or a model download completed in another process.
+    const installed = await request(`/api/local-models/installed?refresh=${Date.now()}`);
+    state.localModelMarket = {
+      ...(state.localModelMarket || {}),
+      installed: installed.models || [],
+    };
+    if (render && state.onboardingOpen) renderResourceOnboarding();
+    return state.localModelMarket.installed;
+  } catch (_error) {
+    return state.localModelMarket?.installed || [];
+  }
+}
+
 async function updateMcpMarketplaceServer(identifier) {
   const payload = await request("/api/mcp/marketplace/update", { method: "POST", body: JSON.stringify({ id: identifier }) });
   state.settings = payload.settings || state.settings;
@@ -10527,10 +10857,7 @@ async function handleSettingsAction(action, element) {
     return;
   }
   if (action === "reopen-resource-onboarding") {
-    state.onboardingMode = "";
-    state.onboardingStep = "welcome";
-    state.onboardingOpen = true;
-    renderResourceOnboarding();
+    openResourceGuideOverlay();
     return;
   }
   if (action === "open-data-onboarding") {
@@ -10550,7 +10877,7 @@ async function handleSettingsAction(action, element) {
   }
   if (action === "onboarding-open-models") {
     await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开本地能力引导；模型可以按需下载", { close: true });
-    openSettings("resources");
+    openSettings("local-models");
     return;
   }
   if (action === "onboarding-open-knowledge") {
@@ -11017,6 +11344,36 @@ function saveReviewAsNote() {
   openReviewSaveDialog();
 }
 
+function openImagePreview(src, alt = "用户图片") {
+  const imageSrc = String(src || "").trim();
+  if (!imageSrc) return;
+  let dialog = byId("imagePreviewDialog");
+  if (!dialog) {
+    dialog = document.createElement("dialog");
+    dialog.id = "imagePreviewDialog";
+    dialog.className = "image-preview-dialog";
+    dialog.setAttribute("aria-label", "图片预览");
+    dialog.innerHTML = `<div class="image-preview-shell"><button type="button" class="image-preview-close" data-action="close-image-preview" aria-label="关闭图片预览">${uiIcon("x")}</button><img id="imagePreviewImage" alt="" /></div>`;
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+    dialog.addEventListener("cancel", () => dialog.close());
+    document.body.appendChild(dialog);
+  }
+  const image = byId("imagePreviewImage");
+  if (image) {
+    image.src = imageSrc;
+    image.alt = String(alt || "用户图片");
+  }
+  if (typeof dialog.showModal === "function") dialog.showModal();
+  else dialog.setAttribute("open", "");
+}
+
+function closeImagePreview() {
+  const dialog = byId("imagePreviewDialog");
+  if (dialog?.open) dialog.close();
+}
+
 document.addEventListener("change", (event) => {
   const select = event.target.closest?.("select[data-preview-knowledge-select]");
   if (!select || state.activeSettings !== "knowledge-preview") return;
@@ -11109,7 +11466,7 @@ document.addEventListener("click", (event) => {
   }
   else if (action === "preview-knowledge-rebuild") toast("预览：索引检查完成，当前配置可以继续使用");
   else if (action === "preview-knowledge-save") toast("预览：检索设置已保存");
-  else if (action === "open-download-center") openSettings("resources");
+  else if (action === "open-download-center") openSettings("local-models");
   else if (action === "control-download-task") {
     element.disabled = true;
     controlDownloadTask(element.dataset.jobId || "", element.dataset.downloadAction || "", element.dataset.downloadKind || "model")
@@ -11137,6 +11494,8 @@ document.addEventListener("click", (event) => {
   else if (action === "remove-composer-image") removeComposerImage(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.imageId || "");
   else if (action === "remove-composer-audio") removeComposerAudio(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.audioId || "");
   else if (action === "remove-composer-source") removeComposerSource(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.sourceId || "");
+  else if (action === "open-image-preview") openImagePreview(element.dataset.imageSrc || "", element.dataset.imageAlt || "用户图片");
+  else if (action === "close-image-preview") closeImagePreview();
   else if (action === "use-file-suggestion") useFileSuggestion(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.fileName || "当前文件", element.dataset.suggestion || "总结");
   else if (action === "open-ingestion-source") {
     const url = element.dataset.sourceUrl || "";
@@ -11477,12 +11836,17 @@ document.addEventListener("click", (event) => {
   else if (action === "toggle-history-search") toggleHistorySearch();
   else if (action === "toggle-history-view") toggleHistoryView();
   else if (action === "toggle-task-menu") toggleTaskMenu(element.dataset.taskId || "");
+  else if (action === "toggle-direct-menu") toggleDirectMenu(element.dataset.conversationId || "");
   else if (action === "archive-task") archiveTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
   else if (action === "restore-task") restoreTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
   else if (action === "delete-task") deleteTask(element.dataset.taskId || "").catch((error) => toast(error.message, true));
+  else if (action === "archive-direct-conversation") archiveDirectConversation(element.dataset.conversationId || "").catch((error) => toast(error.message, true));
+  else if (action === "restore-direct-conversation") restoreDirectConversation(element.dataset.conversationId || "").catch((error) => toast(error.message, true));
+  else if (action === "delete-direct-conversation") deleteDirectConversation(element.dataset.conversationId || "").catch((error) => toast(error.message, true));
   else if (action === "new-task") startTask();
   else if (action === "open-extensions") openExtensions();
   else if (action === "open-mcp-marketplace") openMcpMarketplace();
+  else if (action === "close-settings") closeSettings();
   else if (action === "test-mcp-server") testMcpServer(element.dataset.recordId || "").catch((error) => toast(error.message, true));
   else if (action === "check-extension-updates") refreshExtensionUpdates().catch((error) => toast(error.message, true));
   else if (action === "refresh-marketplace") refreshExtensions({ marketOnly: true }).catch((error) => toast(error.message, true));
@@ -12408,6 +12772,20 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     setView("conversation");
     window.setTimeout(() => byId("sourceFilter").focus(), 0);
+  }
+});
+
+document.addEventListener("contextmenu", (event) => {
+  const directRow = event.target.closest?.(".task-row[data-conversation-id]");
+  if (directRow) {
+    event.preventDefault();
+    toggleDirectMenu(directRow.dataset.conversationId || "");
+    return;
+  }
+  const taskRow = event.target.closest?.(".task-row[data-task-id]");
+  if (taskRow) {
+    event.preventDefault();
+    toggleTaskMenu(taskRow.dataset.taskId || "");
   }
 });
 

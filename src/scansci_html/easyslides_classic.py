@@ -220,7 +220,7 @@ def render_classic_deck(
 
     status = easyslides_plugin_status(root)
     if not status.get("ready"):
-        raise RuntimeError("EasySlides 原生模板运行组件未就绪，请先在资源配置中修复或更新插件。")
+        raise RuntimeError("EasySlides 原生模板运行组件未就绪，请先在插件和技能页修复或更新插件。")
 
     plugin_root = Path(str(status["root"]))
     template_id = str(template.get("id", "")).strip()
