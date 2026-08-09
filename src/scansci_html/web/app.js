@@ -11216,11 +11216,38 @@ function renderLocalModelsSettings() {
     return `<article class="local-agent-route is-${route.tone}"><span class="local-agent-route-mark">${uiIcon(kind === "vision" ? "eye" : kind === "audio" ? "audio" : kind === "reranking" ? "filter" : "database")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p></div><div class="local-agent-route-target"><b>${escapeHtml(route.name)}</b><small>${escapeHtml(route.note)}</small></div></article>`;
   }).join("");
   const runtimeRecovery = !runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "";
+  const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
+  const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
+    const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
+    const ready = isOllama ? Boolean(ollama.model_ready || item.ready) : Boolean(item.ready);
+    const installed = isOllama ? ready : Boolean(item.installed);
+    const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? audioRuntimeReady : runtimeReady;
+    const job = (state.localModelInstall?.jobs || []).find((candidate) => (
+      Array.isArray(candidate?.models) && candidate.models.includes(item.id)
+    )) || null;
+    const jobState = String(job?.state || "");
+    const jobActive = ["queued", "downloading", "installing", "pausing", "cancelling"].includes(jobState);
+    const jobRetryable = ["failed", "cancelled", "interrupted", "paused"].includes(jobState);
+    const action = installed
+      ? `<span class="quiet-row-note">已安装</span>`
+      : jobActive
+        ? `<span class="quiet-row-note">${escapeHtml(downloadJobStatus(job).label)} · ${escapeHtml(downloadJobProgressSummary(job))}</span>`
+      : jobRetryable && job?.job_id
+        ? `<button type="button" class="quiet-text-button" data-action="control-download-task" data-download-kind="model" data-download-action="${jobState === "paused" ? "resume" : "retry"}" data-job-id="${escapeHtml(job.job_id)}">${jobState === "paused" ? "继续" : "重试"}</button>`
+      : canDownload
+        ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
+        : isOllama
+          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
+          : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
+    const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
+    return `<article class="quiet-model-row"><span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span><div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
+  }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
     <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${runtimeReady ? escapeHtml(runtimeDescription) : "本地模型是可选项；基础对话和关键词检索无需额外安装。"}</span><button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button></footer></section>
     ${runtimeRecovery}
     ${runtimeComponentsSettingsMarkup()}
     <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list">${installed}</div></section>
+    <details class="local-model-disclosure local-model-market-disclosure"><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
     <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
     <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
 }
