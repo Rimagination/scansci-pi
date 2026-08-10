@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import deque
 import json
 import subprocess
 from pathlib import Path
+from queue import Empty, Queue
 import threading
 import time
 from types import SimpleNamespace
@@ -1433,7 +1435,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     assert status["ready"] is True
     assert status["runtime"] == "pi"
     assert status["version"] == "0.80.10"
-    assert status["protocol"] == 5
+    assert status["protocol"] == 6
     assert {
         "multi_session",
         "ask_user",
@@ -1566,7 +1568,7 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
         assert process.stdout is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": list(pi_agent._PI_REQUIRED_FEATURES),
             "request_id": "invalid-contract-version",
             "session_id": "invalid-contract-version",
@@ -1654,7 +1656,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert captured["task_contract"]["contract_id"] == "contract-test"
     assert captured["task_contract"]["allowed_tools"] == ["kb_search"]
     assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
-    assert captured["pi_protocol_version"] == 5
+    assert captured["pi_protocol_version"] == 6
     assert "host_tool_authorization" in captured["required_features"]
     assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True
@@ -3585,6 +3587,11 @@ def test_pi_steer_reports_native_queue_and_control_acknowledgement(tmp_path: Pat
             for event in events
         ) and time.monotonic() < acknowledgement_deadline:
             time.sleep(0.01)
+        queued = client.inspect_queue("steer-session")
+        assert "focus on the requested detail" in list(queued.get("steering", []))
+        cleared = client.clear_queue("steer-session")
+        assert "focus on the requested detail" in list(cleared.get("steering", []))
+        assert client.inspect_queue("steer-session").get("pending") == 0
         assert client.cancel() is True
         _OpenAISlowHandler.release.set()
         consumer.join(timeout=10)
@@ -3649,6 +3656,7 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
                 )
             )
         session_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+        assert client.abort_compaction("compact-session", timeout_seconds=30)["aborted"] is True
         result = client.compact("compact-session", instructions="Retain the alpha beta gamma fact.", timeout_seconds=30)
     finally:
         client.close()
@@ -3673,3 +3681,238 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
     assert "session-level base prompt is invariant" not in compaction_payload
     assert "authority-sentinel-0" not in compaction_payload
     assert "authority-sentinel-3" not in compaction_payload
+
+
+def test_protocol_dispatcher_rejects_cross_generation_command_ack() -> None:
+    raw: Queue[str | None] = Queue()
+    audit: deque[dict[str, object]] = deque(maxlen=20)
+    dispatcher = pi_agent._ProtocolDispatcher(raw, generation=7, audit=audit)
+    channel = dispatcher.register_command("command-1")
+    dispatcher.start()
+    raw.put(json.dumps({"type": "session.queue", "command_id": "command-1", "generation": 6}))
+    with pytest.raises(Empty):
+        channel.get(timeout=0.1)
+    raw.put(json.dumps({"type": "session.queue", "command_id": "command-1", "generation": 7}))
+    assert channel.get(timeout=1)["generation"] == 7
+    raw.put(None)
+
+
+def test_fork_command_correlation_rejects_cross_target_ack() -> None:
+    with pytest.raises(RuntimeError, match="target sessions"):
+        PiAgentClient._validate_command_correlation(
+            {
+                "source_session_id": "source",
+                "target_session_id": "expected-target",
+            },
+            {
+                "source_session_id": "source",
+                "target_session_id": "other-target",
+            },
+        )
+
+
+def test_session_queue_controls_do_not_take_lifecycle_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    client._process_generation = 11
+    client._process = SimpleNamespace(poll=lambda: None)
+
+    class FakeDispatcher:
+        def register_command(self, command_id: str):
+            channel: Queue[dict[str, object] | None] = Queue()
+            self.command_id = command_id
+            self.channel = channel
+            return channel
+
+        def start(self) -> None:
+            return None
+
+        def unregister_command(self, _command_id: str) -> None:
+            return None
+
+    dispatcher = FakeDispatcher()
+    monkeypatch.setattr(client, "_ensure_dispatcher", lambda: dispatcher)
+
+    def write(message: dict[str, object]) -> None:
+        response_type = {
+            "session.queue.inspect": "session.queue",
+            "session.queue.clear": "session.queue_cleared",
+            "session.compact.abort": "session.compact_aborted",
+        }[str(message["type"])]
+        dispatcher.channel.put(
+            {
+                "type": response_type,
+                "command_id": message["command_id"],
+                "session_id": message["session_id"],
+                "generation": message["generation"],
+                "steering": [],
+                "follow_up": [],
+            }
+        )
+
+    monkeypatch.setattr(client, "_write", write)
+    results: list[dict[str, object]] = []
+
+    def invoke_controls() -> None:
+        results.extend([
+            client.inspect_queue("active-session"),
+            client.clear_queue("active-session"),
+            client.abort_compaction("active-session"),
+        ])
+
+    with client._lifecycle_lock:
+        worker = threading.Thread(target=invoke_controls, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive(), "non-replacing controls must not wait on the lifecycle lock"
+    assert [item["type"] for item in results] == [
+        "session.queue",
+        "session.queue_cleared",
+        "session.compact_aborted",
+    ]
+    assert all(item["generation"] == 11 for item in results)
+
+
+def test_entry_level_fork_sends_branch_boundary_and_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    client._process_generation = 4
+    client._process = SimpleNamespace(poll=lambda: None)
+    sent: list[dict[str, object]] = []
+
+    def await_command(message: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        sent.append(dict(message))
+        return {
+            "type": "session.forked",
+            "command_id": message["command_id"],
+            "source_session_id": message["source_session_id"],
+            "target_session_id": message["target_session_id"],
+            "generation": message["generation"],
+        }
+
+    monkeypatch.setattr(client, "_await_command", await_command)
+    result = client.fork_session(
+        "source",
+        target_session_id="target",
+        entry_id="entry-2",
+        before=True,
+    )
+
+    assert result["generation"] == 4
+    assert sent[0]["entry_id"] == "entry-2"
+    assert sent[0]["before"] is True
+    assert sent[0]["full_history"] is False
+
+
+def test_thinking_max_clamps_with_explicit_degradation_on_resume(tmp_path: Path) -> None:
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    degradations: list[dict[str, object]] = []
+    try:
+        for turn in range(2):
+            events = list(
+                client.stream_chat(
+                    provider_kind="openai-compatible",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    api_key="fixture-key",
+                    model_id="fixture-model-without-max",
+                    messages=[{"role": "user", "content": f"turn {turn}"}],
+                    thinking_level="max",
+                    task_mode="general",
+                    task_contract={
+                        "schema_version": "scansci.task-contract.v2",
+                        "version": 2,
+                        "contract_id": f"max-{turn}",
+                        "allowed_tools": [],
+                        "initial_tools": [],
+                        "risk_level": "read_only",
+                    },
+                    timeout_seconds=30,
+                    session_id="thinking-max-resume",
+                )
+            )
+            degradations.extend(
+                event for event in events
+                if event.get("type") == "status"
+                and event.get("status") == "capability_degraded"
+                and event.get("name") == "thinking_level"
+            )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert len(degradations) == 2
+    assert all(dict(event.get("details", {}))["requested"] == "max" for event in degradations)
+    assert all(dict(event.get("details", {}))["applied"] != "max" for event in degradations)
+
+
+def test_full_history_clone_and_entry_fork_leave_source_immutable(tmp_path: Path) -> None:
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "source history"}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    "schema_version": "scansci.task-contract.v2",
+                    "version": 2,
+                    "contract_id": "fork-source",
+                    "allowed_tools": [],
+                    "initial_tools": [],
+                    "risk_level": "read_only",
+                },
+                timeout_seconds=30,
+                session_id="fork-source",
+            )
+        )
+        source_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+        source_before = source_file.read_bytes()
+        source_records = [json.loads(line) for line in source_before.decode("utf-8").splitlines()]
+        assistant_entry = next(
+            record for record in reversed(source_records)
+            if record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        )
+
+        cloned = client.fork_session("fork-source", target_session_id="fork-clone", timeout_seconds=30)
+        branched = client.fork_session(
+            "fork-source",
+            target_session_id="fork-before-assistant",
+            entry_id=str(assistant_entry["id"]),
+            before=True,
+            timeout_seconds=30,
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert source_file.read_bytes() == source_before
+    clone_records = [json.loads(line) for line in Path(str(cloned["session_file"])).read_text(encoding="utf-8").splitlines()]
+    branch_records = [json.loads(line) for line in Path(str(branched["session_file"])).read_text(encoding="utf-8").splitlines()]
+    assert any(
+        record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        for record in clone_records
+    )
+    assert not any(
+        record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        for record in branch_records
+    )

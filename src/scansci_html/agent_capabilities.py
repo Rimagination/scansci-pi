@@ -109,6 +109,28 @@ _BUILTIN_CAPABILITIES: tuple[CapabilityDescriptor, ...] = (
         output_kinds=("page_content", "browser_status"), timeout_seconds=180,
     ),
     CapabilityDescriptor(
+        "delegate_scientific_agents", "control", "Delegate scientific agents",
+        "Atomically reserve and start bounded, read-only scientific child runs owned by the active durable parent.",
+        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        output_kinds=("scientific_children",), idempotent=False,
+    ),
+    CapabilityDescriptor(
+        "list_scientific_agents", "control", "List scientific agents",
+        "List durable scientific child runs owned by the active durable parent.",
+        subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_children",),
+    ),
+    CapabilityDescriptor(
+        "collect_scientific_agents", "control", "Collect scientific agents",
+        "Validate and collect partial structured handoffs from owned scientific child runs.",
+        subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_handoffs",),
+    ),
+    CapabilityDescriptor(
+        "cancel_scientific_agents", "control", "Cancel scientific agents",
+        "Cancel only scientific child runs owned by the active durable parent.",
+        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        output_kinds=("scientific_children",), idempotent=False,
+    ),
+    CapabilityDescriptor(
         "self_assess", "control", "执行自评", "基于当前轮次的工具记录检查缺口和下一步。",
         evidence_policy="off", output_kinds=("self_assessment",),
     ),
@@ -154,6 +176,10 @@ _CANONICAL_TOOL_IDS: tuple[str, ...] = (
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "delegate_scientific_agents",
+    "list_scientific_agents",
+    "collect_scientific_agents",
+    "cancel_scientific_agents",
     "self_assess",
 )
 _REVERSIBLE_TOOL_IDS = {
@@ -165,6 +191,8 @@ _REVERSIBLE_TOOL_IDS = {
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "delegate_scientific_agents",
+    "cancel_scientific_agents",
 }
 _SUBAGENT_DENIED_TOOL_IDS = {
     "create_document",
@@ -174,6 +202,10 @@ _SUBAGENT_DENIED_TOOL_IDS = {
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "delegate_scientific_agents",
+    "list_scientific_agents",
+    "collect_scientific_agents",
+    "cancel_scientific_agents",
 }
 _PLUGIN_TOOL_IDS = {
     "zotero": {

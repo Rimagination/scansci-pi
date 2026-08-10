@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from .agent_context import build_agent_system_context, runtime_self_description
 from .agent_skill_tools import ProgressiveSkillRuntime, SKILL_STATE_SCHEMA, SkillAccessError
 from .agent_advisor import review_research_run
-from .agent_capabilities import capability_catalog, compile_capability_lease
+from .agent_capabilities import capability_catalog, compile_capability_lease, make_resource_uri, parse_resource_uri
 from .agent_contract import compile_task_contract
 from .agent_reasoning import evidence_budget_for_thinking, managed_glm_thinking_mode, normalize_thinking_level
 from .academic_search import DEFAULT_PROVIDER_NAMES, FederatedAcademicSearch, build_academic_provider, search_academic_papers
@@ -94,6 +94,7 @@ from .research_subagents import (
     public_role_catalog,
     select_scientific_roles,
     structured_output_schema,
+    validate_scientific_resource_uri,
     validate_subagent_result,
 )
 from .vector_index import load_embedding_cache_rows, prewarm_embedding_cache, vector_cache_status
@@ -149,6 +150,57 @@ _GOOD_QUESTION_FIELDS = (
 
 _NEURAL_LIBRARY_MIN_BYTES = 1_000_000
 _SKILL_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9._-])\$[A-Za-z0-9._-]+")
+
+
+def _owned_scientific_evidence_uris(
+    tool_name: str,
+    result: object,
+    evidence_dbs: list[Path],
+) -> set[str]:
+    """Derive evidence URIs only from host evidence rows, never result prose."""
+
+    if not isinstance(result, dict) or tool_name not in {
+        "search_local_evidence",
+        "build_verified_answer",
+    }:
+        return set()
+    candidates: list[dict[str, Any]] = []
+    if tool_name == "search_local_evidence":
+        candidates = [item for item in list(result.get("hits", []) or []) if isinstance(item, dict)]
+    else:
+        reader = dict(result.get("reader_answer", {}) or {})
+        candidates = [item for item in list(reader.get("citations", []) or []) if isinstance(item, dict)]
+    owned: set[str] = set()
+    for candidate in candidates[:80]:
+        evidence_id = str(candidate.get("evidence_id", "") or "").strip()
+        doc_id = str(candidate.get("doc_id", "") or "").strip()
+        try:
+            library_index = int(candidate.get("library_index", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not evidence_id
+            or not doc_id
+            or len(evidence_id) > 300
+            or len(doc_id) > 300
+            or library_index < 0
+            or library_index >= len(evidence_dbs)
+        ):
+            continue
+        evidence_db = evidence_dbs[library_index]
+        if not evidence_db.is_file():
+            continue
+        try:
+            with sqlite3.connect(evidence_db) as connection:
+                exists = connection.execute(
+                    "select 1 from evidence_spans where evidence_id = ? and doc_id = ? limit 1",
+                    (evidence_id, doc_id),
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        if exists:
+            owned.add(make_resource_uri("evidence", doc_id, evidence_id))
+    return owned
 
 
 def _intent_classification_text(text: object) -> str:
@@ -1965,6 +2017,29 @@ class ResearchAgentRuntime:
             capability_lease=lease,
         )
 
+    def _contract_for_active_run(
+        self,
+        active_run_id: str,
+        *,
+        fallback: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Use the durable host-issued child lease for its actual Pi run."""
+
+        if not str(active_run_id or "").strip():
+            return json.loads(json.dumps(dict(fallback or {})))
+        try:
+            run = self.store.get_run(str(active_run_id))
+        except (KeyError, FileNotFoundError):
+            # Direct-chat AG-UI ids are host correlation ids, not durable
+            # ResearchStore runs. They retain the freshly compiled contract.
+            return json.loads(json.dumps(dict(fallback or {})))
+        if str(dict(run.get("metadata", {}) or {}).get("runtime", "")) != "scansci-scientific-subagent.v1":
+            return json.loads(json.dumps(dict(fallback or {})))
+        persisted = dict(run.get("task_contract", {}) or {})
+        if not persisted:
+            raise PermissionError("Scientific child run is missing its durable capability contract")
+        return json.loads(json.dumps(persisted))
+
     def preview_academic_search_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return a bounded public-source search plan before a run is created.
 
@@ -2277,7 +2352,7 @@ class ResearchAgentRuntime:
             "shared_state": "parent notebook, evidence store, artifacts and task registry",
         }
 
-    def delegate_scientific_agents(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _legacy_delegate_scientific_agents(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Start bounded scientific child runs that share the parent's evidence store."""
 
         parent = self.store.get_run(run_id)
@@ -2399,7 +2474,7 @@ class ResearchAgentRuntime:
             "max_concurrent": MAX_CONCURRENT_SCIENTIFIC_SUBAGENTS,
         }
 
-    def collect_scientific_agents(self, run_id: str) -> dict[str, Any]:
+    def _legacy_collect_scientific_agents(self, run_id: str) -> dict[str, Any]:
         """Collect auditable child results without pretending unfinished roles succeeded."""
 
         parent = self.store.get_run(run_id)
@@ -2467,6 +2542,393 @@ class ResearchAgentRuntime:
             "completed": sum(item["status"] == "completed" and item["handoff_status"] == "valid" for item in results),
             "total": len(results),
         }
+
+    def delegate_scientific_agents(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Atomically reserve and start bounded, read-only scientific children."""
+
+        parent = self.store.get_run(run_id)
+        if str(dict(parent.get("metadata", {}) or {}).get("runtime", "")) == "scansci-scientific-subagent.v1":
+            raise PermissionError("Scientific child runs cannot delegate recursively")
+        roles = select_scientific_roles(payload.get("roles"))
+        question = self._original_request_summary(
+            dict(parent.get("input", {}) or {}),
+            parent.get("workflow_type", ""),
+        )
+        instruction = str(payload.get("instruction", "") or "")
+        batch_key = str(payload.get("idempotency_key", "") or "").strip() or f"delegate-{uuid4().hex}"
+        settings = load_settings(self.workspace)
+        catalog = capability_catalog(
+            workspace=self.workspace,
+            evidence_db=self.evidence_db,
+            mcp_servers=list(settings.get("mcp_servers", []) or []),
+            plugins=list(settings.get("plugins", []) or []),
+        )
+        descriptors = {
+            str(item.get("id", "")): dict(item)
+            for item in list(catalog.get("capabilities", []) or [])
+            if isinstance(item, dict)
+        }
+        parent_contract = dict(parent.get("task_contract", {}) or {})
+        parent_allowed = set(str(item) for item in list(parent_contract.get("allowed_tools", []) or []))
+        parent_initial = set(str(item) for item in list(parent_contract.get("initial_tools", []) or []))
+        parent_max_tools = max(1, int(parent_contract.get("max_tool_budget", 6) or 6))
+        parent_max_tokens = max(2, int(parent_contract.get("max_model_token_budget", 48000) or 48000))
+        child_specs: list[dict[str, Any]] = []
+        for role in roles:
+            prompt = delegation_prompt(
+                role,
+                parent_title=str(parent.get("title", "")),
+                parent_question=question,
+                instruction=instruction,
+            )
+            role_tools = set(str(item) for item in role.allowed_capabilities)
+            child_allowed = [
+                name
+                for name in role.allowed_capabilities
+                if name in parent_allowed
+                and str(descriptors.get(name, {}).get("status", "")) == "ready"
+                and bool(descriptors.get(name, {}).get("subagent_allowed", False))
+                and str(descriptors.get(name, {}).get("risk_level", "")) == "read_only"
+            ]
+            child_initial = [name for name in child_allowed if name in parent_initial]
+            child_max_tools = max(1, min(4, parent_max_tools - 1)) if parent_max_tools > 1 else 1
+            child_max_tokens = max(1, min(48000, parent_max_tokens - 1, parent_max_tokens // 2))
+            compiled = compile_task_contract(
+                task_mode=role.task_mode,
+                user_text=prompt,
+                workflow_type="scientific_subagent",
+                available_tool_ids=child_allowed,
+                allowed_mcp_servers=[],
+            )
+            compiled_lease = dict(compiled.get("capability_lease", {}) or {})
+            child_lease = {
+                **compiled_lease,
+                "subagent": True,
+                "requested_tools": list(role.allowed_capabilities),
+                "allowed_tools": list(child_allowed),
+                "unavailable_tools": sorted(role_tools - set(child_allowed)),
+                "requested_mcp_servers": [],
+                "allowed_mcp_servers": [],
+                "unavailable_mcp_servers": [],
+            }
+            child_contract = {
+                **compiled,
+                "autonomy": "read_only",
+                "risk_level": "read_only",
+                "requires_plan": False,
+                "allow_external_write": False,
+                "allowed_tools": list(child_allowed),
+                "initial_tools": child_initial,
+                "allowed_mcp_servers": [],
+                "capability_lease": child_lease,
+                "initial_tool_budget": min(child_max_tools, max(1, len(child_initial))),
+                "max_tool_budget": child_max_tools,
+                "initial_model_token_budget": min(child_max_tokens, max(1, child_max_tokens // 2)),
+                "max_model_token_budget": child_max_tokens,
+                "success_criteria": [
+                    "Return the required structured sub-agent handoff",
+                    "Distinguish metadata, discovery snippets, and verified full text",
+                    "Do not modify the parent workspace or external systems",
+                ],
+                "subagent": {
+                    "role": role.role_id,
+                    "parent_run_id": run_id,
+                    "output_schema": structured_output_schema(role),
+                    "recursive_delegation": False,
+                    "trace_id": f"subagent-{uuid4().hex}",
+                },
+            }
+            child_specs.append(
+                {
+                    "role_id": role.role_id,
+                    "workflow_type": "ask",
+                    "title": f"{role.label} · {str(parent.get('title', 'Scientific task'))}",
+                    "input_payload": {
+                        "question": prompt,
+                        "task_mode": role.task_mode,
+                        "thinking_level": str(dict(parent.get("metadata", {}) or {}).get("thinking_level", "medium")),
+                        "subagent_role": role.role_id,
+                        "parent_run_id": run_id,
+                        "output_schema": structured_output_schema(role),
+                    },
+                    "stages": _WORKFLOWS["ask"]["stages"],
+                    "model_provider_id": str(dict(parent.get("model", {}) or {}).get("provider_id", "")),
+                    "model_id": str(dict(parent.get("model", {}) or {}).get("model_id", "")),
+                    "metadata": {
+                        "runtime": "scansci-scientific-subagent.v1",
+                        "subagent": {
+                            "role": role.role_id,
+                            "label": role.label,
+                            "allowed_capabilities": list(role.allowed_capabilities),
+                            "output_contract": role.output_contract,
+                            "output_schema": structured_output_schema(role),
+                            "write_access": False,
+                        },
+                        "shared_evidence": {
+                            "notebook_id": str(parent.get("notebook_id", "")),
+                            "parent_run_id": run_id,
+                        },
+                    },
+                    "task_contract": child_contract,
+                }
+            )
+        reservation = self.store.reserve_scientific_children(
+            run_id,
+            idempotency_key=batch_key,
+            child_specs=child_specs,
+            max_children=MAX_CONCURRENT_SCIENTIFIC_SUBAGENTS,
+        )
+        replayed = bool(reservation.get("replayed", False))
+        for reserved_child in list(reservation.get("children", []) or []):
+            child_run_id = str(reserved_child.get("run_id", ""))
+            child = self.store.get_run(child_run_id)
+            if replayed:
+                error = dict(child.get("error", {}) or {})
+                if not (
+                    str(child.get("status", "")) == "paused"
+                    and str(error.get("code", "")) == "app_restarted"
+                ):
+                    # Same-process idempotent replay must never submit a second
+                    # worker.  Only the durable crash marker proves that the
+                    # commit-before-submit window was interrupted.
+                    continue
+            try:
+                if replayed:
+                    child = self.store.prepare_resume(child_run_id)
+                self._submit(child_run_id)
+            except Exception as exc:
+                # One failed resume/submit is isolated to that child; reserved
+                # siblings remain independently runnable and collectable.
+                try:
+                    self.store.begin_run(child_run_id)
+                    self.store.fail_stage(
+                        child_run_id,
+                        str(child.get("current_stage", "answer")),
+                        exc,
+                    )
+                except Exception:
+                    pass
+        children = [
+            self.store.get_run(str(child["run_id"]))
+            for child in list(reservation.get("children", []) or [])
+        ]
+        return {
+            "parent_run_id": run_id,
+            "children": children,
+            "accepted": int(reservation.get("accepted", 0) or 0),
+            "replayed": bool(reservation.get("replayed", False)),
+            "max_concurrent": MAX_CONCURRENT_SCIENTIFIC_SUBAGENTS,
+        }
+
+    def list_scientific_agents(self, run_id: str) -> dict[str, Any]:
+        """Idempotently list only durable children owned by one parent."""
+
+        parent = self.store.get_run(run_id)
+        return {
+            "parent_run_id": run_id,
+            "parent_run_uri": str(parent.get("uri", "")),
+            "children": self.store.list_scientific_children(run_id),
+            "max_concurrent": MAX_CONCURRENT_SCIENTIFIC_SUBAGENTS,
+        }
+
+    def cancel_scientific_agents(
+        self,
+        run_id: str,
+        child_run_ids: Iterable[object] | None = None,
+    ) -> dict[str, Any]:
+        """Cancel selected owned children without trusting a model parent id."""
+
+        owned = self.store.list_scientific_children(run_id)
+        by_id = {str(child.get("run_id", "")): child for child in owned}
+        requested = by_id.keys() if child_run_ids is None else child_run_ids
+        selected = [str(item or "").strip() for item in list(requested)]
+        if any(child_id not in by_id for child_id in selected):
+            raise PermissionError("A scientific child must be owned by the active parent run")
+        results: list[dict[str, Any]] = []
+        cancelled = 0
+        for child_id in dict.fromkeys(selected):
+            child = self.store.get_run(child_id)
+            if str(child.get("status", "")) not in {"completed", "failed", "cancelled"}:
+                child = self.cancel(child_id)
+                if str(child.get("status", "")) == "cancelled":
+                    cancelled += 1
+            results.append(child)
+        return {
+            "parent_run_id": run_id,
+            "children": results,
+            "selected": len(results),
+            "cancelled": cancelled,
+        }
+
+    def collect_scientific_agents(
+        self,
+        run_id: str,
+        *,
+        wait_seconds: float = 0.0,
+        poll_interval_ms: int = 50,
+    ) -> dict[str, Any]:
+        """Collect partial, membership-validated structured child handoffs."""
+
+        try:
+            bounded_wait = min(30.0, max(0.0, float(wait_seconds or 0.0)))
+            bounded_poll_ms = min(1_000, max(10, int(poll_interval_ms or 50)))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Scientific collect wait controls must be numeric") from error
+        wait_started = time.monotonic()
+        deadline = wait_started + bounded_wait
+        wait_timed_out = False
+        wait_interrupted = False
+        if bounded_wait > 0:
+            while True:
+                snapshot = self.store.list_scientific_children(run_id)
+                if not snapshot or all(
+                    str(child.get("status", "")) in {"completed", "failed", "cancelled"}
+                    for child in snapshot
+                ):
+                    break
+                if self.store.stop_requested(run_id):
+                    wait_interrupted = True
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    wait_timed_out = True
+                    break
+                time.sleep(min(bounded_poll_ms / 1000.0, remaining))
+        parent = self.store.get_run(run_id)
+        children = self.store.list_scientific_children(run_id)
+        allowed_uris = {str(parent.get("uri", ""))}
+        for owned_run in [parent, *children]:
+            allowed_uris.add(str(owned_run.get("uri", "")))
+            for artifact in list(owned_run.get("artifacts", []) or []):
+                if not isinstance(artifact, dict):
+                    continue
+                allowed_uris.add(str(artifact.get("uri", "")))
+                allowed_uris.update(
+                    str(link.get("uri", ""))
+                    for link in list(artifact.get("evidence_links", []) or [])
+                    if isinstance(link, dict) and str(link.get("uri", ""))
+                )
+        allowed_uris.discard("")
+        results: list[dict[str, Any]] = []
+        aggregated_findings: list[dict[str, Any]] = []
+        aggregated_evidence_uris: list[str] = []
+        counts = {"valid": 0, "running": 0, "failed": 0, "cancelled": 0, "invalid": 0, "total": len(children)}
+        for child in children:
+            artifact = dict(child.get("output_artifact") or {})
+            role = dict(dict(child.get("metadata", {}) or {}).get("subagent", {}) or {})
+            role_id = str(role.get("role", ""))
+            status = str(child.get("status", ""))
+            validation = (
+                validate_subagent_result(
+                    dict(artifact.get("payload", {}) or {}),
+                    role_id=role_id,
+                    allowed_uris=allowed_uris,
+                )
+                if artifact and status == "completed" and role_id
+                else {"valid": False, "errors": ["child_not_completed_or_artifact_missing"], "result": None}
+            )
+            handoff = dict(validation.get("result") or {})
+            artifact_evidence_uris = [
+                str(item.get("uri", ""))
+                for item in list(artifact.get("evidence_links", []) or [])
+                if isinstance(item, dict) and str(item.get("uri", "")) in allowed_uris
+            ]
+            evidence_uris = list(dict.fromkeys([
+                *[str(item) for item in list(handoff.get("evidence_uris", []) or [])],
+                *artifact_evidence_uris,
+            ]))
+            if status == "completed" and validation["valid"]:
+                counts["valid"] += 1
+                aggregated_findings.append(
+                    {
+                        "run_uri": str(child.get("uri", "")),
+                        "artifact_uri": str(artifact.get("uri", "")),
+                        "role": role_id,
+                        "handoff": handoff,
+                    }
+                )
+                aggregated_evidence_uris.extend(evidence_uris)
+            elif status == "failed":
+                counts["failed"] += 1
+            elif status == "cancelled":
+                counts["cancelled"] += 1
+            elif status == "completed":
+                counts["invalid"] += 1
+            else:
+                counts["running"] += 1
+            handoff_status = "valid" if validation["valid"] else ("invalid" if status == "completed" else status)
+            results.append(
+                {
+                    "run_id": str(child.get("run_id", "")),
+                    "run_uri": str(child.get("uri", "")),
+                    "role": role_id,
+                    "label": str(role.get("label", "")),
+                    "status": status,
+                    "summary": str(artifact.get("summary", "") or child.get("error", {}).get("message", "")),
+                    "artifact_id": str(artifact.get("artifact_id", "")),
+                    "artifact_uri": str(artifact.get("uri", "")),
+                    "handoff_status": handoff_status,
+                    "handoff": handoff if validation["valid"] else None,
+                    "handoff_errors": list(validation.get("errors", []) or []),
+                    "evidence_uris": evidence_uris,
+                    "recovery": dict(child.get("recovery", {}) or {}),
+                }
+            )
+        return {
+            "parent_run_id": run_id,
+            "parent_run_uri": str(parent.get("uri", "")),
+            "children": results,
+            "aggregated_findings": aggregated_findings,
+            "evidence_uris": list(dict.fromkeys(aggregated_evidence_uris)),
+            "complete": bool(results) and counts["valid"] == counts["total"],
+            "counts": counts,
+            "completed": counts["valid"],
+            "total": len(results),
+            "wait": {
+                "requested_seconds": bounded_wait,
+                "waited_seconds": round(time.monotonic() - wait_started, 6),
+                "timed_out": wait_timed_out,
+                "interrupted": wait_interrupted,
+                "poll_interval_ms": bounded_poll_ms,
+            },
+        }
+
+    def _scientific_agent_control(
+        self,
+        name: str,
+        active_run_id: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute a Pi scientific control under the host-bound active run."""
+
+        parent = self.store.get_run(active_run_id)
+        if str(dict(parent.get("metadata", {}) or {}).get("runtime", "")) == "scansci-scientific-subagent.v1":
+            raise PermissionError("Scientific child runs cannot control or delegate scientific agents")
+        if str(parent.get("status", "")) not in {
+            "queued", "planning", "running", "verifying", "paused", "waiting_input", "needs_confirmation"
+        }:
+            raise PermissionError("Scientific agent controls require an active durable parent run")
+        if name == "delegate_scientific_agents":
+            return self.delegate_scientific_agents(active_run_id, dict(arguments or {}))
+        if name == "list_scientific_agents":
+            return self.list_scientific_agents(active_run_id)
+        if name == "collect_scientific_agents":
+            return self.collect_scientific_agents(
+                active_run_id,
+                wait_seconds=arguments.get("wait_seconds", 0.0),
+                poll_interval_ms=arguments.get("poll_interval_ms", 50),
+            )
+        if name == "cancel_scientific_agents":
+            child_run_ids = (
+                list(arguments.get("child_run_ids") or [])
+                if "child_run_ids" in arguments
+                else None
+            )
+            return self.cancel_scientific_agents(
+                active_run_id,
+                child_run_ids,
+            )
+        raise ValueError(f"Unsupported scientific agent control: {name}")
 
     def branch_run(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a durable conversation/task branch and optionally execute it."""
@@ -2768,6 +3230,31 @@ class ResearchAgentRuntime:
         # drafting) that can leave the direct-chat surface waiting for minutes.
         force_local_evidence = bool(payload.get("force_local_evidence", False))
         research_run_id = str(payload.get("_research_run_id", "") or "")
+        durable_task_contract: dict[str, Any] | None = None
+        scientific_child_role = ""
+        scientific_child_schema: dict[str, Any] = {}
+        scientific_allowed_uris: set[str] = set()
+        if research_run_id:
+            durable_run = self.store.get_run(research_run_id)
+            persisted_contract = dict(durable_run.get("task_contract", {}) or {})
+            is_scientific_child = (
+                str(dict(durable_run.get("metadata", {}) or {}).get("runtime", ""))
+                == "scansci-scientific-subagent.v1"
+            )
+            if is_scientific_child and not persisted_contract:
+                raise PermissionError("Scientific child run is missing its durable capability contract")
+            durable_task_contract = persisted_contract or None
+            if is_scientific_child:
+                subagent_contract = dict(persisted_contract.get("subagent", {}) or {})
+                scientific_child_role = str(subagent_contract.get("role", "")).strip()
+                scientific_child_schema = dict(subagent_contract.get("output_schema", {}) or {})
+                if not scientific_child_role or not scientific_child_schema:
+                    raise PermissionError("Scientific child run is missing its durable output contract")
+                scientific_allowed_uris.add(str(durable_run.get("uri", "")))
+                parent_run_id = str(durable_run.get("parent_run_id", "")).strip()
+                if parent_run_id:
+                    scientific_allowed_uris.add(str(self.store.get_run(parent_run_id).get("uri", "")))
+                scientific_allowed_uris.discard("")
         image_attachments = list(payload.get("images", []) or [])
         image_analysis: dict[str, Any] | None = None
         if image_attachments:
@@ -2855,9 +3342,26 @@ class ResearchAgentRuntime:
             analysis_text = str(image_analysis.get("text", "")).strip()
             if analysis_text:
                 question = f"{question}\n\n【图片内容（{str(image_analysis.get('model', ''))}）】\n{analysis_text}"
-        if provider is not None and provider.get("kind") != "local" and not force_local_evidence:
+        if scientific_child_role and provider is None:
+            raise RuntimeError("Scientific child run has no configured Pi model route")
+        if scientific_child_role or (
+            provider is not None and provider.get("kind") != "local" and not force_local_evidence
+        ):
+            assert provider is not None
             managed = str(provider.get("auth_mode", "")) == "managed"
-            api_key = "scansci-managed-gateway" if managed else get_provider_api_key(self.workspace, str(provider.get("id", "")))
+            local_provider = str(provider.get("kind", "")).strip().lower() == "local"
+            api_key = (
+                "scansci-managed-gateway"
+                if managed
+                else "local"
+                if local_provider
+                else get_provider_api_key(self.workspace, str(provider.get("id", "")))
+            )
+            pi_provider_kind = str(provider.get("kind", ""))
+            pi_base_url = str(provider.get("base_url", ""))
+            if str(provider.get("id", "")) == "local-huggingface":
+                pi_base_url = ensure_local_transformers_runtime(str(active.get("model_id", "")))
+                pi_provider_kind = "openai-compatible"
             if not api_key and not image_attachments:
                 raise ValueError("当前生成模型尚未配置 API Key")
             task_mode = str(payload.get("task_mode", "evidence")).strip().lower() or "evidence"
@@ -2909,7 +3413,7 @@ class ResearchAgentRuntime:
                     active_model_id = str(active.get("model_id", ""))
                     native_api_surface = select_api_surface(
                         str(provider.get("api_surface", "chat_completions")),
-                        provider_kind=str(provider.get("kind", "")),
+                        provider_kind=pi_provider_kind,
                         provider_id=str(provider.get("id", "")),
                         model=active_model_id,
                         responses_enabled=bool(provider.get("responses_enabled", False)),
@@ -2924,7 +3428,7 @@ class ResearchAgentRuntime:
                     )
                     native_model_runtime = descriptor_from_model_record(
                         provider_id=str(provider.get("id", "")),
-                        provider_kind=str(provider.get("kind", "")),
+                        provider_kind=pi_provider_kind,
                         model_id=active_model_id,
                         model_record=native_model_record,
                         api_surface=native_api_surface,
@@ -2936,6 +3440,10 @@ class ResearchAgentRuntime:
                         additional_evidence_dbs=evidence_dbs[1:],
                         notebook_ids=requested_notebook_ids,
                         knowledge_scope=self._scope_for_notebook(payload, notebook),
+                        active_run_id=research_run_id,
+                        scientific_agent_control=(
+                            self._scientific_agent_control if research_run_id else None
+                        ),
                     )
                     pi_agent.embedding_provider = local_evidence.embedding_provider
                     pi_agent.reranker = local_evidence.reranker
@@ -2943,9 +3451,22 @@ class ResearchAgentRuntime:
                         with self._active_pi_lock:
                             self._active_pi_clients[research_run_id] = pi_agent
                     try:
+                        if scientific_child_role:
+                            system_content = (
+                                "You are a bounded ScanSci scientific sub-agent. Execute only tools in the "
+                                "host-issued lease. Return exactly one JSON object matching this schema; do not "
+                                "wrap it in Markdown or add prose: "
+                                + json.dumps(scientific_child_schema, ensure_ascii=False, separators=(",", ":"))
+                            )
+                        else:
+                            system_content = (
+                                "You are ScanSci. This endpoint requires a source-grounded answer. "
+                                "Call build_verified_answer and use its verified result for delivery."
+                            )
+                        child_fragments: list[str] = []
                         pi_events = pi_agent.stream_chat(
-                            provider_kind=str(provider.get("kind", "")),
-                            base_url=str(provider.get("base_url", "")),
+                            provider_kind=pi_provider_kind,
+                            base_url=pi_base_url,
                             api_key=api_key,
                             model_id=active_model_id,
                             api_surface=native_api_surface,
@@ -2954,10 +3475,7 @@ class ResearchAgentRuntime:
                             messages=[
                                 {
                                     "role": "system",
-                                    "content": (
-                                        "You are ScanSci. This endpoint requires a source-grounded answer. "
-                                        "Call build_verified_answer and use its verified result for delivery."
-                                    ),
+                                    "content": system_content,
                                 },
                                 {"role": "user", "content": question},
                             ],
@@ -2966,18 +3484,63 @@ class ResearchAgentRuntime:
                             # this one-action protocol non-reasoning so the
                             # bounded output window contains the actual intent
                             # instead of being exhausted by hidden thoughts.
-                            thinking_level="off" if managed else thinking_level,
+                            # Scientific children inherit the parent's durable
+                            # request.  Pi must see max/xhigh so its provider-
+                            # specific clamp emits an explicit degradation;
+                            # silently forcing managed children to off would
+                            # discard that contract.
+                            thinking_level=(
+                                thinking_level
+                                if scientific_child_role
+                                else "off"
+                                if managed
+                                else thinking_level
+                            ),
                             task_mode="verified-answer" if task_mode in {"auto", "evidence"} else task_mode,
+                            task_contract=durable_task_contract,
                             timeout_seconds=self.verified_answer_pi_timeout_seconds(managed=managed),
                         )
                         for pi_event in pi_events:
-                            if pi_event.get("type") == "tool.completed":
+                            event_type = str(pi_event.get("type", ""))
+                            if event_type == "delta" and scientific_child_role:
+                                child_fragments.append(str(pi_event.get("content", "")))
+                            elif event_type == "tool.completed":
                                 tool_name = str(pi_event.get("name", ""))
                                 tool_calls.append({"name": tool_name, "status": "completed"})
-                                if tool_name == "build_verified_answer":
+                                if scientific_child_role:
+                                    scientific_allowed_uris.update(
+                                        _owned_scientific_evidence_uris(
+                                            tool_name,
+                                            pi_event.get("result", {}),
+                                            evidence_dbs,
+                                        )
+                                    )
+                                if not scientific_child_role and tool_name == "build_verified_answer":
                                     result = dict(pi_event.get("result", {}) or {})
-                            elif pi_event.get("type") == "cancelled":
+                            elif event_type == "cancelled":
                                 raise _RunCancelled("Pi Agent run was cancelled")
+                        if scientific_child_role:
+                            raw_handoff = "".join(child_fragments).strip()
+                            try:
+                                parsed_handoff = json.loads(raw_handoff)
+                            except (json.JSONDecodeError, TypeError) as error:
+                                raise RuntimeError(
+                                    "Scientific child Pi turn did not return one valid JSON object"
+                                ) from error
+                            validation = validate_subagent_result(
+                                {"subagent_handoff": parsed_handoff},
+                                role_id=scientific_child_role,
+                                allowed_uris=scientific_allowed_uris,
+                            )
+                            if not validation["valid"]:
+                                raise RuntimeError(
+                                    "Scientific child Pi handoff failed its durable schema: "
+                                    + ", ".join(str(item) for item in validation.get("errors", []))
+                                )
+                            result = {
+                                "subagent_handoff": dict(validation["result"] or {}),
+                                "_scientific_allowed_uris": sorted(scientific_allowed_uris),
+                            }
                     finally:
                         if research_run_id:
                             with self._active_pi_lock:
@@ -2990,6 +3553,10 @@ class ResearchAgentRuntime:
                 except _RunCancelled:
                     raise
                 except Exception as error:  # provider tool compatibility boundary
+                    if scientific_child_role:
+                        # A child may not escape its persisted lease by falling
+                        # into the broader fixed verified-answer workflow.
+                        raise
                     # Do not fail the user's evidence task merely because a
                     # nominally OpenAI-compatible endpoint implements a
                     # different tool/message schema.  The fixed workflow
@@ -3338,7 +3905,7 @@ class ResearchAgentRuntime:
             re.search(
                 r"(?:linked|local|selected|current).{0,18}(?:knowledge\s*base|library|documents?|papers?)"
                 r"|(?:knowledge\s*base|zotero|obsidian|知识库|本地库|文献库|资料库|向量库)"
-                r"|(?:只|仅|基于|使用).{0,14}(?:已连接|已链接|当前|本地).{0,12}(?:知识库|文献|资料|论文)",
+                r"|(?:只|仅|基于|使用).{0,14}(?:已连接|已链接|当前|本地).{0,12}(?:知识库|文献|资料|论文|文档)",
                 normalized,
                 re.IGNORECASE,
             )
@@ -3553,6 +4120,7 @@ class ResearchAgentRuntime:
             workflow_type=workflow_type,
             mcp_scope="selected-library" if requested_notebook_ids else "default",
         )
+        turn_contract = self._contract_for_active_run(active_run_id, fallback=turn_contract)
         mode_parts = _pi_mode_parts(resolved_task_mode)
         local_evidence = None
         if mode_parts & {"knowledge", "research", "verified-answer", "benchmark"}:
@@ -3567,6 +4135,7 @@ class ResearchAgentRuntime:
             embedding_provider=local_evidence.embedding_provider if local_evidence else None,
             reranker=local_evidence.reranker if local_evidence else None,
             active_run_id=active_run_id,
+            scientific_agent_control=self._scientific_agent_control,
         )
         control_id = str(active_run_id or "").strip()
         if control_id:
@@ -9116,9 +9685,62 @@ class ResearchAgentRuntime:
         spec = _WORKFLOWS[str(run["workflow_type"])]
         result = self._tool_output(run)
         subagent = dict(dict(run.get("metadata", {}) or {}).get("subagent", {}) or {})
-        if str(dict(run.get("metadata", {}) or {}).get("runtime", "")) == "scansci-scientific-subagent.v1":
+        scientific_child = (
+            str(dict(run.get("metadata", {}) or {}).get("runtime", ""))
+            == "scansci-scientific-subagent.v1"
+        )
+        if scientific_child:
             role_id = str(subagent.get("role", ""))
-            validation = validate_subagent_result(result, role_id=role_id)
+            trusted_uris = {str(run.get("uri", ""))}
+            parent_run_id = str(run.get("parent_run_id", "") or "").strip()
+            owned_runs = [run]
+            if parent_run_id:
+                owned_runs.append(self.store.get_run(parent_run_id))
+            for owned_run in owned_runs:
+                trusted_uris.add(str(owned_run.get("uri", "")))
+                for artifact in list(owned_run.get("artifacts", []) or []):
+                    if not isinstance(artifact, dict):
+                        continue
+                    trusted_uris.add(str(artifact.get("uri", "")))
+                    trusted_uris.update(
+                        str(link.get("uri", ""))
+                        for link in list(artifact.get("evidence_links", []) or [])
+                        if isinstance(link, dict) and str(link.get("uri", ""))
+                    )
+            evidence_db = self.evidence_db
+            notebook_id = str(run.get("notebook_id", "") or "").strip()
+            if notebook_id:
+                try:
+                    evidence_db = self._evidence_db_for_notebook(self._notebook(notebook_id))
+                except FileNotFoundError:
+                    evidence_db = self.evidence_db
+            for candidate_uri in list(result.get("_scientific_allowed_uris", []) or []):
+                parsed = parse_resource_uri(candidate_uri)
+                segments = list(dict(parsed or {}).get("segments", []) or [])
+                if str(dict(parsed or {}).get("kind", "")) != "evidence" or len(segments) != 2:
+                    continue
+                canonical = make_resource_uri("evidence", segments[0], segments[1])
+                if canonical != str(candidate_uri):
+                    continue
+                trusted_uris.update(
+                    _owned_scientific_evidence_uris(
+                        "search_local_evidence",
+                        {
+                            "hits": [{
+                                "doc_id": segments[0],
+                                "evidence_id": segments[1],
+                                "library_index": 0,
+                            }]
+                        },
+                        [evidence_db],
+                    )
+                )
+            trusted_uris.discard("")
+            validation = validate_subagent_result(
+                result,
+                role_id=role_id,
+                allowed_uris=trusted_uris,
+            )
             if not validation["valid"]:
                 raise RuntimeError(
                     "Scientific sub-agent handoff must be one valid JSON object: "
@@ -9141,6 +9763,22 @@ class ResearchAgentRuntime:
                 }
                 for item in list(dict(result.get("reader_answer", {}) or {}).get("citations", []) or [])
             ]
+        if scientific_child:
+            evidence_links = []
+            handoff = dict(result.get("subagent_handoff", {}) or {})
+            for resource_uri in list(handoff.get("evidence_uris", []) or []):
+                parsed = parse_resource_uri(resource_uri)
+                segments = list(dict(parsed or {}).get("segments", []) or [])
+                if str(dict(parsed or {}).get("kind", "")) != "evidence" or not segments:
+                    continue
+                evidence_links.append(
+                    {
+                        "doc_id": str(segments[0]),
+                        "evidence_id": str(segments[1]) if len(segments) > 1 else "",
+                        "relationship": "supports",
+                        "metadata": {"source_uri": str(resource_uri)},
+                    }
+                )
         file_path = str(
             result.get("file_path", "")
             or result.get("output_path", "")

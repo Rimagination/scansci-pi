@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from typing import Any, Iterable
+from urllib.parse import unquote, urlsplit
 
 from .agent_capabilities import parse_resource_uri
 
@@ -81,7 +82,65 @@ def structured_output_schema(role: ScientificRole) -> dict[str, Any]:
     }
 
 
-def validate_subagent_result(payload: object, *, role_id: str) -> dict[str, Any]:
+def validate_scientific_resource_uri(
+    value: object,
+    *,
+    allowed_uris: Iterable[str],
+) -> str | None:
+    """Accept only an exact, host-issued ScanSci resource membership URI.
+
+    URI parsing alone is not authority.  The caller supplies the concrete
+    parent-owned resource set and this function rejects ambiguous spellings
+    before applying exact membership, so percent-encoding cannot manufacture
+    a different authority or path after validation.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        return None
+    lowered = raw.lower()
+    if "%25" in lowered or "\\" in raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "scansci"
+        or parsed.netloc not in {"run", "artifact", "evidence"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+    ):
+        return None
+    for encoded_segment in parsed.path.split("/")[1:]:
+        if not encoded_segment:
+            return None
+        try:
+            decoded = unquote(encoded_segment, errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if (
+            decoded in {".", ".."}
+            or "%" in decoded
+            or "/" in decoded
+            or "\\" in decoded
+            or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+        ):
+            return None
+    return raw if raw in {str(uri) for uri in allowed_uris} else None
+
+
+def validate_subagent_result(
+    payload: object,
+    *,
+    role_id: str,
+    allowed_uris: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """Validate the one JSON handoff a scientific child may give its parent.
 
     Prose remains in the durable child run for diagnosis, but a coordinator
@@ -126,6 +185,13 @@ def validate_subagent_result(payload: object, *, role_id: str) -> dict[str, Any]
 
     valid_uris: list[str] = []
     for value in list(normalized.get("evidence_uris", []) or []):
+        if allowed_uris is not None:
+            validated = validate_scientific_resource_uri(value, allowed_uris=allowed_uris)
+            if validated is None:
+                errors.append("invalid_evidence_uri")
+                continue
+            valid_uris.append(validated)
+            continue
         parsed = parse_resource_uri(value)
         if not parsed or str(parsed.get("kind", "")) not in {"evidence", "paper", "artifact", "run"}:
             errors.append("invalid_evidence_uri")

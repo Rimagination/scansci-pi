@@ -119,14 +119,14 @@ def test_old_database_migration_preserves_counts_and_is_repeatable(tmp_path: Pat
     assert before == after_first == after_second
     assert reopened.schema_status() == {
         "schema_name": "research_runs",
-        "schema_version": 3,
-        "target_version": 3,
+        "schema_version": 4,
+        "target_version": 4,
     }
     migrated = reopened.get_run("run_legacy")
     assert migrated["input"] == {"question": "keep"}
     assert migrated["events"][0]["schema_version"] == "scientific_event.v1"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("select count(*) from schema_migrations where schema_name = 'research_runs'").fetchone()[0] == 3
+        assert connection.execute("select count(*) from schema_migrations where schema_name = 'research_runs'").fetchone()[0] == 4
         assert connection.execute("select count(*) from research_run_events where sequence = 1").fetchone()[0] == 1
 
 

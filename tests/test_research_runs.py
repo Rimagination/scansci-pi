@@ -490,7 +490,10 @@ def test_scientific_subagents_are_bounded_and_share_parent_evidence_scope(tmp_pa
         assert child["metadata"]["subagent"]["output_schema"]["schema_version"] == "scansci.subagent-result.v1"
 
 
-def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_path: Path):
+def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(
+    tmp_path: Path,
+    monkeypatch,
+):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     parent = runtime.store.create_run(
         notebook_id="library",
@@ -499,18 +502,11 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
         input_payload={"question": "Compare evidence"},
         stages=_stages(),
     )
-    child = runtime.store.create_run(
-        notebook_id="library",
-        workflow_type="ask",
-        title="Scout",
-        input_payload={"question": "Scout"},
-        stages=[StageSpec("deliver", "Deliver", "delivery")],
-        metadata={
-            "runtime": "scansci-scientific-subagent.v1",
-            "subagent": {"role": "literature_scout", "label": "Scout"},
-        },
-        parent_run_id=parent["run_id"],
-    )
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    child = runtime.delegate_scientific_agents(
+        parent["run_id"],
+        {"roles": ["literature_scout"], "idempotency_key": "valid-handoff"},
+    )["children"][0]
     artifact = runtime.store.create_artifact(
         child["run_id"],
         artifact_type="evidence_answer",
@@ -518,9 +514,10 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
         summary="JSON handoff",
         payload={
             "reader_answer": {
-                "text": '{"role":"literature_scout","findings":["candidate paper"],"evidence_uris":["scansci://paper/10.1%2Fexample"],"uncertainties":[],"recommended_next_action":"verify DOI"}'
+                "text": '{"role":"literature_scout","findings":["candidate paper"],"evidence_uris":["scansci://evidence/doc-1/ev-1"],"uncertainties":[],"recommended_next_action":"verify DOI"}'
             }
         },
+        evidence_links=[{"doc_id": "doc-1", "evidence_id": "ev-1"}],
     )
     runtime.store.complete_run(child["run_id"], output_artifact_id=artifact["artifact_id"])
 
@@ -530,7 +527,7 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
     assert collected["completed"] == 1
     assert collected["children"][0]["handoff_status"] == "valid"
     assert collected["aggregated_findings"][0]["handoff"]["role"] == "literature_scout"
-    assert collected["evidence_uris"] == ["scansci://paper/10.1%2Fexample"]
+    assert collected["evidence_uris"] == ["scansci://evidence/doc-1/ev-1"]
 
 
 def test_advisor_action_forks_an_evidence_safe_follow_up(tmp_path: Path, monkeypatch) -> None:

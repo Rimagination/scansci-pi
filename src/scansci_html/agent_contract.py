@@ -43,6 +43,8 @@ _READ_ONLY_TOOLS = {
     "search_journal",
     "audit_references",
     "build_presentation_outline",
+    "list_scientific_agents",
+    "collect_scientific_agents",
     "self_assess",
 }
 _REVERSIBLE_LOCAL_TOOLS = {
@@ -54,6 +56,8 @@ _REVERSIBLE_LOCAL_TOOLS = {
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "delegate_scientific_agents",
+    "cancel_scientific_agents",
 }
 _MODE_TOOLS = {
     "workspace-status": {"inspect_workspace"},
@@ -86,6 +90,10 @@ _MODE_TOOLS = {
         "obsidian_read",
         "obsidian_backlinks",
         "build_verified_answer",
+        "delegate_scientific_agents",
+        "list_scientific_agents",
+        "collect_scientific_agents",
+        "cancel_scientific_agents",
         "self_assess",
     },
     "research": {
@@ -112,6 +120,10 @@ _MODE_TOOLS = {
         "obsidian_read",
         "obsidian_backlinks",
         "build_verified_answer",
+        "delegate_scientific_agents",
+        "list_scientific_agents",
+        "collect_scientific_agents",
+        "cancel_scientific_agents",
         "self_assess",
     },
     "verified-answer": {"build_verified_answer"},

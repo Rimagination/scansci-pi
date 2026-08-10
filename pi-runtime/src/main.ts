@@ -175,6 +175,13 @@ function emit(payload: JsonRecord): void {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
+function commandCorrelation(message: JsonRecord): JsonRecord {
+  return {
+    command_id: String(message.command_id || ""),
+    generation: Number(message.generation || 0),
+  };
+}
+
 function redactSensitiveText(value: unknown): string {
   let text = value instanceof Error ? value.message : String(value ?? "");
   const providerKey = String(process.env.SCANSCIPI_PROVIDER_KEY || "").trim();
@@ -649,6 +656,32 @@ function thinkingLevel(value: unknown): ThinkingLevel {
     return normalized as ThinkingLevel;
   }
   return "medium";
+}
+
+function applyRequestedThinkingLevel(session: AgentSession, request: RunStart): void {
+  const requested = thinkingLevel(request.thinking_level);
+  const available = session.getAvailableThinkingLevels();
+  // Pi SDK owns provider-specific clamping.  This matters for sparse maps:
+  // selecting the numerically highest available level can silently expand a
+  // low request into xhigh, whereas AgentSession chooses the provider's
+  // nearest legal level.
+  session.setThinkingLevel(requested);
+  const applied = session.thinkingLevel;
+  if (requested !== applied) {
+    emit({
+      type: "status.update",
+      request_id: request.request_id,
+      session_id: request.session_id,
+      status: "capability_degraded",
+      name: "thinking_level",
+      details: {
+        requested,
+        applied,
+        available,
+        resume_preserves_requested_level: true,
+      },
+    });
+  }
 }
 
 function modelCompat(request: RunStart): JsonRecord | undefined {
@@ -2259,6 +2292,44 @@ function tools(
       }),
     ),
     bridgeTool(
+      "delegate_scientific_agents",
+      "Delegate scientific agents",
+      "Reserve and start up to three independent read-only scientific child runs owned by this active durable parent. Children cannot recursively delegate.",
+      Type.Object({
+        roles: Type.Optional(Type.Array(Type.Union([
+          Type.Literal("literature_scout"),
+          Type.Literal("fulltext_analyst"),
+          Type.Literal("evidence_auditor"),
+          Type.Literal("synthesis_writer"),
+        ]), { minItems: 1, maxItems: 3 })),
+        instruction: Type.Optional(Type.String({ maxLength: 2000 })),
+        idempotency_key: Type.String({ minLength: 1, maxLength: 200 }),
+      }),
+    ),
+    bridgeTool(
+      "list_scientific_agents",
+      "List scientific agents",
+      "Read the durable statuses of scientific children owned by this active parent.",
+      Type.Object({}),
+    ),
+    bridgeTool(
+      "collect_scientific_agents",
+      "Collect scientific agents",
+      "Collect partial, schema-validated handoffs from scientific children owned by this active parent, optionally waiting for a bounded interval.",
+      Type.Object({
+        wait_seconds: Type.Optional(Type.Number({ minimum: 0, maximum: 30 })),
+        poll_interval_ms: Type.Optional(Type.Integer({ minimum: 10, maximum: 1000 })),
+      }),
+    ),
+    bridgeTool(
+      "cancel_scientific_agents",
+      "Cancel scientific agents",
+      "Cancel selected scientific children owned by this active parent; cross-parent ids are rejected.",
+      Type.Object({
+        child_run_ids: Type.Optional(Type.Array(Type.String({ maxLength: 120 }), { minItems: 1, maxItems: 3 })),
+      }),
+    ),
+    bridgeTool(
       "self_assess",
       "Assess progress",
       "Return a structured summary of tools called so far, their results, and a suggestion for whether to continue, adjust, or deliver.",
@@ -2875,6 +2946,7 @@ async function createSession(
       },
     }),
   });
+  applyRequestedThinkingLevel(created.session, request);
   sessionRef = created.session;
   // Register the whole authorized inventory, then reduce the active surface.
   // Passing `tools` to createAgentSession would make it a hard registry
@@ -2988,6 +3060,7 @@ async function getSession(request: RunStart): Promise<{ state: SessionState; res
   if (existing && existing.signature === sessionSignature(request)) {
     existing.request = request;
     existing.requestRef.current = request;
+    applyRequestedThinkingLevel(existing.session, request);
     existing.activeToolNames = domainActiveToolNames(existing.session);
     existing.prefixShape = buildPrefixShape(
       request,
@@ -3334,7 +3407,7 @@ async function cancelRun(message: JsonRecord): Promise<void> {
   const commandId = String(message.command_id || "");
   const activeRun = activeRuns.get(requestId);
   if (!activeRun) {
-    emit({ type: "run.cancel_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
+    emit({ type: "run.cancel_rejected", request_id: requestId, ...commandCorrelation(message), error: "Run is not active" });
     return;
   }
   activeRun.cancelled = true;
@@ -3343,12 +3416,12 @@ async function cancelRun(message: JsonRecord): Promise<void> {
   const state = sessions.get(activeRun.sessionId);
   try {
     await state?.session.abort();
-    emit({ type: "run.cancel_ack", request_id: requestId, command_id: commandId, session_id: activeRun.sessionId });
+    emit({ type: "run.cancel_ack", request_id: requestId, ...commandCorrelation(message), session_id: activeRun.sessionId });
   } catch (error) {
     emit({
       type: "run.cancel_rejected",
       request_id: requestId,
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: activeRun.sessionId,
       error: errorText(error),
     });
@@ -3360,7 +3433,7 @@ async function steerRun(message: JsonRecord): Promise<void> {
   const commandId = String(message.command_id || "");
   const activeRun = activeRuns.get(requestId);
   if (!activeRun) {
-    emit({ type: "run.steer_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
+    emit({ type: "run.steer_rejected", request_id: requestId, ...commandCorrelation(message), error: "Run is not active" });
     return;
   }
   const state = sessions.get(activeRun.sessionId);
@@ -3376,12 +3449,12 @@ async function steerRun(message: JsonRecord): Promise<void> {
       throw new Error("The selected model runtime descriptor does not support image input");
     }
     await state.session.steer(String(message.text || ""), images);
-    emit({ type: "run.steer_ack", request_id: requestId, command_id: commandId, session_id: activeRun.sessionId });
+    emit({ type: "run.steer_ack", request_id: requestId, ...commandCorrelation(message), session_id: activeRun.sessionId });
   } catch (error) {
     emit({
       type: "run.steer_rejected",
       request_id: requestId,
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: activeRun.sessionId,
       error: errorText(error),
     });
@@ -3393,7 +3466,7 @@ async function followUpRun(message: JsonRecord): Promise<void> {
   const commandId = String(message.command_id || "");
   const activeRun = activeRuns.get(requestId);
   if (!activeRun) {
-    emit({ type: "run.follow_up_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
+    emit({ type: "run.follow_up_rejected", request_id: requestId, ...commandCorrelation(message), error: "Run is not active" });
     return;
   }
   const state = sessions.get(activeRun.sessionId);
@@ -3414,7 +3487,7 @@ async function followUpRun(message: JsonRecord): Promise<void> {
     emit({
       type: "run.follow_up_ack",
       request_id: requestId,
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: activeRun.sessionId,
       queued: state.session.pendingMessageCount,
     });
@@ -3422,7 +3495,7 @@ async function followUpRun(message: JsonRecord): Promise<void> {
     emit({
       type: "run.follow_up_rejected",
       request_id: requestId,
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: activeRun.sessionId,
       error: errorText(error),
     });
@@ -3468,7 +3541,7 @@ function resolveInteraction(message: JsonRecord): void {
 function listActiveRuns(message: JsonRecord): void {
   emit({
     type: "runtime.active_runs",
-    command_id: String(message.command_id || ""),
+    ...commandCorrelation(message),
     runs: [...activeRuns.values()].map((item) => ({
       request_id: item.requestId,
       session_id: item.sessionId,
@@ -3486,21 +3559,70 @@ async function compactSession(message: JsonRecord): Promise<void> {
   const commandId = String(message.command_id || "");
   const state = sessions.get(sessionId);
   if (!state) {
-    emit({ type: "session.compact_failed", command_id: commandId, session_id: sessionId, error: "Session is not loaded" });
+    emit({ type: "session.compact_failed", ...commandCorrelation(message), session_id: sessionId, error: "Session is not loaded" });
     return;
   }
   try {
     const result = await state.session.compact(String(message.instructions || "") || undefined);
     emit({
       type: "session.compact_completed",
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: sessionId,
       result,
       stats: { ...sessionStats(state), contextCleanup: state.lastContextReport },
     });
   } catch (error) {
-    emit({ type: "session.compact_failed", command_id: commandId, session_id: sessionId, error: errorText(error) });
+    emit({ type: "session.compact_failed", ...commandCorrelation(message), session_id: sessionId, error: errorText(error) });
   }
+}
+
+function sessionQueue(message: JsonRecord, clear: boolean): void {
+  const sessionId = String(message.session_id || "");
+  const state = sessions.get(sessionId);
+  if (!state) {
+    emit({
+      type: "session.queue_failed",
+      ...commandCorrelation(message),
+      session_id: sessionId,
+      error: "Session is not loaded",
+    });
+    return;
+  }
+  const queued = clear
+    ? state.session.clearQueue()
+    : {
+      steering: [...state.session.getSteeringMessages()],
+      followUp: [...state.session.getFollowUpMessages()],
+    };
+  emit({
+    type: clear ? "session.queue_cleared" : "session.queue",
+    ...commandCorrelation(message),
+    session_id: sessionId,
+    steering: queued.steering,
+    follow_up: queued.followUp,
+    pending: clear ? 0 : state.session.pendingMessageCount,
+  });
+}
+
+function abortSessionCompaction(message: JsonRecord): void {
+  const sessionId = String(message.session_id || "");
+  const state = sessions.get(sessionId);
+  if (!state) {
+    emit({
+      type: "session.compact_abort_failed",
+      ...commandCorrelation(message),
+      session_id: sessionId,
+      error: "Session is not loaded",
+    });
+    return;
+  }
+  state.session.abortCompaction();
+  emit({
+    type: "session.compact_aborted",
+    ...commandCorrelation(message),
+    session_id: sessionId,
+    aborted: true,
+  });
 }
 
 async function loadSession(message: JsonRecord): Promise<void> {
@@ -3508,7 +3630,7 @@ async function loadSession(message: JsonRecord): Promise<void> {
   const commandId = String(message.command_id || "");
   const sessionFile = String(message.session_file || "");
   if (!sessionId || !sessionFile) {
-    emit({ type: "session.load_failed", command_id: commandId, session_id: sessionId, error: "Session file is unavailable" });
+    emit({ type: "session.load_failed", ...commandCorrelation(message), session_id: sessionId, error: "Session file is unavailable" });
     return;
   }
   try {
@@ -3533,9 +3655,9 @@ async function loadSession(message: JsonRecord): Promise<void> {
       disabled_tools: Array.isArray(message.disabled_tools) ? message.disabled_tools.map(String) : [],
     } satisfies RunStart;
     const resolved = await getSession(request);
-    emit({ type: "session.loaded", command_id: commandId, session_id: sessionId, session_file: resolved.state.session.sessionFile || "", resumed: resolved.resumed, stats: sessionStats(resolved.state) });
+    emit({ type: "session.loaded", ...commandCorrelation(message), session_id: sessionId, session_file: resolved.state.session.sessionFile || "", resumed: resolved.resumed, stats: sessionStats(resolved.state) });
   } catch (error) {
-    emit({ type: "session.load_failed", command_id: commandId, session_id: sessionId, error: errorText(error) });
+    emit({ type: "session.load_failed", ...commandCorrelation(message), session_id: sessionId, error: errorText(error) });
   }
 }
 
@@ -3545,7 +3667,7 @@ async function closeSession(message: JsonRecord): Promise<void> {
   if (activeSessionRequests.has(sessionId)) {
     emit({
       type: "session.close_rejected",
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: sessionId,
       request_id: activeSessionRequests.get(sessionId) || "",
       error: "Session has an active run",
@@ -3560,11 +3682,11 @@ async function closeSession(message: JsonRecord): Promise<void> {
       await Promise.all(state.mcpClients.map((client) => client.close().catch(() => undefined)));
       sessions.delete(sessionId);
     }
-    emit({ type: "session.closed", command_id: commandId, session_id: sessionId });
+    emit({ type: "session.closed", ...commandCorrelation(message), session_id: sessionId });
   } catch (error) {
     emit({
       type: "session.close_rejected",
-      command_id: commandId,
+      ...commandCorrelation(message),
       session_id: sessionId,
       error: errorText(error),
     });
@@ -3579,7 +3701,7 @@ async function forkSession(message: JsonRecord): Promise<void> {
   if (!source || !source.session.sessionFile) {
     emit({
       type: "session.fork_failed",
-      command_id: commandId,
+      ...commandCorrelation(message),
       source_session_id: sourceSessionId,
       target_session_id: targetSessionId,
       error: "Source session is not loaded or has no durable file",
@@ -3589,7 +3711,7 @@ async function forkSession(message: JsonRecord): Promise<void> {
   if (sessions.has(targetSessionId) || activeSessionRequests.has(targetSessionId)) {
     emit({
       type: "session.fork_failed",
-      command_id: commandId,
+      ...commandCorrelation(message),
       source_session_id: sourceSessionId,
       target_session_id: targetSessionId,
       error: "Target session already exists",
@@ -3597,6 +3719,12 @@ async function forkSession(message: JsonRecord): Promise<void> {
     return;
   }
   try {
+    const entryId = String(message.entry_id || "").trim();
+    const before = message.before === true;
+    const fullHistory = message.full_history !== false;
+    if (entryId && fullHistory) {
+      throw new Error("Entry-level fork cannot also request full history");
+    }
     const request: RunStart = {
       ...source.request,
       request_id: `fork-${commandId || crypto.randomUUID()}`,
@@ -3607,19 +3735,50 @@ async function forkSession(message: JsonRecord): Promise<void> {
     };
     const sessionDir = `${request.agent_dir}/sessions`;
     fs.mkdirSync(sessionDir, { recursive: true });
-    const manager = SessionManager.forkFrom(
-      source.session.sessionFile,
-      request.cwd,
-      sessionDir,
-      { id: targetSessionId },
-    );
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(targetSessionId)) {
+      throw new Error("Target session id is invalid");
+    }
+    let manager: SessionManager;
+    if (!entryId) {
+      manager = SessionManager.forkFrom(
+        source.session.sessionFile,
+        request.cwd,
+        sessionDir,
+        { id: targetSessionId },
+      );
+    } else {
+      const entry = source.sessionManager.getEntry(entryId);
+      if (!entry) throw new Error("Fork entry is not part of the source session");
+      const leafId = before ? entry.parentId : entry.id;
+      const branchEntries = leafId === null ? [] : source.sessionManager.getBranch(leafId);
+      const timestamp = new Date().toISOString();
+      const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+      const branchFile = `${sessionDir}/${fileTimestamp}_${targetSessionId}.jsonl`;
+      const header = {
+        type: "session",
+        version: source.sessionManager.getHeader()?.version || 3,
+        id: targetSessionId,
+        timestamp,
+        cwd: request.cwd,
+        parentSession: source.session.sessionFile,
+      };
+      fs.writeFileSync(
+        branchFile,
+        [header, ...branchEntries].map((record) => JSON.stringify(record)).join("\n") + "\n",
+        { flag: "wx" },
+      );
+      manager = SessionManager.open(branchFile, sessionDir, request.cwd);
+    }
     const state = await createSession(request, manager);
     sessions.set(targetSessionId, state);
     emit({
       type: "session.forked",
-      command_id: commandId,
+      ...commandCorrelation(message),
       source_session_id: sourceSessionId,
       target_session_id: targetSessionId,
+      entry_id: entryId,
+      before,
+      full_history: !entryId,
       session_file: state.session.sessionFile || "",
       stats: sessionStats(state),
     });
@@ -3627,7 +3786,7 @@ async function forkSession(message: JsonRecord): Promise<void> {
     const failure = classifyError(error);
     emit({
       type: "session.fork_failed",
-      command_id: commandId,
+      ...commandCorrelation(message),
       source_session_id: sourceSessionId,
       target_session_id: targetSessionId,
       error: String(failure.message || errorText(error)),
@@ -3702,6 +3861,26 @@ async function shutdown(): Promise<void> {
 }
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+function acceptSessionProtocol(message: JsonRecord): boolean {
+  const negotiation = negotiateProtocol(message);
+  if (negotiation.ok) return true;
+  emit({
+    type: "protocol.error",
+    ...commandCorrelation(message),
+    session_id: String(message.session_id || message.source_session_id || ""),
+    error: negotiation.error || "Pi protocol negotiation failed",
+    failure: {
+      code: "protocol_incompatible",
+      message: negotiation.error || "Pi protocol negotiation failed",
+      retryable: false,
+      protocol: negotiation.protocol,
+      missing_features: negotiation.missingFeatures,
+    },
+  });
+  return false;
+}
+
 input.on("line", (line) => {
   if (Buffer.byteLength(line, "utf8") > MAX_PROTOCOL_LINE_BYTES) {
     emit({ type: "protocol.error", error: "Pi protocol JSONL line exceeds the bounded size limit" });
@@ -3721,6 +3900,7 @@ input.on("line", (line) => {
     const supported = new Set<string>(PI_PROTOCOL_FEATURES);
     emit({
       type: "pong",
+      ...commandCorrelation(message),
       runtime: "pi",
       version: "0.80.10",
       protocol: PI_PROTOCOL_VERSION,
@@ -3809,8 +3989,17 @@ input.on("line", (line) => {
     void followUpRun(message).catch((error) => emit({ type: "protocol.error", error: errorText(error) }));
   } else if (message.type === "runtime.list_active_runs") {
     listActiveRuns(message);
+  } else if (String(message.type || "").startsWith("session.") && !acceptSessionProtocol(message)) {
+    // The rejection was emitted above.  No durable session state may be read
+    // or mutated before both protocol version and required features agree.
   } else if (message.type === "session.compact") {
     void compactSession(message);
+  } else if (message.type === "session.compact.abort") {
+    abortSessionCompaction(message);
+  } else if (message.type === "session.queue.inspect") {
+    sessionQueue(message, false);
+  } else if (message.type === "session.queue.clear") {
+    sessionQueue(message, true);
   } else if (message.type === "session.load") {
     void loadSession(message);
   } else if (message.type === "session.close") {

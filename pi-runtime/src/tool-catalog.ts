@@ -79,6 +79,8 @@ const REVERSIBLE_TOOLS = new Set([
   "compile_latex",
   "edit_section",
   "edit_slide",
+  "delegate_scientific_agents",
+  "cancel_scientific_agents",
 ]);
 
 // Keep this allow-list explicit: a read-only risk label does not prove that a
@@ -99,6 +101,8 @@ const THREAD_SAFE_READ_TOOLS = new Set([
   "agent_reach",
   "search_journal",
   "audit_references",
+  "list_scientific_agents",
+  "collect_scientific_agents",
 ]);
 
 export function executionModeForTool(
@@ -145,6 +149,10 @@ const TOOL_GROUPS: Record<string, string> = {
   compile_latex: "artifacts",
   edit_section: "artifacts",
   edit_slide: "artifacts",
+  delegate_scientific_agents: "scientific-agents",
+  list_scientific_agents: "scientific-agents",
+  collect_scientific_agents: "scientific-agents",
+  cancel_scientific_agents: "scientific-agents",
   self_assess: "control",
 };
 

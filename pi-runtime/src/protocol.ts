@@ -1,6 +1,6 @@
 import type { ModelRuntimeDescriptor, PiImageContent } from "./multimodal.js";
 
-export const PI_PROTOCOL_VERSION = 5;
+export const PI_PROTOCOL_VERSION = 6;
 
 export const PI_PROTOCOL_FEATURES = [
   "multi_session",
@@ -25,6 +25,9 @@ export const PI_PROTOCOL_FEATURES = [
   "model_runtime_descriptor",
   "token_envelope",
   "multimodal_turns",
+  "scientific_subagents_v1",
+  "session_controls_v2",
+  "thinking_max",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;

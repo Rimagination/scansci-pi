@@ -146,7 +146,7 @@ const state = {
   sidebarCollapsed: sidebarCollapsedPreference === "true"
     || (sidebarCollapsedPreference === null && window.innerWidth <= 900),
   sidebarWidth: Math.max(260, Math.min(520, Number(window.localStorage.getItem("scansci.sidebar.width")) || 352)),
-  thinkingLevel: ["auto", "low", "medium", "high"].includes(window.localStorage.getItem("scansci.thinking.level"))
+  thinkingLevel: ["auto", "low", "medium", "high", "xhigh", "max"].includes(window.localStorage.getItem("scansci.thinking.level"))
     ? window.localStorage.getItem("scansci.thinking.level")
     : "auto",
   webSearchMode: ["auto", "on", "off"].includes(window.localStorage.getItem("scansci.web-search.mode"))
@@ -3377,6 +3377,8 @@ const thinkingLevels = [
   { value: "low", label: "\u4f4e", detail: "\u66f4\u5feb\u54cd\u5e94\uff0c\u8f83\u5c11\u68c0\u7d22\u4e0e\u5de5\u5177\u9884\u7b97" },
   { value: "medium", label: "\u4e2d", detail: "\u5e73\u8861\u63a8\u7406\u3001\u68c0\u7d22\u8303\u56f4\u4e0e\u54cd\u5e94\u901f\u5ea6" },
   { value: "high", label: "\u9ad8", detail: "\u66f4\u5927\u7684 Agent \u8bc1\u636e\u9884\u7b97\u4e0e\u539f\u751f\u63a8\u7406\u5f3a\u5ea6" },
+  { value: "xhigh", label: "\u6781\u9ad8", detail: "\u66f4\u6df1\u63a8\u7406\u4e0e\u66f4\u5927\u7684 Agent \u8bc1\u636e\u9884\u7b97" },
+  { value: "max", label: "\u6700\u9ad8", detail: "\u8bf7\u6c42 Pi \u4e0e\u6a21\u578b\u652f\u6301\u7684\u6700\u9ad8\u601d\u8003\u5f3a\u5ea6\uff1b\u4e0d\u652f\u6301\u65f6\u5b89\u5168\u964d\u7ea7" },
 ];
 
 function currentThinkingLevel() {

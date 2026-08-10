@@ -413,7 +413,7 @@ def test_identical_reads_only_coalesce_for_the_explicit_safe_allowlist(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
@@ -516,7 +516,7 @@ def test_immediate_cancel_during_session_setup_never_reaches_the_provider(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
@@ -540,11 +540,15 @@ def test_immediate_cancel_during_session_setup_never_reaches_the_provider(
             "type": "run.cancel",
             "request_id": request_id,
             "command_id": command_id,
+            "generation": 0,
         }) + "\n")
         process.stdin.flush()
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            line = output.get(timeout=1)
+            try:
+                line = output.get(timeout=1)
+            except Empty:
+                continue
             assert line is not None, process.stderr.read() if process.stderr else "sidecar closed"
             event = json.loads(line)
             observed.append(event)
@@ -1099,6 +1103,7 @@ def test_session_close_registers_command_before_write_and_waits_for_ack(
                 "type": "session.closed",
                 "command_id": message.get("command_id"),
                 "session_id": message.get("session_id"),
+                "generation": message.get("generation"),
             }))
 
     monkeypatch.setattr(client, "_write", reply_immediately)
@@ -1132,6 +1137,7 @@ def test_same_session_commands_are_serialized(
                 "type": "session.closed",
                 "command_id": message["command_id"],
                 "session_id": message["session_id"],
+                "generation": message["generation"],
             }))
 
         threading.Thread(target=reply, daemon=True).start()
@@ -1180,6 +1186,7 @@ def test_same_session_run_waits_for_an_inflight_management_command(
                     "type": "session.closed",
                     "command_id": message["command_id"],
                     "session_id": message["session_id"],
+                    "generation": message["generation"],
                 }))
 
             threading.Thread(target=acknowledge, daemon=True).start()
@@ -1238,9 +1245,9 @@ def test_dispatcher_routes_interleaved_requests_and_commands_and_broadcasts_eof(
     command_b = dispatcher.register_command("command-b")
     dispatcher.start()
 
-    raw.put(json.dumps({"type": "session.loaded", "command_id": "command-b"}))
+    raw.put(json.dumps({"type": "session.loaded", "command_id": "command-b", "generation": 7}))
     raw.put(json.dumps({"type": "status.update", "request_id": "request-a", "status": "working"}))
-    raw.put(json.dumps({"type": "session.closed", "command_id": "command-a"}))
+    raw.put(json.dumps({"type": "session.closed", "command_id": "command-a", "generation": 7}))
 
     assert command_b.get(timeout=1)["command_id"] == "command-b"
     assert request.get(timeout=1)["request_id"] == "request-a"

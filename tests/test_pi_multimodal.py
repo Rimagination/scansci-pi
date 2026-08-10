@@ -280,7 +280,7 @@ def test_python_bridge_forwards_canonical_images_and_runtime_descriptor(tmp_path
     )
 
     assert events[-1]["type"] == "done"
-    assert captured["pi_protocol_version"] == 5
+    assert captured["pi_protocol_version"] == 6
     assert captured["images"] == [_IMAGE]
     assert captured["model_runtime"]["context_window_tokens"] == 32_768
     assert "multimodal_turns" in captured["required_features"]
@@ -526,7 +526,7 @@ def test_node_rejects_invalid_image_without_echoing_base64(
     try:
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": ["model_runtime_descriptor", "token_envelope", "multimodal_turns"],
             "request_id": "invalid-image",
             "session_id": "invalid-image",
@@ -585,7 +585,7 @@ def test_node_rejects_semantically_inconsistent_descriptor_before_network(tmp_pa
     try:
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": ["model_runtime_descriptor", "token_envelope", "multimodal_turns"],
             "request_id": "invalid-descriptor",
             "session_id": "invalid-descriptor",
@@ -653,7 +653,7 @@ def test_provider_gate_blocks_oversized_final_payload_after_fail_open_hook(
     try:
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 5,
+            "pi_protocol_version": 6,
             "required_features": ["model_runtime_descriptor", "token_envelope", "multimodal_turns"],
             "request_id": "provider-hard-gate",
             "session_id": "provider-hard-gate",
@@ -890,7 +890,7 @@ def test_real_sidecar_steer_and_followup_images_reach_provider(tmp_path: Path) -
     output_thread.start()
     start = {
         "type": "run.start",
-        "pi_protocol_version": 5,
+        "pi_protocol_version": 6,
         "required_features": ["model_runtime_descriptor", "token_envelope", "multimodal_turns"],
         "request_id": "queued-images",
         "session_id": "queued-images",

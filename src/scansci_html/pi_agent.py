@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .academic_search import search_academic_papers
@@ -103,7 +103,7 @@ _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
 _GATEWAY_TRANSPORT_ATTEMPTS = 3
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
-_PI_PROTOCOL_VERSION = 5
+_PI_PROTOCOL_VERSION = 6
 _PI_REQUIRED_FEATURES = (
     "task_contract_v2",
     "explicit_empty_leases",
@@ -119,6 +119,9 @@ _PI_REQUIRED_FEATURES = (
     "model_runtime_descriptor",
     "token_envelope",
     "multimodal_turns",
+    "scientific_subagents_v1",
+    "session_controls_v2",
+    "thinking_max",
 )
 _MAX_JSONL_LINE_BYTES = 20 * 1024 * 1024
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
@@ -160,6 +163,8 @@ _PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "agent_reach",
     "search_journal",
     "audit_references",
+    "list_scientific_agents",
+    "collect_scientific_agents",
 })
 _TOOL_EXECUTOR_WORKERS = 4
 _TOOL_EXECUTOR_CAPACITY = 16
@@ -326,6 +331,14 @@ class _ProtocolDispatcher:
                 continue
             request_id = str(event.get("request_id", ""))
             command_id = str(event.get("command_id", ""))
+            event_generation = event.get("generation")
+            if command_id and (
+                event_generation is None
+                or not str(event_generation).isdigit()
+                or int(event_generation) != self.generation
+            ):
+                self._record("cross_generation", event)
+                continue
             delivered = False
             with self._lock:
                 request_channel = self._requests.get(request_id) if request_id else None
@@ -1243,6 +1256,7 @@ class PiAgentClient:
         embedding_provider: Any | None = None,
         reranker: Any | None = None,
         active_run_id: str = "",
+        scientific_agent_control: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.evidence_db = Path(evidence_db).resolve()
@@ -1261,11 +1275,13 @@ class PiAgentClient:
         self.embedding_provider = embedding_provider
         self.reranker = reranker
         self.active_run_id = str(active_run_id or "").strip()
+        self._scientific_agent_control = scientific_agent_control
         self.agent_dir = self.workspace.parent / ".scansci-pi-agent"
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._process: subprocess.Popen[str] | None = None
         self._output: Queue[str | None] = Queue()
         self._process_generation = 0
+        self._protocol_generation = 0
         self._dispatcher: _ProtocolDispatcher | None = None
         self._dispatch_audit: deque[dict[str, Any]] = deque(maxlen=_DISPATCH_AUDIT_CAPACITY)
         self._errors: list[str] = []
@@ -1909,6 +1925,36 @@ class PiAgentClient:
             self._dispatcher = dispatcher
         return dispatcher
 
+    def _ensure_protocol_negotiated(self, *, timeout_seconds: float) -> None:
+        """Fail closed before a fresh sidecar may mutate durable sessions."""
+
+        if self._protocol_generation == self._process_generation and self._process_generation > 0:
+            return
+        try:
+            event = self._await_command(
+                {
+                    "type": "ping",
+                    "command_id": uuid4().hex,
+                    "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                    "required_features": list(_PI_REQUIRED_FEATURES),
+                },
+                terminal_types={"pong"},
+                timeout_seconds=max(0.05, float(timeout_seconds)),
+                session_lock_id=f"__protocol__:{self._process_generation}",
+                timeout_message="Pi sidecar protocol handshake exceeded the timeout",
+            )
+        except Exception as error:
+            raise PiRuntimeUnavailable(
+                f"The ScanSci Pi sidecar protocol handshake failed: {error}"
+            ) from error
+        protocol = int(event.get("protocol", 0) or 0)
+        capabilities = {str(value) for value in list(event.get("capabilities", []) or [])}
+        missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
+        if protocol != _PI_PROTOCOL_VERSION or missing_features:
+            detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
+            raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
+        self._protocol_generation = self._process_generation
+
     def _write(self, message: dict[str, Any]) -> None:
         process = self._process
         if process is None or process.poll() is not None or process.stdin is None:
@@ -2249,6 +2295,7 @@ class PiAgentClient:
                 "type": "run.cancel",
                 "request_id": context.request_id,
                 "command_id": uuid4().hex,
+                "generation": self._process_generation,
             })
         return {
             "type": "tool.completed",
@@ -2286,6 +2333,7 @@ class PiAgentClient:
                     "type": "run.cancel",
                     "request_id": context.request_id,
                     "command_id": command_id,
+                    "generation": self._process_generation,
                 })
             except (BrokenPipeError, OSError, PiRuntimeUnavailable):
                 pass
@@ -2715,16 +2763,17 @@ class PiAgentClient:
             "type": "run.cancel",
             "request_id": target,
             "command_id": uuid4().hex,
+            "generation": self._process_generation,
         })
         return True
 
     def pause(self, request_id: str | None = None) -> bool:
-        """Pause the current turn while keeping its durable session resumable.
+        """Request cooperative abort-and-resume for the current durable turn.
 
-        The Pi sidecar currently exposes the same cooperative interruption
-        primitive as ``run.cancel``.  At this layer it is a pause operation:
-        the session and prior turn history remain intact, and the caller may
-        resume by starting the unfinished turn again.
+        The Pi sidecar exposes ``run.cancel`` as its interruption primitive.
+        This is not a suspended SDK operation: the current operation aborts,
+        while durable session history is retained so the host can explicitly
+        start a new or resumed turn.
         """
 
         return self.cancel(request_id)
@@ -2752,6 +2801,7 @@ class PiAgentClient:
             "type": "run.steer",
             "request_id": target,
             "command_id": uuid4().hex,
+            "generation": self._process_generation,
             "text": text,
             "images": validated_images,
         })
@@ -2780,6 +2830,7 @@ class PiAgentClient:
             "type": "run.follow_up",
             "request_id": target,
             "command_id": uuid4().hex,
+            "generation": self._process_generation,
             "text": str(text).strip(),
             "images": validated_images,
         })
@@ -2827,11 +2878,18 @@ class PiAgentClient:
         session_lock_id: str,
         timeout_message: str,
     ) -> dict[str, Any]:
+        if str(message.get("type", "")).startswith("session."):
+            message = {
+                **message,
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }
         command_id = str(message.get("command_id", ""))
         if not command_id:
             raise ValueError("Pi session commands require a command_id")
         with self._lifecycle_lock:
             dispatcher = self._ensure_dispatcher()
+            message = {**message, "generation": self._process_generation}
             lock = self._session_command_lock(session_lock_id)
             with lock:
                 channel = dispatcher.register_command(command_id)
@@ -2857,9 +2915,96 @@ class PiAgentClient:
                         if str(event.get("type", "")) == "protocol.error":
                             raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
                         if str(event.get("type", "")) in terminal_types:
+                            self._validate_command_correlation(message, event)
                             return dict(event)
                 finally:
                     dispatcher.unregister_command(command_id)
+
+    @staticmethod
+    def _validate_command_correlation(message: dict[str, Any], event: dict[str, Any]) -> None:
+        expected_session = str(message.get("session_id", ""))
+        actual_session = str(event.get("session_id", ""))
+        if expected_session and actual_session != expected_session:
+            raise RuntimeError("Pi session command acknowledgement crossed session boundaries")
+        expected_source = str(message.get("source_session_id", ""))
+        actual_source = str(event.get("source_session_id", ""))
+        if expected_source and actual_source != expected_source:
+            raise RuntimeError("Pi session fork acknowledgement crossed source sessions")
+        expected_target = str(message.get("target_session_id", ""))
+        actual_target = str(event.get("target_session_id", ""))
+        if expected_target and actual_target != expected_target:
+            raise RuntimeError("Pi session fork acknowledgement crossed target sessions")
+
+    def _await_control_command(
+        self,
+        message: dict[str, Any],
+        *,
+        terminal_types: set[str],
+        timeout_seconds: float,
+        timeout_message: str,
+    ) -> dict[str, Any]:
+        """Await a non-replacing control without taking lifecycle/session locks."""
+
+        if str(message.get("type", "")).startswith("session."):
+            message = {
+                **message,
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }
+        command_id = str(message.get("command_id", ""))
+        if not command_id:
+            raise ValueError("Pi control commands require a command_id")
+        dispatcher = self._ensure_dispatcher()
+        message = {**message, "generation": self._process_generation}
+        channel = dispatcher.register_command(command_id)
+        dispatcher.start()
+        try:
+            self._write(message)
+            deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(timeout_message)
+                try:
+                    event = channel.get(timeout=min(0.25, remaining))
+                except Empty:
+                    process = self._process
+                    if process is not None and process.poll() is not None:
+                        raise RuntimeError("Pi Agent exited while awaiting a control command")
+                    continue
+                if event is None:
+                    raise RuntimeError("Pi Agent closed while awaiting a control command")
+                if str(event.get("type", "")) == "protocol.error":
+                    raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                if str(event.get("type", "")) in terminal_types:
+                    self._validate_command_correlation(message, event)
+                    return dict(event)
+        finally:
+            dispatcher.unregister_command(command_id)
+
+    def inspect_queue(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.queue.inspect", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.queue", "session.queue_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Inspecting the Pi session queue exceeded the timeout",
+        )
+
+    def clear_queue(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.queue.clear", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.queue_cleared", "session.queue_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Clearing the Pi session queue exceeded the timeout",
+        )
+
+    def abort_compaction(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.compact.abort", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.compact_aborted", "session.compact_abort_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Aborting Pi session compaction exceeded the timeout",
+        )
 
     def compact(self, session_id: str, *, instructions: str = "", timeout_seconds: float = 180.0) -> dict[str, Any]:
         """Run Pi's native context compactor for a loaded durable session."""
@@ -2932,6 +3077,7 @@ class PiAgentClient:
             )
         with self._lifecycle_lock:
             self._ensure_process(api_key=api_key)
+            self._ensure_protocol_negotiated(timeout_seconds=min(8.0, timeout_seconds))
             command_id = uuid4().hex
             event = self._await_command(
                 {
@@ -2969,6 +3115,7 @@ class PiAgentClient:
                 "type": "session.closed",
                 "command_id": command_id,
                 "session_id": str(session_id or ""),
+                "generation": self._process_generation,
                 "not_loaded": True,
             }
         event = self._await_command(
@@ -2991,6 +3138,8 @@ class PiAgentClient:
         source_session_id: str,
         *,
         target_session_id: str | None = None,
+        entry_id: str = "",
+        before: bool = False,
         timeout_seconds: float = 90.0,
     ) -> dict[str, Any]:
         """Fork a loaded durable Pi session into a new independently resumable session."""
@@ -3008,8 +3157,12 @@ class PiAgentClient:
             {
                 "type": "session.fork",
                 "command_id": command_id,
+                "generation": self._process_generation,
                 "source_session_id": source_id,
                 "target_session_id": target_id,
+                "entry_id": str(entry_id or "").strip(),
+                "before": bool(before),
+                "full_history": not bool(str(entry_id or "").strip()),
             },
             terminal_types={"session.forked", "session.fork_failed"},
             timeout_seconds=timeout_seconds,
@@ -3412,17 +3565,16 @@ class PiAgentClient:
     ) -> _PreparedToolResult:
         """Write a request-scoped temporary result without publishing it."""
 
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tool_name).strip())[:60] or "tool"
-        safe_request = re.sub(r"[^A-Za-z0-9._-]+", "-", str(request_id).strip())[:48] or "direct"
-        safe_call = re.sub(r"[^A-Za-z0-9._-]+", "-", str(call_id).strip())[:48] or "call"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tool_name).strip())[:32] or "tool"
         result_dir = self.agent_dir / "tool-results"
         result_dir.mkdir(parents=True, exist_ok=True)
         result_id = f"{safe_name}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:12]}.json"
         result_path = result_dir / result_id
         encoded = json.dumps(_json_safe(payload), ensure_ascii=False, indent=2).encode("utf-8")
-        temporary = result_dir / (
-            f".{safe_name}-{safe_request}-g{max(0, int(generation))}-{safe_call}-{uuid4().hex}.tmp"
-        )
+        scope_hash = hashlib.sha256(
+            f"{request_id}\0{max(0, int(generation))}\0{call_id}".encode("utf-8")
+        ).hexdigest()[:16]
+        temporary = result_dir / f".{safe_name[:24]}-{scope_hash}-{uuid4().hex[:8]}.tmp"
         try:
             temporary.write_bytes(encoded)
         except BaseException:
@@ -4034,6 +4186,20 @@ class PiAgentClient:
         }
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name in {
+            "delegate_scientific_agents",
+            "list_scientific_agents",
+            "collect_scientific_agents",
+            "cancel_scientific_agents",
+        }:
+            if not self.active_run_id or self._scientific_agent_control is None:
+                raise PermissionError("Scientific agent controls require a host-bound active durable run")
+            sanitized = {
+                str(key): value
+                for key, value in dict(arguments or {}).items()
+                if str(key) not in {"parent_run_id", "run_id"}
+            }
+            return self._scientific_agent_control(name, self.active_run_id, sanitized)
         if name in {"create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex"}:
             plugin_by_tool = {
                 "create_document": "documents",
