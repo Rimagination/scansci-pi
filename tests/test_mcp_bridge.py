@@ -10,6 +10,7 @@ import threading
 import pytest
 
 from scansci_html.app_settings import load_settings, save_settings
+from scansci_html.evidence_store import index_evidence_library
 from scansci_html.pi_agent import PiAgentClient
 from scansci_html.research_agent import ResearchAgentRuntime
 
@@ -302,6 +303,83 @@ class _OrdinaryMcpDiscoveryHandler(_DeferredDottedWriteHandler):
         self.wfile.write(encoded)
 
 
+class _LocalOnlyMcpAttemptHandler(_DeferredDottedWriteHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "try-local-only-mcp",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["mcp__reader__search"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 2:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "activate-local-evidence",
+                    "type": "function",
+                    "function": {
+                        "name": "search_tools",
+                        "arguments": '{"names":["search_local_evidence"],"activate":true}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 3:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "read-local-evidence",
+                    "type": "function",
+                    "function": {
+                        "name": "search_local_evidence",
+                        "arguments": '{"query":"local concept","result_limit":3}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "The explanation used only local evidence."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-local-only-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-local-only-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
 class _DeferredReadFilterHandler(_DeferredDottedWriteHandler):
     request_payloads: list[dict[str, object]] = []
 
@@ -443,6 +521,105 @@ def test_ordinary_non_social_turn_discovers_enabled_read_only_mcp_without_regex_
     loader = json.loads(str(loader_messages[-1]["content"]))
     assert loader["activated"] == ["mcp__reader__search"]
     assert "mcp__reader__search" in events[-1]["stats"]["toolInventory"]["names"]
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "user_text"),
+    [
+        (
+            "chat",
+            "Use only local documents. Do not use the web or internet. Explain this concept.",
+        ),
+        (
+            "chat_stream",
+            "仅使用本地文档，不要联网或使用互联网。请解释这个概念。",
+        ),
+    ],
+)
+def test_local_only_language_blocks_mcp_discovery_in_real_chat_entrypoints(
+    tmp_path: Path,
+    entrypoint: str,
+    user_text: str,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    workspace = tmp_path / "workspace.sqlite"
+
+    _LocalOnlyMcpAttemptHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LocalOnlyMcpAttemptHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    settings = load_settings(workspace)
+    settings["active_model"] = {"provider_id": "fixture-provider", "model_id": "fixture-model"}
+    settings["providers"] = [{
+        "id": "fixture-provider",
+        "name": "Fixture provider",
+        "kind": "openai-compatible",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "auth_mode": "local",
+        "enabled": True,
+        "models": [{"id": "fixture-model", "name": "Fixture model"}],
+    }]
+    settings["mcp_servers"] = [{
+        "id": "reader",
+        "name": "Reader MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}"',
+        "allow_write": False,
+        "tool_effects": {"search_library": "read"},
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    library = tmp_path / "local-library"
+    library.mkdir()
+    (library / "concept.html").write_text(
+        "<article><h1>Local concept</h1><h2>Results</h2>"
+        "<p>Local documents contain a verified explanation of this concept.</p></article>",
+        encoding="utf-8",
+    )
+    evidence_db = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=evidence_db, min_sentence_length=10)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db)
+    payload = {
+        "chat_mode": "general",
+        "messages": [{"role": "user", "content": user_text}],
+    }
+    try:
+        if entrypoint == "chat":
+            result = runtime.chat(payload)
+        else:
+            events = list(runtime.chat_stream(payload))
+            assert events[-1]["type"] == "RUN_FINISHED"
+            result = dict(events[-1]["result"])
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    contract = dict(result["agent_runtime"]["task_contract"])
+    assert contract["allowed_mcp_servers"] == []
+    assert len(_LocalOnlyMcpAttemptHandler.request_payloads) == 4
+    for provider_request in _LocalOnlyMcpAttemptHandler.request_payloads:
+        provider_tools = {
+            str(dict(item.get("function", {}) or {}).get("name", ""))
+            for item in list(provider_request.get("tools", []) or [])
+            if isinstance(item, dict)
+        }
+        assert not any(name.startswith("mcp__reader__") for name in provider_tools)
+    loader_messages = [
+        message
+        for message in _LocalOnlyMcpAttemptHandler.request_payloads[1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    loader = json.loads(str(loader_messages[-1]["content"]))
+    assert loader["activated"] == []
+    assert loader["matches"] == []
+    assert loader["rejected"] == [{
+        "name": "mcp__reader__search",
+        "reason": "not_authorized_or_unavailable",
+    }]
 
 
 @pytest.mark.parametrize("mcp_scope", ["local-only", "selected-library"])

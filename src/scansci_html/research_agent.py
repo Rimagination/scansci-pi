@@ -1890,6 +1890,8 @@ class ResearchAgentRuntime:
         )
         profile = dict(preliminary.get("task_profile", {}) or {})
         normalized_mcp_scope = str(mcp_scope or "default").strip().lower()
+        if normalized_mcp_scope == "default" and self._local_only_intent(user_text):
+            normalized_mcp_scope = "local-only"
         social_turn = "greeting" in set(profile.get("reasons", []) or [])
         allow_unrelated_mcp = (
             not social_turn
