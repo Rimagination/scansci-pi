@@ -19,6 +19,33 @@ export const PI_PROTOCOL_FEATURES = [
 
 type ProtocolRecord = Record<string, unknown>;
 
+export interface RunStartMessage extends ProtocolRecord {
+  type: "run.start";
+  pi_protocol_version?: number;
+  required_features?: string[];
+  request_id: string;
+  session_id: string;
+  ephemeral_session?: boolean;
+  session_file?: string;
+  cwd: string;
+  agent_dir: string;
+  provider_kind: string;
+  base_url: string;
+  model_id: string;
+  api_surface?: string;
+  responses_enabled?: boolean;
+  thinking_level?: string;
+  system_prompt: string;
+  prompt: string;
+  task_mode?: string;
+  task_contract?: ProtocolRecord;
+  prefix_shape?: ProtocolRecord;
+  context_policy?: ProtocolRecord;
+  mcp_servers?: ProtocolRecord[];
+  disabled_tools?: string[];
+  background?: boolean;
+}
+
 export interface ProtocolNegotiation {
   ok: boolean;
   protocol: number;

@@ -15,7 +15,12 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { PI_PROTOCOL_FEATURES, PI_PROTOCOL_VERSION, negotiateProtocol } from "./protocol.js";
+import {
+  PI_PROTOCOL_FEATURES,
+  PI_PROTOCOL_VERSION,
+  negotiateProtocol,
+  type RunStartMessage,
+} from "./protocol.js";
 import {
   buildToolCatalog,
   executionModeForTool,
@@ -28,31 +33,7 @@ type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
-interface RunStart extends JsonRecord {
-  type: "run.start";
-  pi_protocol_version?: number;
-  required_features?: string[];
-  request_id: string;
-  session_id: string;
-  session_file?: string;
-  cwd: string;
-  agent_dir: string;
-  provider_kind: string;
-  base_url: string;
-  model_id: string;
-  api_surface?: string;
-  responses_enabled?: boolean;
-  thinking_level?: string;
-  system_prompt: string;
-  prompt: string;
-  task_mode?: string;
-  task_contract?: JsonRecord;
-  prefix_shape?: JsonRecord;
-  context_policy?: JsonRecord;
-  mcp_servers?: JsonRecord[];
-  disabled_tools?: string[];
-  background?: boolean;
-}
+type RunStart = RunStartMessage;
 
 type ToolRisk = "read_only" | "reversible" | "high";
 type McpEffect = "read" | "write" | "destructive" | "unknown";
@@ -2131,6 +2112,7 @@ function sessionSignature(request: RunStart): string {
   return JSON.stringify([
     request.cwd,
     request.agent_dir,
+    request.ephemeral_session === true,
     request.provider_kind,
     request.api_surface || "chat_completions",
     request.responses_enabled === true,
@@ -2267,14 +2249,19 @@ async function createSession(
     ["search_tools", "ask_user", "submit_plan"],
   );
   const prefixShape = buildPrefixShape(request, registeredToolNames, activeToolNames);
-  const sessionDir = `${request.agent_dir}/sessions`;
-  fs.mkdirSync(sessionDir, { recursive: true });
   const resumeFile = String(request.session_file || "");
-  const sessionManager = sessionManagerOverride || (
-    resumeFile && fs.existsSync(resumeFile)
+  let sessionManager: SessionManager;
+  if (sessionManagerOverride) {
+    sessionManager = sessionManagerOverride;
+  } else if (request.ephemeral_session === true) {
+    sessionManager = SessionManager.inMemory(request.cwd);
+  } else {
+    const sessionDir = `${request.agent_dir}/sessions`;
+    fs.mkdirSync(sessionDir, { recursive: true });
+    sessionManager = resumeFile && fs.existsSync(resumeFile)
       ? SessionManager.open(resumeFile, sessionDir, request.cwd)
-      : SessionManager.create(request.cwd, sessionDir, { id: request.session_id })
-  );
+      : SessionManager.create(request.cwd, sessionDir, { id: request.session_id });
+  }
   const created = await createAgentSession({
     cwd: request.cwd,
     agentDir: request.agent_dir,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from scansci_html.capability_ledger import CapabilityLedger, CapabilityDeliveryError
 
 
@@ -33,6 +35,28 @@ def test_mutating_failure_is_not_replayed_automatically() -> None:
     assert isinstance(error, CapabilityDeliveryError)
     assert error.failure["retryable"] is False
     assert error.failure["capability_ledger"]["failed_groups"] == [["download_and_index"]]
+
+
+@pytest.mark.parametrize("provider_error", ["HTTP 429", "HTTP 503"])
+def test_search_tools_is_internal_read_only_when_the_followup_provider_call_fails(
+    provider_error: str,
+) -> None:
+    ledger = CapabilityLedger([["search_web"]])
+    ledger.record_event({"type": "status", "status": "tool_started", "name": "search_tools"})
+    ledger.record_event({"type": "tool.completed", "name": "search_tools", "result": {"activated": []}})
+
+    assert ledger.has_non_idempotent_effect is False
+    assert ledger.safe_retry_allowed() is True
+    assert ledger.delivery_error(cause=provider_error).failure["retryable"] is True
+
+
+@pytest.mark.parametrize("tool_name", ["submit_plan", "download_and_index"])
+def test_control_and_effectful_tools_still_block_automatic_replay(tool_name: str) -> None:
+    ledger = CapabilityLedger([["search_web"]])
+    ledger.record_event({"type": "status", "status": "tool_started", "name": tool_name})
+
+    assert ledger.has_non_idempotent_effect is True
+    assert ledger.safe_retry_allowed() is False
 
 
 def test_preflight_marks_an_entire_required_group_unavailable() -> None:

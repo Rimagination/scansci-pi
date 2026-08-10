@@ -20,6 +20,7 @@ from scansci_html.pi_agent import (
     _parse_text_tool_intents,
     _redact_tool_value,
 )
+from scansci_html.research_agent import _PiBackedChatJsonClient
 from scansci_html.research_runs import ResearchRunStore, StageSpec
 from scansci_html.workspace import initialize_notebook
 
@@ -878,6 +879,39 @@ class _OpenAIToolLoopHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIJsonHandler(_OpenAIStreamHandler):
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        chunks = [
+            {
+                "id": "chatcmpl-json",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": '{"value":"ephemeral"}'},
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "id": "chatcmpl-json",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
 class _OpenAIPlanDefaultDenyHandler(BaseHTTPRequestHandler):
     request_payloads: list[dict[str, object]] = []
 
@@ -1353,6 +1387,60 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
     assert captured["pi_protocol_version"] == 4
     assert "host_tool_authorization" in captured["required_features"]
+    assert captured["ephemeral_session"] is True
+
+
+def test_pi_backed_json_client_keeps_two_transient_sidecar_sessions_off_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIJsonHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    observed_processes: list[subprocess.Popen[str]] = []
+    original_ensure_process = PiAgentClient._ensure_process
+
+    def recording_ensure_process(self, *, api_key: str):
+        process = original_ensure_process(self, api_key=api_key)
+        observed_processes.append(process)
+        return process
+
+    monkeypatch.setattr(PiAgentClient, "_ensure_process", recording_ensure_process)
+    client = _PiBackedChatJsonClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+        provider_kind="openai-compatible",
+        provider_id="fixture-provider",
+        base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        api_key="fixture-key",
+        model="fixture-model",
+        api_surface="chat_completions",
+        responses_enabled=False,
+        role="writing",
+        timeout_seconds=30,
+    )
+    try:
+        first = client.complete_json(
+            [{"role": "user", "content": "Return the first JSON result."}],
+            schema_name="ephemeral_adapter_fixture",
+        )
+        second = client.complete_json(
+            [{"role": "user", "content": "Return the second JSON result."}],
+            schema_name="ephemeral_adapter_fixture",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert first == second == {"value": "ephemeral"}
+    assert len(observed_processes) == 2
+    assert all(process.poll() is not None for process in observed_processes)
+    agent_dir = tmp_path / ".scansci-pi-agent"
+    registry_path = agent_dir / "sessions.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8")) if registry_path.exists() else {}
+    assert registry == {}
+    assert list((agent_dir / "sessions").glob("*.jsonl")) == []
 
 
 def test_python_bridge_reauthorizes_spoofed_tool_call_before_dispatch(tmp_path: Path, monkeypatch) -> None:
@@ -2234,6 +2322,10 @@ def test_pi_session_survives_sidecar_restart(tmp_path: Path) -> None:
         server.server_close()
 
     assert session_file.is_file()
+    registry = json.loads(
+        (tmp_path / ".scansci-pi-agent" / "sessions.json").read_text(encoding="utf-8")
+    )
+    assert registry["durable-session"] == str(session_file)
     assert next(event for event in second if event["type"] == "session")["resumed"] is True
     second_messages = _OpenAIPersistentHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "user" and "first question" in str(message.get("content")) for message in second_messages)

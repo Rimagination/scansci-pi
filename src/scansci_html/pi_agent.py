@@ -1259,6 +1259,7 @@ class PiAgentClient:
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": logical_session_id,
+            "ephemeral_session": transient_session,
             "session_file": session_file,
             "cwd": str(self.workspace.parent),
             "agent_dir": str(self.agent_dir),
