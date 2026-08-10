@@ -179,6 +179,14 @@ class _PendingToolCall:
     parallel_safe: bool
 
 
+@dataclass(frozen=True)
+class _PreparedToolResult:
+    temporary_path: Path
+    final_path: Path
+    reference: str
+    encoded_bytes: int
+
+
 @dataclass
 class _RunContext:
     request_id: str
@@ -199,6 +207,10 @@ class _RunContext:
     pending_terminal: dict[str, Any] | None = None
     terminal_tool_completed: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Linearizes the final tool.result wire commit against cancellation.  File
+    # preparation and rename stay outside this lock so cancellation remains
+    # responsive during slow disk I/O.
+    result_commit_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def has_pending_tools(self) -> bool:
         with self.lock:
@@ -1855,6 +1867,16 @@ class PiAgentClient:
         with self._contexts_lock:
             return self._run_contexts.get(context.request_id) is context and context.active
 
+    @staticmethod
+    def _mark_context_cancelled(context: _RunContext) -> None:
+        # Signal workers immediately, then cross the final result-commit lock.
+        # If the commit already owns the lock it linearizes first and finishes
+        # file/wire/history consistently; otherwise the commit observes the
+        # event and is suppressed before writing to the sidecar.
+        context.cancel_event.set()
+        with context.result_commit_lock:
+            pass
+
     def _execute_tool_worker(
         self,
         context: _RunContext,
@@ -1949,7 +1971,7 @@ class PiAgentClient:
             try:
                 context.completions.put_nowait(completion)
             except Full:
-                context.cancel_event.set()
+                self._mark_context_cancelled(context)
                 self._record_dispatch_audit(
                     "completion_queue_full",
                     request_id=context.request_id,
@@ -1994,6 +2016,14 @@ class PiAgentClient:
         for pending in to_start:
             self._submit_tool(context, pending)
 
+    def _tool_result_commit_checkpoint(
+        self,
+        _stage: str,
+        _context: _RunContext,
+        _completion: _ToolCompletion,
+    ) -> None:
+        """Test seam for deterministic cancellation at result commit phases."""
+
     def _finish_tool_completion(
         self,
         context: _RunContext,
@@ -2012,43 +2042,122 @@ class PiAgentClient:
             return None
         if completion.error_type:
             public_error = str(_redact_tool_value(completion.error))[:500]
-            with context.history_lock:
-                context.history.append({
-                    "name": completion.name,
-                    "status": "failed",
-                    "error": public_error[:200],
+            self._tool_result_commit_checkpoint("before_error_wire", context, completion)
+            with context.result_commit_lock:
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                self._write({
+                    "type": "tool.result",
+                    "request_id": context.request_id,
+                    "call_id": completion.call_id,
+                    "ok": False,
+                    "error": f"{completion.error_type}: {public_error}",
                 })
-            self._write({
-                "type": "tool.result",
-                "request_id": context.request_id,
-                "call_id": completion.call_id,
-                "ok": False,
-                "error": f"{completion.error_type}: {public_error}",
-            })
+                with context.history_lock:
+                    context.history.append({
+                        "name": completion.name,
+                        "status": "failed",
+                        "error": public_error[:200],
+                    })
+                self._tool_result_commit_checkpoint("after_error_wire", context, completion)
             return {"type": "tool.failed", "name": completion.name, "error": public_error}
 
         safe_result = _redact_tool_value(_json_safe(completion.result))
-        model_result, result_meta = _bounded_tool_result_for_model(completion.name, safe_result)
-        if result_meta["persist_full"]:
-            result_reference, persisted_bytes = self._persist_tool_result(
-                completion.name,
-                safe_result if isinstance(safe_result, dict) else {"result": safe_result},
-            )
-            model_result["_full_result_reference"] = result_reference
-            model_result["_persisted_bytes"] = persisted_bytes
-        with context.history_lock:
-            context.history.append({
-                "name": completion.name,
-                "status": "ok",
-                "result_summary": _summarize_tool_result(completion.name, model_result),
-            })
-        self._write({
-            "type": "tool.result",
-            "request_id": context.request_id,
-            "call_id": completion.call_id,
-            "ok": True,
-            "result": model_result,
-        })
+        prepared: _PreparedToolResult | None = None
+        wire_committed = False
+        try:
+            if completion.name == "discover_papers" and isinstance(safe_result, dict):
+                prepared = self._prepare_tool_result(
+                    "discover-papers",
+                    safe_result,
+                    request_id=context.request_id,
+                    generation=context.generation,
+                    call_id=completion.call_id,
+                )
+                model_result = _compact_academic_search_result_for_model(
+                    safe_result,
+                    requested_limit=_bounded_limit(
+                        completion.arguments.get("result_limit", completion.arguments.get("limit")),
+                        default=8,
+                    ),
+                    result_reference=prepared.reference,
+                    result_bytes=prepared.encoded_bytes,
+                )
+                result_meta: dict[str, int | bool] = {
+                    "original_bytes": prepared.encoded_bytes,
+                    "model_bytes": len(json.dumps(model_result, ensure_ascii=False).encode("utf-8")),
+                    "truncated": True,
+                    "persist_full": True,
+                }
+            else:
+                model_result, result_meta = _bounded_tool_result_for_model(completion.name, safe_result)
+                if result_meta["persist_full"]:
+                    prepared = self._prepare_tool_result(
+                        completion.name,
+                        safe_result if isinstance(safe_result, dict) else {"result": safe_result},
+                        request_id=context.request_id,
+                        generation=context.generation,
+                        call_id=completion.call_id,
+                    )
+                    model_result["_full_result_reference"] = prepared.reference
+                    model_result["_persisted_bytes"] = prepared.encoded_bytes
+            if prepared is not None:
+                self._tool_result_commit_checkpoint("persist_prepared", context, completion)
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                os.replace(prepared.temporary_path, prepared.final_path)
+                self._tool_result_commit_checkpoint("result_renamed", context, completion)
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+
+            self._tool_result_commit_checkpoint("before_wire", context, completion)
+            with context.result_commit_lock:
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                # This dedicated lock has no sidecar callback dependency.  It
+                # only orders cancellation against the short stdin commit.
+                self._write({
+                    "type": "tool.result",
+                    "request_id": context.request_id,
+                    "call_id": completion.call_id,
+                    "ok": True,
+                    "result": model_result,
+                })
+                wire_committed = True
+                with context.history_lock:
+                    context.history.append({
+                        "name": completion.name,
+                        "status": "ok",
+                        "result_summary": _summarize_tool_result(completion.name, model_result),
+                    })
+                self._tool_result_commit_checkpoint("after_wire", context, completion)
+        finally:
+            if prepared is not None and not wire_committed:
+                self._discard_prepared_tool_result(prepared)
         if completion.name == "build_verified_answer" and task_mode == "verified-answer":
             context.terminal_tool_completed = completion.name
             self._write({
@@ -2074,7 +2183,7 @@ class PiAgentClient:
         terminal_received: bool,
         request_started: bool,
     ) -> None:
-        context.cancel_event.set()
+        self._mark_context_cancelled(context)
         with context.lock:
             context.active = False
             pending_futures = list(context.in_flight.values())
@@ -2513,7 +2622,7 @@ class PiAgentClient:
             context = self._run_contexts.get(target)
         if context is None or not context.active:
             return False
-        context.cancel_event.set()
+        self._mark_context_cancelled(context)
         self._write({
             "type": "run.cancel",
             "request_id": target,
@@ -3158,19 +3267,55 @@ class PiAgentClient:
             "failures": failures,
         }
 
-    def _persist_tool_result(self, tool_name: str, payload: dict[str, Any]) -> tuple[str, int]:
-        """Keep complete tool output off-model while retaining a durable task record."""
+    def _prepare_tool_result(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        *,
+        request_id: str = "",
+        generation: int = 0,
+        call_id: str = "",
+    ) -> _PreparedToolResult:
+        """Write a request-scoped temporary result without publishing it."""
 
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tool_name).strip())[:60] or "tool"
+        safe_request = re.sub(r"[^A-Za-z0-9._-]+", "-", str(request_id).strip())[:48] or "direct"
+        safe_call = re.sub(r"[^A-Za-z0-9._-]+", "-", str(call_id).strip())[:48] or "call"
         result_dir = self.agent_dir / "tool-results"
         result_dir.mkdir(parents=True, exist_ok=True)
         result_id = f"{safe_name}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:12]}.json"
         result_path = result_dir / result_id
         encoded = json.dumps(_json_safe(payload), ensure_ascii=False, indent=2).encode("utf-8")
-        temporary = result_path.with_suffix(f"{result_path.suffix}.{uuid4().hex}.tmp")
-        temporary.write_bytes(encoded)
-        os.replace(temporary, result_path)
-        return str(result_path.relative_to(self.agent_dir)).replace("\\", "/"), len(encoded)
+        temporary = result_dir / (
+            f".{safe_name}-{safe_request}-g{max(0, int(generation))}-{safe_call}-{uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_bytes(encoded)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return _PreparedToolResult(
+            temporary_path=temporary,
+            final_path=result_path,
+            reference=str(result_path.relative_to(self.agent_dir)).replace("\\", "/"),
+            encoded_bytes=len(encoded),
+        )
+
+    @staticmethod
+    def _discard_prepared_tool_result(prepared: _PreparedToolResult) -> None:
+        prepared.temporary_path.unlink(missing_ok=True)
+        prepared.final_path.unlink(missing_ok=True)
+
+    def _persist_tool_result(self, tool_name: str, payload: dict[str, Any]) -> tuple[str, int]:
+        """Keep complete tool output off-model while retaining a durable task record."""
+
+        prepared = self._prepare_tool_result(tool_name, payload)
+        try:
+            os.replace(prepared.temporary_path, prepared.final_path)
+        except BaseException:
+            self._discard_prepared_tool_result(prepared)
+            raise
+        return prepared.reference, prepared.encoded_bytes
 
     def _selected_writable_notebook_id(self, requested: str = "") -> str:
         """Resolve the notebook a Pi write action is allowed to update."""
@@ -3992,6 +4137,11 @@ class PiAgentClient:
                 reranker=self.reranker,
             )
             result["search_plan"] = plan
+            if isinstance(getattr(self._worker_context, "run_context", None), _RunContext):
+                # The owning event thread publishes this complete provider payload
+                # together with its bounded model view.  A worker must not create
+                # a durable file that cancellation can strand before tool.result.
+                return result
             result_reference, result_bytes = self._persist_tool_result("discover-papers", result)
             return _compact_academic_search_result_for_model(
                 result,

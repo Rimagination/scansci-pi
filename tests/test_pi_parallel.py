@@ -12,7 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from scansci_html.pi_agent import PiAgentClient, _ProtocolDispatcher
+from scansci_html.pi_agent import (
+    _PendingToolCall,
+    PiAgentClient,
+    _ProtocolDispatcher,
+    _RunContext,
+    _ToolCompletion,
+)
 
 
 def _read_only_contract(*tools: str) -> dict[str, object]:
@@ -723,6 +729,294 @@ def test_timeout_tombstones_late_worker_and_does_not_poison_next_request(
     cancel_message = next(message for message in written if message.get("type") == "run.cancel")
     assert str(cancel_message.get("command_id", ""))
     assert any(record.get("kind") == "late_tool_completion" for record in client._dispatch_audit)
+
+
+def test_cancel_during_persist_discards_file_history_and_wire_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id="persist-cancel", session_id="persist-cancel", generation=1)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    persist_started = threading.Event()
+    release_persist = threading.Event()
+
+    def checkpoint(stage: str, _context: _RunContext, _completion: _ToolCompletion) -> None:
+        if stage == "persist_prepared":
+            persist_started.set()
+            release_persist.wait(timeout=5)
+
+    monkeypatch.setattr(client, "_tool_result_commit_checkpoint", checkpoint)
+    completion = _ToolCompletion(
+        request_id=context.request_id,
+        generation=context.generation,
+        call_id="persist-call",
+        name="search_web",
+        arguments={"query": "fixture"},
+        parallel_safe=True,
+        result={"payload": "x" * 200_000},
+    )
+    outcomes: list[dict[str, object] | None] = []
+    errors: list[BaseException] = []
+
+    def finish() -> None:
+        try:
+            outcomes.append(client._finish_tool_completion(context, completion, task_mode="general"))
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    thread = threading.Thread(target=finish, daemon=True)
+    thread.start()
+    assert persist_started.wait(timeout=2)
+    assert client.cancel(context.request_id) is True
+    release_persist.set()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert outcomes == [None]
+    assert not list((client.agent_dir / "tool-results").glob("*.json"))
+    assert not list((client.agent_dir / "tool-results").glob("*.tmp"))
+    assert not any(entry.get("status") == "ok" for entry in context.history)
+    assert not any(message.get("type") == "tool.result" for message in written)
+
+
+@pytest.mark.parametrize("cancel_stage", ["result_renamed", "before_wire"])
+def test_cancel_before_wire_rolls_back_renamed_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_stage: str,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id=f"cancel-{cancel_stage}", session_id="atomic", generation=2)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+
+    def checkpoint(stage: str, _context: _RunContext, _completion: _ToolCompletion) -> None:
+        if stage == cancel_stage:
+            assert client.cancel(context.request_id) is True
+
+    monkeypatch.setattr(client, "_tool_result_commit_checkpoint", checkpoint)
+    completion = _ToolCompletion(
+        request_id=context.request_id,
+        generation=context.generation,
+        call_id=f"call-{cancel_stage}",
+        name="search_web",
+        arguments={"query": "fixture"},
+        parallel_safe=True,
+        result={"payload": "x" * 200_000},
+    )
+
+    outcome = client._finish_tool_completion(context, completion, task_mode="general")
+
+    assert outcome is None
+    result_dir = client.agent_dir / "tool-results"
+    assert not list(result_dir.glob("*.json"))
+    assert not list(result_dir.glob("*.tmp"))
+    assert not any(entry.get("status") == "ok" for entry in context.history)
+    assert not any(message.get("type") == "tool.result" for message in written)
+
+
+def test_cancel_while_wire_commit_is_in_progress_linearizes_after_full_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id="cancel-during-wire", session_id="atomic", generation=3)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+    write_started = threading.Event()
+    release_write = threading.Event()
+    written: list[dict[str, object]] = []
+
+    def blocked_write(message: dict[str, object]) -> None:
+        if message.get("type") == "tool.result":
+            write_started.set()
+            release_write.wait(timeout=5)
+        written.append(dict(message))
+
+    monkeypatch.setattr(client, "_write", blocked_write)
+    completion = _ToolCompletion(
+        request_id=context.request_id,
+        generation=context.generation,
+        call_id="wire-call",
+        name="search_web",
+        arguments={"query": "fixture"},
+        parallel_safe=True,
+        result={"payload": "x" * 200_000},
+    )
+    outcomes: list[dict[str, object] | None] = []
+    finish_thread = threading.Thread(
+        target=lambda: outcomes.append(
+            client._finish_tool_completion(context, completion, task_mode="general")
+        ),
+        daemon=True,
+    )
+    finish_thread.start()
+    assert write_started.wait(timeout=2)
+    cancel_results: list[bool] = []
+    cancel_thread = threading.Thread(
+        target=lambda: cancel_results.append(client.cancel(context.request_id)),
+        daemon=True,
+    )
+    cancel_thread.start()
+    time.sleep(0.05)
+    assert cancel_thread.is_alive()
+    assert context.cancel_event.is_set()
+
+    release_write.set()
+    finish_thread.join(timeout=3)
+    cancel_thread.join(timeout=3)
+
+    assert not finish_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert cancel_results == [True]
+    assert outcomes and outcomes[0] is not None
+    assert len(list((client.agent_dir / "tool-results").glob("*.json"))) == 1
+    assert len([entry for entry in context.history if entry.get("status") == "ok"]) == 1
+    assert len([message for message in written if message.get("type") == "tool.result"]) == 1
+
+
+def test_wire_failure_removes_unreferenced_persisted_result_and_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id="wire-failure", session_id="atomic", generation=4)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+
+    def broken_write(message: dict[str, object]) -> None:
+        if message.get("type") == "tool.result":
+            raise BrokenPipeError("fixture wire failure")
+
+    monkeypatch.setattr(client, "_write", broken_write)
+    completion = _ToolCompletion(
+        request_id=context.request_id,
+        generation=context.generation,
+        call_id="broken-wire-call",
+        name="search_web",
+        arguments={"query": "fixture"},
+        parallel_safe=True,
+        result={"payload": "x" * 200_000},
+    )
+
+    with pytest.raises(BrokenPipeError, match="wire failure"):
+        client._finish_tool_completion(context, completion, task_mode="general")
+
+    result_dir = client.agent_dir / "tool-results"
+    assert not list(result_dir.glob("*.json"))
+    assert not list(result_dir.glob("*.tmp"))
+    assert not context.history
+
+
+def test_discover_worker_defers_full_result_until_active_result_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_abstract = "A" * 20_000
+
+    def fake_search(query: str, **_kwargs: object) -> dict[str, object]:
+        return {
+            "query": query,
+            "count": 1,
+            "items": [{"title": "Fixture paper", "doi": "10.1000/fixture", "abstract": full_abstract}],
+        }
+
+    monkeypatch.setattr("scansci_html.pi_agent.search_academic_papers", fake_search)
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id="discover-cancel", session_id="atomic", generation=5)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+    completion = client._execute_tool_worker(
+        context,
+        _PendingToolCall(
+            call_id="discover-call",
+            name="discover_papers",
+            arguments={"query": "forest productivity", "result_limit": 8},
+            parallel_safe=False,
+        ),
+    )
+
+    assert completion.error_type == "", completion.error
+    result_dir = client.agent_dir / "tool-results"
+    assert not list(result_dir.glob("*.json"))
+    assert not list(result_dir.glob("*.tmp"))
+
+    client._mark_context_cancelled(context)
+    assert client._finish_tool_completion(context, completion, task_mode="research") is None
+    assert not list(result_dir.glob("*.json"))
+    assert not list(result_dir.glob("*.tmp"))
+    assert not context.history
+
+
+def test_discover_active_result_commit_persists_full_payload_and_sends_bounded_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_abstract = "A" * 20_000
+
+    def fake_search(query: str, **_kwargs: object) -> dict[str, object]:
+        return {
+            "query": query,
+            "count": 1,
+            "items": [{"title": "Fixture paper", "doi": "10.1000/fixture", "abstract": full_abstract}],
+        }
+
+    monkeypatch.setattr("scansci_html.pi_agent.search_academic_papers", fake_search)
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    context = _RunContext(request_id="discover-success", session_id="atomic", generation=6)
+    with client._contexts_lock:
+        client._run_contexts[context.request_id] = context
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    completion = client._execute_tool_worker(
+        context,
+        _PendingToolCall(
+            call_id="discover-call",
+            name="discover_papers",
+            arguments={"query": "forest productivity", "result_limit": 8},
+            parallel_safe=False,
+        ),
+    )
+
+    outcome = client._finish_tool_completion(context, completion, task_mode="research")
+
+    assert outcome is not None
+    result_files = list((client.agent_dir / "tool-results").glob("*.json"))
+    assert len(result_files) == 1
+    assert not list((client.agent_dir / "tool-results").glob("*.tmp"))
+    assert json.loads(result_files[0].read_text(encoding="utf-8"))["items"][0]["abstract"] == full_abstract
+    result_messages = [message for message in written if message.get("type") == "tool.result"]
+    assert len(result_messages) == 1
+    model_result = dict(result_messages[0]["result"])
+    assert len(model_result["items"][0]["abstract_excerpt"]) == 600
+    assert model_result["full_result_reference"].endswith(".json")
+    assert model_result["full_result_bytes"] == result_files[0].stat().st_size
+    assert len([entry for entry in context.history if entry.get("status") == "ok"]) == 1
 
 
 def test_timeout_waits_for_real_sidecar_cancellation_before_reusing_session(
