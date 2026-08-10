@@ -2861,7 +2861,7 @@ def test_direct_chat_web_search_policy_selects_pi_tool_boundary(
         assert result["agent_runtime"]["tool_calls"] == [{"name": "discover_papers", "status": "completed"}]
 
 
-def test_explicit_web_access_skill_forces_required_pi_web_mode(
+def test_explicit_web_access_skill_does_not_override_web_search_off(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2870,21 +2870,152 @@ def test_explicit_web_access_skill_forces_required_pi_web_mode(
     def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
         observed["task_mode"] = task_mode
         observed["skills"] = [item.get("id") for item in chat_request.selected_skills]
-        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
-        yield {"type": "delta", "content": "已根据联网来源完成回答。"}
+        yield {"type": "delta", "content": "Argument structure analyzed without web access."}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
 
     monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "web_search": "auto",
-        "messages": [{"role": "user", "content": "$web-access 帮我看看今天大A的情况"}],
+        "web_search": "off",
+        "skills": ["web-access"],
+        "messages": [{
+            "role": "user",
+            "content": "Analyze the logical structure of this argument and identify assumptions.",
+        }],
     }))
 
     assert events[-1]["type"] == "RUN_FINISHED"
-    assert observed["task_mode"] == "web"
+    assert observed["task_mode"] is None
     assert "web-access" in observed["skills"]
+    assert events[-1]["result"]["agent_runtime"]["task_mode"] == "general"
+    assert events[-1]["result"]["agent_runtime"]["tool_calls"] == []
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_loaded_web_skill_does_not_expand_host_contract_or_evidence_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    observed: list[dict[str, object]] = []
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        observed.append({
+            "task_mode": task_mode,
+            "skills": [item.get("id") for item in chat_request.selected_skills],
+        })
+        if task_mode in {"web", "web-auto"}:
+            yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
+        yield {"type": "delta", "content": "Argument structure analyzed."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    def invoke(skills: list[str]) -> dict[str, object]:
+        payload = {
+            "web_search": "auto",
+            "skills": skills,
+            "messages": [{
+                "role": "user",
+                "content": "Analyze the logical structure of this argument and identify assumptions.",
+            }],
+        }
+        if entrypoint == "chat":
+            return runtime.chat(payload)
+        return list(runtime.chat_stream(payload))[-1]["result"]
+
+    baseline = invoke([])
+    with_skill = invoke(["web-access"])
+    baseline_runtime = baseline["agent_runtime"]
+    selected_runtime = with_skill["agent_runtime"]
+
+    assert "web-access" in observed[-1]["skills"]
+    assert selected_runtime["task_mode"] == baseline_runtime["task_mode"]
+    assert selected_runtime["evidence_policy"] == baseline_runtime["evidence_policy"]
+    for key in (
+        "allowed_tools", "initial_tools", "required_tool_groups", "required_evidence", "risk_level",
+    ):
+        assert selected_runtime["task_contract"].get(key) == baseline_runtime["task_contract"].get(key)
+    assert selected_runtime.get("tool_calls", []) == baseline_runtime.get("tool_calls", [])
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_dollar_skill_mention_is_excluded_from_intent_and_contract_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        yield {"type": "delta", "content": "Argument structure analyzed."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    def invoke(*, content: str, skills: list[str]) -> dict[str, object]:
+        payload = {
+            "web_search": "off",
+            "skills": skills,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if entrypoint == "chat":
+            return runtime.chat(payload)
+        return list(runtime.chat_stream(payload))[-1]["result"]
+
+    baseline = invoke(
+        content="看看这个观点中有哪些隐含假设。",
+        skills=["web-access"],
+    )
+    with_mention = invoke(
+        content="$web-access 看看这个观点中有哪些隐含假设。",
+        skills=[],
+    )
+
+    baseline_runtime = baseline["agent_runtime"]
+    mention_runtime = with_mention["agent_runtime"]
+    assert mention_runtime["task_mode"] == baseline_runtime["task_mode"] == "general"
+    assert mention_runtime["evidence_policy"] == baseline_runtime["evidence_policy"]
+    for key in (
+        "allowed_tools", "initial_tools", "required_tool_groups", "required_evidence", "risk_level",
+    ):
+        assert mention_runtime["task_contract"].get(key) == baseline_runtime["task_contract"].get(key)
+
+
+def test_real_network_request_still_selects_web_after_skill_mention_is_stripped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        observed["task_mode"] = task_mode
+        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
+        yield {"type": "delta", "content": "Public-web result."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    events = list(runtime.chat_stream({
+        "web_search": "off",
+        "messages": [{
+            "role": "user",
+            "content": "$web-access 请在公开网络搜索今天的科技新闻。",
+        }],
+    }))
+
+    assert observed["task_mode"] == "web"
+    assert events[-1]["result"]["agent_runtime"]["task_mode"] == "web"
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
         {"name": "search_web", "status": "completed"}
     ]
@@ -3304,6 +3435,57 @@ def test_streaming_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
     assert observed["thinking_mode"] == "disabled"
 
 
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_pi_pre_effect_direct_fallback_materializes_explicit_skill_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def direct_completion(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        return "Direct fallback reply", {"total_tokens": 3}
+
+    def direct_stream(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        yield {"type": "delta", "content": "Direct fallback reply"}
+        yield {"type": "done", "usage": {"total_tokens": 3}}
+
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_completion)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_stream)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    if entrypoint == "chat":
+        monkeypatch.setattr(
+            runtime,
+            "_complete_with_pi",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
+        )
+        result = runtime.chat({
+            "web_search": "off",
+            "skills": ["web-access"],
+            "messages": [{"role": "user", "content": "Analyze the assumptions in this argument."}],
+        })
+    else:
+        monkeypatch.setattr(
+            ResearchAgentRuntime,
+            "_pi_model_events",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
+        )
+        result = list(runtime.chat_stream({
+            "web_search": "off",
+            "skills": ["web-access"],
+            "messages": [{"role": "user", "content": "Analyze the assumptions in this argument."}],
+        }))[-1]["result"]
+
+    assert result["agent_runtime"]["compatibility_fallback"] is True
+    fallback_text = json.dumps(observed["messages"], ensure_ascii=False)
+    assert fallback_text.count("# web-access Skill") == 1
+
+
 def test_explicit_structured_writing_receives_a_completion_budget_and_safe_continuation() -> None:
     request = (
         "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
@@ -3545,13 +3727,9 @@ def test_direct_chat_knows_scansci_identity_and_loads_an_explicit_skill(tmp_path
     assert '<selected_skill id="good-question" provenance="explicit"' in system
     assert 'package_hash="sha256:' in system
     assert 'content_hash="sha256:' in system
-    assert "## 好问题卡" in system
-    assert "**竞争性解释：** H1 ...；H2 ...；H3 ..." in system
-    assert "**关键判别证据或实验：** ..." in system
-    assert "**两周内可做的 pilot：** ..." in system
-    assert "**最强评审质疑：** ..." in system
-    assert "Load reference cards on demand" in system
-    assert "references/platt-strong-inference.md" in system
+    assert 'resource="SKILL.md"' in system
+    assert "## 好问题卡" not in system
+    assert "Load reference cards on demand" not in system
     assert len(system.encode("utf-8")) < 256 * 1024
     assert chat_request.chat_mode == "writing"
     assert [item["id"] for item in chat_request.selected_skills] == ["good-question"]

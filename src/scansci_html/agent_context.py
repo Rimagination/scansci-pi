@@ -13,10 +13,6 @@ from .skill_manager import installed_skills
 from .skill_runtime import SkillSelection, resolve_skill_selection
 
 
-_MAX_SKILL_CHARS = 64 * 1024
-_MAX_SKILL_CONTEXT_CHARS = 256 * 1024
-
-
 _COMPACT_SKILL_CONTRACTS = {
     "web-access": """# Web Access：ScanSci 运行时契约
 
@@ -154,7 +150,7 @@ def build_agent_system_context(
     selected_ids: list[str],
     selection: SkillSelection | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Build compact Skill discovery context and preload explicit Skills only."""
+    """Build compact Skill discovery context and stage explicit Skill preloads."""
 
     resolved = selection or SkillSelection(
         selected_ids=tuple(selected_ids),
@@ -171,7 +167,6 @@ def build_agent_system_context(
     selected: list[dict[str, Any]] = []
     skill_contracts: list[str] = []
     skill_hints: list[str] = []
-    remaining_skill_chars = _MAX_SKILL_CONTEXT_CHARS
     for identifier in resolved.explicit_ids:
         item = catalog_by_id.get(identifier.lower())
         if item is None or identifier not in resolved.selected_ids:
@@ -180,11 +175,6 @@ def build_agent_system_context(
             loaded = progressive.load_skill(identifier, provenance="explicit")
         except (OSError, SkillAccessError):
             continue
-        instructions = str(loaded.get("content", ""))[:_MAX_SKILL_CHARS]
-        if remaining_skill_chars <= 0:
-            break
-        instructions = instructions[:remaining_skill_chars]
-        remaining_skill_chars -= len(instructions)
         selected.append(
             {
                 "id": str(item["id"]),
@@ -199,9 +189,9 @@ def build_agent_system_context(
             }
         )
         skill_contracts.append(
-            f"\n<selected_skill id=\"{item['id']}\" provenance=\"explicit\" "
-            f"package_hash=\"{loaded['package_hash']}\" content_hash=\"{loaded['content_hash']}\">\n"
-            f"{instructions}\n</selected_skill>"
+            f"<selected_skill id=\"{item['id']}\" provenance=\"explicit\" "
+            f"resource=\"{loaded['resource']}\" package_hash=\"{loaded['package_hash']}\" "
+            f"content_hash=\"{loaded['content_hash']}\" bytes=\"{loaded['bytes']}\" />"
         )
 
     for identifier in resolved.inferred_ids:

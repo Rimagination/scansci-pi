@@ -41,6 +41,33 @@ def _sha256(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
 
+def _assert_resource_size(path: Path, max_bytes: int) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise SkillAccessError("Skill resource could not be inspected") from error
+    if size > max_bytes:
+        raise SkillAccessError(
+            f"Skill resource exceeds the individual {max_bytes}-byte limit"
+        )
+
+
+def _read_bounded_resource(path: Path, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes + 1`` bytes, rejecting a concurrent growth."""
+
+    _assert_resource_size(path, max_bytes)
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
+    except OSError as error:
+        raise SkillAccessError("Skill resource could not be read") from error
+    if len(raw) > max_bytes:
+        raise SkillAccessError(
+            f"Skill resource exceeds the individual {max_bytes}-byte limit"
+        )
+    return raw
+
+
 def _is_link(path: Path) -> bool:
     try:
         if path.is_symlink():
@@ -392,17 +419,14 @@ class ProgressiveSkillRuntime:
         require_restored: bool,
     ) -> dict[str, Any]:
         record, relative, resolved = self._resource_path(str(skill_id or ""), resource)
+        _assert_resource_size(resolved, self.max_resource_bytes)
         self._assert_current_snapshot(record)
         record, relative, resolved = self._resource_path(str(skill_id or ""), resource)
         key = f"{record['id']}:{relative}"
         cached = self._loaded.get(key)
         if require_restored and cached is None:
             raise SkillAccessError("Skill resource is absent from validated restored state")
-        raw = resolved.read_bytes()
-        if len(raw) > self.max_resource_bytes:
-            raise SkillAccessError(
-                f"Skill resource exceeds the individual {self.max_resource_bytes}-byte limit"
-            )
+        raw = _read_bounded_resource(resolved, self.max_resource_bytes)
         if b"\x00" in raw:
             raise SkillAccessError("Skill resource is not UTF-8 text")
         try:
@@ -452,8 +476,10 @@ class ProgressiveSkillRuntime:
             resource = str(item.get("resource", "") or "")
             try:
                 record, relative, resolved = self._resource_path(skill_id, resource)
+                _assert_resource_size(resolved, self.max_resource_bytes)
                 self._assert_current_snapshot(record)
-                data = resolved.read_bytes()
+                record, relative, resolved = self._resource_path(skill_id, resource)
+                data = _read_bounded_resource(resolved, self.max_resource_bytes)
             except (OSError, SkillAccessError):
                 continue
             if (

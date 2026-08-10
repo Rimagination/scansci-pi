@@ -1052,6 +1052,45 @@ class _OpenAIResumeBudgetHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIExplicitSkillPreloadHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        chunks = [
+            {
+                "id": "chatcmpl-explicit-preload",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "explicit-preload-complete"},
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "id": "chatcmpl-explicit-preload",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class _OpenAIJsonHandler(_OpenAIStreamHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         length = int(self.headers.get("Content-Length", "0"))
@@ -1985,6 +2024,13 @@ def test_progressive_skill_sidecar_load_resume_and_compaction_preserve_hash_and_
     first_followup = json.dumps(_OpenAIProgressiveSkillHandler.request_payloads[1], ensure_ascii=False)
     assert "instructions_only" in first_followup
     assert "good-question" in first_followup
+    skill_sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    provider_skill_counts = [
+        json.dumps(payload.get("messages", []), ensure_ascii=False).count(skill_sentinel)
+        for payload in _OpenAIProgressiveSkillHandler.request_payloads
+    ]
+    assert any(count == 1 for count in provider_skill_counts)
+    assert max(provider_skill_counts) == 1, provider_skill_counts
 
     records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
     skill_records = [
@@ -2015,6 +2061,8 @@ def test_progressive_skill_sidecar_load_resume_and_compaction_preserve_hash_and_
     )
     assert '<loaded_skill id="good-question"' in resumed_system
     assert state_data["content_hash"] in resumed_system
+    sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    assert resumed_system.count(sentinel) == 1
 
 
 def test_repeated_skill_load_transmits_content_and_custom_state_once(tmp_path: Path) -> None:
@@ -2084,6 +2132,70 @@ def test_repeated_skill_load_transmits_content_and_custom_state_once(tmp_path: P
         if record.get("type") == "custom" and record.get("customType") == "scansci.skill-state.v1"
     ]
     assert len(custom_records) == 1
+
+
+def test_explicit_skill_body_appears_once_in_first_provider_request(tmp_path: Path) -> None:
+    from scansci_html.agent_context import build_agent_system_context
+    from scansci_html.skill_runtime import resolve_skill_selection
+
+    user_text = "Help me sharpen a research question."
+    selection = resolve_skill_selection(
+        {"skills": ["good-question"]},
+        [{"role": "user", "content": user_text}],
+    )
+    system_context, selected = build_agent_system_context(
+        tmp_path / "workspace.sqlite",
+        model_id="fixture-model",
+        provider_name="fixture-provider",
+        chat_mode="general",
+        selected_ids=list(selection.selected_ids),
+        selection=selection,
+    )
+    assert selected[0]["status"] == "loaded"
+
+    _OpenAIExplicitSkillPreloadHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIExplicitSkillPreloadHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    try:
+        events = list(client.stream_chat(
+            messages=[
+                {"role": "system", "content": system_context},
+                {"role": "user", "content": user_text},
+            ],
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "explicit-skill-single-channel",
+                "allowed_tools": [],
+                "initial_tools": [],
+                "risk_level": "read_only",
+            },
+            selected_skills=selected,
+            timeout_seconds=30,
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert events[-1]["stats"]["skillInventory"]["selected"] == 1
+    assert events[-1]["stats"]["skillInventory"]["ids"] == ["good-question"]
+    first_payload = _OpenAIExplicitSkillPreloadHandler.request_payloads[0]
+    provider_text = "\n".join(str(message.get("content", "")) for message in first_payload["messages"])
+    sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    assert provider_text.count(sentinel) == 1
 
 
 def test_restart_restores_out_of_catalog_skill_without_spending_model_skill_budget(

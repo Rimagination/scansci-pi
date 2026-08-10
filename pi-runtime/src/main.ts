@@ -582,6 +582,11 @@ function sessionStats(state: SessionState): JsonRecord {
   }
   const systemPrompt = estimateTokenText(state.session.systemPrompt);
   const selectedSkillBlocks = String(state.request.system_prompt || "").match(/<selected_skill\b[\s\S]*?<\/selected_skill>/gi) || [];
+  const selectedSkillIds = [...new Set(
+    [...String(state.request.system_prompt || "").matchAll(/<selected_skill\s+id="([^"]+)"/gi)]
+      .map((match) => String(match[1] || ""))
+      .filter(Boolean),
+  )];
   const skillTokens = selectedSkillBlocks.reduce((total, block) => total + estimateTokenText(block), 0);
   const systemPromptTokens = Math.max(0, systemPrompt - skillTokens);
   const context = base.contextUsage && typeof base.contextUsage === "object" ? base.contextUsage as JsonRecord : {};
@@ -639,8 +644,8 @@ function sessionStats(state: SessionState): JsonRecord {
       registeredNames: registeredTools,
     },
     skillInventory: {
-      selected: selectedSkillBlocks.length,
-      ids: selectedSkillBlocks.map((block) => block.match(/<selected_skill\s+id="([^"]+)"/i)?.[1] || "").filter(Boolean),
+      selected: selectedSkillIds.length,
+      ids: selectedSkillIds,
       catalog: skillCatalog.length,
       provenance: skillSelection.map((item) => ({
         id: String(item.id || "").slice(0, 100),
@@ -2553,6 +2558,7 @@ async function createSession(
   const taskContract = normalizeTaskContract(request);
   const requestRef = { current: request };
   const loadedSkillsRef = { current: new Map<string, LoadedSkill>() };
+  const injectedSkillKeysRef = { current: new Set<string>() };
   let sessionManagerRef: SessionManager | undefined;
   const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
   runtime.registerProvider("scansci-pi", {
@@ -2583,11 +2589,50 @@ async function createSession(
     extensionFactories: [{
       name: "scansci-provider-request-guard",
       factory: (pi) => {
-        pi.on("before_agent_start", (event) => ({
-          // Compose from Pi's actual cached base prompt.  The loader base is
-          // deliberately session-invariant; all authority and date-sensitive
-          // content comes from the current request reference on every turn.
-          systemPrompt: `${event.systemPrompt}\n\n${currentTurnSystemPrompt(requestRef.current, loadedSkillsRef.current)}`,
+        pi.on("before_agent_start", (event) => {
+          // Snapshot only the resources included in this agent-start prompt.
+          // A Skill loaded later in the same loop must remain in its first
+          // tool result so the very next provider call can read it once.
+          injectedSkillKeysRef.current = new Set(loadedSkillsRef.current.keys());
+          return {
+            // Compose from Pi's actual cached base prompt.  The loader base is
+            // deliberately session-invariant; all authority and date-sensitive
+            // content comes from the current request reference on every turn.
+            systemPrompt: `${event.systemPrompt}\n\n${currentTurnSystemPrompt(requestRef.current, loadedSkillsRef.current)}`,
+          };
+        });
+        pi.on("context", (event) => ({
+          messages: event.messages.map((message) => {
+            if (
+              message.role !== "toolResult"
+              || message.toolName !== "load_skill"
+              || !message.details
+              || typeof message.details !== "object"
+              || Array.isArray(message.details)
+            ) {
+              return message;
+            }
+            try {
+              const metadata = skillMetadata(message.details as JsonRecord);
+              const key = `${metadata.skill_id}:${metadata.resource}`;
+              if (!injectedSkillKeysRef.current.has(key)) return message;
+              const payload = {
+                ...metadata,
+                already_loaded: true,
+                instructions_in_system_prompt: true,
+                authority: "instructions_only",
+              };
+              return {
+                ...message,
+                content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+                details: payload,
+              };
+            } catch {
+              // Only host-created, hash-valid Skill results are eligible for
+              // deduplication; malformed records stay visible and fail closed.
+              return message;
+            }
+          }),
         }));
         pi.on("before_provider_request", (event) => {
           const currentRequest = requestRef.current;

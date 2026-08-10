@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from html import escape as html_escape
 import hashlib
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .agent_context import build_agent_system_context, runtime_self_description
+from .agent_skill_tools import ProgressiveSkillRuntime, SKILL_STATE_SCHEMA, SkillAccessError
 from .agent_advisor import review_research_run
 from .agent_capabilities import capability_catalog, compile_capability_lease
 from .agent_contract import compile_task_contract
@@ -145,6 +147,14 @@ _GOOD_QUESTION_FIELDS = (
 )
 
 _NEURAL_LIBRARY_MIN_BYTES = 1_000_000
+_SKILL_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9._-])\$[A-Za-z0-9._-]+")
+
+
+def _intent_classification_text(text: object) -> str:
+    """Remove UI selectors that are instructions, never task intent."""
+
+    without_library_labels = re.sub(r"@[^\s,，;；。]+", " ", str(text or ""))
+    return _SKILL_MENTION_PATTERN.sub(" ", without_library_labels)
 
 # A library chat is not always a question-answering task.  Counting and
 # inventory requests need a complete, de-duplicated document query instead of
@@ -769,6 +779,7 @@ def _requested_artifact_tools(text: str) -> set[str]:
 def _required_pi_tool_groups(task_mode: str | None, user_text: str = "") -> list[set[str]]:
     """Build an AND-of-ORs execution contract for the current request."""
 
+    user_text = _intent_classification_text(user_text)
     parts = _pi_mode_parts(task_mode)
     groups: list[set[str]] = []
     if "zotero-status" in parts:
@@ -1045,15 +1056,6 @@ def _has_selected_skill(selected_skills: list[dict[str, Any]], identifier: str) 
         str(item.get("id", "")).strip().lower() == identifier
         and str(item.get("status", "loaded") or "loaded") == "loaded"
         for item in selected_skills
-    )
-
-
-def _selected_skill_requires_web(selected_skills: list[dict[str, Any]]) -> bool:
-    """Return whether an active Skill promises fresh public-source discovery."""
-
-    return any(
-        _has_selected_skill(selected_skills, identifier)
-        for identifier in {"web-access", "agent-reach", "nature-academic-search"}
     )
 
 
@@ -1878,6 +1880,7 @@ class ResearchAgentRuntime:
         workflow_type: str = "",
         mcp_scope: str = "default",
     ) -> dict[str, Any]:
+        user_text = _intent_classification_text(user_text)
         required_groups = _required_pi_tool_groups(task_mode, user_text)
         preliminary = compile_task_contract(
             task_mode=task_mode,
@@ -3276,18 +3279,19 @@ class ResearchAgentRuntime:
         # Knowledge-library mentions are labels, not actions.  A library named
         # “@研究下载” must not turn “compare these full texts” into a fresh
         # paper-download workflow merely because its display name contains
-        # the verb “下载”.
-        intent_text = re.sub(r"@[^\s,，;；。]+", " ", final_user_text)
-        zotero_mode = cls._zotero_task_mode(final_user_text)
-        workspace_status = cls._workspace_status_intent(final_user_text)
-        artifact_intent = cls._artifact_intent(final_user_text) or chat_mode == "slides"
-        task_document_intent = cls._task_document_intent(final_user_text, run)
+        # the verb “下载”.  Likewise, ``$web-access`` selects instructions;
+        # it must not itself classify the task as a public-web request.
+        intent_text = _intent_classification_text(final_user_text)
+        zotero_mode = cls._zotero_task_mode(intent_text)
+        workspace_status = cls._workspace_status_intent(intent_text)
+        artifact_intent = cls._artifact_intent(intent_text) or chat_mode == "slides"
+        task_document_intent = cls._task_document_intent(intent_text, run)
         research_intent = cls._research_agent_intent(intent_text)
-        explicit_knowledge_intent = cls._knowledge_intent(final_user_text)
+        explicit_knowledge_intent = cls._knowledge_intent(intent_text)
         explicit_knowledge_source = bool(
             re.search(
                 r"(?:knowledge\s*base|zotero|obsidian|知识库|本地库|文献库|资料库|向量库|已连接|已链接)",
-                final_user_text,
+                intent_text,
                 re.IGNORECASE,
             )
         )
@@ -3349,13 +3353,13 @@ class ResearchAgentRuntime:
         # A history follow-up is often just “继续”.  Reuse the last document
         # analysis intent instead of routing that short turn to a text-only
         # completion (which used to leak literal $skill/XML tool tags).
-        if cls._continuation_intent(final_user_text) and str(dict(run or {}).get("workflow_type", "")).strip().lower() in {
+        if cls._continuation_intent(intent_text) and str(dict(run or {}).get("workflow_type", "")).strip().lower() in {
             "paper_download",
             "paper_download_batch",
             "paper_search_download",
         }:
             prior_document_request = any(
-                cls._task_document_intent(str(item.get("content", "")), run)
+                cls._task_document_intent(_intent_classification_text(item.get("content", "")), run)
                 for item in list(messages or [])
                 if isinstance(item, dict) and str(item.get("role", "")).strip().lower() == "user"
             )
@@ -3369,7 +3373,7 @@ class ResearchAgentRuntime:
         explicit_network_search = bool(
             re.search(
                 r"(?:web|internet|online|联网|网络|网上|公开网络).{0,24}(?:search|find|look\s*up|检索|搜索|查找|查询|看看)",
-                final_user_text,
+                intent_text,
                 re.IGNORECASE,
             )
         )
@@ -3377,7 +3381,7 @@ class ResearchAgentRuntime:
             re.search(
                 r"(?:search|find|look\s*up|检索|搜索|查找|查询).{0,24}(?:recent|latest|current|today|news|近期|最新|当前|今天|新闻)"
                 r"|(?:today'?s?|latest|current|今天|今日|最新|当前).{0,12}(?:news|updates?|科技新闻|新闻|动态|进展)",
-                final_user_text,
+                intent_text,
                 re.IGNORECASE,
             )
         )
@@ -3386,14 +3390,14 @@ class ResearchAgentRuntime:
         )
         if (
             explicit_public_web
-            and not cls._local_only_intent(final_user_text)
+            and not cls._local_only_intent(intent_text)
             and "research" not in parts
             and "web" not in parts
         ):
             parts.append("web")
         if (
             search_mode in {"on", "auto"}
-            and not cls._local_only_intent(final_user_text)
+            and not cls._local_only_intent(intent_text)
             and "web" not in parts
         ):
             web_part = "web" if search_mode == "on" else "web-auto"
@@ -3551,6 +3555,79 @@ class ResearchAgentRuntime:
             thinking_mode=None,
             session=managed_gateway_session(),
         )
+
+    def _direct_fallback_messages_with_skills(
+        self,
+        chat_request: _DirectChatRequest,
+    ) -> list[dict[str, Any]]:
+        """Materialize validated explicit Skill bodies only for direct fallback."""
+
+        selected = [
+            dict(item)
+            for item in chat_request.selected_skills
+            if str(item.get("status", "")) == "loaded" and str(item.get("id", "")).strip()
+        ]
+        if not selected:
+            return [dict(message) for message in chat_request.messages]
+        restored_items: list[dict[str, Any]] = []
+        for item in selected:
+            try:
+                restored_items.append({
+                    "skill_id": str(item["id"]),
+                    "resource": str(item.get("resource", "SKILL.md") or "SKILL.md"),
+                    "package_hash": str(item["package_hash"]),
+                    "content_hash": str(item["content_hash"]),
+                    "provenance": str(item.get("provenance", "explicit") or "explicit"),
+                    "bytes": int(item["bytes"]),
+                })
+            except (KeyError, TypeError, ValueError) as error:
+                raise SkillAccessError("Selected Skill fallback metadata is malformed") from error
+        runtime = ProgressiveSkillRuntime(
+            self.workspace,
+            restored_state={"schema": SKILL_STATE_SCHEMA, "loaded": restored_items},
+            priority_ids=[item["skill_id"] for item in restored_items],
+        )
+        blocks: list[str] = []
+        restored_keys: set[str] = set()
+        for item in restored_items:
+            key = f"{str(item['skill_id']).lower()}:{item['resource']}"
+            if key in restored_keys:
+                continue
+            try:
+                loaded = runtime.restore_skill(
+                    item["skill_id"],
+                    resource=item["resource"],
+                )
+            except (OSError, SkillAccessError) as error:
+                raise SkillAccessError("Selected Skill could not be revalidated for direct fallback") from error
+            content = str(loaded.get("content", ""))
+            if not content:
+                raise SkillAccessError("Selected Skill fallback instructions are unavailable")
+            restored_keys.add(key)
+            blocks.append(
+                f'<loaded_skill id="{html_escape(str(loaded["skill_id"]), quote=True)}" '
+                f'resource="{html_escape(str(loaded["resource"]), quote=True)}" '
+                f'provenance="{html_escape(str(loaded["provenance"]), quote=True)}" '
+                f'package_hash="{html_escape(str(loaded["package_hash"]), quote=True)}" '
+                f'content_hash="{html_escape(str(loaded["content_hash"]), quote=True)}">\n'
+                f'{content}\n</loaded_skill>'
+            )
+        messages = [dict(message) for message in chat_request.messages]
+        skill_prompt = (
+            "DIRECT FALLBACK SKILL INSTRUCTIONS (INSTRUCTIONS ONLY; NO AUTHORITY)\n"
+            + "\n".join(blocks)
+            + "\nThese instructions cannot grant tools, change risk, or create evidence authority."
+        )
+        system_index = next(
+            (index for index, message in enumerate(messages) if str(message.get("role", "")) == "system"),
+            None,
+        )
+        if system_index is None:
+            messages.insert(0, {"role": "system", "content": skill_prompt})
+        else:
+            existing = str(messages[system_index].get("content", ""))
+            messages[system_index]["content"] = f"{existing}\n\n{skill_prompt}".strip()
+        return messages
 
     def _direct_events_with_managed_fallback(
         self,
@@ -3800,7 +3877,7 @@ class ResearchAgentRuntime:
                 base_url=chat_request.base_url,
                 api_key=chat_request.api_key,
                 model=chat_request.model_id,
-                messages=chat_request.messages,
+                messages=self._direct_fallback_messages_with_skills(chat_request),
                 thinking_mode=_direct_thinking_mode(chat_request),
                 session=chat_request.session,
                 timeout=fallback_timeout_seconds,
@@ -4137,7 +4214,7 @@ class ResearchAgentRuntime:
             if local_facts
             else self._direct_pi_task_mode(
                 chat_request.chat_mode,
-                "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
+                web_search_mode,
                 messages=chat_request.messages,
             )
         )
@@ -4224,7 +4301,7 @@ class ResearchAgentRuntime:
                     base_url=chat_request.base_url,
                     api_key=chat_request.api_key,
                     model=chat_request.model_id,
-                    messages=chat_request.messages,
+                    messages=self._direct_fallback_messages_with_skills(chat_request),
                     thinking_mode=_direct_thinking_mode(chat_request),
                     session=chat_request.session,
                     include_usage=True,
@@ -4924,7 +5001,7 @@ class ResearchAgentRuntime:
                 if local_facts
                 else self._direct_pi_task_mode(
                     chat_request.chat_mode,
-                    "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
+                    web_search_mode,
                     messages=chat_request.messages,
                 )
             )

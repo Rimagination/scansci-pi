@@ -98,7 +98,7 @@ def _skill_record(
     return record
 
 
-def test_explicit_skill_preloads_full_instructions_with_hash_and_provenance(
+def test_explicit_skill_stages_preload_metadata_with_hash_and_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -121,7 +121,9 @@ def test_explicit_skill_preloads_full_instructions_with_hash_and_provenance(
     )
 
     assert '<selected_skill id="explicit-helper"' in system
-    assert "Explicit sentinel" in system
+    assert "Explicit sentinel" not in system
+    assert 'resource="SKILL.md"' in system
+    assert 'bytes="47" />' in system
     assert selected == [
         {
             "id": "explicit-helper",
@@ -290,6 +292,103 @@ def test_load_skill_enforces_individual_and_cumulative_byte_limits(tmp_path: Pat
         runtime.load_skill("bounded")
 
 
+def test_load_and_restore_use_bounded_resource_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scansci_html.agent_skill_tools as skill_tools
+    from scansci_html.agent_skill_tools import ProgressiveSkillRuntime
+
+    record = _skill_record(tmp_path, "bounded-read", text="# bounded read\n")
+    package = Path(str(record["package_path"]))
+    snapshot = skill_tools._package_snapshot(package)
+    seed = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite", records=[record])
+    state = seed.state()
+    state["loaded"] = [
+        {
+            key: value
+            for key, value in seed.load_skill("bounded-read", provenance="explicit").items()
+            if key != "content"
+        }
+    ]
+
+    monkeypatch.setattr(skill_tools, "_package_snapshot", lambda _root: snapshot)
+    read_sizes: list[int] = []
+    original_open = Path.open
+
+    class ObservedBinaryFile:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self._handle.__exit__(exc_type, exc_value, traceback)
+
+        def read(self, size: int = -1):
+            read_sizes.append(size)
+            return self._handle.read(size)
+
+    def observed_open(path: Path, *args, **kwargs):
+        return ObservedBinaryFile(original_open(path, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", observed_open)
+    fresh = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite", records=[record])
+    fresh.load_skill("bounded-read")
+    ProgressiveSkillRuntime(
+        tmp_path / "workspace.sqlite",
+        records=[record],
+        restored_state=state,
+    )
+
+    assert read_sizes == [
+        skill_tools.MAX_SKILL_RESOURCE_BYTES + 1,
+        skill_tools.MAX_SKILL_RESOURCE_BYTES + 1,
+    ]
+
+
+def test_oversized_load_and_restore_fail_from_stat_without_opening_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scansci_html.agent_skill_tools as skill_tools
+    from scansci_html.agent_skill_tools import ProgressiveSkillRuntime, SkillAccessError
+
+    record = _skill_record(tmp_path, "oversized-read", text="x" * 13)
+    package = Path(str(record["package_path"]))
+    snapshot = skill_tools._package_snapshot(package)
+    seed = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite", records=[record])
+    loaded = seed.load_skill("oversized-read", provenance="explicit")
+    restored_state = {
+        "schema": skill_tools.SKILL_STATE_SCHEMA,
+        "loaded": [{key: value for key, value in loaded.items() if key != "content"}],
+    }
+
+    monkeypatch.setattr(skill_tools, "_package_snapshot", lambda _root: snapshot)
+
+    def forbidden_open(_path: Path, *_args, **_kwargs):
+        raise AssertionError("oversized Skill resource was opened instead of rejected by stat")
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    runtime = ProgressiveSkillRuntime(
+        tmp_path / "workspace.sqlite",
+        records=[record],
+        max_resource_bytes=12,
+    )
+    with pytest.raises(SkillAccessError, match="individual|12"):
+        runtime.load_skill("oversized-read")
+
+    restored = ProgressiveSkillRuntime(
+        tmp_path / "workspace.sqlite",
+        records=[record],
+        restored_state=restored_state,
+        max_resource_bytes=12,
+    )
+    assert restored.state()["loaded"] == []
+
+
 def test_loaded_skill_state_restores_stable_hashes_without_content(tmp_path: Path) -> None:
     from scansci_html.agent_skill_tools import ProgressiveSkillRuntime
 
@@ -399,7 +498,8 @@ def test_explicit_skill_is_prioritized_into_bounded_catalog_and_preloaded(
         selection=selection,
     )
 
-    assert "# safe 64" in system
+    assert "# safe 64" not in system
+    assert f'<selected_skill id="{explicit_id}" provenance="explicit"' in system
     assert selected[0]["id"] == explicit_id
     assert selected[0]["status"] == "loaded"
 
