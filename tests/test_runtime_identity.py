@@ -19,6 +19,7 @@ from scansci_html.webapp import create_notebook_server
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = (PROJECT_ROOT / "src" / "scansci_html").resolve()
 PREVIEW_ENTRY = PROJECT_ROOT / "scripts" / "scansci_preview_entry.py"
+EXPECTED_RELEASE_VERSION = "0.4.0"
 
 
 def test_source_and_release_version_declarations_cannot_drift() -> None:
@@ -26,13 +27,31 @@ def test_source_and_release_version_declarations_cannot_drift() -> None:
     package = json.loads((PROJECT_ROOT / "package.json").read_text(encoding="utf-8"))
     package_lock = json.loads((PROJECT_ROOT / "package-lock.json").read_text(encoding="utf-8"))
     release_contract = json.loads((PROJECT_ROOT / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    release_scope = json.loads((PROJECT_ROOT / "config" / "release-scope.json").read_text(encoding="utf-8"))
     expected = str(release_contract["version"])
 
+    assert expected == EXPECTED_RELEASE_VERSION
     assert APP_VERSION == expected
+    assert release_scope["version"] == expected
     assert pyproject["project"]["version"] == expected
     assert package["version"] == expected
     assert package_lock["version"] == expected
     assert package_lock["packages"][""]["version"] == expected
+
+
+def test_desktop_build_default_uses_the_release_identity() -> None:
+    build_script = (PROJECT_ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8")
+
+    assert '[string]$Version = "0.4.0"' in build_script
+
+
+def test_mcp_client_identity_comes_from_the_root_package_version() -> None:
+    runtime_source = (PROJECT_ROOT / "pi-runtime" / "src" / "main.ts").read_text(encoding="utf-8")
+
+    assert 'import rootPackage from "../../package.json";' in runtime_source
+    assert "const SCANSCI_PRODUCT_VERSION = String(rootPackage.version);" in runtime_source
+    assert runtime_source.count('new McpClient({ name: "scansci-pi", version: SCANSCI_PRODUCT_VERSION }') == 2
+    assert 'new McpClient({ name: "scansci-pi", version: "0.2.0" }' not in runtime_source
 
 
 def test_update_service_defaults_to_the_runtime_build_identity(

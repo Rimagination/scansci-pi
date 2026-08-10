@@ -23,7 +23,7 @@ from .update_blockmap import (
 )
 
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"

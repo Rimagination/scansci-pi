@@ -8,7 +8,7 @@ param(
     [string]$PackageProfile = "core",
     [string]$OutputDir = "",
     [string]$Name = "ScanSci",
-    [string]$Version = "0.3.1",
+    [string]$Version = "0.4.0",
     [string]$BuildId = "",
     # Populated only by scripts/release_gate.py. This binds an auditable
     # release candidate to the exact source fingerprint that passed its gate.

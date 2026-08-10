@@ -6,7 +6,8 @@ ScanSci 主程序和本地模型推理栈具有不同的更新频率。界面、
 
 现在发行物分为：
 
-- `core`：轻量桌面包。包含界面、对话、知识库、文档、PPT、Skill 和 MCP；**不包含** PyTorch、Transformers 或任何模型权重。
+- `core`：轻量桌面包。包含界面、对话、知识库、文档、PPT、Skill、MCP 和已构建的 `pi_runtime/main.mjs`；**不包含** PyTorch、Transformers、Node executable 或任何模型权重。
+- `node`：Pi sidecar 的独立可执行运行组件，由 `node_component_manifest_url` 单独安装、校验和升级。bundle 属于 core 资源，Node executable 不属于 core；两者缺一时 Pi 只能明确报不可用，不能偷偷改用系统 shell 或打入另一套 Node。
 - `local-transformers`：ScanSci 默认推荐的本地 AI 组件，包含 PyTorch、Transformers、sentence-transformers 与回环 sidecar；用于 Qwen3-ASR、原生 Hugging Face 视觉模型、语义检索和重排。
 - 用户模型：由用户在“设置 · 本地模型”中按需下载，默认进入 Transformers 路线；Ollama / LM Studio 等外部运行时保留为可选连接，模型文件保留在用户选择的位置，不属于应用包。
 - `full`：仅用于内部支持或离线交付的技术包，必须显式指定，不是公开发行默认值。
@@ -48,11 +49,11 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 ```json
 {
   "windows": {
-    "url": "https://download.example/ScanSci-0.3.0-windows-x64.zip",
+    "url": "https://download.example/ScanSci-0.4.0-windows-x64.zip",
     "sha256": "<完整 ZIP 的 SHA256>",
     "size": 123456789,
     "blockmap": {
-      "url": "https://download.example/ScanSci-0.3.0-windows-x64.zip.blockmap",
+      "url": "https://download.example/ScanSci-0.4.0-windows-x64.zip.blockmap",
       "sha256": "<blockmap 的 SHA256>",
       "size": 12345,
       "block_size": 65536
@@ -75,8 +76,8 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 ```powershell
 .\scripts\package_desktop_release.ps1 `
   -BuildDir dist-core\ScanSci `
-  -Version 0.3.0 `
-  -PackageUrl https://download.example/ScanSci-0.3.0-windows-x64.zip `
+  -Version 0.4.0 `
+  -PackageUrl https://download.example/ScanSci-0.4.0-windows-x64.zip `
   -OutputDir release
 ```
 
@@ -87,7 +88,7 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 ```powershell
 python .\scripts\verify_update_channel.py `
   --manifest-url https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json `
-  --expected-version 0.3.1
+  --expected-version 0.4.0
 ```
 
 审计会核对版本、HTTPS 地址、完整包大小、SHA256、blockmap 身份和 HTTP Range。Range 不可用不会破坏更新通道，结果会明确标记使用完整包回退。
@@ -110,7 +111,7 @@ python .\scripts\verify_update_channel.py `
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "windows": {"url": "https://example/ScanSci-core.zip", "sha256": "..."},
   "components": {
     "local-transformers": {
@@ -144,10 +145,13 @@ python .\scripts\verify_update_channel.py `
 正式门禁默认构建 `core`。它不携带大型推理依赖，也不预装模型权重：
 
 - `build-info.json` 的 `package_profile` 为 `core`；
+- `pi_runtime/main.mjs` 必须存在且通过 bundle hash/受限工具循环诊断；Node executable 继续由独立组件清单提供，不能为通过诊断把它塞回 core；
 - 资料导入仅建立资料卡、章节和基础关键词索引；
 - 用户默认通过可信 HTTPS 清单安装 `local-transformers` 组件，也可连接已经安装的 Ollama、LM Studio 等外部运行时；
 - 只有运行时健康后，界面才允许下载 Qwen3 Embedding 0.6B 与 Qwen3 Reranker 0.6B；下载完成后自动校验并构建语义索引；
 - 发行包必须低于 `core` 的体积门禁，原有桌面对话、知识库、模型和窗口验收继续通过。
+
+Pi v0.4.0 不改变更新契约：正式资产仍是完整 Windows ZIP + 可选 64 KiB `.zip.blockmap` + `stable.json`，完整 ZIP 永远是差分失败的安全回退。`local-transformers`、Node、Tectonic 和模型权重保持独立版本/清单，不因 core 或 Pi bundle 小改动重复分发。
 
 官方按需运行组件必须使用国内可访问、带 SHA256 的发行清单构建：
 

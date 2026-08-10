@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as readline from "node:readline";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import rootPackage from "../../package.json";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -59,6 +60,8 @@ import {
   type McpRunCache,
   type McpToolPolicy,
 } from "./mcp-registry.js";
+
+const SCANSCI_PRODUCT_VERSION = String(rootPackage.version);
 
 type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -1695,7 +1698,7 @@ function deferredMcpTools(
           });
           const transport = createMcpTransport(raw, currentRequest);
           if (!transport) throw new Error(`MCP server ${serverLabel} has no usable transport configuration`);
-          const next = new McpClient({ name: "scansci-pi", version: "0.2.0" }, { capabilities: {} });
+          const next = new McpClient({ name: "scansci-pi", version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
           try {
             await next.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
           } catch (error) {
@@ -2054,7 +2057,7 @@ async function externalMcpTools(
       directConnection = (async () => {
         const transport = createMcpTransport(raw, requestRef.current);
         if (!transport) throw new Error("MCP server has no usable transport configuration");
-        const next = new McpClient({ name: "scansci-pi", version: "0.2.0" }, { capabilities: {} });
+        const next = new McpClient({ name: "scansci-pi", version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
         try {
           await next.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
           directClient = next;

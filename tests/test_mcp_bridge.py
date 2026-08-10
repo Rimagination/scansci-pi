@@ -398,7 +398,7 @@ def test_deferred_mcp_registers_and_calls_native_remote_schema_after_search(tmp_
         "enabled": True,
         "transport": "stdio",
         "command": str(node),
-        "args": f'"{fixture}" "{marker}"',
+        "args": f'"{fixture}" "{marker}" "identity"',
         "allow_write": False,
         "deferred": True,
         "tool_policies": [{
@@ -444,7 +444,11 @@ def test_deferred_mcp_registers_and_calls_native_remote_schema_after_search(tmp_
         server.server_close()
 
     assert events[-1]["type"] == "done"
-    assert marker.read_text(encoding="utf-8").splitlines() == ["connected", "called"]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "connected",
+        "called",
+        "client:scansci-pi@0.4.0",
+    ]
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     assert _DeferredNativeSchemaHandler.marker_states[2] == ["connected"]
     third_tools = {
@@ -545,6 +549,7 @@ def test_deferred_streamable_http_stays_disconnected_until_search_then_calls_nat
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     methods = marker.read_text(encoding="utf-8").splitlines()
     assert methods.count("initialize") == 1
+    assert methods.count("client:scansci-pi@0.4.0") == 1
     assert methods.count("tools/list") == 1
     assert methods.count("tools/call") == 1
     assert methods.count("called") == 1

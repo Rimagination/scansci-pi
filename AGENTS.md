@@ -12,6 +12,14 @@
 
 如果任务会改变其中任何契约，必须同时更新对应文档、测试和发布门禁；不能只修改实现后把新策略留在当前对话里。
 
+## Pi 与 Host 权责（v0.4.0）
+
+- Pi 是所有模型介导轮次的唯一编排面：模型在当前租约内自主规划、搜索并激活工具、并行只读调用、加载 Skill、委派科研子代理、使用延迟 MCP、多模态输入和会话控制。
+- Host 是不可转让的权威面：编译 `TaskContract v2`、签发/撤销 capability lease、逐次授权工具与 effect、持久化 Research Run/Artifact、验证证据与引用、执行后处理并发布 UI 事件。Pi、Skill、MCP 和子代理都不能扩大权限。
+- Python/Node 只写 `protocol v7`，并对 required features、当前 request/run、generation、schema 和租约 fail-closed 校验。兼容读取旧契约不得改变当前写入格式或放宽授权。
+- `direct fallback`、OCR/text degradation、Host 确定性事实和 effect 前拒绝必须显式记录；它们可以形成安全交付，但不计作 Pi capability 成功。provider 不支持或未配置时记录 `degraded`/`not_run`，不得伪造通过。
+- “100% Pi 能力”仅表示 [`config/release-scope.json`](config/release-scope.json) 声明的能力边界及 Task8 的 10 个报告轴全部有合格证据；不表示无限上下文/并发、任意 shell/文件系统、任意 extension/MCP 权限或任意模型质量保证。
+
 ## 当前不可悄悄改变的架构决定
 
 ### 桌面包与本地 AI 运行时
@@ -43,6 +51,8 @@
 ## Agent 交接要求
 
 每个 agent 结束任务时，必须说明：改了什么、依据哪个契约、运行了哪些验证、有哪些未完成项，以及是否需要更新下一轮 P0。架构决定不能只存在于聊天记录；应写入 `docs/`、`config/`、测试或实现注释中的稳定位置。
+
+涉及 Pi 的交接还必须列出：protocol/SDK 版本、10 轴 matrix 状态、`fallback_count` 与 degradation/not-run 数量、source/matrix/bundle 哈希、run manifest 与 capability report 路径、未完成轴及真实 provider/打包外部 blocker。没有这些证据不得用“Pi 已完成”替代实际状态。
 
 ## 深色主题设计契约
 

@@ -16,6 +16,10 @@ server.registerTool(
   },
   async () => {
     if (marker) fs.appendFileSync(marker, "called\n", "utf8");
+    if (marker && mode === "identity") {
+      const client = server.server.getClientVersion() || {};
+      fs.appendFileSync(marker, `client:${client.name || ""}@${client.version || ""}\n`, "utf8");
+    }
     if (mode === "disconnect-once") {
       const calls = fs.readFileSync(marker, "utf8").split(/\r?\n/).filter((line) => line === "called").length;
       if (calls === 1) process.exit(23);

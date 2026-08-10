@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import time
 from zipfile import ZipFile
@@ -248,6 +249,98 @@ def test_release_contract_requires_one_p0_with_acceptance_and_non_goals() -> Non
     scope["non_goals"] = []
     with pytest.raises(release_gate.GateFailure, match="non-empty acceptance and non_goals"):
         release_gate.validate_release_inputs(_contract(), scope)
+
+
+def test_release_contract_requires_scope_version_to_match_the_gate() -> None:
+    contract = _contract()
+    scope = _scope()
+    scope["schema_version"] = 2
+    scope["version"] = "0.4.0"
+    contract["version"] = "0.3.1"
+
+    with pytest.raises(release_gate.GateFailure, match="scope version must match"):
+        release_gate.validate_release_inputs(contract, scope)
+
+
+def test_v040_release_contract_rejects_schema_v1_scope_downgrade() -> None:
+    contract = _contract()
+    contract["version"] = "0.4.0"
+
+    with pytest.raises(release_gate.GateFailure, match="schema v2"):
+        release_gate.validate_release_inputs(contract, _scope())
+
+
+@pytest.mark.parametrize("value", [True, 2.0, "2"])
+def test_release_contract_rejects_non_integer_schema_numbers(value: object) -> None:
+    root = Path(__file__).resolve().parents[1]
+    contract = json.loads((root / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    scope = json.loads((root / "config" / "release-scope.json").read_text(encoding="utf-8"))
+    scope["schema_version"] = value
+
+    with pytest.raises(release_gate.GateFailure, match="schema_version must be an integer"):
+        release_gate.validate_release_inputs(contract, scope)
+
+
+@pytest.mark.parametrize("value", [True, 40.0, "40"])
+def test_release_contract_rejects_non_integer_axis_thresholds(value: object) -> None:
+    root = Path(__file__).resolve().parents[1]
+    contract = json.loads((root / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    scope = json.loads((root / "config" / "release-scope.json").read_text(encoding="utf-8"))
+    scope["acceptance"][0]["threshold"] = value
+
+    with pytest.raises(release_gate.GateFailure, match="threshold must be an integer"):
+        release_gate.validate_release_inputs(contract, scope)
+
+
+def test_v2_scope_acceptance_must_match_the_pi_matrix() -> None:
+    root = Path(__file__).resolve().parents[1]
+    contract = json.loads((root / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    scope = json.loads((root / "config" / "release-scope.json").read_text(encoding="utf-8"))
+    release_gate.validate_release_inputs(contract, scope)
+
+    scope["acceptance"][0]["threshold"] = 39
+    with pytest.raises(release_gate.GateFailure, match="Pi acceptance mapping"):
+        release_gate.validate_release_inputs(contract, scope)
+
+    scope = json.loads((root / "config" / "release-scope.json").read_text(encoding="utf-8"))
+    scope["acceptance"][0]["threshold"] = "not-an-integer"
+    with pytest.raises(release_gate.GateFailure, match="threshold"):
+        release_gate.validate_release_inputs(contract, scope)
+
+
+def test_v2_scope_rejects_mutated_frozen_v031_history() -> None:
+    root = Path(__file__).resolve().parents[1]
+    contract = json.loads((root / "config" / "release-gate.json").read_text(encoding="utf-8"))
+    scope = json.loads((root / "config" / "release-scope.json").read_text(encoding="utf-8"))
+    scope["release_history"][0]["acceptance"][0]["id"] = "rewritten-history"
+
+    with pytest.raises(release_gate.GateFailure, match="v0.3.1 history"):
+        release_gate.validate_release_inputs(contract, scope)
+
+
+def test_release_gate_accepts_the_real_matrix_validation_artifact(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    report = tmp_path / "pi-capability-matrix.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts" / "verify_pi_capabilities.py"),
+            "--validate-matrix-only",
+            "--output",
+            str(report),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    gate = object.__new__(release_gate.ReleaseGate)
+    payload = gate._validate_required_result(report, result_kind="pi_matrix_validation")
+
+    assert payload and payload["matrix"]["schema_version"] == 2
 
 
 def test_release_gate_console_output_survives_legacy_windows_codepages(capsys: pytest.CaptureFixture[str]) -> None:

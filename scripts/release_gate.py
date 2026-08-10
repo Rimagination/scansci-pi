@@ -41,6 +41,7 @@ CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({
     "node.exe",
     "tectonic.exe",
 })
+FROZEN_V031_SCOPE_SHA256 = "a253baca5ae32f0edaba4baf5b2a77e1023d84db714014b5032768c8fb16acc4"
 
 
 class GateFailure(RuntimeError):
@@ -146,6 +147,12 @@ def _source_fingerprint() -> str:
         digest.update(_sha256(path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _required_int(value: object, *, label: str) -> int:
+    if type(value) is not int:
+        raise GateFailure(f"{label} must be an integer")
+    return value
 
 
 _PI_AXIS_THRESHOLDS = {
@@ -712,21 +719,93 @@ def _resolve_from_root(value: str | Path) -> Path:
 
 
 def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> None:
-    if int(contract.get("schema_version", 0)) != 1:
+    if _required_int(contract.get("schema_version", 0), label="release-gate.json schema_version") != 1:
         raise GateFailure("release-gate.json schema_version must be 1")
-    if not str(contract.get("version", "")).strip():
+    contract_version = str(contract.get("version", "")).strip()
+    if not contract_version:
         raise GateFailure("release-gate.json must define version")
-    if int(scope.get("schema_version", 0)) != 1:
-        raise GateFailure("release-scope.json schema_version must be 1")
+    scope_schema = _required_int(scope.get("schema_version", 0), label="release-scope.json schema_version")
+    if scope_schema not in {1, 2}:
+        raise GateFailure("release-scope.json schema_version must be 1 or 2")
+    version_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", contract_version)
+    if version_match and tuple(int(part) for part in version_match.groups()) >= (0, 4, 0) and scope_schema != 2:
+        raise GateFailure("release-scope.json schema v2 is required for v0.4.0 and newer release contracts")
+    if scope_schema == 2:
+        scope_version = str(scope.get("version", "")).strip()
+        if not scope_version:
+            raise GateFailure("release-scope.json schema v2 must define version")
+        if scope_version != str(contract.get("version", "")).strip():
+            raise GateFailure("release-scope.json scope version must match release-gate.json version")
     if not str(scope.get("p0_objective", "")).strip():
         raise GateFailure("release-scope.json must contain exactly one non-empty p0_objective")
     acceptance = list(scope.get("acceptance", []) or [])
     non_goals = list(scope.get("non_goals", []) or [])
     if not acceptance or not non_goals:
         raise GateFailure("release-scope.json requires non-empty acceptance and non_goals")
+    if not all(isinstance(item, dict) for item in acceptance):
+        raise GateFailure("release-scope.json acceptance entries must be objects")
     acceptance_ids = [str(item.get("id", "")).strip() for item in acceptance]
     if any(not item for item in acceptance_ids) or len(set(acceptance_ids)) != len(acceptance_ids):
         raise GateFailure("release-scope.json acceptance ids must be non-empty and unique")
+    if scope_schema == 2:
+        matrix_path = PROJECT_ROOT / "bench" / "pi_capability_tasks.json"
+        matrix = _read_json(matrix_path)
+        acceptance_id_by_axis = {
+            "routing": "pi-routing",
+            "dynamic_tools": "pi-dynamic-tools",
+            "parallelism": "pi-parallelism",
+            "long_context": "pi-long-context",
+            "skills": "pi-skills",
+            "subagents": "pi-subagents",
+            "mcp": "pi-mcp",
+            "multimodal": "pi-multimodal",
+            "safety": "pi-safety",
+            "observability": "pi-observability",
+        }
+        expected_mapping = {
+            acceptance_id_by_axis[str(axis.get("id", ""))]: (
+                str(axis.get("id", "")),
+                _required_int(axis.get("threshold", 0), label="Pi matrix threshold"),
+            )
+            for axis in list(matrix.get("axes", []) or [])
+            if str(axis.get("id", "")) in acceptance_id_by_axis
+        }
+        actual_mapping = {
+            str(item.get("id", "")).strip(): (
+                str(item.get("report_axis", "")).strip(),
+                _required_int(item.get("threshold", 0), label="Pi acceptance threshold"),
+            )
+            for item in acceptance
+        }
+        if actual_mapping != expected_mapping or len(expected_mapping) != 10:
+            raise GateFailure("release-scope.json Pi acceptance mapping must match the 10-axis capability matrix")
+        history = list(scope.get("release_history", []) or [])
+        if not all(isinstance(item, dict) for item in history):
+            raise GateFailure("release-scope.json release_history entries must be objects")
+        previous_v031 = [item for item in history if str(item.get("version", "")).strip() == "0.3.1"]
+        if len(previous_v031) != 1:
+            raise GateFailure("release-scope.json must preserve one v0.3.1 history entry")
+        previous = previous_v031[0]
+        if (
+            str(previous.get("state", "")) != "superseded"
+            or str(previous.get("verification", "")) != "frozen_unverified"
+            or not list(previous.get("acceptance", []) or [])
+            or not list(previous.get("non_goals", []) or [])
+        ):
+            raise GateFailure("release-scope.json v0.3.1 history must remain superseded/frozen_unverified and complete")
+        snapshot_digest = str(previous.get("snapshot_sha256", "")).strip().casefold()
+        canonical_previous = dict(previous)
+        canonical_previous.pop("snapshot_sha256", None)
+        actual_snapshot_digest = hashlib.sha256(
+            json.dumps(
+                canonical_previous,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if snapshot_digest != FROZEN_V031_SCOPE_SHA256 or actual_snapshot_digest != FROZEN_V031_SCOPE_SHA256:
+            raise GateFailure("release-scope.json v0.3.1 history snapshot is not the frozen original")
     command_ids: list[str] = []
     allowed_result_kinds = {"", "pi_capability_report", "pi_matrix_validation", "pytest_junit"}
     for group in ("targeted_commands", "full_commands", "real_verifications"):
@@ -1442,7 +1521,14 @@ class ReleaseGate:
                 raise GateFailure("Pi capability matrix validation report is invalid")
             if int(payload.get("axis_count", 0) or 0) != 10 or int(payload.get("case_count", 0) or 0) < 226:
                 raise GateFailure("Pi capability matrix validation report is incomplete")
-            _validated_file_evidence(payload.get("matrix"), label="matrix")
+            matrix_evidence = payload.get("matrix")
+            _validated_file_evidence(
+                matrix_evidence,
+                label="matrix",
+                extra_required={"schema_version"},
+            )
+            if int(dict(matrix_evidence or {}).get("schema_version", 0)) != 2:
+                raise GateFailure("Pi capability matrix evidence schema_version must be 2")
             return payload
         if kind == "pytest_junit":
             try:

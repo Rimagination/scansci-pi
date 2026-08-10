@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "ScanSci",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "scope_file": "config/release-scope.json",
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [
@@ -93,6 +93,7 @@
         "tests/test_skill_manager.py",
         "tests/test_library_manager.py",
         "tests/test_slides_templates.py",
+        "tests/test_pi_release_contract.py",
         "tests/test_release_gate.py",
         "tests/test_verify_scansci_knowledge.py",
         "tests/test_build_profiles.py",

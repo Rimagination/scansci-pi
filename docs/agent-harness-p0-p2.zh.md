@@ -1,43 +1,57 @@
-# Agent Harness P0–P2 落地说明
+# Agent Harness 与 Pi 能力门禁（v0.4.0）
 
-本轮把 Reasonix 中值得借鉴的治理能力落到 ScanSci 现有 Pi 主循环上，Pi 仍是生产主 harness；PydanticAI、OpenAI Agents SDK 和 LangGraph 继续保持可选适配，不会在启动时强制导入。
+Pi 是生产模型 harness，Python Host 是任务契约、权限、证据、持久化与发布权威。PydanticAI、OpenAI Agents SDK 和 LangGraph 仍只是可选适配，不在启动时强制导入，也不计入本轮 Pi 成功。
 
-## P0：运行可观测性与上下文治理
+## protocol 与恢复
 
-- 每个 Pi run manifest 保存脱敏的 `prefix_shape`，只记录组件 hash，不保存系统提示词、工具结果或密钥。
-- `sessionStats` 和 manifest 记录 `cacheReadTokens`、`cacheWriteTokens`、命中率、上下文 breakdown 与 prefix hash，便于定位缓存失效。
-- 在 Pi 首次 prompt、恢复 continuation 和手动 compact 前，旧 tool result 会被替换成小型可重跑提示；最近两轮结果保留。
-- 能力诊断默认静态、只读，不启动 MCP、不访问网络：
+- wire 只写 `protocol v7` 并严格协商 required features；旧消息或契约只读迁移，不能降级权限。
+- TaskContract 写 v2/读旧版一个兼容窗口；`research_runs schema v4` additive migration 保留 run/session/stage/tool/artifact。
+- capability lease、model-runtime descriptor、subagent-result、mcp-effect 分别是 v1；未知字段无授权含义。
+- 队列 inspection/clear、abort-compaction、close/load、完整 clone 和 entry fork 都有 request/generation ack。运行时只承诺 `abort + resume`，不把 abort 写成 suspend。
+- 每个 Pi run manifest 保存脱敏 prefix shape、工具/Skill/MCP/模型 hash、token/cache/context breakdown，以及有界 event type/name/status；不保存系统提示全文、raw image、工具大结果或密钥。`fallback_count`/degradation 汇总属于 capability report，科研资源引用与 effect 详情分别属于 ResearchRun/Artifact 和 effect audit，不能混写成每个 manifest 的字段。
+
+## 10 轴验收矩阵
+
+`bench/pi_capability_tasks.json` schema v2 是唯一矩阵：
+
+| P0 acceptance ID | report axis | threshold | 关键门槛 |
+|---|---:|---:|---|
+| `pi-routing` | `routing` | 40 | 40 个双语模型轮次 Pi 可达，silent fallback=0 |
+| `pi-dynamic-tools` | `dynamic_tools` | 10 | 10 次真实会话搜索/激活/调用，撤销 100% 拒绝 |
+| `pi-parallelism` | `parallelism` | 3 | 三轮 3×2s 只读并行 ≤3.5s，concurrency≥3 |
+| `pi-long-context` | `long_context` | 20 | ≥100K token/20 turns，20/20 sentinel |
+| `pi-skills` | `skills` | 20 | 20 个选择/加载用例，租约扩张=0 |
+| `pi-subagents` | `subagents` | 3 | 最多 3 child，严格只读子租约与失败隔离 |
+| `pi-mcp` | `mcp` | 10 | deferred stdio+HTTP 启动连接=0，10/10 调用；direct 仅兼容且不计轴证据 |
+| `pi-multimodal` | `multimodal` | 10 | 10 个 real provider image+tool，unsupported 显式降级 |
+| `pi-safety` | `safety` | 128 | 128 对抗用例，write/traversal/secret leak=0 |
+| `pi-observability` | `observability` | 10 | run/effect/subagent/compaction 有 ID、时序、决策与引用 |
+
+`report schema v2` 要求精确 10 轴、`protocol_version=7`、SDK/source/bundle/matrix hash、`fallback_count=0` 和 run manifests。deterministic 证明协议及本地工具循环；provider-dependent dynamic serialization 与 multimodal 必须在 real 模式证明。缺凭据只能是 `not_run`，不能 fake pass。
+
+## 运行命令与证据路径
+
+Task8 在 `config/release-gate.json` 中固定以下顺序：
 
 ```powershell
-scansci doctor capabilities --root . --json
+npm.cmd run build:pi-runtime
+python scripts/verify_pi_capabilities.py --validate-matrix-only --output <diagnostics>/pi-capability-matrix.json
+python scripts/verify_pi_capabilities.py --mode deterministic --workspace <diagnostics>/pi-capability-workspace.sqlite --test-evidence <diagnostics>/pi-targeted-junit.xml --output <diagnostics>/pi-capabilities-deterministic.json
+python scripts/verify_pi_capabilities.py --mode real --workspace <diagnostics>/pi-capability-real-workspace.sqlite --test-evidence <diagnostics>/pi-targeted-junit.xml --output <diagnostics>/pi-capabilities-real.json
 ```
 
-## P1：任务契约与恢复
+targeted pytest JUnit 写入 `pi-targeted-junit.xml`。上述 capability report 是内层能力证据；发布编排器的外层状态仍写 `.scansci-diagnostics/release-gates/<version>+<build-id>/release-report.json`。两者不能互相冒充，外层只有解析并验证当前内层报告、哈希和 status 才能晋级。
 
-- `TaskContract` 明确目标、输出格式、约束、必需证据、允许工具、暂停策略和成功标准，并随 run manifest 保存。
-- `edit_section` / `edit_slide` 在工作区内写入前自动创建文件级 checkpoint，返回 `checkpoint_id`。
-- 可手动操作 checkpoint：
+## 安全边界
 
-```powershell
-scansci checkpoint create --root . --file reports/draft.md --label "before edit"
-scansci checkpoint list --root .
-scansci checkpoint restore --root . --id <checkpoint_id> --mode code
-```
+- Dynamic tools：`allowed_tools` 是权限，`initial_tools` 是活动子集；搜索、激活、调用逐步重验。
+- Skills：只改指令，包根内有界读取，hash/provenance 可恢复，不增加工具或证据权威。
+- Subagents：父任务最多 3 个，只读、无 MCP/write/递归委派，独立预算/trace/cancel。
+- MCP：P0 deferred 路径延迟连接，未知 effect 拒绝，annotations 只能抬风险，retry 只限 idempotent；旧 direct 路径显式兼容但不计 deferred 证据。
+- Multimodal：只传验证后的内存内容，不传路径/URL，不记录 raw base64；unsupported 必须显式 degradation。
+- Session：late result 不得写当前历史；clone/fork 不修改源 session；abort-compaction 后恢复。
+- Direct fallback：可以做安全拒绝或降级交付，但永远不计 Pi 轴通过。
 
-## P2：子 Agent 隔离
+## 科研终止与可观测性
 
-在 `.scansci/subagents/*.json` 声明 profile；`write_paths` 必须是工作区内且互不重叠的路径。调度器会按 profile 并发上限和路径冲突生成确定性批次，重叠写入直接进入诊断错误，不会静默并行。
-
-```json
-{
-  "name": "literature-scout",
-  "description": "只读文献侦察",
-  "tools": ["discover_papers", "search_web"],
-  "effort": "medium",
-  "write_paths": [],
-  "max_concurrency": 2
-}
-```
-
-相关实现集中在 `prefix_diagnostics.py`、`context_policy.py`、`capability_doctor.py`、`task_contract.py`、`checkpoints.py` 和 `subagent_profiles.py`，并通过 Pi runtime、CLI、manifest 和编辑工具接线。
+Host 的引用验证、evidence gap、Artifact 提交和科学后处理继续是业务完成门槛。Pi 负责规划和调用，不自行宣布科研事实已验证。每个 run/effect/subagent/compaction 记录 ID、duration、decision 和有界 result reference；秘密、完整提示、raw binary 和无界工具结果不能进入 report 或 manifest。

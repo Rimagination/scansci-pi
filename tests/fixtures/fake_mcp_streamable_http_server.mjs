@@ -34,6 +34,10 @@ const app = createMcpExpressApp({ host: "127.0.0.1" });
 app.post("/mcp", async (req, res) => {
   const method = String(req.body?.method || "request");
   if (marker) fs.appendFileSync(marker, `${method}\n`, "utf8");
+  if (marker && method === "initialize") {
+    const client = req.body?.params?.clientInfo || {};
+    fs.appendFileSync(marker, `client:${client.name || ""}@${client.version || ""}\n`, "utf8");
+  }
   const server = makeServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   try {
