@@ -16,9 +16,28 @@ export const PI_PROTOCOL_FEATURES = [
   "current_request_context",
   "dynamic_tools",
   "ephemeral_sessions",
+  "progressive_skills",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;
+
+export interface SkillCatalogEntry extends ProtocolRecord {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  package_hash: string;
+}
+
+export interface SkillSelectionEntry extends ProtocolRecord {
+  id: string;
+  provenance: "explicit" | "inferred" | "suppressed" | string;
+  status: "loaded" | "hint" | "suppressed" | string;
+  package_hash?: string;
+  content_hash?: string;
+  resource?: string;
+  bytes?: number;
+}
 
 export interface RunStartMessage extends ProtocolRecord {
   type: "run.start";
@@ -45,6 +64,9 @@ export interface RunStartMessage extends ProtocolRecord {
   mcp_servers?: ProtocolRecord[];
   disabled_tools?: string[];
   background?: boolean;
+  skill_catalog?: SkillCatalogEntry[];
+  skill_selection?: SkillSelectionEntry[];
+  skill_state?: ProtocolRecord;
 }
 
 export interface ProtocolNegotiation {

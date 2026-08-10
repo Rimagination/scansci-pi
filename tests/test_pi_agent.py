@@ -879,6 +879,179 @@ class _OpenAIToolLoopHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIProgressiveSkillHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_load_skill",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"good-question"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": f"skill-turn-{turn}"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIRepeatedSkillHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn <= 5:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": f"call_load_skill_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"good-question"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "deduplicated-skill-complete"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-repeated-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-repeated-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIResumeBudgetHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn == 2:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_search_after_restore",
+                    "type": "function",
+                    "function": {
+                        "name": "search_skills",
+                        "arguments": '{"query":"safe-64","limit":8}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 3:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_load_after_restore",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"safe-64","resource":"one.md"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": f"resume-budget-turn-{turn}"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-resume-budget-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-resume-budget-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class _OpenAIJsonHandler(_OpenAIStreamHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         length = int(self.headers.get("Content-Length", "0"))
@@ -1233,6 +1406,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
         "host_tool_authorization",
         "structured_mcp_effects",
         "current_request_context",
+        "progressive_skills",
     }.issubset(set(status["capabilities"]))
 
 
@@ -1390,7 +1564,14 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
         for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
         if isinstance(tool, dict)
     }
-    assert advertised <= {"ask_user", "search_tools", "submit_plan"}
+    assert {"search_skills", "load_skill"} <= advertised
+    assert advertised <= {
+        "ask_user",
+        "search_tools",
+        "search_skills",
+        "load_skill",
+        "submit_plan",
+    }
 
 
 def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch) -> None:
@@ -1433,6 +1614,650 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert "host_tool_authorization" in captured["required_features"]
     assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True
+
+
+def test_pi_stream_forwards_compact_skill_catalog_without_expanding_domain_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_request(start_message, *, api_key, timeout_seconds):
+        captured.update(start_message)
+        yield {"type": "done", "stats": {}, "truncated": False}
+
+    monkeypatch.setattr(client, "_run_request", fake_run_request)
+    task_contract = {
+        **_TASK_CONTRACT_V2,
+        "contract_id": "empty-skill-control-plane",
+        "risk_level": "read_only",
+        "allowed_tools": [],
+        "initial_tools": [],
+    }
+    selected = [{
+        "id": "nature-response",
+        "name": "nature-response",
+        "source": "builtin:nature-response",
+        "provenance": "inferred",
+        "status": "hint",
+        "package_hash": "sha256:fixture",
+    }]
+
+    list(client.stream_chat(
+        provider_kind="openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model_id="fixture",
+        messages=[{"role": "user", "content": "reply to reviewers"}],
+        task_mode="general",
+        task_contract=task_contract,
+        selected_skills=selected,
+        timeout_seconds=30,
+    ))
+
+    assert "progressive_skills" in captured["required_features"]
+    assert captured["task_contract"]["allowed_tools"] == []
+    assert captured["task_contract"]["initial_tools"] == []
+    assert captured["skill_selection"] == selected
+    assert 0 < len(captured["skill_catalog"]) <= 64
+    assert "search_skills" not in captured["tool_set"]["registered_tools"]
+    assert "load_skill" not in captured["tool_set"]["active_tools"]
+
+
+def test_skill_control_plane_accepts_empty_domain_lease_and_rejects_spoofed_domain_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    executed: list[tuple[str, dict[str, object]]] = []
+    written: list[dict[str, object]] = []
+    fake_process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: fake_process)
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_skill_tool",
+        lambda request_id, name, arguments: executed.append((name, dict(arguments))) or {
+            "skill_id": "fixture-skill",
+            "content": "instruction only",
+            "content_hash": "sha256:fixture",
+        },
+        raising=False,
+    )
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "request_id": "request-current",
+        "call_id": "skill-call",
+        "name": "load_skill",
+        "arguments": {"skill_id": "fixture-skill"},
+    }))
+    client._output.put(json.dumps({
+        "type": "tool.call",
+        "request_id": "request-current",
+        "call_id": "domain-spoof",
+        "name": "inspect_workspace",
+        "arguments": {},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+    contract = {
+        "schema_version": "scansci.task-contract.v2",
+        "version": 2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "risk_level": "read_only",
+        "max_tool_budget": 2,
+    }
+
+    events = list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "general",
+            "task_contract": contract,
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert executed == [("load_skill", {"skill_id": "fixture-skill"})]
+    skill_result = next(message for message in written if message.get("call_id") == "skill-call")
+    assert skill_result["type"] == "skill.result"
+    assert skill_result["ok"] is True
+    rejected = next(message for message in written if message.get("call_id") == "domain-spoof")
+    assert rejected["type"] == "tool.result"
+    assert rejected["ok"] is False
+    assert contract["allowed_tools"] == []
+    assert any(event.get("type") == "skill.loaded" for event in events)
+
+
+def test_skill_control_plane_rejects_missing_request_identity_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    executed: list[object] = []
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_skill_tool",
+        lambda *_args: executed.append(_args) or {},
+        raising=False,
+    )
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "call_id": "missing-request",
+        "name": "search_skills",
+        "arguments": {"query": "statistics"},
+    }))
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "request_id": "request-other",
+        "call_id": "wrong-request",
+        "name": "load_skill",
+        "arguments": {"skill_id": "nature-statistics"},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+
+    list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "general",
+            "task_contract": {
+                "schema_version": "scansci.task-contract.v2",
+                "allowed_tools": [],
+                "risk_level": "read_only",
+            },
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert executed == []
+    rejected = next(message for message in written if message.get("call_id") == "missing-request")
+    assert rejected["type"] == "skill.result"
+    assert rejected["ok"] is False
+    assert "request" in str(rejected["error"]).lower()
+    wrong_request = next(message for message in written if message.get("call_id") == "wrong-request")
+    assert wrong_request["type"] == "skill.result"
+    assert wrong_request["ok"] is False
+    assert wrong_request["request_id"] == "request-current"
+    assert "request" in str(wrong_request["error"]).lower()
+
+
+def test_persisted_skill_priority_reads_only_the_active_session_branch(tmp_path: Path) -> None:
+    from scansci_html.pi_agent import _persisted_skill_state
+
+    def metadata(skill_id: str) -> dict[str, object]:
+        return {
+            "skill_id": skill_id,
+            "resource": "SKILL.md",
+            "package_hash": "sha256:" + ("a" * 64),
+            "content_hash": "sha256:" + ("b" * 64),
+            "provenance": "model",
+            "bytes": 12,
+        }
+
+    session_file = tmp_path / "branched-session.jsonl"
+    records = [
+        {"type": "session", "version": 3, "id": "session-id", "cwd": str(tmp_path)},
+        {
+            "type": "custom", "id": "root", "parentId": None,
+            "customType": "scansci.skill-state.v1", "data": metadata("active-root"),
+        },
+        {"type": "message", "id": "fork", "parentId": "root", "message": {"role": "user", "content": "fork"}},
+        {
+            "type": "custom", "id": "stale", "parentId": "fork",
+            "customType": "scansci.skill-state.v1", "data": metadata("stale-branch"),
+        },
+        {"type": "message", "id": "leaf", "parentId": "fork", "message": {"role": "user", "content": "active"}},
+    ]
+    session_file.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    state = _persisted_skill_state(session_file)
+
+    assert state["schema"] == "scansci.skill-state.v1"
+    assert [item["skill_id"] for item in state["loaded"]] == ["active-root"]
+    assert all(set(item) == {
+        "skill_id", "resource", "package_hash", "content_hash", "provenance", "bytes",
+    } for item in state["loaded"])
+
+
+def test_progressive_skill_sidecar_load_resume_and_compaction_preserve_hash_and_provenance(
+    tmp_path: Path,
+) -> None:
+    _OpenAIProgressiveSkillHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIProgressiveSkillHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    common = {
+        "provider_kind": "openai-compatible",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "api_key": "fixture-key",
+        "model_id": "fixture-model",
+        "thinking_level": "off",
+        "task_mode": "general",
+        "task_contract": {
+            **_TASK_CONTRACT_V2,
+            "contract_id": "progressive-skill-empty-domain",
+            "allowed_tools": [],
+            "initial_tools": [],
+            "risk_level": "read_only",
+        },
+        "selected_skills": [{
+            "id": "good-question",
+            "provenance": "inferred",
+            "status": "hint",
+        }],
+        "timeout_seconds": 30,
+        "session_id": "progressive-skill-session",
+    }
+    first_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    first_skill_calls: list[tuple[str, str, dict[str, object]]] = []
+    first_wire_messages: list[dict[str, object]] = []
+    original_execute_skill = first_client._execute_skill_tool
+    original_first_write = first_client._write
+
+    def record_skill_call(request_id, name, arguments):
+        first_skill_calls.append((str(request_id), str(name), dict(arguments)))
+        return original_execute_skill(request_id, name, arguments)
+
+    def record_first_wire(message):
+        first_wire_messages.append(dict(message))
+        return original_first_write(message)
+
+    first_client._execute_skill_tool = record_skill_call
+    first_client._write = record_first_wire
+    try:
+        first = list(first_client.stream_chat(
+            messages=[{
+                "role": "user",
+                "content": "Use the relevant method instructions. " + ("context " * 5_000),
+            }],
+            **common,
+        ))
+        session_file = Path(str(next(event for event in first if event["type"] == "session")["session_file"]))
+        for turn in range(1, 4):
+            continuation = list(first_client.stream_chat(
+                messages=[{
+                    "role": "user",
+                    "content": f"Continue turn {turn}. " + ("context " * 5_000),
+                }],
+                **common,
+            ))
+            assert continuation[-1]["type"] == "done"
+        compacted = first_client.compact(
+            "progressive-skill-session",
+            instructions="Retain the selected Skill state.",
+            timeout_seconds=30,
+        )
+    finally:
+        first_client.close()
+
+    second_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    second_skill_calls: list[tuple[str, str, dict[str, object]]] = []
+    second_wire_messages: list[dict[str, object]] = []
+    original_second_execute_skill = second_client._execute_skill_tool
+    original_second_write = second_client._write
+
+    def record_restored_skill_call(request_id, name, arguments):
+        second_skill_calls.append((str(request_id), str(name), dict(arguments)))
+        return original_second_execute_skill(request_id, name, arguments)
+
+    def record_second_wire(message):
+        second_wire_messages.append(dict(message))
+        return original_second_write(message)
+
+    second_client._execute_skill_tool = record_restored_skill_call
+    second_client._write = record_second_wire
+    try:
+        second = list(second_client.stream_chat(
+            messages=[{"role": "user", "content": "Continue using the same method."}],
+            **common,
+        ))
+    finally:
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert compacted["summary"]
+    assert first[-1]["type"] == "done"
+    assert second[-1]["type"] == "done"
+    loaded_event = next(event for event in first if event["type"] == "skill.loaded")
+    assert loaded_event["value"]["provenance"] == "inferred"
+    assert "content" not in loaded_event["value"]
+    assert first_skill_calls == [
+        (first_skill_calls[0][0], "load_skill", {"skill_id": "good-question", "provenance": "inferred"}),
+    ]
+    first_skill_result = next(message for message in first_wire_messages if message.get("type") == "skill.result")
+    assert first_skill_result["ok"] is True
+    assert first_skill_result["request_id"] == first_skill_calls[0][0]
+    assert second_skill_calls == [
+        (second_skill_calls[0][0], "restore_skill", {
+            "skill_id": "good-question",
+            "resource": "SKILL.md",
+        }),
+    ]
+    assert any(message.get("type") == "skill.result" and message.get("ok") is True for message in second_wire_messages)
+    first_tools = {
+        item["function"]["name"]
+        for item in _OpenAIProgressiveSkillHandler.request_payloads[0]["tools"]
+    }
+    assert {"search_skills", "load_skill"} <= first_tools
+    assert "inspect_workspace" not in first_tools
+    first_inventory = first[-1]["stats"]["toolInventory"]
+    assert "search_skills" not in first_inventory["names"]
+    assert "load_skill" not in first_inventory["names"]
+    assert "search_skills" not in first_inventory["registeredNames"]
+    assert "load_skill" not in first_inventory["registeredNames"]
+    first_followup = json.dumps(_OpenAIProgressiveSkillHandler.request_payloads[1], ensure_ascii=False)
+    assert "instructions_only" in first_followup
+    assert "good-question" in first_followup
+
+    records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
+    skill_records = [
+        record for record in records
+        if record.get("type") == "custom" and record.get("customType") == "scansci.skill-state.v1"
+    ]
+    assert skill_records
+    state_data = skill_records[-1]["data"]
+    assert set(state_data) == {
+        "skill_id", "resource", "package_hash", "content_hash", "provenance", "bytes",
+    }
+    assert state_data["provenance"] == "inferred"
+    assert str(tmp_path) not in json.dumps(state_data, ensure_ascii=False)
+    assert any(record.get("type") == "compaction" for record in records)
+
+    restored = next(
+        event for event in second
+        if event.get("type") == "status" and event.get("status") == "skill_restored"
+    )
+    assert restored["details"]["content_hash"] == state_data["content_hash"]
+    first_hash = first[-1]["stats"]["skillInventory"]["loadedHash"]
+    second_hash = second[-1]["stats"]["skillInventory"]["loadedHash"]
+    assert first_hash == second_hash
+    resumed_system = "\n".join(
+        str(message.get("content", ""))
+        for message in _OpenAIProgressiveSkillHandler.request_payloads[-1]["messages"]
+        if message.get("role") in {"system", "developer"}
+    )
+    assert '<loaded_skill id="good-question"' in resumed_system
+    assert state_data["content_hash"] in resumed_system
+
+
+def test_repeated_skill_load_transmits_content_and_custom_state_once(tmp_path: Path) -> None:
+    _OpenAIRepeatedSkillHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIRepeatedSkillHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    wire_messages: list[dict[str, object]] = []
+    original_write = client._write
+
+    def record_wire(message):
+        wire_messages.append(dict(message))
+        return original_write(message)
+
+    client._write = record_wire
+    try:
+        events = list(client.stream_chat(
+            messages=[{"role": "user", "content": "Load the method once and reuse it."}],
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "repeated-skill-empty-domain",
+                "allowed_tools": [],
+                "initial_tools": [],
+                "risk_level": "read_only",
+            },
+            selected_skills=[{
+                "id": "good-question",
+                "provenance": "inferred",
+                "status": "hint",
+            }],
+            timeout_seconds=30,
+            session_id="repeated-skill-session",
+        ))
+        session_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    skill_results = [message for message in wire_messages if message.get("type") == "skill.result"]
+    assert len(skill_results) == 5
+    assert all(message.get("ok") is True for message in skill_results)
+    assert "content" in skill_results[0]["result"]
+    assert all(message["result"].get("already_loaded") is True for message in skill_results[1:])
+    assert all("content" not in message["result"] for message in skill_results[1:])
+
+    final_messages = _OpenAIRepeatedSkillHandler.request_payloads[-1]["messages"]
+    tool_messages = [message for message in final_messages if message.get("role") == "tool"]
+    load_results = [message for message in tool_messages if "good-question" in str(message.get("content", ""))]
+    assert len(load_results) == 5
+    assert sum('"instructions"' in str(message.get("content", "")) for message in load_results) == 1
+
+    records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
+    custom_records = [
+        record for record in records
+        if record.get("type") == "custom" and record.get("customType") == "scansci.skill-state.v1"
+    ]
+    assert len(custom_records) == 1
+
+
+def test_restart_restores_out_of_catalog_skill_without_spending_model_skill_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import scansci_html.agent_skill_tools as agent_skill_tools
+    import scansci_html.pi_agent as pi_agent_module
+
+    records: list[dict[str, object]] = []
+    for index in range(65):
+        identifier = f"safe-{index:02d}"
+        package = tmp_path / "skills" / identifier
+        package.mkdir(parents=True)
+        skill_file = package / "SKILL.md"
+        skill_file.write_text(f"# {identifier}\n", encoding="utf-8")
+        records.append({
+            "id": identifier,
+            "name": identifier,
+            "description": f"bounded fixture {identifier}",
+            "enabled": True,
+            "available": True,
+            "builtin": True,
+            "source_type": "builtin",
+            "source": "ScanSci",
+            "package_path": str(package),
+            "skill_file": str(skill_file),
+        })
+    target = records[-1]
+    target_package = Path(str(target["package_path"]))
+    (target_package / "one.md").write_text("# one\n", encoding="utf-8")
+    (target_package / "two.md").write_text("# two\n", encoding="utf-8")
+
+    seed_runtime = agent_skill_tools.ProgressiveSkillRuntime(
+        tmp_path / "workspace.sqlite",
+        records=records,
+        priority_ids=["safe-64"],
+    )
+    selected_skills = []
+    for resource in ("SKILL.md", "one.md", "two.md"):
+        loaded = seed_runtime.load_skill("safe-64", resource=resource, provenance="explicit")
+        selected_skills.append({
+            "id": loaded["skill_id"],
+            "name": "safe-64",
+            "source": loaded["source"],
+            "provenance": "explicit",
+            "status": "loaded",
+            "resource": loaded["resource"],
+            "package_hash": loaded["package_hash"],
+            "content_hash": loaded["content_hash"],
+            "bytes": loaded["bytes"],
+        })
+
+    real_runtime = agent_skill_tools.ProgressiveSkillRuntime
+
+    def limited_runtime(*args, **kwargs):
+        kwargs["max_instruction_calls"] = 2
+        return real_runtime(*args, **kwargs)
+
+    monkeypatch.setattr(agent_skill_tools, "installed_skills", lambda _workspace: records)
+    monkeypatch.setattr(pi_agent_module, "ProgressiveSkillRuntime", limited_runtime)
+    _OpenAIResumeBudgetHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIResumeBudgetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    common = {
+        "provider_kind": "openai-compatible",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "api_key": "fixture-key",
+        "model_id": "fixture-model",
+        "thinking_level": "off",
+        "task_mode": "general",
+        "task_contract": {
+            **_TASK_CONTRACT_V2,
+            "contract_id": "restore-budget-empty-domain",
+            "allowed_tools": [],
+            "initial_tools": [],
+            "risk_level": "read_only",
+        },
+        "timeout_seconds": 30,
+        "session_id": "restore-budget-session",
+    }
+    first_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    first_calls: list[tuple[str, dict[str, object]]] = []
+    first_wire: list[dict[str, object]] = []
+    original_first_execute = first_client._execute_skill_tool
+    original_first_write = first_client._write
+
+    def record_first_execute(request_id, name, arguments):
+        first_calls.append((str(name), dict(arguments)))
+        return original_first_execute(request_id, name, arguments)
+
+    def record_first_wire(message):
+        first_wire.append(dict(message))
+        return original_first_write(message)
+
+    first_client._execute_skill_tool = record_first_execute
+    first_client._write = record_first_wire
+    try:
+        first = list(first_client.stream_chat(
+            messages=[{"role": "user", "content": "Seed the explicit method state."}],
+            selected_skills=selected_skills,
+            **common,
+        ))
+    finally:
+        first_client.close()
+
+    second_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    second_calls: list[tuple[str, dict[str, object]]] = []
+    second_wire: list[dict[str, object]] = []
+    original_execute = second_client._execute_skill_tool
+    original_write = second_client._write
+
+    def record_execute(request_id, name, arguments):
+        second_calls.append((str(name), dict(arguments)))
+        return original_execute(request_id, name, arguments)
+
+    def record_wire(message):
+        second_wire.append(dict(message))
+        return original_write(message)
+
+    second_client._execute_skill_tool = record_execute
+    second_client._write = record_wire
+    try:
+        second = list(second_client.stream_chat(
+            messages=[{"role": "user", "content": "Continue with no composer Skill selection."}],
+            selected_skills=[],
+            **common,
+        ))
+    finally:
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    first_start = next(message for message in first_wire if message.get("type") == "run.start")
+    assert len(first_start["skill_state"]["loaded"]) == 3, first_start["skill_state"]
+    first_loaded = first[-1]["stats"]["skillInventory"]["loaded"]
+    second_loaded = second[-1]["stats"]["skillInventory"]["loaded"]
+    assert len(first_loaded) == 3, {
+        "calls": first_calls,
+        "skill_results": [message for message in first_wire if message.get("type") == "skill.result"],
+        "start": next((message for message in first_wire if message.get("type") == "run.start"), {}),
+        "events": [event for event in first if str(event.get("type", "")).startswith("skill")],
+    }
+    assert second_loaded == first_loaded
+    assert second[-1]["stats"]["skillInventory"]["loadedHash"] == first[-1]["stats"]["skillInventory"]["loadedHash"]
+    assert [name for name, _args in second_calls[:3]] == ["restore_skill"] * 3
+    assert [name for name, _args in second_calls[-2:]] == ["search_skills", "load_skill"]
+    all_skill_results = [message for message in second_wire if message.get("type") == "skill.result"]
+    assert len(all_skill_results) == 5
+    model_results = all_skill_results[-2:]
+    assert len(model_results) == 2
+    assert all(message.get("ok") is True for message in model_results)
+    assert model_results[-1]["result"]["already_loaded"] is True
+
+    start = next(message for message in second_wire if message.get("type") == "run.start")
+    catalog = start["skill_catalog"]
+    assert len(catalog) == 64
+    assert len(json.dumps(catalog, ensure_ascii=False).encode("utf-8")) <= 16 * 1024
+    assert "safe-64" in {item["id"] for item in catalog}
+    advertised = {
+        item["function"]["name"]
+        for payload in _OpenAIResumeBudgetHandler.request_payloads
+        for item in payload.get("tools", [])
+    }
+    assert {"search_skills", "load_skill"} <= advertised
+    assert "restore_skill" not in advertised
 
 
 def test_pi_backed_json_client_keeps_two_transient_sidecar_sessions_off_disk(
@@ -1575,7 +2400,15 @@ def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) ->
         for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
         if isinstance(tool, dict)
     }
-    assert advertised <= {"ask_user", "search_tools", "submit_plan"}
+    assert advertised <= {
+        "ask_user", "search_tools", "submit_plan", "search_skills", "load_skill",
+    }
+    assert {"search_skills", "load_skill"} <= advertised
+    domain_inventory = events[-1]["stats"]["toolInventory"]
+    assert "search_skills" not in domain_inventory["names"]
+    assert "load_skill" not in domain_inventory["names"]
+    assert "search_skills" not in domain_inventory["registeredNames"]
+    assert "load_skill" not in domain_inventory["registeredNames"]
 
 
 def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:

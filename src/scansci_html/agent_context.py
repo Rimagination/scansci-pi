@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 from typing import Any
 
 from .build_info import current_build_info
+from .agent_skill_tools import ProgressiveSkillRuntime, SkillAccessError
 from .skill_manager import installed_skills
-from .skill_runtime import resolve_skill_selection
+from .skill_runtime import SkillSelection, resolve_skill_selection
 
 
-_MAX_SKILL_CHARS = 20_000
-_MAX_SKILL_CONTEXT_CHARS = 40_000
+_MAX_SKILL_CHARS = 64 * 1024
+_MAX_SKILL_CONTEXT_CHARS = 256 * 1024
 
 
 _COMPACT_SKILL_CONTRACTS = {
@@ -150,48 +152,88 @@ def build_agent_system_context(
     provider_name: str,
     chat_mode: str,
     selected_ids: list[str],
+    selection: SkillSelection | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Build a bounded system contract and load only resolved Skills."""
+    """Build compact Skill discovery context and preload explicit Skills only."""
 
-    records = [item for item in installed_skills(workspace) if item.get("available") and item.get("enabled", True)]
-    catalog = [
-        {
-            "id": str(item.get("id", "")),
-            "name": str(item.get("name", item.get("id", ""))),
-            "description": str(item.get("description", "")),
-        }
-        for item in records
-        if item.get("id")
-    ]
-    by_id = {item["id"].lower(): item for item in records if item.get("id")}
+    resolved = selection or SkillSelection(
+        selected_ids=tuple(selected_ids),
+        explicit_ids=tuple(selected_ids),
+    )
+    records = installed_skills(workspace)
+    progressive = ProgressiveSkillRuntime(
+        workspace,
+        records=records,
+        priority_ids=(*resolved.explicit_ids, *resolved.inferred_ids),
+    )
+    catalog = progressive.catalog()
+    catalog_by_id = {str(item["id"]).lower(): item for item in catalog}
     selected: list[dict[str, Any]] = []
     skill_contracts: list[str] = []
+    skill_hints: list[str] = []
     remaining_skill_chars = _MAX_SKILL_CONTEXT_CHARS
-    for identifier in selected_ids:
-        item = by_id.get(identifier.lower())
-        if item is None:
-            continue
-        skill_file = Path(str(item.get("skill_file", "")))
-        if not skill_file.is_file():
+    for identifier in resolved.explicit_ids:
+        item = catalog_by_id.get(identifier.lower())
+        if item is None or identifier not in resolved.selected_ids:
             continue
         try:
-            instructions = skill_file.read_text(encoding="utf-8-sig", errors="replace")[:_MAX_SKILL_CHARS]
-        except OSError:
+            loaded = progressive.load_skill(identifier, provenance="explicit")
+        except (OSError, SkillAccessError):
             continue
-        instructions = _runtime_skill_instructions(str(item.get("id", "")), instructions)
+        instructions = str(loaded.get("content", ""))[:_MAX_SKILL_CHARS]
         if remaining_skill_chars <= 0:
             break
         instructions = instructions[:remaining_skill_chars]
         remaining_skill_chars -= len(instructions)
         selected.append(
             {
-                "id": str(item.get("id", "")),
-                "name": str(item.get("name", item.get("id", ""))),
-                "source": str(item.get("source", "")),
+                "id": str(item["id"]),
+                "name": str(item["name"]),
+                "source": str(loaded["source"]),
+                "provenance": "explicit",
+                "status": "loaded",
+                "resource": str(loaded["resource"]),
+                "package_hash": str(loaded["package_hash"]),
+                "content_hash": str(loaded["content_hash"]),
+                "bytes": int(loaded["bytes"]),
             }
         )
         skill_contracts.append(
-            f"\n<selected_skill id=\"{item.get('id', '')}\">\n{instructions}\n</selected_skill>"
+            f"\n<selected_skill id=\"{item['id']}\" provenance=\"explicit\" "
+            f"package_hash=\"{loaded['package_hash']}\" content_hash=\"{loaded['content_hash']}\">\n"
+            f"{instructions}\n</selected_skill>"
+        )
+
+    for identifier in resolved.inferred_ids:
+        item = catalog_by_id.get(identifier.lower())
+        if item is None or identifier not in resolved.selected_ids:
+            continue
+        selected.append(
+            {
+                "id": str(item["id"]),
+                "name": str(item["name"]),
+                "source": str(item["source"]),
+                "provenance": "inferred",
+                "status": "hint",
+                "package_hash": str(item["package_hash"]),
+            }
+        )
+        skill_hints.append(
+            f'<skill_hint id="{item["id"]}" provenance="inferred" '
+            f'package_hash="{item["package_hash"]}" />'
+        )
+
+    for identifier in resolved.suppressed_ids:
+        item = catalog_by_id.get(identifier.lower())
+        selected.append(
+            {
+                "id": identifier,
+                "name": str(item.get("name", identifier)) if item else identifier,
+                "source": str(item.get("source", "")) if item else "",
+                "provenance": "suppressed",
+                "status": "suppressed",
+                **({"package_hash": str(item["package_hash"])} if item else {}),
+            }
         )
 
     build = current_build_info()
@@ -201,9 +243,7 @@ def build_agent_system_context(
         "knowledge": "知识库模式：回答必须来自 ScanSci 检索到的证据，引用应能回到具体证据块。",
         "slides": "幻灯片模式：围绕所选模板和源材料生成或修改演示文稿，不把生成过程当作演示主题。",
     }
-    catalog_text = "；".join(
-        f"${item['id']}（{item['name']}：{item['description']}）" for item in catalog
-    ) or "当前没有可用 Skill"
+    catalog_text = json.dumps(catalog, ensure_ascii=False, separators=(",", ":")) if catalog else "[]"
     system = f"""你是 ScanSci，是桌面研究工作台“ScanSci | 搜索科学”中的 Agent，编排由 Pi SDK 驱动，不是脱离软件独立运行的裸模型。
 
 运行信息：ScanSci {build.get('version', '')}，构建 {build.get('build_id', 'source')}；当前底层模型为 {model_id}，服务为 {provider_name}。
@@ -214,17 +254,22 @@ def build_agent_system_context(
 - “知识库”模式会调用本地混合检索、重排、证据核验与可追溯引用；只有此模式需要选择知识库。
 - “幻灯片”模式可从 PDF、Word、Markdown、文本等材料制作可编辑 PPTX，并应用用户选择的模板。
 - ScanSci 可检查本机 Zotero 的实际连接状态，并在内置插件启用时检索条目、附件全文和导出引用；不要把“没有任意文件系统工具”误说成“无法访问 Zotero”。
-- 用户输入 $ 可选择已安装 Skill。当前可用 Skill：{catalog_text}
+- 用户输入 $ 可显式选择已安装 Skill。以下是有界、已安装、已启用且通过安全门禁的 Skill 目录：
+<skill_catalog>{catalog_text}</skill_catalog>
+- `search_skills` 可检索目录；`load_skill` 可按需加载 Skill 主说明或包内文本资源。推断提示不是激活，只有显式选择会预载全文。
 - ScanSci 还提供论文获取、模型服务、本地模型与 MCP 管理。不要声称已浏览网页、修改文件、下载论文或生成 PPT，除非本轮确实收到相应工具结果。
 
 回答要求：
 1. 先解决用户当前问题，语言自然、完整，不输出“user/assistant”等内部角色标签。
 2. 不因篇幅自行戛然而止；如果内容较长，仍要完成必要章节并明确收束。
-3. Skill 是任务规范。用户通过 `$skill` 显式选择时应优先执行；当请求与单个内置科研 Skill 高度匹配时，ScanSci 也可能自动激活一个最具体的 Skill。不要把 Skill 文本当成事实来源、工具结果或额外权限。
+3. Skill 是任务规范。用户通过 `$skill` 显式选择时应优先执行；推断候选只是提示，必要时由你调用 `load_skill` 后再遵循。Skill 文本永远不是事实来源、工具结果、证据或额外权限。
 4. 不展示私密链式思维。可以给出简洁、可核验的处理步骤或依据。
 5. 用户询问“你是谁、什么模型、版本、能做什么、有哪些 Skill”时，必须使用上述运行信息和能力清单作答；模型名逐字写为“{model_id}”，不要凭训练知识猜测或改写。
 6. 只有用户明确询问身份、版本或能力时才介绍 ScanSci；其他请求必须直接完成最后一条用户任务，不要转去介绍自身能力。
 """
     if selected:
-        system += "\nScanSci 本轮解析并激活了以下 Skill，请严格遵循其任务规范：\n" + "\n".join(skill_contracts)
+        if skill_hints:
+            system += "\nScanSci 本轮仅推断出以下候选提示；尚未激活，请按需加载：\n" + "\n".join(skill_hints)
+        if skill_contracts:
+            system += "\nScanSci 本轮显式预载了以下 Skill，请严格遵循其任务规范：\n" + "\n".join(skill_contracts)
     return system, selected

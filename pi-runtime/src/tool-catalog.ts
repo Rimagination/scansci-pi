@@ -24,6 +24,52 @@ export interface ToolCatalogMatch extends ToolCatalogEntry {
   active: boolean;
 }
 
+export interface SkillCatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  package_hash: string;
+}
+
+const MAX_SKILL_CATALOG_ITEMS = 64;
+const MAX_SKILL_CATALOG_BYTES = 16 * 1024;
+
+export function boundedSkillCatalog(value: unknown): SkillCatalogEntry[] {
+  if (!Array.isArray(value)) return [];
+  const result: SkillCatalogEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of value.slice(0, MAX_SKILL_CATALOG_ITEMS)) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    const id = String(record.id || "").trim().toLowerCase().slice(0, 100);
+    const packageHash = String(record.package_hash || "").slice(0, 80);
+    const source = String(record.source || "").trim().slice(0, 500);
+    const safeSource = (
+      new RegExp(`^(?:builtin|installed):${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`).test(source)
+      || /^https:\/\/[^\s]+$/i.test(source)
+    );
+    if (
+      !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(id)
+      || seen.has(id)
+      || !/^sha256:[a-f0-9]{64}$/.test(packageHash)
+      || !safeSource
+    ) continue;
+    const item = {
+      id,
+      name: String(record.name || id).slice(0, 100),
+      description: String(record.description || "").slice(0, 240),
+      source,
+      package_hash: packageHash,
+    };
+    const encoded = Buffer.byteLength(JSON.stringify([...result, item]), "utf8");
+    if (encoded > MAX_SKILL_CATALOG_BYTES) break;
+    seen.add(id);
+    result.push(item);
+  }
+  return result;
+}
+
 const REVERSIBLE_TOOLS = new Set([
   "download_and_index",
   "create_document",

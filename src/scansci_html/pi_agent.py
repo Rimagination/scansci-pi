@@ -29,6 +29,7 @@ from .academic_planning import plan_academic_search
 from .agent_capabilities import builtin_capability_descriptor
 from .agent_contract import compile_task_contract as compile_host_task_contract
 from .agent_reach import run_agent_reach
+from .agent_skill_tools import ProgressiveSkillRuntime, SKILL_STATE_SCHEMA
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
 from .checkpoints import CheckpointError, CheckpointStore
@@ -102,6 +103,7 @@ _PI_REQUIRED_FEATURES = (
     "current_request_context",
     "dynamic_tools",
     "ephemeral_sessions",
+    "progressive_skills",
 )
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
@@ -117,6 +119,87 @@ _ARXIV_IN_TEXT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:arxiv:)?(?:\d{4}\.\d{4,5}|[a-z-]+/\d{7})(?:v\d+)?",
     re.IGNORECASE,
 )
+_SKILL_STATE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_SKILL_STATE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_SESSION_STATE_ENTRIES = 200_000
+_MAX_SESSION_STATE_LINE_CHARS = 16_000_000
+_MAX_PERSISTED_SKILL_RESOURCES = 512
+
+
+def _persisted_skill_state(session_file: str | Path) -> dict[str, Any]:
+    """Read only bounded Skill metadata from the active Pi JSONL branch."""
+
+    path = Path(session_file) if str(session_file or "").strip() else None
+    if path is None or path.suffix.lower() != ".jsonl" or not path.is_file():
+        return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+    entries: dict[str, tuple[str | None, dict[str, Any] | None]] = {}
+    leaf_id = ""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= _MAX_SESSION_STATE_ENTRIES or len(line) > _MAX_SESSION_STATE_LINE_CHARS:
+                    return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+                raw = json.loads(line)
+                if not isinstance(raw, dict) or raw.get("type") == "session":
+                    continue
+                entry_id = str(raw.get("id", "") or "")
+                parent_value = raw.get("parentId")
+                parent_id = None if parent_value is None else str(parent_value)
+                if (
+                    not entry_id
+                    or len(entry_id) > 128
+                    or (parent_id is not None and len(parent_id) > 128)
+                ):
+                    return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+                custom = None
+                if raw.get("type") == "custom" and raw.get("customType") == SKILL_STATE_SCHEMA:
+                    data = raw.get("data")
+                    custom = dict(data) if isinstance(data, dict) else None
+                entries[entry_id] = (parent_id, custom)
+                leaf_id = entry_id
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+
+    loaded_by_key: dict[str, dict[str, Any]] = {}
+    visited: set[str] = set()
+    current = leaf_id
+    while current:
+        if current in visited or current not in entries:
+            return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+        visited.add(current)
+        parent_id, custom = entries[current]
+        if custom is not None:
+            skill_id = str(custom.get("skill_id", "") or "").strip().lower()
+            resource = str(custom.get("resource", "") or "")
+            package_hash = str(custom.get("package_hash", "") or "")
+            content_hash = str(custom.get("content_hash", "") or "")
+            provenance = str(custom.get("provenance", "resume") or "resume")[:32]
+            try:
+                byte_count = int(custom.get("bytes", -1))
+            except (TypeError, ValueError):
+                byte_count = -1
+            if (
+                _SKILL_STATE_ID_PATTERN.fullmatch(skill_id)
+                and 0 < len(resource) <= 500
+                and _SKILL_STATE_HASH_PATTERN.fullmatch(package_hash)
+                and _SKILL_STATE_HASH_PATTERN.fullmatch(content_hash)
+                and 0 <= byte_count <= 64 * 1024
+            ):
+                key = f"{skill_id}:{resource}"
+                if key not in loaded_by_key and len(loaded_by_key) < _MAX_PERSISTED_SKILL_RESOURCES:
+                    loaded_by_key[key] = {
+                        "skill_id": skill_id,
+                        "resource": resource,
+                        "package_hash": package_hash,
+                        "content_hash": content_hash,
+                        "provenance": provenance,
+                        "bytes": byte_count,
+                    }
+        current = parent_id or ""
+    return {
+        "schema": SKILL_STATE_SCHEMA,
+        "loaded": list(loaded_by_key.values()),
+    }
 
 
 def _explicit_paper_identifiers(text: str) -> list[str]:
@@ -951,6 +1034,7 @@ class PiAgentClient:
         self._interaction_lock = threading.Lock()
         self._pending_interaction_kinds: dict[str, tuple[str, str]] = {}
         self._approval_tokens: dict[str, ApprovalToken] = {}
+        self._skill_runtimes: dict[str, ProgressiveSkillRuntime] = {}
         self._provider_key_fingerprint = ""
         self._gateway_adapter: _ManagedGatewayAdapter | None = None
         self._gateway_adapter_signature = ""
@@ -1145,6 +1229,7 @@ class PiAgentClient:
         thinking_level: str = "medium",
         task_mode: str = "general",
         task_contract: dict[str, Any] | None = None,
+        selected_skills: list[dict[str, Any]] | None = None,
         timeout_seconds: float = 900.0,
         session_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
@@ -1212,6 +1297,52 @@ class PiAgentClient:
                 task_mode=task_mode,
             ).to_dict()
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
+        skill_selection = [
+            dict(item)
+            for item in list(selected_skills or [])
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        persisted_skill_state = _persisted_skill_state(session_file) if is_recovery else {
+            "schema": SKILL_STATE_SCHEMA,
+            "loaded": [],
+        }
+        restored_by_key = {
+            f"{str(item.get('skill_id', '')).lower()}:{str(item.get('resource', 'SKILL.md') or 'SKILL.md')}": dict(item)
+            for item in list(persisted_skill_state.get("loaded", []) or [])
+            if isinstance(item, dict) and str(item.get("skill_id", "")).strip()
+        }
+        for item in skill_selection:
+            if str(item.get("status", "")) != "loaded":
+                continue
+            metadata = {
+                "skill_id": str(item.get("id", "")),
+                "resource": str(item.get("resource", "SKILL.md") or "SKILL.md"),
+                "package_hash": str(item.get("package_hash", "")),
+                "content_hash": str(item.get("content_hash", "")),
+                "provenance": str(item.get("provenance", "explicit") or "explicit"),
+                "bytes": int(item.get("bytes", 0) or 0),
+            }
+            restored_by_key[f"{metadata['skill_id'].lower()}:{metadata['resource']}"] = metadata
+        restored_skill_state = {
+            "schema": SKILL_STATE_SCHEMA,
+            "loaded": list(restored_by_key.values()),
+        }
+        priority_ids = [
+            str(item.get("id", ""))
+            for item in skill_selection
+            if str(item.get("provenance", "")) in {"explicit", "inferred"}
+        ]
+        priority_ids.extend(
+            str(item.get("skill_id", ""))
+            for item in list(persisted_skill_state.get("loaded", []) or [])
+            if isinstance(item, dict)
+        )
+        skill_runtime = ProgressiveSkillRuntime(
+            self.workspace,
+            restored_state=restored_skill_state,
+            priority_ids=priority_ids,
+        )
+        self._skill_runtimes[request_id] = skill_runtime
         registered_tools = sorted({
             "ask_user",
             "search_tools",
@@ -1276,8 +1407,12 @@ class PiAgentClient:
             "mcp_servers": self._enabled_mcp_servers(),
             "disabled_tools": self._disabled_artifact_tools(),
             "task_contract": effective_contract,
+            "tool_set": tool_set,
             "prefix_shape": prefix_shape,
             "context_policy": context_report.to_dict(),
+            "skill_catalog": skill_runtime.catalog(),
+            "skill_selection": skill_selection,
+            "skill_state": skill_runtime.state(),
         }
         manifest: RunManifest | None = None
         try:
@@ -1345,8 +1480,35 @@ class PiAgentClient:
                 manifest.fail(error, retryable=isinstance(error, (TimeoutError, ConnectionError)))
             raise
         finally:
+            self._skill_runtimes.pop(request_id, None)
             if transient_session:
                 self.close()
+
+    def _execute_skill_tool(
+        self,
+        request_id: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one bounded instruction-plane operation for the current request."""
+
+        runtime = self._skill_runtimes.get(str(request_id or ""))
+        if runtime is None:
+            raise PermissionError("Skill call belongs to an inactive request")
+        if name == "search_skills":
+            return runtime.search_skills(arguments.get("query", ""), arguments.get("limit", 8))
+        if name == "load_skill":
+            return runtime.load_skill(
+                arguments.get("skill_id", ""),
+                resource=arguments.get("resource"),
+                provenance=arguments.get("provenance", "model"),
+            )
+        if name == "restore_skill":
+            return runtime.restore_skill(
+                arguments.get("skill_id", ""),
+                resource=arguments.get("resource"),
+            )
+        raise PermissionError(f"Unknown Skill instruction operation: {name}")
 
     def _ensure_process(self, *, api_key: str) -> subprocess.Popen[str]:
         fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
@@ -1445,7 +1607,58 @@ class PiAgentClient:
 
                 event_type = str(event.get("type", ""))
                 event_request_id = str(event.get("request_id", ""))
-                if event_request_id and event_request_id != request_id:
+                if event_type != "skill.call" and event_request_id and event_request_id != request_id:
+                    continue
+                if event_type == "skill.call":
+                    call_id = str(event.get("call_id", ""))
+                    name = str(event.get("name", ""))
+                    arguments = dict(event.get("arguments", {}) or {})
+                    try:
+                        if not event_request_id or event_request_id != request_id:
+                            raise PermissionError("Skill call belongs to another request")
+                        if self._cancel_requested.is_set():
+                            raise InterruptedError("Pi Skill loading was cancelled")
+                        result = self._execute_skill_tool(request_id, name, arguments)
+                        response = {
+                            "type": "skill.result",
+                            "request_id": request_id,
+                            "call_id": call_id,
+                            "ok": True,
+                            "result": result,
+                        }
+                        if name in {"load_skill", "restore_skill"}:
+                            public = {
+                                key: value
+                                for key, value in result.items()
+                                if key != "content"
+                            }
+                            yield {"type": "skill.loaded", "name": str(result.get("skill_id", "")), "value": public}
+                        else:
+                            yield {
+                                "type": "skill.searched",
+                                "name": "search_skills",
+                                "value": {
+                                    "query": str(result.get("query", "")),
+                                    "count": int(result.get("count", 0) or 0),
+                                    "limit": int(result.get("limit", 0) or 0),
+                                    "skill_ids": [
+                                        str(item.get("id", ""))
+                                        for item in list(result.get("skills", []) or [])
+                                        if isinstance(item, dict)
+                                    ],
+                                },
+                            }
+                    except Exception as error:  # noqa: BLE001 - returned to Pi as bounded tool output
+                        public_error = str(_redact_tool_value(str(error)))[:500]
+                        response = {
+                            "type": "skill.result",
+                            "request_id": request_id,
+                            "call_id": call_id,
+                            "ok": False,
+                            "error": f"{type(error).__name__}: {public_error}",
+                        }
+                        yield {"type": "skill.failed", "name": name, "error": public_error}
+                    self._write(response)
                     continue
                 if event_type == "tool.call":
                     call_id = str(event.get("call_id", ""))

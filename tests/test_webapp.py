@@ -2933,6 +2933,20 @@ def test_inferred_academic_search_skill_requires_a_real_search(
     def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
         observed["task_mode"] = task_mode
         observed["skills"] = [item.get("id") for item in chat_request.selected_skills]
+        observed["skill_records"] = [dict(item) for item in chat_request.selected_skills]
+        yield {
+            "type": "skill.loaded",
+            "name": "nature-academic-search",
+            "value": {
+                "skill_id": "nature-academic-search",
+                "resource": "SKILL.md",
+                "source": "builtin:nature-academic-search",
+                "package_hash": "sha256:" + ("a" * 64),
+                "content_hash": "sha256:" + ("b" * 64),
+                "provenance": "inferred",
+                "bytes": 123,
+            },
+        }
         yield {"type": "tool.completed", "name": "discover_papers", "result": {"count": 2}}
         yield {"type": "delta", "content": "已完成公开学术检索。"}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
@@ -2948,6 +2962,15 @@ def test_inferred_academic_search_skill_requires_a_real_search(
     assert events[-1]["type"] == "RUN_FINISHED"
     assert observed["task_mode"] == "web"
     assert observed["skills"] == ["nature-academic-search"]
+    assert observed["skill_records"][0]["provenance"] == "inferred"
+    assert observed["skill_records"][0]["status"] == "hint"
+    skill_event = next(event for event in events if event.get("name") == "skill_runtime")
+    assert skill_event["value"]["type"] == "skill.loaded"
+    assert skill_event["value"]["value"]["provenance"] == "inferred"
+    assert "content" not in skill_event["value"]["value"]
+    runtime_skills = events[-1]["result"]["agent_runtime"]["skills"]
+    assert runtime_skills[0]["provenance"] == "inferred"
+    assert runtime_skills[-1]["value"]["content_hash"] == "sha256:" + ("b" * 64)
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
         {"name": "discover_papers", "status": "completed"}
     ]
@@ -3519,20 +3542,23 @@ def test_direct_chat_knows_scansci_identity_and_loads_an_explicit_skill(tmp_path
     assert "ScanSci | 搜索科学" in system
     assert "当前底层模型为 glm-4.7-flash" in system
     assert "写作模式" in system
-    assert '<selected_skill id="good-question">' in system
+    assert '<selected_skill id="good-question" provenance="explicit"' in system
+    assert 'package_hash="sha256:' in system
+    assert 'content_hash="sha256:' in system
     assert "## 好问题卡" in system
-    assert "分别写 H1、H2、H3" in system
-    assert "必须能在 14 天内完成" in system
-    assert "一年、季度或完整项目" in system
-    assert "不要写回归公式" in system
-    assert "可观察数据图形或结果模式" in system
-    assert "零效应、混杂、反向关系或测量偏差" in system
-    assert "观察性数据不得被写成已识别的因果效应" in system
-    assert "不得只靠 p 值" in system
-    assert "references/platt-strong-inference.md" not in system
-    assert len(system) < 8_000
+    assert "**竞争性解释：** H1 ...；H2 ...；H3 ..." in system
+    assert "**关键判别证据或实验：** ..." in system
+    assert "**两周内可做的 pilot：** ..." in system
+    assert "**最强评审质疑：** ..." in system
+    assert "Load reference cards on demand" in system
+    assert "references/platt-strong-inference.md" in system
+    assert len(system.encode("utf-8")) < 256 * 1024
     assert chat_request.chat_mode == "writing"
     assert [item["id"] for item in chat_request.selected_skills] == ["good-question"]
+    assert chat_request.selected_skills[0]["provenance"] == "explicit"
+    assert chat_request.selected_skills[0]["status"] == "loaded"
+    assert chat_request.selected_skills[0]["resource"] == "SKILL.md"
+    assert str(chat_request.selected_skills[0]["content_hash"]).startswith("sha256:")
 
 
 def test_good_question_output_is_cleaned_and_must_be_a_complete_card():

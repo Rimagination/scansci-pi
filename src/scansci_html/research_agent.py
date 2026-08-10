@@ -16,7 +16,7 @@ from urllib.parse import quote
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .agent_context import build_agent_system_context, runtime_self_description, selected_skill_ids
+from .agent_context import build_agent_system_context, runtime_self_description
 from .agent_advisor import review_research_run
 from .agent_capabilities import capability_catalog, compile_capability_lease
 from .agent_contract import compile_task_contract
@@ -1041,7 +1041,11 @@ def _tor_failure_hint(error_name: str) -> str:
 
 
 def _has_selected_skill(selected_skills: list[dict[str, Any]], identifier: str) -> bool:
-    return any(str(item.get("id", "")).strip().lower() == identifier for item in selected_skills)
+    return any(
+        str(item.get("id", "")).strip().lower() == identifier
+        and str(item.get("status", "loaded") or "loaded") == "loaded"
+        for item in selected_skills
+    )
 
 
 def _selected_skill_requires_web(selected_skills: list[dict[str, Any]]) -> bool:
@@ -3471,6 +3475,7 @@ class ResearchAgentRuntime:
                 thinking_level=chat_request.thinking_level,
                 task_mode=resolved_task_mode,
                 task_contract=turn_contract,
+                selected_skills=chat_request.selected_skills,
                 timeout_seconds=120.0 if _pi_mode_parts(resolved_task_mode) <= {"web", "web-auto"} else 900.0,
                 session_id=session_id,
             )
@@ -4979,6 +4984,7 @@ class ResearchAgentRuntime:
                 "task_contract": task_contract,
                 "web_search": web_search_mode,
                 "tool_calls": [],
+                "skills": [dict(item) for item in chat_request.selected_skills],
                 "session": {},
                 "compactions": [],
                 "interactions": [],
@@ -5168,6 +5174,32 @@ class ResearchAgentRuntime:
                     tool_name = str(model_event.get("name", ""))
                     agent_runtime["tool_calls"].append({"name": tool_name, "status": "failed"})
                     trace.append({"title": "ScanSci 工具未完成", "detail": f"{tool_name}：{model_event.get('error', '')}", "tool_name": tool_name, "status": "failed"})
+                    yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                elif model_event.get("type") in {"skill.loaded", "skill.searched", "skill.failed"}:
+                    skill_event = {
+                        "type": str(model_event.get("type", "")),
+                        "name": str(model_event.get("name", "")),
+                        "value": dict(model_event.get("value", {}) or {}),
+                        "error": str(model_event.get("error", "")),
+                    }
+                    agent_runtime["skills"].append(skill_event)
+                    if skill_event["type"] == "skill.loaded":
+                        detail = (
+                            f"按需加载 Skill：{skill_event['name']}；"
+                            f"provenance={skill_event['value'].get('provenance', 'model')}，"
+                            f"hash={skill_event['value'].get('content_hash', '')}。"
+                        )
+                    elif skill_event["type"] == "skill.searched":
+                        detail = f"检索 Skill 目录，命中 {skill_event['value'].get('count', 0)} 项。"
+                    else:
+                        detail = f"Skill 指令未加载：{skill_event['error']}"
+                    trace.append({
+                        "title": "Skill 渐进加载",
+                        "detail": detail,
+                        "skill_provenance": str(skill_event["value"].get("provenance", "")),
+                        "status": skill_event["type"].removeprefix("skill."),
+                    })
+                    yield run_event(CUSTOM, run_id=run_id, name="skill_runtime", value=skill_event)
                     yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "session":
                     agent_runtime["session"] = {
@@ -7362,13 +7394,14 @@ class ResearchAgentRuntime:
         chat_mode = str(payload.get("chat_mode", "general") or "general").strip().lower()
         if chat_mode not in {"general", "writing", "knowledge", "slides"}:
             chat_mode = "general"
-        skill_ids = selected_skill_ids(payload, messages)
+        selection = resolve_skill_selection(payload, messages)
         system_context, selected_skills = build_agent_system_context(
             self.workspace,
             model_id=model_id,
             provider_name=str(provider.get("name", provider_id)),
             chat_mode=chat_mode,
-            selected_ids=skill_ids,
+            selected_ids=list(selection.selected_ids),
+            selection=selection,
         )
         system_context += (
             "\n\nConversation budget: answer the final user request directly. "
@@ -7493,9 +7526,36 @@ class ResearchAgentRuntime:
         trace: list[dict[str, str]] = []
         if had_attachments:
             trace.append({"title": "读取附件", "detail": "已将本轮添加的本地材料解析为可引用上下文。"})
-        if chat_request.selected_skills:
-            names = "、".join(str(item.get("id", "")) for item in chat_request.selected_skills)
-            trace.append({"title": "应用 Skill", "detail": f"已应用用户显式选择的 Skill：{names}。"})
+        explicit = [
+            str(item.get("id", ""))
+            for item in chat_request.selected_skills
+            if item.get("provenance") == "explicit" and item.get("status") == "loaded"
+        ]
+        inferred = [
+            str(item.get("id", ""))
+            for item in chat_request.selected_skills
+            if item.get("provenance") == "inferred" and item.get("status") == "hint"
+        ]
+        suppressed = [
+            str(item.get("id", ""))
+            for item in chat_request.selected_skills
+            if item.get("provenance") == "suppressed"
+        ]
+        if explicit:
+            trace.append({
+                "title": "应用 Skill",
+                "detail": f"已预载用户显式选择的 Skill：{'、'.join(explicit)}（provenance=explicit）。",
+            })
+        if inferred:
+            trace.append({
+                "title": "Skill 候选",
+                "detail": f"仅提供推断候选，尚未激活：{'、'.join(inferred)}（provenance=inferred）。",
+            })
+        if suppressed:
+            trace.append({
+                "title": "Skill 选择",
+                "detail": f"已抑制重复或超限 Skill：{'、'.join(suppressed)}（provenance=suppressed）。",
+            })
         return trace
 
     def _submit(self, run_id: str) -> None:
