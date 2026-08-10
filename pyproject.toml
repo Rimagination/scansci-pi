@@ -29,6 +29,7 @@ dependencies = [
   "pyzotero>=1.6,<2",
   "requests>=2.31",
   "sqlite-vec>=0.1.6,<0.2",
+  "tiktoken>=0.12,<0.13",
 ]
 
 [project.optional-dependencies]

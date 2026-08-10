@@ -13,6 +13,7 @@ from scansci_html.app_settings import (
     save_settings,
     settings_path,
 )
+from scansci_html.model_metadata import descriptor_from_settings
 
 
 def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_path: Path):
@@ -153,6 +154,34 @@ def test_saved_settings_keep_models_and_never_write_api_key(tmp_path: Path):
     assert "api_key" not in persisted["providers"][0]
     assert persisted["mcp_servers"][0]["command"] == "node server.mjs"
     assert persisted["mcp_servers"][0]["deferred"] is True
+
+
+def test_numeric_context_window_round_trips_through_provider_settings(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    settings = save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "custom", "model_id": "numeric-window"},
+            "providers": [{
+                "id": "custom",
+                "name": "Numeric provider",
+                "kind": "openai-compatible",
+                "base_url": "https://example.invalid/v1",
+                "models": [{
+                    "id": "numeric-window",
+                    "name": "Numeric window",
+                    "context_window": 32_768,
+                    "capabilities": ["reasoning", "tool"],
+                }],
+            }],
+        },
+    )
+
+    persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    assert persisted["providers"][0]["models"][0]["context_window"] == "32768"
+    descriptor = descriptor_from_settings(settings, provider_id="custom", model_id="numeric-window")
+    assert descriptor.context_window_tokens == 32_768
+    assert descriptor.degraded is False
 
 
 def test_mcp_host_owned_tool_policies_round_trip_with_bounded_values(tmp_path: Path):

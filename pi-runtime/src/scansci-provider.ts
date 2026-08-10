@@ -14,6 +14,7 @@ import {
   type ModelRuntimeDescriptor,
   type PiImageContent,
 } from "./multimodal.js";
+import { conservativeTextTokens } from "./token-estimate.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -71,13 +72,7 @@ function conservativeTokens(value: unknown, descriptor: ModelRuntimeDescriptor):
   if (images.length && !descriptor.input_modalities.includes("image")) {
     throw new Error("Provider payload contains images for a text-only model descriptor");
   }
-  let ascii = 0;
-  let nonAsciiBytes = 0;
-  for (const character of text) {
-    if (character.charCodeAt(0) <= 0x7f) ascii += 1;
-    else nonAsciiBytes += Buffer.byteLength(character, "utf8");
-  }
-  return Math.ceil(ascii / 4) + Math.ceil(nonAsciiBytes / 2) + estimatePiImageTokens(images);
+  return conservativeTextTokens(text, descriptor) + estimatePiImageTokens(images);
 }
 
 export function assertProviderRequest(

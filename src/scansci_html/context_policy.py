@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 import copy
 import hashlib
 import json
-import math
+import re
 from typing import Any
+
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - dependency guard for damaged installs
+    tiktoken = None  # type: ignore[assignment]
 
 from .image_attachments import estimate_pi_image_tokens
 from .model_metadata import ModelRuntimeDescriptor
@@ -16,6 +22,7 @@ from .model_metadata import ModelRuntimeDescriptor
 
 _IMAGE_TOKEN_ESTIMATE = 1_200
 _OMISSION_MARKER_MIN_TOKENS = 48
+_TOKENIZER_CHUNK_CHARACTERS = 2_048
 
 
 class ContextEnvelopeError(ValueError):
@@ -52,26 +59,58 @@ class TokenEnvelopeReport:
         }
 
 
-def estimate_text_tokens(value: Any) -> int:
-    """Return a conservative tokenizer-independent estimate.
+def _known_openai_encoding(descriptor: ModelRuntimeDescriptor | None) -> str:
+    if descriptor is None or descriptor.provider_id.lower() != "openai":
+        return ""
+    model = descriptor.model_id.lower()
+    if re.match(r"^(?:gpt-5|gpt-4o|gpt-4\.1|chatgpt-4o|o[1345](?:-|$))", model):
+        return "o200k_base"
+    if re.match(r"^(?:gpt-4(?:-|$)|gpt-3\.5(?:-|$)|text-embedding-)", model):
+        return "cl100k_base"
+    return ""
 
-    UTF-8 bytes/3 intentionally overestimates ordinary English while mapping
-    CJK to roughly one token per character and emoji to more than one.  The
-    safety envelope is not billing data and must remain provider-neutral.
-    """
+
+@lru_cache(maxsize=2)
+def _tiktoken_encoding(name: str):
+    if tiktoken is None:
+        return None
+    return tiktoken.get_encoding(name)
+
+
+def estimate_text_tokens(value: Any, *, descriptor: ModelRuntimeDescriptor | None = None) -> int:
+    """Return an exact known-model count or a tokenizer-neutral safe upper bound."""
 
     text = str(value or "")
-    return math.ceil(len(text.encode("utf-8")) / 3) if text else 0
+    if not text:
+        return 0
+    encoding_name = _known_openai_encoding(descriptor)
+    if encoding_name:
+        try:
+            encoding = _tiktoken_encoding(encoding_name)
+            if encoding is not None:
+                # Summed BPE chunks are equal to or slightly above the whole
+                # count because merges cannot cross a chunk boundary.  The
+                # bound avoids quadratic behavior on huge repeated runs.
+                return sum(
+                    len(encoding.encode(text[start : start + _TOKENIZER_CHUNK_CHARACTERS]))
+                    for start in range(0, len(text), _TOKENIZER_CHUNK_CHARACTERS)
+                )
+        except (KeyError, ValueError):
+            pass
+    # Unknown/custom tokenizers fail closed to one token per UTF-8 byte.  This
+    # is an upper bound for byte-backed model tokenizers, unlike chars/4 or
+    # bytes/3 averages which fail badly on high-entropy ASCII and JSON.
+    return len(text.encode("utf-8"))
 
 
-def _estimate_content_tokens(content: Any) -> int:
+def _estimate_content_tokens(content: Any, *, descriptor: ModelRuntimeDescriptor | None = None) -> int:
     if isinstance(content, str):
-        return estimate_text_tokens(content)
+        return estimate_text_tokens(content, descriptor=descriptor)
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
         total = 0
         for block in content:
             if not isinstance(block, Mapping):
-                total += estimate_text_tokens(block)
+                total += estimate_text_tokens(block, descriptor=descriptor)
                 continue
             block_type = str(block.get("type", ""))
             if block_type in {"image", "input_image", "image_url"}:
@@ -83,27 +122,38 @@ def _estimate_content_tokens(content: Any) -> int:
                 else:
                     total += _IMAGE_TOKEN_ESTIMATE
             elif block_type == "text":
-                total += estimate_text_tokens(block.get("text", ""))
+                total += estimate_text_tokens(block.get("text", ""), descriptor=descriptor)
             else:
                 safe = {
                     key: ("[IMAGE_BYTES]" if key in {"data", "image_url", "url"} else value)
                     for key, value in block.items()
                 }
-                total += estimate_text_tokens(json.dumps(safe, ensure_ascii=False, default=str))
+                total += estimate_text_tokens(
+                    json.dumps(safe, ensure_ascii=False, default=str),
+                    descriptor=descriptor,
+                )
         return total
     if isinstance(content, Mapping):
         safe = {
             key: ("[IMAGE_BYTES]" if key in {"data", "image_url", "url"} else value)
             for key, value in content.items()
         }
-        return estimate_text_tokens(json.dumps(safe, ensure_ascii=False, default=str))
-    return estimate_text_tokens(content)
+        return estimate_text_tokens(json.dumps(safe, ensure_ascii=False, default=str), descriptor=descriptor)
+    return estimate_text_tokens(content, descriptor=descriptor)
 
 
-def estimate_message_tokens(message: Mapping[str, Any]) -> int:
+def estimate_message_tokens(
+    message: Mapping[str, Any],
+    *,
+    descriptor: ModelRuntimeDescriptor | None = None,
+) -> int:
     # Role/framing overhead is intentionally explicit so a large message count
     # cannot evade the byte-based content estimate.
-    return 6 + estimate_text_tokens(message.get("role", "")) + _estimate_content_tokens(message.get("content", ""))
+    return (
+        6
+        + estimate_text_tokens(message.get("role", ""), descriptor=descriptor)
+        + _estimate_content_tokens(message.get("content", ""), descriptor=descriptor)
+    )
 
 
 def _context_kind(message: Mapping[str, Any]) -> str:
@@ -137,6 +187,7 @@ def _truncate_referenced_message(
     message: Mapping[str, Any],
     *,
     budget_tokens: int,
+    descriptor: ModelRuntimeDescriptor,
 ) -> tuple[dict[str, Any] | None, str]:
     content = message.get("content", "")
     reference = _message_reference(message)
@@ -144,28 +195,42 @@ def _truncate_referenced_message(
         return None, ""
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
     marker = f"\n… [omitted; ref={reference}; omission_sha256={digest}] …\n"
-    marker_tokens = estimate_text_tokens(marker) + 8
+    marker_tokens = estimate_text_tokens(marker, descriptor=descriptor) + 8
     if marker_tokens >= budget_tokens:
         return None, ""
-    char_budget = max(0, (budget_tokens - marker_tokens) * 3)
-    head_chars = max(1, char_budget // 2)
-    tail_chars = max(1, char_budget - head_chars)
-    projected = dict(message)
-    projected["content"] = f"{content[:head_chars]}{marker}{content[-tail_chars:]}"
-    projected["_scansci_context_omission"] = {
-        "ref": reference,
-        "omission_sha256": digest,
-        "original_tokens": estimate_text_tokens(content),
-    }
-    while estimate_message_tokens(projected) > budget_tokens and head_chars + tail_chars > 2:
-        if head_chars >= tail_chars:
-            head_chars -= 1
-        else:
-            tail_chars -= 1
-        projected["content"] = f"{content[:head_chars]}{marker}{content[-tail_chars:]}"
-    if estimate_message_tokens(projected) > budget_tokens:
+    original_tokens = max(1, estimate_text_tokens(content, descriptor=descriptor))
+    if len(content) < 2:
         return None, ""
-    return projected, digest
+
+    def candidate(retained_chars: int) -> dict[str, Any]:
+        head_chars = max(1, retained_chars // 2)
+        tail_chars = max(1, retained_chars - head_chars)
+        projected = dict(message)
+        projected["content"] = f"{content[:head_chars]}{marker}{content[-tail_chars:]}"
+        projected["_scansci_context_omission"] = {
+            "ref": reference,
+            "omission_sha256": digest,
+            "original_tokens": original_tokens,
+        }
+        return projected
+
+    # Token density can vary sharply inside one payload (for example a
+    # compressible middle with high-entropy identifiers at both edges).  A
+    # global token/character ratio followed by one-character decrements turns
+    # that shape into thousands of full tokenizer passes.  Find the largest
+    # fitting balanced head+tail preview with logarithmically many probes.
+    low = 2
+    high = len(content)
+    best: dict[str, Any] | None = None
+    while low <= high:
+        retained_chars = (low + high) // 2
+        projected = candidate(retained_chars)
+        if estimate_message_tokens(projected, descriptor=descriptor) <= budget_tokens:
+            best = projected
+            low = retained_chars + 1
+        else:
+            high = retained_chars - 1
+    return (best, digest) if best is not None else (None, "")
 
 
 def build_token_envelope(
@@ -188,14 +253,31 @@ def build_token_envelope(
     )
     if final_user_index < 0:
         raise ContextEnvelopeError("A final user message is mandatory")
-    host_contract_tokens = estimate_text_tokens(json.dumps(dict(host_contract or {}), ensure_ascii=False, default=str))
-    before = host_contract_tokens + sum(estimate_message_tokens(message) for message in clean)
+    # ``TaskContract.request`` is the same final user text that is transmitted
+    # as the mandatory user message.  Pi's current-turn system prompt renders
+    # the bounded goal/policy/lease fields but never renders this raw duplicate.
+    # Counting it here would reject a valid large request before the provider-
+    # visible envelope is even constructed.
+    visible_host_contract = {
+        key: value
+        for key, value in dict(host_contract or {}).items()
+        if key != "request"
+    }
+    host_contract_tokens = estimate_text_tokens(
+        json.dumps(visible_host_contract, ensure_ascii=False, default=str),
+        descriptor=descriptor,
+    )
+    before = host_contract_tokens + sum(
+        estimate_message_tokens(message, descriptor=descriptor) for message in clean
+    )
     mandatory_indices = {
         index
         for index, message in enumerate(clean)
         if index == final_user_index or _context_kind(message) in {"host_contract", "explicit_skill"}
     }
-    mandatory_tokens = host_contract_tokens + sum(estimate_message_tokens(clean[index]) for index in mandatory_indices)
+    mandatory_tokens = host_contract_tokens + sum(
+        estimate_message_tokens(clean[index], descriptor=descriptor) for index in mandatory_indices
+    )
     limit = int(descriptor.provider_input_tokens)
     if mandatory_tokens > limit:
         raise ContextEnvelopeError(
@@ -239,7 +321,7 @@ def build_token_envelope(
     truncated = 0
     omission_hashes: list[str] = []
     for _semantic_priority, _recency, indices in optional_units:
-        tokens = sum(estimate_message_tokens(clean[index]) for index in indices)
+        tokens = sum(estimate_message_tokens(clean[index], descriptor=descriptor) for index in indices)
         remaining = limit - used
         if tokens <= remaining:
             for index in indices:
@@ -258,16 +340,19 @@ def build_token_envelope(
             projected, digest = _truncate_referenced_message(
                 clean[index],
                 budget_tokens=remaining,
+                descriptor=descriptor,
             )
             if projected is not None:
                 retained[index] = projected
-                projected_tokens = estimate_message_tokens(projected)
+                projected_tokens = estimate_message_tokens(projected, descriptor=descriptor)
                 used += projected_tokens
                 truncated += 1
                 omission_hashes.append(digest)
 
     output = [retained[index] for index in sorted(retained)]
-    estimated = host_contract_tokens + sum(estimate_message_tokens(message) for message in output)
+    estimated = host_contract_tokens + sum(
+        estimate_message_tokens(message, descriptor=descriptor) for message in output
+    )
     if estimated > limit:  # defensive invariant; never silently overrun.
         raise ContextEnvelopeError("Token envelope exceeded the provider input limit")
     report = TokenEnvelopeReport(

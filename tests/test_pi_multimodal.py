@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -20,6 +21,220 @@ _PNG = base64.b64encode(
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
 ).decode("ascii")
 _IMAGE = {"type": "image", "data": _PNG, "mimeType": "image/png"}
+_REPOSITORY = Path(__file__).resolve().parents[1]
+
+
+def _fixed_high_entropy_ascii(label: str, length: int) -> str:
+    output = ""
+    counter = 0
+    while len(output) < length:
+        output += base64.b64encode(hashlib.sha256(f"{label}:{counter}".encode()).digest()).decode().rstrip("=")
+        counter += 1
+    return output[:length]
+
+
+def _run_runtime_extension_harness(tmp_path: Path, cases: list[dict[str, object]]) -> list[dict[str, object]]:
+    entry = tmp_path / "runtime-extension-harness.ts"
+    output = tmp_path / "runtime-extension-harness.mjs"
+    runtime_extension = (_REPOSITORY / "pi-runtime" / "src" / "runtime-extension.ts").as_posix()
+    token_estimate = (_REPOSITORY / "pi-runtime" / "src" / "token-estimate.ts").as_posix()
+    entry.write_text(
+        "\n".join([
+            f'import {{ buildTokenEnvelopeContextView }} from "{runtime_extension}";',
+            f'import {{ conservativeTextTokens }} from "{token_estimate}";',
+            f"const cases = {json.dumps(cases, ensure_ascii=False)};",
+            "const output = cases.map((item) => {",
+            "  try {",
+            "    if (typeof item.text === 'string') {",
+            "      return { name: item.name, tokens: conservativeTextTokens(item.text, item.descriptor) };",
+            "    }",
+            "    const projected = buildTokenEnvelopeContextView(item.messages, Number(item.limit), Number(item.reserved || 0));",
+            "    return { name: item.name, messages: projected.messages, report: projected.report };",
+            "  } catch (error) {",
+            "    return { name: item.name, error: String(error?.message || error), code: String(error?.code || '') };",
+            "  }",
+            "});",
+            "process.stdout.write(JSON.stringify(output));",
+        ]),
+        encoding="utf-8",
+    )
+    node, _script = PiAgentClient.runtime_paths()
+    esbuild = _REPOSITORY / "node_modules" / "esbuild" / "bin" / "esbuild"
+    built = subprocess.run(
+        [
+            str(node),
+            str(esbuild),
+            str(entry),
+            "--bundle",
+            "--platform=node",
+            "--format=esm",
+            "--banner:js=import { createRequire as __scansciCreateRequire } from 'node:module'; const require = __scansciCreateRequire(import.meta.url);",
+            f"--outfile={output}",
+        ],
+        cwd=_REPOSITORY,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    executed = subprocess.run(
+        [str(node), str(output)],
+        cwd=_REPOSITORY,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert executed.returncode == 0, executed.stderr
+    return json.loads(executed.stdout)
+
+
+def test_node_token_estimator_uses_exact_known_encoding_and_safe_unknown_fallback(tmp_path: Path) -> None:
+    repeated = "X" * 70_000
+    high_entropy = _fixed_high_entropy_ascii("node-tokenizer", 70_000)
+    results = _run_runtime_extension_harness(tmp_path, [
+        {
+            "name": "o200k",
+            "text": repeated,
+            "descriptor": {"provider_id": "openai", "model_id": "gpt-4o"},
+        },
+        {
+            "name": "cl100k",
+            "text": repeated,
+            "descriptor": {"provider_id": "openai", "model_id": "gpt-4"},
+        },
+        {
+            "name": "unknown",
+            "text": high_entropy,
+            "descriptor": {"provider_id": "custom", "model_id": "fixture-model"},
+        },
+    ])
+
+    assert results == [
+        {"name": "o200k", "tokens": 4_375},
+        {"name": "cl100k", "tokens": 8_750},
+        {"name": "unknown", "tokens": len(high_entropy.encode("utf-8"))},
+    ]
+
+
+def test_node_token_envelope_keeps_current_tool_turn_atomic_across_provider_shapes(tmp_path: Path) -> None:
+    old_turn = [
+        {"role": "user", "content": "OLD-USER " + ("x" * 20_000)},
+        {"role": "assistant", "content": "OLD-ASSISTANT " + ("y" * 20_000)},
+    ]
+    cases = [
+        {
+            "name": "pi-canonical",
+            "limit": 4096,
+            "messages": [
+                *old_turn,
+                {"role": "user", "content": "FINAL-USER"},
+                {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "call-1", "name": "search_web", "arguments": {"query": "one"}},
+                    {"type": "toolCall", "id": "call-2", "name": "search_web", "arguments": {"query": "two"}},
+                ]},
+                {"role": "toolResult", "toolCallId": "call-1", "content": [{"type": "text", "text": "CURRENT-TOOL-RESULT-1"}]},
+                {"role": "toolResult", "toolCallId": "call-2", "content": [{"type": "text", "text": "CURRENT-TOOL-RESULT-2"}]},
+            ],
+        },
+        {
+            "name": "openai-like",
+            "limit": 4096,
+            "messages": [
+                *old_turn,
+                {"role": "user", "content": "FINAL-USER"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call-1", "type": "function", "function": {"name": "search_web", "arguments": "{\"query\":\"one\"}"}},
+                    {"id": "call-2", "type": "function", "function": {"name": "search_web", "arguments": "{\"query\":\"two\"}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "CURRENT-TOOL-RESULT-1"},
+                {"role": "tool", "tool_call_id": "call-2", "content": "CURRENT-TOOL-RESULT-2"},
+            ],
+        },
+        {
+            "name": "anthropic-like",
+            "limit": 4096,
+            "messages": [
+                *old_turn,
+                {"role": "user", "content": "FINAL-USER"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "search_web", "input": {"query": "one"}},
+                    {"type": "tool_use", "id": "call-2", "name": "search_web", "input": {"query": "two"}},
+                ]},
+                {"role": "toolResult", "toolCallId": "call-1", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "CURRENT-TOOL-RESULT-1"}]},
+                {"role": "toolResult", "toolCallId": "call-2", "content": [{"type": "tool_result", "tool_use_id": "call-2", "content": "CURRENT-TOOL-RESULT-2"}]},
+            ],
+        },
+    ]
+
+    results = _run_runtime_extension_harness(tmp_path, cases)
+
+    assert {result["name"] for result in results} == {"pi-canonical", "openai-like", "anthropic-like"}
+    for result in results:
+        assert "error" not in result
+        projected_messages = result["messages"]
+        encoded = json.dumps(projected_messages, ensure_ascii=False)
+        assert "FINAL-USER" in encoded
+        assert "call-1" in encoded and "call-2" in encoded
+        assert "CURRENT-TOOL-RESULT-1" in encoded and "CURRENT-TOOL-RESULT-2" in encoded
+        assert "OLD-USER" not in encoded and "OLD-ASSISTANT" not in encoded
+        final_user_index = next(
+            index for index, message in enumerate(projected_messages)
+            if message.get("role") == "user" and message.get("content") == "FINAL-USER"
+        )
+        assistant_calls = [
+            message for message in projected_messages[final_user_index + 1:]
+            if message.get("role") == "assistant"
+        ]
+        assert len(assistant_calls) == 1
+        assistant_wire = json.dumps(assistant_calls[0], ensure_ascii=False)
+        assert "call-1" in assistant_wire and "call-2" in assistant_wire
+
+
+def test_node_token_envelope_rejects_current_tool_turn_overflow_as_typed_error(tmp_path: Path) -> None:
+    results = _run_runtime_extension_harness(tmp_path, [{
+        "name": "mandatory-overflow",
+        "limit": 4096,
+        "messages": [
+            {"role": "user", "content": "FINAL-USER"},
+            {"role": "assistant", "content": [{
+                "type": "toolCall",
+                "id": "call-overflow",
+                "name": "search_web",
+                "arguments": {"query": "Q" * 20_000},
+            }]},
+            {"role": "toolResult", "toolCallId": "call-overflow", "content": "CURRENT-TOOL-RESULT"},
+        ],
+    }])
+
+    assert results == [{
+        "name": "mandatory-overflow",
+        "error": "Current active tool turn exceeds the provider input token limit",
+        "code": "SCANSCI_CONTEXT_MANDATORY_OVERFLOW",
+    }]
+
+
+def test_node_token_envelope_reserves_provider_prefix_before_admitting_old_turns(tmp_path: Path) -> None:
+    results = _run_runtime_extension_harness(tmp_path, [{
+        "name": "provider-prefix-reserve",
+        "limit": 4096,
+        "reserved": 1600,
+        "messages": [
+            {"role": "user", "content": "OLD-USER " + ("x" * 2400)},
+            {"role": "assistant", "content": "OLD-ASSISTANT"},
+            {"role": "user", "content": "FINAL-USER"},
+        ],
+    }])
+
+    assert "error" not in results[0]
+    encoded = json.dumps(results[0]["messages"], ensure_ascii=False)
+    assert "FINAL-USER" in encoded
+    assert "OLD-USER" not in encoded
+    assert results[0]["report"]["provider_prefix_tokens"] == 1600
+    assert results[0]["report"]["estimated_tokens"] <= 4096
 
 
 def _descriptor(
@@ -409,7 +624,15 @@ def test_node_rejects_semantically_inconsistent_descriptor_before_network(tmp_pa
     assert "capability" in output.lower() or "modality" in output.lower()
 
 
-def test_provider_gate_blocks_oversized_final_payload_after_fail_open_hook(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "oversized_prompt",
+    ["X" * 150_000, _fixed_high_entropy_ascii("provider-gate", 70_000)],
+    ids=["long-repeat", "high-entropy-ascii"],
+)
+def test_provider_gate_blocks_oversized_final_payload_after_fail_open_hook(
+    tmp_path: Path,
+    oversized_prompt: str,
+) -> None:
     _ShapeHandler.mode = "openai"
     _ShapeHandler.payloads = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ShapeHandler)
@@ -442,10 +665,10 @@ def test_provider_gate_blocks_oversized_final_payload_after_fail_open_hook(tmp_p
             "model_id": "fixture-model",
             "api_surface": "chat_completions",
             "system_prompt": "",
-            # ~37.5K conservative tokens, above the descriptor's 27,648
-            # provider-input envelope. The extension hook throws, but Pi's
+            # Above the descriptor's 27,648 provider-input envelope under a
+            # real tokenizer. The extension hook throws, but Pi's
             # runner catches that exception and otherwise sends the request.
-            "prompt": "X" * 150_000,
+            "prompt": oversized_prompt,
             "images": [],
             "model_runtime": _descriptor(),
             "task_contract": {"schema_version": "scansci.task-contract.v2", "version": 2, "allowed_tools": []},
@@ -792,9 +1015,11 @@ def test_100k_token_20_turn_compaction_preserves_all_sentinels_after_resume(tmp_
         "timeout_seconds": 60,
         "session_id": "twenty-turn-compaction",
     }
-    body = "X" * 20_000
-    # ASCII is conservatively estimated at four characters per token here.
-    assert 20 * ((len(body) + 3) // 4) >= 100_000
+    body = _fixed_high_entropy_ascii("compaction", 8_000)
+    # Precomputed with the two local encodings used by the hard gate:
+    # cl100k=5,682 and o200k=5,446 tokens per turn.  The smaller count still
+    # proves this is a genuine >100K-token 20-turn history.
+    assert 20 * 5_446 >= 100_000
     first_client = PiAgentClient(workspace=workspace, evidence_db=evidence_db)
     session_file: Path | None = None
     try:

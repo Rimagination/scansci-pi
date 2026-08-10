@@ -8,14 +8,28 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { estimatePiImageTokens, type PiImageContent } from "./multimodal.js";
+import {
+  estimatePiImageTokens,
+  type ModelRuntimeDescriptor,
+  type PiImageContent,
+} from "./multimodal.js";
 import { searchToolCatalog, type ToolCatalogEntry } from "./tool-catalog.js";
+import { conservativeTextTokens } from "./token-estimate.js";
 
 type JsonRecord = Record<string, unknown>;
 
 export interface ContextViewResult {
   messages: ContextEvent["messages"];
   report?: JsonRecord;
+}
+
+export class ContextEnvelopeError extends Error {
+  readonly code = "SCANSCI_CONTEXT_MANDATORY_OVERFLOW";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ContextEnvelopeError";
+  }
 }
 
 function contextSafeValue(value: unknown, depth = 0): unknown {
@@ -53,7 +67,7 @@ function collectContextImages(value: unknown, images: PiImageContent[], depth = 
   for (const item of Object.values(record)) collectContextImages(item, images, depth + 1);
 }
 
-function conservativeContextTokens(value: unknown): number {
+function conservativeContextTokens(value: unknown, descriptor?: ModelRuntimeDescriptor): number {
   const text = JSON.stringify(contextSafeValue(value));
   const images: PiImageContent[] = [];
   collectContextImages(value, images);
@@ -63,15 +77,19 @@ function conservativeContextTokens(value: unknown): number {
   } catch {
     visualTokens = images.length * 1200;
   }
-  return Math.ceil(Buffer.byteLength(text, "utf8") / 3) + visualTokens + 6;
+  return conservativeTextTokens(text, descriptor) + visualTokens + 6;
 }
 
 export function buildTokenEnvelopeContextView(
   messages: ContextEvent["messages"],
-  inputLimit: number,
+  runtime: number | ModelRuntimeDescriptor,
+  providerPrefixTokens = 0,
 ): ContextViewResult {
   const clean = structuredClone(messages);
+  const descriptor = typeof runtime === "number" ? undefined : runtime;
+  const inputLimit = typeof runtime === "number" ? runtime : runtime.provider_input_tokens;
   const limit = Math.max(4096, Math.floor(Number(inputLimit) || 0));
+  const prefixTokens = Math.max(0, Math.floor(Number(providerPrefixTokens) || 0));
   const finalUserIndex = (() => {
     for (let index = clean.length - 1; index >= 0; index -= 1) {
       const role = String((clean[index] as unknown as JsonRecord).role || "").toLowerCase();
@@ -80,31 +98,33 @@ export function buildTokenEnvelopeContextView(
     return -1;
   })();
   if (finalUserIndex < 0) return { messages: clean, report: { token_envelope: "no_user_message" } };
-  const originalTokens = clean.reduce((total, message) => total + conservativeContextTokens(message), 0);
-  const mandatoryTokens = conservativeContextTokens(clean[finalUserIndex]);
-  if (mandatoryTokens > limit) {
-    // Never clip the current user request. The non-swallowable provider gate
-    // below the extension layer will reject it before network transmission.
-    return {
-      messages: clean,
-      report: {
-        token_envelope: "mandatory_overflow",
-        provider_input_tokens: limit,
-        mandatory_tokens: mandatoryTokens,
-        estimated_tokens_before: originalTokens,
-      },
-    };
+  const originalTokens = clean.reduce(
+    (total, message) => total + conservativeContextTokens(message, descriptor),
+    0,
+  );
+  // The final user request and every assistant/tool message emitted after it
+  // form the current active turn.  A provider must never see a tool result
+  // without the assistant call that produced it (or vice versa).
+  const currentTurnIndices = Array.from(
+    { length: clean.length - finalUserIndex },
+    (_value, offset) => finalUserIndex + offset,
+  );
+  const mandatoryTokens = currentTurnIndices.reduce(
+    (total, index) => total + conservativeContextTokens(clean[index], descriptor),
+    0,
+  );
+  if (mandatoryTokens + prefixTokens > limit) {
+    throw new ContextEnvelopeError("Current active tool turn exceeds the provider input token limit");
   }
 
   const units: Array<{ indices: number[]; priority: number; recency: number }> = [];
   let turn = 0;
   const dialogue = new Map<number, number[]>();
-  for (let index = 0; index < clean.length; index += 1) {
-    if (index === finalUserIndex) continue;
+  for (let index = 0; index < finalUserIndex; index += 1) {
     const message = clean[index] as unknown as JsonRecord;
     const role = String(message.role || "").toLowerCase();
     if (role === "user") turn += 1;
-    if (["tool", "toolresult", "tool_result"].includes(role)) {
+    if (["tool", "toolresult", "tool_result"].includes(role) && turn === 0) {
       units.push({ indices: [index], priority: 1, recency: index });
     } else {
       const indices = dialogue.get(turn) || [];
@@ -117,11 +137,16 @@ export function buildTokenEnvelopeContextView(
   }
   units.sort((left, right) => right.priority - left.priority || right.recency - left.recency);
 
-  const retained = new Map<number, ContextEvent["messages"][number]>([[finalUserIndex, clean[finalUserIndex]]]);
-  let used = mandatoryTokens;
+  const retained = new Map<number, ContextEvent["messages"][number]>(
+    currentTurnIndices.map((index) => [index, clean[index]]),
+  );
+  let used = mandatoryTokens + prefixTokens;
   let omitted = 0;
   for (const unit of units) {
-    const tokens = unit.indices.reduce((total, index) => total + conservativeContextTokens(clean[index]), 0);
+    const tokens = unit.indices.reduce(
+      (total, index) => total + conservativeContextTokens(clean[index], descriptor),
+      0,
+    );
     if (used + tokens <= limit) {
       for (const index of unit.indices) retained.set(index, clean[index]);
       used += tokens;
@@ -137,6 +162,7 @@ export function buildTokenEnvelopeContextView(
     report: {
       token_envelope: "model_aware_token_envelope_v1",
       provider_input_tokens: limit,
+      provider_prefix_tokens: prefixTokens,
       estimated_tokens_before: originalTokens,
       estimated_tokens: used,
       retained_messages: output.length,

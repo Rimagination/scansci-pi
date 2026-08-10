@@ -12,6 +12,7 @@
     "@earendil-works/pi-ai": "0.80.10",
     "@earendil-works/pi-coding-agent": "0.80.10",
     "@modelcontextprotocol/sdk": "1.29.0",
+    "gpt-tokenizer": "2.9.0",
     "pdfjs-dist": "6.1.200",
     "pptxgenjs": "4.0.1",
     "typebox": "1.1.38"

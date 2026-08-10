@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 
 import pytest
 
+import scansci_html.context_policy as context_policy
 from scansci_html.context_policy import (
     ContextEnvelopeError,
     build_token_envelope,
@@ -20,6 +22,38 @@ from scansci_html.model_metadata import (
 from scansci_html.research_agent import ResearchAgentRuntime
 
 
+def _fixed_high_entropy_ascii(label: str, length: int) -> str:
+    blocks: list[str] = []
+    size = 0
+    counter = 0
+    while size < length:
+        block = base64.b64encode(hashlib.sha256(f"{label}:{counter}".encode()).digest()).decode().rstrip("=")
+        blocks.append(block)
+        size += len(block)
+        counter += 1
+    return "".join(blocks)[:length]
+
+
+_HIGH_ENTROPY_ASCII = _fixed_high_entropy_ascii("ascii", 70_000)
+_HIGH_ENTROPY_JSON = json.dumps(
+    {"records": [{"id": index, "nonce": _fixed_high_entropy_ascii(f"json-{index}", 160)} for index in range(390)]},
+    separators=(",", ":"),
+)
+_HIGH_ENTROPY_TOOL_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            f"field_{index}": {
+                "type": "string",
+                "enum": [_fixed_high_entropy_ascii(f"schema-{index}-{item}", 48) for item in range(4)],
+            }
+            for index in range(245)
+        },
+    },
+    separators=(",", ":"),
+)
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -28,13 +62,14 @@ from scansci_html.research_agent import ResearchAgentRuntime
         ("200K", 200 * 1024),
         ("1.5M", int(1.5 * 1024 * 1024)),
         (" 200 k ", 200 * 1024),
+        ("32768", 32_768),
     ],
 )
 def test_context_window_parser_accepts_numeric_and_human_units(raw: object, expected: int) -> None:
     assert parse_context_window_tokens(raw) == expected
 
 
-@pytest.mark.parametrize("raw", [None, "", "本地", "unknown", -1, 0, True, False, object()])
+@pytest.mark.parametrize("raw", [None, "", "本地", "unknown", -1, 0, 8_192, "16K", True, False, object()])
 def test_context_window_parser_fails_closed_to_32k(raw: object) -> None:
     assert parse_context_window_tokens(raw) == DEFAULT_CONTEXT_WINDOW_TOKENS
 
@@ -107,6 +142,43 @@ def test_token_estimator_is_conservative_for_english_chinese_json_and_emoji() ->
     assert estimate_text_tokens("🧪" * 40) >= 40
     fixture = json.dumps({"query": "检索", "items": ["alpha", "beta"]}, ensure_ascii=False)
     assert estimate_text_tokens(fixture) >= 15
+
+
+@pytest.mark.parametrize(
+    ("fixture", "known_token_count"),
+    [
+        (_HIGH_ENTROPY_ASCII, 50_154),
+        (_HIGH_ENTROPY_JSON, 47_488),
+        (_HIGH_ENTROPY_TOOL_SCHEMA, 37_645),
+    ],
+    ids=["ascii", "json", "tool-schema"],
+)
+def test_unknown_tokenizer_fallback_is_an_upper_bound_for_high_entropy_fixtures(
+    fixture: str,
+    known_token_count: int,
+) -> None:
+    assert estimate_text_tokens(fixture) >= known_token_count
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [("gpt-4o", 4_375), ("gpt-4", 8_750)],
+)
+def test_known_openai_tokenizer_counts_repeated_text_without_byte_overrejection(model_id: str, expected: int) -> None:
+    descriptor = descriptor_from_model_record(
+        provider_id="openai",
+        provider_kind="openai-compatible",
+        model_id=model_id,
+        model_record={"id": model_id, "context_window": "200K", "capabilities": ["reasoning", "tool"]},
+    )
+
+    assert estimate_text_tokens("X" * 70_000, descriptor=descriptor) == expected
+
+
+def test_unknown_model_tokenizer_falls_back_to_utf8_byte_upper_bound() -> None:
+    descriptor = ModelRuntimeDescriptor.for_testing(context_window_tokens=200 * 1024)
+
+    assert estimate_text_tokens(_HIGH_ENTROPY_ASCII, descriptor=descriptor) == len(_HIGH_ENTROPY_ASCII.encode("utf-8"))
 
 
 def test_image_base64_is_not_counted_as_text_tokens() -> None:
@@ -193,6 +265,67 @@ def test_token_envelope_never_truncates_mandatory_final_user_request() -> None:
             [{"role": "user", "content": final_request}],
             descriptor=descriptor,
         )
+
+
+def test_host_contract_budget_does_not_count_the_duplicate_raw_request() -> None:
+    descriptor = ModelRuntimeDescriptor.for_testing(context_window_tokens=200 * 1024)
+    final_request = "a" * 100_000
+
+    projected, report = build_token_envelope(
+        [{"role": "user", "content": final_request}],
+        descriptor=descriptor,
+        host_contract={
+            "schema_version": "scansci.task-contract.v2",
+            "version": 2,
+            "contract_id": "duplicate-request-budget",
+            "goal": "Answer the final user request.",
+            "request": final_request,
+            "allowed_tools": [],
+        },
+    )
+
+    assert projected == [{"role": "user", "content": final_request}]
+    assert report.host_contract_tokens < 2_000
+    assert report.estimated_tokens <= descriptor.provider_input_tokens
+
+
+def test_referenced_omission_uses_bounded_tokenizer_probes_for_high_entropy_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = descriptor_from_model_record(
+        provider_id="openai",
+        provider_kind="openai-compatible",
+        model_id="gpt-4",
+        model_record={"id": "gpt-4", "context_window": "200K", "capabilities": ["reasoning"]},
+    )
+    edge = _fixed_high_entropy_ascii("omission-edge", 1_000)
+    message = {
+        "role": "tool",
+        "content": edge + ("A" * 30_000) + edge,
+        "context_ref": "bounded-omission",
+    }
+    original_estimator = context_policy.estimate_message_tokens
+    probes = 0
+
+    def bounded_estimator(*args, **kwargs):
+        nonlocal probes
+        probes += 1
+        if probes > 64:
+            raise AssertionError("referenced omission used an unbounded linear tokenizer loop")
+        return original_estimator(*args, **kwargs)
+
+    monkeypatch.setattr(context_policy, "estimate_message_tokens", bounded_estimator)
+
+    projected, digest = context_policy._truncate_referenced_message(
+        message,
+        budget_tokens=2_500,
+        descriptor=descriptor,
+    )
+
+    assert projected is not None
+    assert digest
+    assert probes <= 64
+    assert original_estimator(projected, descriptor=descriptor) <= 2_500
 
 
 def test_follow_up_with_ten_or_fewer_large_messages_is_still_enveloped() -> None:

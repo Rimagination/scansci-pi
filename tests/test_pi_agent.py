@@ -2179,6 +2179,13 @@ def test_explicit_skill_body_appears_once_in_first_provider_request(tmp_path: Pa
             base_url=f"http://127.0.0.1:{server.server_port}/v1",
             api_key="fixture-key",
             model_id="fixture-model",
+            # This test verifies single-channel Skill injection, not the
+            # fail-closed 32K policy for an unknown tokenizer.  The selected
+            # Skill plus the host system contract is intentionally larger than
+            # that unknown-model byte upper bound.
+            model_runtime=pi_agent.ModelRuntimeDescriptor.for_testing(
+                context_window_tokens=200 * 1024,
+            ).to_dict(),
             thinking_level="off",
             task_mode="general",
             task_contract={

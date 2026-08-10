@@ -41,6 +41,7 @@ import {
   createSearchToolsTool,
   registerRuntimeLifecycleHooks,
 } from "./runtime-extension.js";
+import { conservativeTextTokens } from "./token-estimate.js";
 
 type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -2464,6 +2465,35 @@ function currentTurnSystemPrompt(
   return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Independent tools marked parallel-safe may be called as siblings; all other tools run sequentially. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n${skillRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
 }
 
+function providerPrefixTokens(session: AgentSession, descriptor: ModelRuntimeDescriptor): number {
+  const active = new Set(session.getActiveToolNames());
+  const tools = session.getAllTools()
+    .filter((tool) => active.has(String(tool.name)))
+    .map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }));
+  // Context hooks receive only conversation messages.  The provider request
+  // also contains the effective per-turn system prompt, active tool schemas,
+  // model/output fields, and serialization framing.  Reserve that exact
+  // provider-visible prefix before admitting optional historical turns so the
+  // final post-hook hard gate does not have to reject an otherwise compactable
+  // session.  Separate counting is conservative because BPE merges cannot
+  // cross the prefix/message boundary.
+  const projection = {
+    model: descriptor.model_id,
+    messages: [{ role: "developer", content: session.systemPrompt }],
+    tools,
+    stream: true,
+    max_output_tokens: descriptor.max_output_tokens,
+  };
+  return conservativeTextTokens(JSON.stringify(projection), descriptor) + 256;
+}
+
 function looksLikeDeferredAnswer(text: string): boolean {
   const tail = String(text || "").trim().slice(-700);
   if (!tail) return true;
@@ -2680,7 +2710,8 @@ async function createSession(
             });
             const enveloped = buildTokenEnvelopeContextView(
               messages,
-              modelRuntime.provider_input_tokens,
+              modelRuntime,
+              sessionRef ? providerPrefixTokens(sessionRef, modelRuntime) : 0,
             );
             return {
               messages: enveloped.messages,

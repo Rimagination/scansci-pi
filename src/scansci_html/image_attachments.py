@@ -43,9 +43,7 @@ def persist_image_attachments(workspace: str | Path, images: object) -> list[dic
     if len(images) > _MAX_IMAGES:
         raise ValueError(f"一次最多可发送 {_MAX_IMAGES} 张图片")
 
-    root = _attachments_root(workspace)
-    root.mkdir(parents=True, exist_ok=True)
-    records: list[dict[str, Any]] = []
+    validated: list[tuple[str, bytes, str]] = []
     total = 0
     for index, item in enumerate(images, start=1):
         if not isinstance(item, dict):
@@ -56,20 +54,56 @@ def persist_image_attachments(workspace: str | Path, images: object) -> list[dic
         total += len(raw)
         if total > _MAX_TOTAL_BYTES:
             raise ValueError("本次图片总大小不能超过 10 MB")
-        attachment_id = f"image-{uuid.uuid4().hex}"
-        target = root / f"{attachment_id}{_IMAGE_TYPES[mime_type]}"
-        target.write_bytes(raw)
         name = _display_name(str(item.get("name", "")), index, _IMAGE_TYPES[mime_type])
-        records.append(
-            {
-                "id": attachment_id,
-                "name": name,
-                "mime_type": mime_type,
-                "size": len(raw),
-                "preview_url": f"/api/attachments/{attachment_id}",
-            }
-        )
-    return records
+        validated.append((mime_type, raw, name))
+
+    if not validated:
+        return []
+
+    root = _attachments_root(workspace)
+    root_existed = root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    staged: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        for mime_type, raw, name in validated:
+            attachment_id = f"image-{uuid.uuid4().hex}"
+            target = root / f"{attachment_id}{_IMAGE_TYPES[mime_type]}"
+            staging = root / f".{attachment_id}.{uuid.uuid4().hex}.tmp"
+            staged.append((staging, target))
+            staging.write_bytes(raw)
+            records.append(
+                {
+                    "id": attachment_id,
+                    "name": name,
+                    "mime_type": mime_type,
+                    "size": len(raw),
+                    "preview_url": f"/api/attachments/{attachment_id}",
+                }
+            )
+
+        for staging, target in staged:
+            staging.replace(target)
+            committed.append(target)
+        return records
+    except Exception:
+        for staging, _target in staged:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for target in committed:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if not root_existed:
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+        raise
 
 
 def vision_image_blocks(workspace: str | Path, attachments: object) -> list[dict[str, str]]:

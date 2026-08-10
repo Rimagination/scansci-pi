@@ -45,7 +45,7 @@ def _parsed_context_window(value: object) -> tuple[int, bool]:
     if isinstance(value, bool):
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     if isinstance(value, int):
-        if 0 < value <= _MAX_CONTEXT_WINDOW_TOKENS:
+        if DEFAULT_CONTEXT_WINDOW_TOKENS <= value <= _MAX_CONTEXT_WINDOW_TOKENS:
             return value, True
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     if not isinstance(value, str):
@@ -54,9 +54,13 @@ def _parsed_context_window(value: object) -> tuple[int, bool]:
     if match is None:
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     number = float(match.group("value"))
-    multiplier = {"": 1, "k": 1024, "m": 1024 * 1024}[match.group("unit").lower()]
+    multiplier = {"": 1, "k": 1024, "m": 1024 * 1024}[(match.group("unit") or "").lower()]
     parsed = int(number * multiplier)
-    if not math.isfinite(number) or parsed <= 0 or parsed > _MAX_CONTEXT_WINDOW_TOKENS:
+    if (
+        not math.isfinite(number)
+        or parsed < DEFAULT_CONTEXT_WINDOW_TOKENS
+        or parsed > _MAX_CONTEXT_WINDOW_TOKENS
+    ):
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     return parsed, True
 
