@@ -413,7 +413,7 @@ def test_identical_reads_only_coalesce_for_the_explicit_safe_allowlist(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 6,
+            "pi_protocol_version": 7,
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
@@ -516,7 +516,7 @@ def test_immediate_cancel_during_session_setup_never_reaches_the_provider(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 6,
+            "pi_protocol_version": 7,
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,

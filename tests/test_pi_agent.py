@@ -1435,7 +1435,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     assert status["ready"] is True
     assert status["runtime"] == "pi"
     assert status["version"] == "0.80.10"
-    assert status["protocol"] == 6
+    assert status["protocol"] == 7
     assert {
         "multi_session",
         "ask_user",
@@ -1451,10 +1451,13 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
         "model_runtime_descriptor",
         "token_envelope",
         "multimodal_turns",
+        "deferred_mcp_v2",
+        "mcp_effect_audit_v1",
+        "mcp_run_cache_v1",
     }.issubset(set(status["capabilities"]))
 
 
-def test_python_host_rejects_protocol_v4_sidecar_without_ephemeral_sessions(
+def test_python_host_rejects_protocol_v6_sidecar_without_deferred_mcp_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1479,7 +1482,7 @@ input.on("line", (line) => {
     type: "pong",
     runtime: "pi",
     version: "old-fixture",
-    protocol: 4,
+    protocol: 6,
     capabilities,
     negotiated_features: required.filter((feature) => capabilities.includes(feature)),
     missing_features: required.filter((feature) => !capabilities.includes(feature)),
@@ -1494,7 +1497,7 @@ input.on("line", (line) => {
         staticmethod(lambda: (node, old_sidecar)),
     )
 
-    with pytest.raises(pi_agent.PiRuntimeUnavailable, match="ephemeral_sessions"):
+    with pytest.raises(pi_agent.PiRuntimeUnavailable, match="protocol=6"):
         PiAgentClient.runtime_status()
 
 
@@ -1568,7 +1571,7 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
         assert process.stdout is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 6,
+            "pi_protocol_version": 7,
             "required_features": list(pi_agent._PI_REQUIRED_FEATURES),
             "request_id": "invalid-contract-version",
             "session_id": "invalid-contract-version",
@@ -1656,7 +1659,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert captured["task_contract"]["contract_id"] == "contract-test"
     assert captured["task_contract"]["allowed_tools"] == ["kb_search"]
     assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
-    assert captured["pi_protocol_version"] == 6
+    assert captured["pi_protocol_version"] == 7
     assert "host_tool_authorization" in captured["required_features"]
     assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True

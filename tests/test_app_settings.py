@@ -187,9 +187,9 @@ def test_numeric_context_window_round_trips_through_provider_settings(tmp_path: 
 def test_mcp_host_owned_tool_policies_round_trip_with_bounded_values(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     policies = [
-        {"name": "lookup_records", "effect": "read", "idempotent": True},
-        {"tool": "notes.put", "effect": "reversible", "idempotent": False},
-        {"name": "invalid", "effect": "execute", "idempotent": True},
+        {"name": "lookup_records", "effect": "read", "idempotent": True, "freshness": "run"},
+        {"tool": "notes.put", "effect": "reversible", "idempotent": False, "freshness": "volatile"},
+        {"name": "invalid", "effect": "execute", "idempotent": True, "freshness": "forever"},
         {"name": "x" * 161, "effect": "read", "idempotent": True},
         *({"name": f"bounded_{index}", "effect": "write"} for index in range(80)),
     ]
@@ -221,8 +221,8 @@ def test_mcp_host_owned_tool_policies_round_trip_with_bounded_values(tmp_path: P
         server = payload["mcp_servers"][0]
         assert server["tool_effects"] == expected_effects
         assert server["tool_policies"][:2] == [
-            {"name": "lookup_records", "effect": "read", "idempotent": True},
-            {"name": "notes.put", "effect": "reversible", "idempotent": False},
+            {"name": "lookup_records", "effect": "read", "idempotent": True, "freshness": "run"},
+            {"name": "notes.put", "effect": "reversible", "idempotent": False, "freshness": "volatile"},
         ]
         assert len(server["tool_policies"]) == 64
         assert all(policy["effect"] in {"read", "reversible", "write", "high"} for policy in server["tool_policies"])

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
 
 import pytest
 
@@ -110,7 +111,11 @@ def test_pi_mcp_bridge_discovers_read_tools_and_hides_write_tools_by_default(tmp
 
 
 def test_pi_mcp_bridge_exposes_write_tools_after_explicit_authorization(tmp_path: Path) -> None:
-    result = _probe(tmp_path, allow_write=True, tool_effects={"search_library": "read"})
+    result = _probe(
+        tmp_path,
+        allow_write=True,
+        tool_effects={"search_library": "read", "create_note": "write", "notes.put": "write"},
+    )
 
     assert result["server_count"] == 1
     assert {tool["name"] for tool in result["tools"]} == {
@@ -252,6 +257,839 @@ class _DeferredDottedWriteHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+
+class _DeferredNativeSchemaHandler(_DeferredDottedWriteHandler):
+    request_payloads: list[dict[str, object]] = []
+    marker: Path | None = None
+    marker_states: list[list[str]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        marker = type(self).marker
+        type(self).marker_states.append(
+            marker.read_text(encoding="utf-8").splitlines() if marker and marker.exists() else []
+        )
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            name = "search_tools"
+            arguments = '{"names":["mcp__fixture__search"],"activate":true}'
+        elif turn == 2:
+            name = "mcp__fixture__search"
+            arguments = "{}"
+        elif turn == 3:
+            name = "mcp__fixture__search_library"
+            arguments = "{}"
+        else:
+            name = ""
+            arguments = "{}"
+        if name:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": f"deferred-native-{turn}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "The native deferred tool completed."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-deferred-native-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-deferred-native-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _DeferredSequenceHandler(_DeferredDottedWriteHandler):
+    request_payloads: list[dict[str, object]] = []
+    sequence: list[str] = []
+    fallback_tool = "search_library"
+    search_target = "mcp__fixture__search"
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        name = type(self).sequence[turn - 1] if turn <= len(type(self).sequence) else ""
+        arguments = {
+            "search_tools": json.dumps({"names": [type(self).search_target], "activate": True}),
+            "mcp__fixture__search": "{}",
+            "mcp__fixture__search_library": '{"query":"same logical query"}',
+            "mcp__fixture__call": json.dumps({
+                "tool": type(self).fallback_tool,
+                "arguments": {"query": "fallback", "path": "../../private", "token": "secret"},
+            }),
+            "submit_plan": json.dumps({
+                "summary": "Attempt the explicitly approved MCP action",
+                "steps": [{"id": "call", "title": "Call the MCP tool"}],
+            }),
+        }.get(name, "{}")
+        if name:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": f"deferred-sequence-{turn}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "The deferred sequence completed."}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-deferred-sequence-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-deferred-sequence-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+def test_deferred_mcp_registers_and_calls_native_remote_schema_after_search(tmp_path: Path) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / "mcp-events.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}"',
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "run",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredNativeSchemaHandler.request_payloads = []
+    _DeferredNativeSchemaHandler.marker = marker
+    _DeferredNativeSchemaHandler.marker_states = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredNativeSchemaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Search the deferred fixture."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 5,
+                "max_tool_budget": 7,
+            },
+            timeout_seconds=30,
+            session_id="deferred-native-schema",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == ["connected", "called"]
+    assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
+    assert _DeferredNativeSchemaHandler.marker_states[2] == ["connected"]
+    third_tools = {
+        str(item.get("function", {}).get("name", ""))
+        for item in _DeferredNativeSchemaHandler.request_payloads[2].get("tools", [])
+    }
+    assert "mcp__fixture__search_library" in third_tools
+    audits = [event for event in events if event.get("status") in {"mcp_effect_start", "mcp_effect_end"}]
+    assert [event.get("status") for event in audits] == [
+        "mcp_effect_start",
+        "mcp_effect_end",
+        "mcp_effect_start",
+        "mcp_effect_end",
+    ]
+    assert all(dict(event.get("details", {}) or {}).get("server_id") == "fixture" for event in audits)
+    assert [dict(event.get("details", {}) or {}).get("remote_name") for event in audits] == [
+        "__catalog__",
+        "__catalog__",
+        "search_library",
+        "search_library",
+    ]
+
+
+def test_deferred_streamable_http_stays_disconnected_until_search_then_calls_native_schema(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_streamable_http_server.mjs"
+    marker = tmp_path / "http-mcp-events.txt"
+    process = subprocess.Popen(
+        [str(node), str(fixture), str(marker)],
+        cwd=Path(__file__).parents[1],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    assert process.stdout is not None
+    startup = json.loads(process.stdout.readline())
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture HTTP MCP",
+        "enabled": True,
+        "transport": "streamable-http",
+        "endpoint": f"http://127.0.0.1:{startup['port']}/mcp",
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "run",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredNativeSchemaHandler.request_payloads = []
+    _DeferredNativeSchemaHandler.marker = marker
+    _DeferredNativeSchemaHandler.marker_states = []
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredNativeSchemaHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Search the HTTP MCP fixture."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 5,
+                "max_tool_budget": 7,
+            },
+            timeout_seconds=30,
+            session_id="deferred-http-native-schema",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+        process.terminate()
+        process.wait(timeout=5)
+
+    assert events[-1]["type"] == "done"
+    assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
+    methods = marker.read_text(encoding="utf-8").splitlines()
+    assert methods.count("initialize") == 1
+    assert methods.count("tools/list") == 1
+    assert methods.count("tools/call") == 1
+    assert methods.count("called") == 1
+    request_ids = {
+        str(event.get("request_id", ""))
+        for event in events
+        if str(event.get("status", "")).startswith("mcp_")
+    }
+    assert len(request_ids) == 1
+    assert "" not in request_ids
+
+
+def test_deferred_mcp_provider_neutral_fallback_calls_authorized_read_tool(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / "mcp-fallback-events.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}"',
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "volatile",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.fallback_tool = "search_library"
+    _DeferredSequenceHandler.search_target = "mcp__fixture__call"
+    _DeferredSequenceHandler.sequence = ["search_tools", "mcp__fixture__call", ""]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Use the provider-neutral MCP fallback."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 4,
+                "max_tool_budget": 6,
+            },
+            timeout_seconds=30,
+            session_id="deferred-read-fallback",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == ["connected", "called"]
+    advertised = {
+        str(dict(item.get("function", {}) or {}).get("name", ""))
+        for item in list(_DeferredSequenceHandler.request_payloads[1].get("tools", []) or [])
+        if isinstance(item, dict)
+    }
+    assert "mcp__fixture__call" in advertised
+    call_end = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "search_library"
+    ]
+    assert len(call_end) == 1
+    assert dict(call_end[0].get("details", {}) or {}).get("decision") == "executed"
+
+
+def test_deferred_mcp_catalog_refreshes_once_per_run_with_current_request_id(tmp_path: Path) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_streamable_http_server.mjs"
+    marker = tmp_path / "http-mcp-refresh-events.txt"
+    process = subprocess.Popen(
+        [str(node), str(fixture), str(marker)],
+        cwd=Path(__file__).parents[1],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        close_fds=True,
+    )
+    assert process.stdout is not None
+    startup = json.loads(process.stdout.readline())
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture HTTP MCP",
+        "enabled": True,
+        "transport": "streamable-http",
+        "endpoint": f"http://127.0.0.1:{startup['port']}/mcp",
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "run",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.search_target = "mcp__fixture__search"
+    _DeferredSequenceHandler.sequence = [
+        "search_tools", "mcp__fixture__search", "", "mcp__fixture__search", "",
+    ]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    contract = {
+        **_TASK_CONTRACT_V2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "allowed_mcp_servers": ["fixture"],
+        "risk_level": "read_only",
+        "initial_tool_budget": 4,
+        "max_tool_budget": 6,
+    }
+    try:
+        first = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Refresh the MCP catalog in run one."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract=contract,
+            timeout_seconds=30,
+            session_id="deferred-catalog-refresh",
+        ))
+        second = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Refresh the MCP catalog in run two."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract=contract,
+            timeout_seconds=30,
+            session_id="deferred-catalog-refresh",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+        process.terminate()
+        process.wait(timeout=5)
+
+    assert first[-1]["type"] == second[-1]["type"] == "done"
+    methods = marker.read_text(encoding="utf-8").splitlines()
+    assert methods.count("initialize") == 1
+    assert methods.count("tools/list") == 2
+    second_catalog_messages = [
+        message
+        for message in _DeferredSequenceHandler.request_payloads[4]["messages"]
+        if message.get("role") == "tool"
+    ]
+    second_catalog = json.loads(str(second_catalog_messages[-1]["content"]))
+    assert second_catalog["count"] == 0
+    assert second_catalog["native_tools_activated"] == []
+    first_ids = {str(event.get("request_id", "")) for event in first if str(event.get("status", "")).startswith("mcp_")}
+    second_ids = {str(event.get("request_id", "")) for event in second if str(event.get("status", "")).startswith("mcp_")}
+    assert len(first_ids) == len(second_ids) == 1
+    assert first_ids.isdisjoint(second_ids)
+
+
+def test_eager_mcp_idempotent_disconnect_reconnects_before_single_retry(tmp_path: Path) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / "mcp-eager-retry-events.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}" "disconnect-once"',
+        "allow_write": False,
+        "deferred": False,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "volatile",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.sequence = ["mcp__fixture__search_library", ""]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Retry the eager MCP read safely."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": ["mcp__fixture__search_library"],
+                "initial_tools": ["mcp__fixture__search_library"],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 3,
+                "max_tool_budget": 5,
+            },
+            timeout_seconds=30,
+            session_id="eager-mcp-disconnect-retry",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "connected", "called", "connected", "called",
+    ]
+    call_end = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "search_library"
+    ]
+    assert len(call_end) == 1
+    assert dict(call_end[0].get("details", {}) or {}).get("decision") == "executed"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_lines", "expected_decision"),
+    [
+        ("disconnect-once", ["connected", "called", "connected", "called"], "executed"),
+        ("timeout-once", ["connected", "called", "connected", "called"], "executed"),
+        ("is-error", ["connected", "called"], "failed"),
+    ],
+)
+def test_deferred_mcp_disconnect_retry_and_error_result_are_policy_safe(
+    tmp_path: Path,
+    mode: str,
+    expected_lines: list[str],
+    expected_decision: str,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / "mcp-reliability-events.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}" "{mode}"',
+        "allow_write": False,
+        "deferred": True,
+        "call_timeout_ms": 250 if mode == "timeout-once" else 120_000,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "volatile",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredNativeSchemaHandler.request_payloads = []
+    _DeferredNativeSchemaHandler.marker = marker
+    _DeferredNativeSchemaHandler.marker_states = []
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredNativeSchemaHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Exercise MCP reliability."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 5,
+                "max_tool_budget": 7,
+            },
+            timeout_seconds=30,
+            session_id=f"deferred-mcp-{mode}",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == expected_lines, json.dumps(
+        _DeferredNativeSchemaHandler.request_payloads,
+        ensure_ascii=False,
+    )
+    call_end = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "search_library"
+    ]
+    assert len(call_end) == 1
+    assert dict(call_end[0].get("details", {}) or {}).get("decision") == expected_decision
+
+
+@pytest.mark.parametrize(
+    ("freshness", "first_physical_calls"),
+    [("run", 1), ("turn", 2), ("volatile", 2)],
+)
+def test_deferred_mcp_read_cache_is_bounded_to_one_run_and_host_freshness(
+    tmp_path: Path,
+    freshness: str,
+    first_physical_calls: int,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / f"mcp-cache-{freshness}.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}"',
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": freshness,
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.search_target = "mcp__fixture__search"
+    _DeferredSequenceHandler.sequence = [
+        "search_tools",
+        "mcp__fixture__search",
+        "mcp__fixture__search_library",
+        "mcp__fixture__search_library",
+        "",
+        "mcp__fixture__search_library",
+        "",
+    ]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    contract = {
+        **_TASK_CONTRACT_V2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "allowed_mcp_servers": ["fixture"],
+        "risk_level": "read_only",
+        "initial_tool_budget": 5,
+        "max_tool_budget": 7,
+    }
+    try:
+        first_events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Call the same read twice."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract=contract,
+            timeout_seconds=30,
+            session_id=f"deferred-cache-{freshness}",
+        ))
+        assert marker.read_text(encoding="utf-8").splitlines().count("called") == first_physical_calls
+        second_events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Call it once in a new run."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract=contract,
+            timeout_seconds=30,
+            session_id=f"deferred-cache-{freshness}",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert first_events[-1]["type"] == "done"
+    assert second_events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines().count("called") == first_physical_calls + 1
+    first_decisions = [
+        dict(event.get("details", {}) or {}).get("decision")
+        for event in first_events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "search_library"
+    ]
+    assert first_decisions == (["executed", "cache_hit"] if freshness == "run" else ["executed", "executed"])
+
+
+def test_selected_library_turn_revokes_previously_registered_native_mcp_tool(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_deferred_server.mjs"
+    marker = tmp_path / "mcp-revocation.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}"',
+        "allow_write": False,
+        "deferred": True,
+        "tool_policies": [{
+            "name": "search_library",
+            "effect": "read",
+            "idempotent": True,
+            "freshness": "volatile",
+        }],
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.search_target = "mcp__fixture__search"
+    _DeferredSequenceHandler.sequence = [
+        "search_tools",
+        "mcp__fixture__search",
+        "mcp__fixture__search_library",
+        "",
+        "mcp__fixture__search_library",
+        "",
+    ]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        first_events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Use the fixture MCP."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": ["fixture"],
+                "risk_level": "read_only",
+                "initial_tool_budget": 4,
+                "max_tool_budget": 6,
+            },
+            timeout_seconds=30,
+            session_id="deferred-native-revocation",
+        ))
+        second_events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+            api_key="fixture",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Use only the selected local library."}],
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "initial_tools": [],
+                "allowed_mcp_servers": [],
+                "risk_level": "read_only",
+                "initial_tool_budget": 3,
+                "max_tool_budget": 5,
+            },
+            timeout_seconds=30,
+            session_id="deferred-native-revocation",
+        ))
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert first_events[-1]["type"] == "done"
+    assert second_events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == ["connected", "called"]
+    second_turn_tools = {
+        str(dict(item.get("function", {}) or {}).get("name", ""))
+        for item in list(_DeferredSequenceHandler.request_payloads[4].get("tools", []) or [])
+        if isinstance(item, dict)
+    }
+    assert "mcp__fixture__search_library" not in second_turn_tools
+    assert not any(name.startswith("mcp__fixture__") for name in second_turn_tools)
 
 
 class _OrdinaryMcpDiscoveryHandler(_DeferredDottedWriteHandler):
@@ -776,6 +1614,7 @@ class _DeferredMaliciousReadHintHandler(_DeferredDottedWriteHandler):
 def test_pi_mcp_deferred_call_rejects_spoofed_read_annotation(tmp_path: Path) -> None:
     node, _sidecar = PiAgentClient.runtime_paths()
     fixture = Path(__file__).parent / "fixtures" / "fake_mcp_malicious_annotations_server.mjs"
+    marker = tmp_path / "malicious-mcp-effects.txt"
     workspace = tmp_path / "workspace.sqlite"
     settings = load_settings(workspace)
     settings["mcp_servers"] = [{
@@ -784,7 +1623,7 @@ def test_pi_mcp_deferred_call_rejects_spoofed_read_annotation(tmp_path: Path) ->
         "enabled": True,
         "transport": "stdio",
         "command": str(node),
-        "args": f'"{fixture}"',
+        "args": f'"{fixture}" "{marker}"',
         "allow_write": False,
         "deferred": True,
     }]
@@ -828,7 +1667,109 @@ def test_pi_mcp_deferred_call_rejects_spoofed_read_annotation(tmp_path: Path) ->
         if message.get("role") == "tool"
     ]
     assert tool_messages
-    assert "unavailable or not authorized" in str(tool_messages[-1].get("content", "")).lower()
+    assert "denied" in str(tool_messages[-1].get("content", "")).lower()
+    denied_audit = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "create_record"
+    ]
+    assert len(denied_audit) == 1
+    assert dict(denied_audit[0].get("details", {}) or {}).get("decision") == "denied"
+    assert marker.read_text(encoding="utf-8").splitlines() == ["connected"]
+
+
+def test_unknown_mcp_effect_stays_denied_after_explicit_high_risk_plan_approval(
+    tmp_path: Path,
+) -> None:
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_malicious_annotations_server.mjs"
+    marker = tmp_path / "approved-unknown-mcp-effects.txt"
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}" "{marker}"',
+        "allow_write": True,
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    _DeferredSequenceHandler.request_payloads = []
+    _DeferredSequenceHandler.fallback_tool = "create_record"
+    _DeferredSequenceHandler.sequence = ["submit_plan", "mcp__fixture__call", ""]
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), _DeferredSequenceHandler)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    events: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            events.extend(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+                api_key="fixture",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Approve the plan but never infer an unknown MCP effect."}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    **_TASK_CONTRACT_V2,
+                    "allowed_tools": ["mcp__fixture__call"],
+                    "initial_tools": ["mcp__fixture__call"],
+                    "allowed_mcp_servers": ["fixture"],
+                    "risk_level": "high",
+                    "allow_external_write": True,
+                    "requires_plan": True,
+                    "initial_tool_budget": 4,
+                    "max_tool_budget": 6,
+                },
+                timeout_seconds=30,
+                session_id="approved-unknown-mcp-effect",
+            ))
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        deadline = time.monotonic() + 10
+        interaction: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            interaction = next((item for item in events if item.get("type") == "interaction"), None)
+            if interaction is not None:
+                break
+            time.sleep(0.01)
+        assert interaction is not None
+        assert client.respond_interaction(
+            str(interaction["interaction_id"]),
+            {"decision": "approve"},
+            request_id=str(interaction["request_id"]),
+        ) is True
+        consumer.join(timeout=15)
+    finally:
+        client.close()
+        provider.shutdown()
+        thread.join(timeout=2)
+        provider.server_close()
+
+    assert not consumer.is_alive()
+    assert errors == []
+    assert events[-1]["type"] == "done"
+    assert marker.read_text(encoding="utf-8").splitlines() == ["connected"]
+    denied = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "create_record"
+    ]
+    assert len(denied) == 1
+    assert dict(denied[0].get("details", {}) or {}).get("decision") == "denied"
 
 
 def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: Path) -> None:
@@ -845,6 +1786,12 @@ def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: 
         "args": f'"{fixture}"',
         "allow_write": True,
         "deferred": True,
+        "tool_policies": [{
+            "name": "notes.put",
+            "effect": "write",
+            "idempotent": False,
+            "freshness": "volatile",
+        }],
     }]
     save_settings(workspace, settings)
     _DeferredDottedWriteHandler.request_payloads = []
@@ -896,3 +1843,11 @@ def test_pi_mcp_deferred_dotted_write_requires_explicit_plan_approval(tmp_path: 
     ]
     assert tool_messages
     assert "approved plan" in str(tool_messages[-1].get("content", "")).lower()
+    denied_audit = [
+        event
+        for event in events
+        if event.get("status") == "mcp_effect_end"
+        and dict(event.get("details", {}) or {}).get("remote_name") == "notes.put"
+    ]
+    assert len(denied_audit) == 1
+    assert dict(denied_audit[0].get("details", {}) or {}).get("decision") == "denied"

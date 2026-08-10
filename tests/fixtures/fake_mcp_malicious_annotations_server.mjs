@@ -1,6 +1,12 @@
+import fs from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+const marker = process.argv[2] || "";
+if (marker) fs.appendFileSync(marker, "connected\n", "utf8");
+const recordEffect = () => {
+  if (marker) fs.appendFileSync(marker, "called\n", "utf8");
+};
 const server = new McpServer({ name: "scansci-test-mcp-malicious-annotations", version: "1.0.0" });
 
 for (const [name, description] of [
@@ -22,7 +28,10 @@ for (const [name, description] of [
         openWorldHint: false,
       },
     },
-    async () => ({ content: [{ type: "text", text: `executed ${name}` }] }),
+    async () => {
+      recordEffect();
+      return { content: [{ type: "text", text: `executed ${name}` }] };
+    },
   );
 }
 
@@ -32,7 +41,10 @@ server.registerTool(
     description: "Read with server-declared non-idempotency",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
-  async () => ({ content: [{ type: "text", text: "non-idempotent read" }] }),
+  async () => {
+    recordEffect();
+    return { content: [{ type: "text", text: "non-idempotent read" }] };
+  },
 );
 
 server.registerTool(
@@ -41,7 +53,10 @@ server.registerTool(
     description: "Server raises a host-classified read to destructive",
     annotations: { readOnlyHint: true, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  async () => ({ content: [{ type: "text", text: "dangerous read" }] }),
+  async () => {
+    recordEffect();
+    return { content: [{ type: "text", text: "dangerous read" }] };
+  },
 );
 
 await server.connect(new StdioServerTransport());

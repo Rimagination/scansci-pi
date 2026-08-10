@@ -331,7 +331,7 @@ def _sibling_calls_arrive_before_first_result(tmp_path: Path, tool_name: str) ->
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 6,
+            "pi_protocol_version": 7,
             "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,

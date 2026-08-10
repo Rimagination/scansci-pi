@@ -1212,6 +1212,9 @@ def _normalize_mcp_tool_policies(value: object) -> list[dict[str, Any]]:
         policy: dict[str, Any] = {"name": name, "effect": effect}
         if isinstance(raw_policy.get("idempotent"), bool):
             policy["idempotent"] = raw_policy["idempotent"]
+        freshness = str(raw_policy.get("freshness", "") or "").strip().lower()
+        if freshness in {"volatile", "turn", "run"}:
+            policy["freshness"] = freshness
         policies.append(policy)
         used.add(name)
         if len(policies) >= _MAX_MCP_TOOL_POLICIES:
@@ -1284,6 +1287,9 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
             # annotations are advisory and must never manufacture read access.
             row["tool_effects"] = _normalize_mcp_tool_effects(item.get("tool_effects"))
             row["tool_policies"] = _normalize_mcp_tool_policies(item.get("tool_policies"))
+            call_timeout = item.get("call_timeout_ms")
+            if isinstance(call_timeout, (int, float)) and not isinstance(call_timeout, bool):
+                row["call_timeout_ms"] = max(250, min(120_000, int(call_timeout)))
             # Deferred servers expose a compact search/call surface and only
             # start the MCP process when the agent actually needs a tool.
             # Keep direct mode as the migration-safe default for existing

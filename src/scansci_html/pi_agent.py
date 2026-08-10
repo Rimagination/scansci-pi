@@ -103,7 +103,7 @@ _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
 _GATEWAY_TRANSPORT_ATTEMPTS = 3
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
-_PI_PROTOCOL_VERSION = 6
+_PI_PROTOCOL_VERSION = 7
 _PI_REQUIRED_FEATURES = (
     "task_contract_v2",
     "explicit_empty_leases",
@@ -122,6 +122,9 @@ _PI_REQUIRED_FEATURES = (
     "scientific_subagents_v1",
     "session_controls_v2",
     "thinking_max",
+    "deferred_mcp_v2",
+    "mcp_effect_audit_v1",
+    "mcp_run_cache_v1",
 )
 _MAX_JSONL_LINE_BYTES = 20 * 1024 * 1024
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
@@ -3262,6 +3265,7 @@ class PiAgentClient:
                         "allow_write",
                         "tool_effects",
                         "tool_policies",
+                        "call_timeout_ms",
                         "deferred",
                         "enabled",
                         "uninstalled",
