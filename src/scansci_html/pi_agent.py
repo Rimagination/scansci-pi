@@ -7,13 +7,16 @@ receives shell or arbitrary filesystem tools.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import re
 import requests
 import shutil
@@ -104,6 +107,9 @@ _PI_REQUIRED_FEATURES = (
     "dynamic_tools",
     "ephemeral_sessions",
     "progressive_skills",
+    "parallel_tool_dispatch",
+    "lifecycle_hooks_v1",
+    "acked_session_commands",
 )
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
@@ -124,6 +130,219 @@ _SKILL_STATE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_SESSION_STATE_ENTRIES = 200_000
 _MAX_SESSION_STATE_LINE_CHARS = 16_000_000
 _MAX_PERSISTED_SKILL_RESOURCES = 512
+
+# A read-only risk label alone does not prove thread safety.  This host-owned
+# allow-list intentionally excludes composite retrieval, mutable caches,
+# browser automation, control/loaders, MCP, and every effectful tool.
+_PARALLEL_SAFE_TOOL_NAMES = frozenset({
+    "inspect_available_tools",
+    "zotero_status",
+    "zotero_fulltext",
+    "zotero_attachment",
+    "zotero_export_bibtex",
+    "zotero_citations",
+    "obsidian_status",
+    "obsidian_search",
+    "obsidian_read",
+    "obsidian_backlinks",
+    "verify_doi",
+    "search_web",
+    "agent_reach",
+    "search_journal",
+    "audit_references",
+})
+_TOOL_EXECUTOR_WORKERS = 4
+_TOOL_EXECUTOR_CAPACITY = 16
+_TOOL_COMPLETION_CAPACITY = 32
+_DISPATCH_AUDIT_CAPACITY = 256
+_CANCEL_DRAIN_SECONDS = 1.5
+
+
+@dataclass(frozen=True)
+class _ToolCompletion:
+    request_id: str
+    generation: int
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    parallel_safe: bool = False
+    result: Any = None
+    error_type: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _PendingToolCall:
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    parallel_safe: bool
+
+
+@dataclass
+class _RunContext:
+    request_id: str
+    session_id: str
+    generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    history: list[dict[str, Any]] = field(default_factory=list)
+    history_lock: threading.Lock = field(default_factory=threading.Lock)
+    completions: Queue[_ToolCompletion] = field(
+        default_factory=lambda: Queue(maxsize=_TOOL_COMPLETION_CAPACITY)
+    )
+    in_flight: dict[str, Future[_ToolCompletion]] = field(default_factory=dict)
+    deferred: deque[_PendingToolCall] = field(default_factory=deque)
+    parallel_in_flight: int = 0
+    sequential_in_flight: bool = False
+    authorized_call_count: int = 0
+    active: bool = True
+    pending_terminal: dict[str, Any] | None = None
+    terminal_tool_completed: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def has_pending_tools(self) -> bool:
+        with self.lock:
+            return bool(self.in_flight or self.deferred)
+
+
+class _ProtocolDispatcher:
+    """Route one sidecar stdout stream without letting waiters steal events."""
+
+    def __init__(
+        self,
+        raw_output: Queue[str | None],
+        *,
+        generation: int,
+        audit: deque[dict[str, Any]],
+    ) -> None:
+        self.raw_output = raw_output
+        self.generation = generation
+        self.audit = audit
+        self._lock = threading.Lock()
+        self._requests: dict[str, Queue[dict[str, Any] | None]] = {}
+        self._commands: dict[str, Queue[dict[str, Any] | None]] = {}
+        self._request_tombstones: set[str] = set()
+        self._command_tombstones: set[str] = set()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, daemon=True, name="scansci-pi-dispatch")
+            self._thread.start()
+
+    def register_request(self, request_id: str) -> Queue[dict[str, Any] | None]:
+        channel: Queue[dict[str, Any] | None] = Queue()
+        with self._lock:
+            if request_id in self._requests:
+                raise RuntimeError(f"Pi request {request_id} is already registered")
+            self._request_tombstones.discard(request_id)
+            self._requests[request_id] = channel
+        return channel
+
+    def unregister_request(self, request_id: str) -> None:
+        with self._lock:
+            self._requests.pop(request_id, None)
+            self._request_tombstones.add(request_id)
+            if len(self._request_tombstones) > _DISPATCH_AUDIT_CAPACITY:
+                self._request_tombstones.pop()
+
+    def register_command(self, command_id: str) -> Queue[dict[str, Any] | None]:
+        channel: Queue[dict[str, Any] | None] = Queue()
+        with self._lock:
+            if command_id in self._commands:
+                raise RuntimeError(f"Pi command {command_id} is already registered")
+            self._command_tombstones.discard(command_id)
+            self._commands[command_id] = channel
+        return channel
+
+    def unregister_command(self, command_id: str) -> None:
+        with self._lock:
+            self._commands.pop(command_id, None)
+            self._command_tombstones.add(command_id)
+            if len(self._command_tombstones) > _DISPATCH_AUDIT_CAPACITY:
+                self._command_tombstones.pop()
+
+    def _record(self, kind: str, event: dict[str, Any] | None = None) -> None:
+        record = {
+            "kind": kind,
+            "generation": self.generation,
+            "type": str((event or {}).get("type", ""))[:80],
+            "request_id": str((event or {}).get("request_id", ""))[:80],
+            "command_id": str((event or {}).get("command_id", ""))[:80],
+        }
+        with self._lock:
+            self.audit.append(record)
+
+    def _broadcast_eof(self) -> None:
+        with self._lock:
+            channels = [*self._requests.values(), *self._commands.values()]
+        for channel in channels:
+            channel.put(None)
+
+    def _run(self) -> None:
+        while True:
+            raw = self.raw_output.get()
+            if raw is None:
+                self._record("eof")
+                self._broadcast_eof()
+                return
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                self._record("invalid_json")
+                with self._lock:
+                    channels = [*self._requests.values(), *self._commands.values()]
+                failure = {"type": "protocol.error", "error": "Pi Agent returned invalid JSON"}
+                for channel in channels:
+                    channel.put(dict(failure))
+                continue
+            if not isinstance(event, dict):
+                self._record("invalid_message")
+                continue
+            request_id = str(event.get("request_id", ""))
+            command_id = str(event.get("command_id", ""))
+            delivered = False
+            with self._lock:
+                request_channel = self._requests.get(request_id) if request_id else None
+                command_channel = self._commands.get(command_id) if command_id else None
+                sole_request_channel = (
+                    next(iter(self._requests.values()))
+                    if len(self._requests) == 1
+                    else None
+                )
+                late_request = bool(request_id and request_id in self._request_tombstones)
+                late_command = bool(command_id and command_id in self._command_tombstones)
+            # Correlated command acknowledgements take their command route.  If
+            # an event intentionally carries both identities, fan it out.
+            if command_channel is not None:
+                command_channel.put(event)
+                delivered = True
+            if request_channel is not None:
+                request_channel.put(event)
+                delivered = True
+            elif not request_id and not command_id and str(event.get("type", "")) == "protocol.error":
+                # An uncorrelated protocol error is generation-fatal.  Fan it
+                # out so no request or command silently waits until timeout.
+                with self._lock:
+                    channels = [*self._requests.values(), *self._commands.values()]
+                for channel in channels:
+                    channel.put(dict(event))
+                delivered = bool(channels)
+            elif (
+                sole_request_channel is not None
+                and str(event.get("type", "")) in {"tool.call", "skill.call"}
+                and not late_request
+            ):
+                # Executable messages with a missing/unknown request identity
+                # must reach the sole active host gate so it can return an
+                # explicit denial instead of leaving the sidecar promise hung.
+                sole_request_channel.put(event)
+                self._record("unauthorized_executable", event)
+                delivered = True
+            if not delivered:
+                self._record("late" if late_request or late_command else "orphan", event)
 
 
 def _persisted_skill_state(session_file: str | Path) -> dict[str, Any]:
@@ -1023,12 +1242,32 @@ class PiAgentClient:
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._process: subprocess.Popen[str] | None = None
         self._output: Queue[str | None] = Queue()
+        self._process_generation = 0
+        self._dispatcher: _ProtocolDispatcher | None = None
+        self._dispatch_audit: deque[dict[str, Any]] = deque(maxlen=_DISPATCH_AUDIT_CAPACITY)
         self._errors: list[str] = []
         self._stdin_lock = threading.Lock()
-        # Accumulate tool call results for self_assess introspection.
+        # Legacy direct-tool history remains available outside a run.  Active
+        # Pi turns use the request-scoped history stored in _RunContext.
         self._tool_history: list[dict[str, Any]] = []
+        self._tool_history_lock = threading.Lock()
+        self._worker_context = threading.local()
+        self._tool_executor = ThreadPoolExecutor(
+            max_workers=_TOOL_EXECUTOR_WORKERS,
+            thread_name_prefix="scansci-pi-tool",
+        )
+        self._tool_slots = threading.BoundedSemaphore(_TOOL_EXECUTOR_CAPACITY)
         self._run_lock = threading.Lock()
+        # Own process/session lifecycle transitions for the full duration of a
+        # run or management command.  Control writes intentionally use only
+        # _stdin_lock so another thread can still cancel an active run.
+        self._lifecycle_lock = threading.RLock()
         self._cancel_requested = threading.Event()
+        self._contexts_lock = threading.Lock()
+        self._run_contexts: dict[str, _RunContext] = {}
+        self._request_generation = 0
+        self._session_command_locks_guard = threading.Lock()
+        self._session_command_locks: dict[str, threading.Lock] = {}
         self._active_request_id = ""
         self._active_session_id = ""
         self._interaction_lock = threading.Lock()
@@ -1511,48 +1750,70 @@ class PiAgentClient:
         raise PermissionError(f"Unknown Skill instruction operation: {name}")
 
     def _ensure_process(self, *, api_key: str) -> subprocess.Popen[str]:
-        fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-        if self._process is not None and self._process.poll() is None:
-            if self._provider_key_fingerprint == fingerprint:
-                return self._process
-            self.close()
-        node_path, script_path = self.runtime_paths()
-        environment = self._node_environment()
-        environment["SCANSCIPI_PROVIDER_KEY"] = api_key
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self._output = Queue()
-        self._errors = []
-        process = subprocess.Popen(
-            [str(node_path), str(script_path)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=environment,
-            creationflags=creation_flags,
-        )
-        assert process.stdin is not None
-        assert process.stdout is not None
-        assert process.stderr is not None
-        self._process = process
-        self._provider_key_fingerprint = fingerprint
+        with self._lifecycle_lock:
+            fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            if self._process is not None and self._process.poll() is None:
+                if self._provider_key_fingerprint == fingerprint:
+                    return self._process
+                self.close()
+            node_path, script_path = self.runtime_paths()
+            environment = self._node_environment()
+            environment["SCANSCIPI_PROVIDER_KEY"] = api_key
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            raw_output: Queue[str | None] = Queue()
+            error_lines: list[str] = []
+            self._output = raw_output
+            self._process_generation += 1
+            self._dispatcher = _ProtocolDispatcher(
+                raw_output,
+                generation=self._process_generation,
+                audit=self._dispatch_audit,
+            )
+            self._errors = error_lines
+            process = subprocess.Popen(
+                [str(node_path), str(script_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=environment,
+                creationflags=creation_flags,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self._process = process
+            self._provider_key_fingerprint = fingerprint
 
-        def drain_stdout() -> None:
-            for line in process.stdout:
-                self._output.put(line)
-            self._output.put(None)
+            def drain_stdout() -> None:
+                for line in process.stdout:
+                    raw_output.put(line)
+                raw_output.put(None)
 
-        def drain_stderr() -> None:
-            for line in process.stderr:
-                if len(self._errors) < 80:
-                    self._errors.append(line.rstrip())
+            def drain_stderr() -> None:
+                for line in process.stderr:
+                    if len(error_lines) < 80:
+                        error_lines.append(line.rstrip())
 
-        threading.Thread(target=drain_stdout, daemon=True).start()
-        threading.Thread(target=drain_stderr, daemon=True).start()
-        return process
+            threading.Thread(target=drain_stdout, daemon=True).start()
+            threading.Thread(target=drain_stderr, daemon=True).start()
+            return process
+
+    def _ensure_dispatcher(self) -> _ProtocolDispatcher:
+        dispatcher = self._dispatcher
+        if dispatcher is None or dispatcher.raw_output is not self._output:
+            if self._process_generation <= 0:
+                self._process_generation = 1
+            dispatcher = _ProtocolDispatcher(
+                self._output,
+                generation=self._process_generation,
+                audit=self._dispatch_audit,
+            )
+            self._dispatcher = dispatcher
+        return dispatcher
 
     def _write(self, message: dict[str, Any]) -> None:
         process = self._process
@@ -1561,6 +1822,322 @@ class PiAgentClient:
         with self._stdin_lock:
             process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
             process.stdin.flush()
+
+    def _session_command_lock(self, session_id: str) -> threading.Lock:
+        key = str(session_id or "").strip() or "__runtime__"
+        with self._session_command_locks_guard:
+            return self._session_command_locks.setdefault(key, threading.Lock())
+
+    def _current_cancel_event(self) -> threading.Event:
+        context = getattr(self._worker_context, "run_context", None)
+        if isinstance(context, _RunContext):
+            return context.cancel_event
+        return self._cancel_requested
+
+    def _record_dispatch_audit(
+        self,
+        kind: str,
+        *,
+        request_id: str = "",
+        command_id: str = "",
+        event_type: str = "",
+        generation: int = 0,
+    ) -> None:
+        self._dispatch_audit.append({
+            "kind": str(kind)[:80],
+            "generation": int(generation or self._process_generation),
+            "type": str(event_type)[:80],
+            "request_id": str(request_id)[:80],
+            "command_id": str(command_id)[:80],
+        })
+
+    def _context_is_active(self, context: _RunContext) -> bool:
+        with self._contexts_lock:
+            return self._run_contexts.get(context.request_id) is context and context.active
+
+    def _execute_tool_worker(
+        self,
+        context: _RunContext,
+        pending: _PendingToolCall,
+    ) -> _ToolCompletion:
+        self._worker_context.run_context = context
+        try:
+            if context.cancel_event.is_set():
+                raise InterruptedError("Pi tool execution was cancelled before it started")
+            result = self._execute_tool(pending.name, dict(pending.arguments))
+            if context.cancel_event.is_set():
+                raise InterruptedError("Pi tool execution was cancelled")
+            retried = _retry_empty_search(
+                pending.name,
+                pending.arguments,
+                result,
+                executor=self._execute_tool,
+            )
+            if retried is not None:
+                result = retried
+            return _ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                result=result,
+            )
+        except Exception as error:  # noqa: BLE001 - serialized on the owning event thread
+            return _ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+        finally:
+            self._worker_context.run_context = None
+
+    def _submit_tool(self, context: _RunContext, pending: _PendingToolCall) -> None:
+        if not self._tool_slots.acquire(blocking=False):
+            context.completions.put_nowait(_ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                error_type="RuntimeError",
+                error="Pi tool executor capacity is exhausted",
+            ))
+            return
+        try:
+            future = self._tool_executor.submit(self._execute_tool_worker, context, pending)
+        except BaseException:
+            self._tool_slots.release()
+            raise
+        with context.lock:
+            context.in_flight[pending.call_id] = future
+            if pending.parallel_safe:
+                context.parallel_in_flight += 1
+            else:
+                context.sequential_in_flight = True
+
+        def completed(done: Future[_ToolCompletion]) -> None:
+            self._tool_slots.release()
+            try:
+                completion = done.result()
+            except BaseException as error:  # pragma: no cover - worker converts ordinary failures
+                completion = _ToolCompletion(
+                    request_id=context.request_id,
+                    generation=context.generation,
+                    call_id=pending.call_id,
+                    name=pending.name,
+                    arguments=dict(pending.arguments),
+                    parallel_safe=pending.parallel_safe,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            if not self._context_is_active(context):
+                self._record_dispatch_audit(
+                    "late_tool_completion",
+                    request_id=context.request_id,
+                    event_type="tool.result",
+                    generation=context.generation,
+                )
+                return
+            try:
+                context.completions.put_nowait(completion)
+            except Full:
+                context.cancel_event.set()
+                self._record_dispatch_audit(
+                    "completion_queue_full",
+                    request_id=context.request_id,
+                    event_type="tool.result",
+                    generation=context.generation,
+                )
+
+        future.add_done_callback(completed)
+
+    def _enqueue_tool(self, context: _RunContext, pending: _PendingToolCall) -> None:
+        with context.lock:
+            if not context.active:
+                return
+            can_start = (
+                not context.sequential_in_flight
+                and not context.deferred
+                and (pending.parallel_safe or not context.in_flight)
+            )
+            if not can_start:
+                context.deferred.append(pending)
+                return
+        self._submit_tool(context, pending)
+
+    def _release_tool_lane(self, context: _RunContext, completion: _ToolCompletion) -> None:
+        to_start: list[_PendingToolCall] = []
+        with context.lock:
+            future = context.in_flight.pop(completion.call_id, None)
+            if future is not None:
+                if completion.parallel_safe:
+                    context.parallel_in_flight = max(0, context.parallel_in_flight - 1)
+                else:
+                    context.sequential_in_flight = False
+            if context.in_flight or not context.active:
+                return
+            while context.deferred:
+                pending = context.deferred.popleft()
+                to_start.append(pending)
+                if not pending.parallel_safe:
+                    break
+                if context.deferred and not context.deferred[0].parallel_safe:
+                    break
+        for pending in to_start:
+            self._submit_tool(context, pending)
+
+    def _finish_tool_completion(
+        self,
+        context: _RunContext,
+        completion: _ToolCompletion,
+        *,
+        task_mode: str,
+    ) -> dict[str, Any] | None:
+        self._release_tool_lane(context, completion)
+        if not self._context_is_active(context) or context.cancel_event.is_set():
+            self._record_dispatch_audit(
+                "late_tool_completion",
+                request_id=context.request_id,
+                event_type="tool.result",
+                generation=context.generation,
+            )
+            return None
+        if completion.error_type:
+            public_error = str(_redact_tool_value(completion.error))[:500]
+            with context.history_lock:
+                context.history.append({
+                    "name": completion.name,
+                    "status": "failed",
+                    "error": public_error[:200],
+                })
+            self._write({
+                "type": "tool.result",
+                "request_id": context.request_id,
+                "call_id": completion.call_id,
+                "ok": False,
+                "error": f"{completion.error_type}: {public_error}",
+            })
+            return {"type": "tool.failed", "name": completion.name, "error": public_error}
+
+        safe_result = _redact_tool_value(_json_safe(completion.result))
+        model_result, result_meta = _bounded_tool_result_for_model(completion.name, safe_result)
+        if result_meta["persist_full"]:
+            result_reference, persisted_bytes = self._persist_tool_result(
+                completion.name,
+                safe_result if isinstance(safe_result, dict) else {"result": safe_result},
+            )
+            model_result["_full_result_reference"] = result_reference
+            model_result["_persisted_bytes"] = persisted_bytes
+        with context.history_lock:
+            context.history.append({
+                "name": completion.name,
+                "status": "ok",
+                "result_summary": _summarize_tool_result(completion.name, model_result),
+            })
+        self._write({
+            "type": "tool.result",
+            "request_id": context.request_id,
+            "call_id": completion.call_id,
+            "ok": True,
+            "result": model_result,
+        })
+        if completion.name == "build_verified_answer" and task_mode == "verified-answer":
+            context.terminal_tool_completed = completion.name
+            self._write({
+                "type": "run.cancel",
+                "request_id": context.request_id,
+                "command_id": uuid4().hex,
+            })
+        return {
+            "type": "tool.completed",
+            "name": completion.name,
+            "result": model_result,
+            "result_bytes": result_meta["original_bytes"],
+            "model_result_bytes": result_meta["model_bytes"],
+            "result_truncated": result_meta["truncated"],
+        }
+
+    def _teardown_run_context(
+        self,
+        context: _RunContext,
+        dispatcher: _ProtocolDispatcher,
+        event_channel: Queue[dict[str, Any] | None],
+        *,
+        terminal_received: bool,
+        request_started: bool,
+    ) -> None:
+        context.cancel_event.set()
+        with context.lock:
+            context.active = False
+            pending_futures = list(context.in_flight.values())
+            context.deferred.clear()
+        for future in pending_futures:
+            future.cancel()
+        with self._contexts_lock:
+            if self._run_contexts.get(context.request_id) is context:
+                self._run_contexts.pop(context.request_id, None)
+
+        if request_started and not terminal_received:
+            command_id = uuid4().hex
+            try:
+                self._write({
+                    "type": "run.cancel",
+                    "request_id": context.request_id,
+                    "command_id": command_id,
+                })
+            except (BrokenPipeError, OSError, PiRuntimeUnavailable):
+                pass
+            else:
+                cancel_deadline = time.monotonic() + _CANCEL_DRAIN_SECONDS
+                cancellation_settled = False
+                while time.monotonic() < cancel_deadline:
+                    remaining = cancel_deadline - time.monotonic()
+                    try:
+                        event = event_channel.get(timeout=min(0.05, max(0.001, remaining)))
+                    except Empty:
+                        process = self._process
+                        if process is not None and process.poll() is not None:
+                            break
+                        continue
+                    if event is None:
+                        break
+                    event_type = str(event.get("type", ""))
+                    if event_type in {"run.cancelled", "run.completed", "run.failed"}:
+                        cancellation_settled = True
+                        break
+                    if event_type == "run.cancel_rejected" and str(event.get("command_id", "")) == command_id:
+                        cancellation_settled = True
+                        break
+                if not cancellation_settled:
+                    self._record_dispatch_audit(
+                        "cancel_drain_timeout",
+                        request_id=context.request_id,
+                        command_id=command_id,
+                        event_type="run.cancel",
+                        generation=context.generation,
+                    )
+
+        dispatcher.unregister_request(context.request_id)
+        if self._active_request_id == context.request_id:
+            self._active_request_id = ""
+            self._active_session_id = ""
+        with self._interaction_lock:
+            self._approval_tokens.pop(context.request_id, None)
+            stale_interactions = [
+                interaction_id
+                for interaction_id, (pending_request_id, _kind) in self._pending_interaction_kinds.items()
+                if pending_request_id == context.request_id
+            ]
+            for interaction_id in stale_interactions:
+                self._pending_interaction_kinds.pop(interaction_id, None)
 
     def _run_request(
         self,
@@ -1571,43 +2148,101 @@ class PiAgentClient:
     ) -> Iterator[dict[str, Any]]:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("This Pi client already has an active run")
-        process = self._ensure_process(api_key=api_key)
         request_id = str(start_message["request_id"])
         session_id = str(start_message["session_id"])
         task_mode = str(start_message.get("task_mode", "general") or "general").strip().lower()
-        self._active_request_id = request_id
-        self._active_session_id = session_id
-        self._cancel_requested.clear()
-        self._write(start_message)
+        self._lifecycle_lock.acquire()
+        dispatcher: _ProtocolDispatcher | None = None
+        event_channel: Queue[dict[str, Any] | None] | None = None
+        context: _RunContext | None = None
+        request_started = False
+        try:
+            process = self._ensure_process(api_key=api_key)
+            dispatcher = self._ensure_dispatcher()
+            event_channel = dispatcher.register_request(request_id)
+            dispatcher.start()
+            self._request_generation += 1
+            context = _RunContext(
+                request_id=request_id,
+                session_id=session_id,
+                generation=self._request_generation,
+            )
+            with self._contexts_lock:
+                self._run_contexts[request_id] = context
+            self._active_request_id = request_id
+            self._active_session_id = session_id
+            self._cancel_requested = context.cancel_event
+            self._tool_history = context.history
+            request_started = True
+            self._write(start_message)
+        except BaseException:
+            try:
+                if context is not None and dispatcher is not None and event_channel is not None:
+                    self._teardown_run_context(
+                        context,
+                        dispatcher,
+                        event_channel,
+                        terminal_received=False,
+                        request_started=request_started,
+                    )
+                elif dispatcher is not None and event_channel is not None:
+                    dispatcher.unregister_request(request_id)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve the setup failure
+                self._record_dispatch_audit(
+                    "run_setup_cleanup_failed",
+                    request_id=request_id,
+                    event_type=type(cleanup_error).__name__,
+                )
+            finally:
+                self._lifecycle_lock.release()
+                self._run_lock.release()
+            raise
+        assert dispatcher is not None
+        assert event_channel is not None
+        assert context is not None
         deadline = time.monotonic() + timeout_seconds
-        terminal_tool_completed = ""
         terminal_received = False
         task_contract = dict(start_message.get("task_contract", {}) or {})
-        authorized_call_count = 0
 
         try:
             while True:
+                while True:
+                    try:
+                        completion = context.completions.get_nowait()
+                    except Empty:
+                        break
+                    public_event = self._finish_tool_completion(
+                        context,
+                        completion,
+                        task_mode=task_mode,
+                    )
+                    if public_event is not None:
+                        yield public_event
+
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("Pi Agent exceeded the request timeout")
-                try:
-                    line = self._output.get(timeout=min(1.0, remaining))
-                except Empty:
-                    if process.poll() is not None:
+                if context.pending_terminal is not None and not context.has_pending_tools():
+                    event = context.pending_terminal
+                    context.pending_terminal = None
+                else:
+                    try:
+                        routed = event_channel.get(timeout=min(0.05, remaining))
+                    except Empty:
+                        if process.poll() is not None:
+                            detail = "\n".join(self._errors[-8:])
+                            raise RuntimeError(f"Pi Agent exited unexpectedly{': ' + detail if detail else ''}")
+                        continue
+                    if routed is None:
                         detail = "\n".join(self._errors[-8:])
-                        raise RuntimeError(f"Pi Agent exited unexpectedly{': ' + detail if detail else ''}")
-                    continue
-                if line is None:
-                    detail = "\n".join(self._errors[-8:])
-                    raise RuntimeError(f"Pi Agent closed its output stream{': ' + detail if detail else ''}")
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise RuntimeError("Pi Agent returned an invalid protocol message") from error
+                        raise RuntimeError(f"Pi Agent closed its output stream{': ' + detail if detail else ''}")
+                    event = routed
 
                 event_type = str(event.get("type", ""))
                 event_request_id = str(event.get("request_id", ""))
-                if event_type != "skill.call" and event_request_id and event_request_id != request_id:
+                if event_type == "protocol.error":
+                    raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                if event_type not in {"skill.call", "tool.call"} and event_request_id and event_request_id != request_id:
                     continue
                 if event_type == "skill.call":
                     call_id = str(event.get("call_id", ""))
@@ -1676,61 +2311,33 @@ class PiAgentClient:
                             request_id=event_request_id,
                             active_request_id=request_id,
                             approval_token=self._approval_tokens.get(request_id),
-                            call_count=authorized_call_count,
+                            call_count=context.authorized_call_count,
                         )
-                        authorized_call_count += 1
-                        if self._cancel_requested.is_set():
+                        context.authorized_call_count += 1
+                        if context.cancel_event.is_set():
                             raise InterruptedError("Pi tool execution was cancelled before it started")
-                        result = self._execute_tool(name, arguments)
-                        if self._cancel_requested.is_set():
-                            raise InterruptedError("Pi tool execution was cancelled")
-                        # L1: auto-retry empty searches with a broadened query.
-                        # If the first pass returns zero hits, the query is
-                        # likely too narrow; a widened retry costs one extra
-                        # API round-trip but often prevents the model from
-                        # giving up or hallucinating.
-                        retried = _retry_empty_search(name, arguments, result, executor=self._execute_tool)
-                        if retried is not None:
-                            result = retried
-                        safe_result = _redact_tool_value(_json_safe(result))
-                        model_result, result_meta = _bounded_tool_result_for_model(name, safe_result)
-                        if result_meta["persist_full"]:
-                            result_reference, persisted_bytes = self._persist_tool_result(
-                                name,
-                                safe_result if isinstance(safe_result, dict) else {"result": safe_result},
-                            )
-                            model_result["_full_result_reference"] = result_reference
-                            model_result["_persisted_bytes"] = persisted_bytes
-                        # Record for self_assess introspection.
-                        self._tool_history.append({
-                            "name": name,
-                            "status": "ok",
-                            "result_summary": _summarize_tool_result(name, model_result),
-                        })
-                        response = {
-                            "type": "tool.result",
-                            "request_id": request_id,
-                            "call_id": call_id,
-                            "ok": True,
-                            "result": model_result,
-                        }
-                        yield {
-                            "type": "tool.completed",
-                            "name": name,
-                            "result": model_result,
-                            "result_bytes": result_meta["original_bytes"],
-                            "model_result_bytes": result_meta["model_bytes"],
-                            "result_truncated": result_meta["truncated"],
-                        }
-                        if name == "build_verified_answer" and task_mode == "verified-answer":
-                            terminal_tool_completed = name
+                        descriptor = builtin_capability_descriptor(name)
+                        parallel_safe = (
+                            name in _PARALLEL_SAFE_TOOL_NAMES
+                            and isinstance(descriptor, dict)
+                            and str(descriptor.get("risk_level", "")) == "read_only"
+                            and descriptor.get("idempotent") is not False
+                        )
+                        self._enqueue_tool(context, _PendingToolCall(
+                            call_id=call_id,
+                            name=name,
+                            arguments=arguments,
+                            parallel_safe=parallel_safe,
+                        ))
+                        continue
                     except Exception as error:  # noqa: BLE001 - error is returned to the model as tool output
                         public_error = str(_redact_tool_value(str(error)))[:500]
-                        self._tool_history.append({
-                            "name": name,
-                            "status": "failed",
-                            "error": public_error[:200],
-                        })
+                        with context.history_lock:
+                            context.history.append({
+                                "name": name,
+                                "status": "failed",
+                                "error": public_error[:200],
+                            })
                         response = {
                             "type": "tool.result",
                             "request_id": request_id,
@@ -1740,13 +2347,6 @@ class PiAgentClient:
                         }
                         yield {"type": "tool.failed", "name": name, "error": public_error}
                     self._write(response)
-                    if terminal_tool_completed:
-                        # This composite tool is the evidence endpoint's final
-                        # product, not intermediate context for another model
-                        # generation. Abort only the SDK's automatic follow-up
-                        # turn after the successful tool result has been
-                        # persisted; report the run as successfully completed.
-                        self._write({"type": "run.cancel", "request_id": request_id})
                     continue
                 if event_type == "session.ready":
                     durable_file = str(event.get("session_file", ""))
@@ -1813,6 +2413,7 @@ class PiAgentClient:
                     accepted = event_type.endswith("_ack")
                     yield {
                         "type": "control",
+                        "command_id": str(event.get("command_id", "")),
                         "action": action,
                         "status": "accepted" if accepted else "rejected",
                         "error": str(event.get("error", "")),
@@ -1833,6 +2434,9 @@ class PiAgentClient:
                         "payload": dict(event.get("payload", {}) or {}),
                     }
                 elif event_type == "run.completed":
+                    if context.has_pending_tools():
+                        context.pending_terminal = dict(event)
+                        continue
                     terminal_received = True
                     yield {
                         "type": "done",
@@ -1843,12 +2447,12 @@ class PiAgentClient:
                     return
                 elif event_type == "run.cancelled":
                     terminal_received = True
-                    if terminal_tool_completed:
+                    if context.terminal_tool_completed:
                         yield {
                             "type": "done",
                             "stats": {},
                             "truncated": False,
-                            "terminal_tool": terminal_tool_completed,
+                            "terminal_tool": context.terminal_tool_completed,
                         }
                     else:
                         yield {"type": "cancelled", "request_id": request_id, "session_id": session_id}
@@ -1877,24 +2481,17 @@ class PiAgentClient:
                         failure=dict(event.get("failure", {}) or {}),
                     )
         finally:
-            if not terminal_received:
-                self._cancel_requested.set()
-                try:
-                    self._write({"type": "run.cancel", "request_id": request_id})
-                except (BrokenPipeError, OSError, PiRuntimeUnavailable):
-                    pass
-            self._active_request_id = ""
-            self._active_session_id = ""
-            with self._interaction_lock:
-                self._approval_tokens.pop(request_id, None)
-                stale_interactions = [
-                    interaction_id
-                    for interaction_id, (pending_request_id, _kind) in self._pending_interaction_kinds.items()
-                    if pending_request_id == request_id
-                ]
-                for interaction_id in stale_interactions:
-                    self._pending_interaction_kinds.pop(interaction_id, None)
-            self._run_lock.release()
+            try:
+                self._teardown_run_context(
+                    context,
+                    dispatcher,
+                    event_channel,
+                    terminal_received=terminal_received,
+                    request_started=request_started,
+                )
+            finally:
+                self._lifecycle_lock.release()
+                self._run_lock.release()
 
     @property
     def active_request_id(self) -> str:
@@ -1912,8 +2509,16 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target:
             return False
-        self._cancel_requested.set()
-        self._write({"type": "run.cancel", "request_id": target})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        context.cancel_event.set()
+        self._write({
+            "type": "run.cancel",
+            "request_id": target,
+            "command_id": uuid4().hex,
+        })
         return True
 
     def pause(self, request_id: str | None = None) -> bool:
@@ -1933,7 +2538,16 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target:
             return False
-        self._write({"type": "run.steer", "request_id": target, "text": text})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        self._write({
+            "type": "run.steer",
+            "request_id": target,
+            "command_id": uuid4().hex,
+            "text": text,
+        })
         return True
 
     def follow_up(self, text: str, request_id: str | None = None) -> bool:
@@ -1942,7 +2556,16 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target or not str(text).strip():
             return False
-        self._write({"type": "run.follow_up", "request_id": target, "text": str(text).strip()})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        self._write({
+            "type": "run.follow_up",
+            "request_id": target,
+            "command_id": uuid4().hex,
+            "text": str(text).strip(),
+        })
         return True
 
     def respond_interaction(
@@ -1978,6 +2601,49 @@ class PiAgentClient:
         )
         return True
 
+    def _await_command(
+        self,
+        message: dict[str, Any],
+        *,
+        terminal_types: set[str],
+        timeout_seconds: float,
+        session_lock_id: str,
+        timeout_message: str,
+    ) -> dict[str, Any]:
+        command_id = str(message.get("command_id", ""))
+        if not command_id:
+            raise ValueError("Pi session commands require a command_id")
+        with self._lifecycle_lock:
+            dispatcher = self._ensure_dispatcher()
+            lock = self._session_command_lock(session_lock_id)
+            with lock:
+                channel = dispatcher.register_command(command_id)
+                dispatcher.start()
+                try:
+                    # Registration must happen before stdin write: a local sidecar
+                    # can acknowledge a command in the same scheduling quantum.
+                    self._write(message)
+                    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(timeout_message)
+                        try:
+                            event = channel.get(timeout=min(0.25, remaining))
+                        except Empty:
+                            process = self._process
+                            if process is not None and process.poll() is not None:
+                                raise RuntimeError("Pi Agent exited while awaiting a session command")
+                            continue
+                        if event is None:
+                            raise RuntimeError("Pi Agent closed while awaiting a session command")
+                        if str(event.get("type", "")) == "protocol.error":
+                            raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                        if str(event.get("type", "")) in terminal_types:
+                            return dict(event)
+                finally:
+                    dispatcher.unregister_command(command_id)
+
     def compact(self, session_id: str, *, instructions: str = "", timeout_seconds: float = 180.0) -> dict[str, Any]:
         """Run Pi's native context compactor for a loaded durable session."""
 
@@ -1986,35 +2652,24 @@ class PiAgentClient:
         if self._process is None or self._process.poll() is not None:
             raise PiRuntimeUnavailable("Load the durable session with stream_chat before compacting it")
         command_id = uuid4().hex
-        self._write(
+        event = self._await_command(
             {
                 "type": "session.compact",
                 "command_id": command_id,
                 "session_id": session_id,
                 "instructions": instructions,
-            }
+            },
+            terminal_types={"session.compact_completed", "session.compact_failed"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=session_id,
+            timeout_message="Pi session compaction exceeded the timeout",
         )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Pi session compaction exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while compacting the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.compact_failed":
-                raise RuntimeError(str(event.get("error", "Pi compaction failed")))
-            if event.get("type") == "session.compact_completed":
-                result = dict(event.get("result", {}) or {})
-                if isinstance(event.get("stats"), dict):
-                    result["_session_stats"] = dict(event["stats"])
-                return result
+        if event.get("type") == "session.compact_failed":
+            raise RuntimeError(str(event.get("error", "Pi compaction failed")))
+        result = dict(event.get("result", {}) or {})
+        if isinstance(event.get("stats"), dict):
+            result["_session_stats"] = dict(event["stats"])
+        return result
 
     def load_session(
         self,
@@ -2035,48 +2690,58 @@ class PiAgentClient:
         session_file = str(self._load_session_registry().get(logical_session_id, ""))
         if not logical_session_id or not session_file or not Path(session_file).is_file():
             raise PiRuntimeUnavailable("The durable Pi session file is unavailable")
-        self._ensure_process(api_key=api_key)
-        command_id = uuid4().hex
-        self._write(
-            {
-                "type": "session.load",
-                "command_id": command_id,
-                "session_id": logical_session_id,
-                "session_file": session_file,
-                "cwd": str(self.workspace.parent),
-                "agent_dir": str(self.agent_dir),
-                "provider_kind": provider_kind,
-                "base_url": base_url,
-                "model_id": model_id,
-                "thinking_level": thinking_level,
-                "mcp_servers": self._enabled_mcp_servers(),
-                "disabled_tools": self._disabled_artifact_tools(),
-            }
-        )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Loading the Pi session exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while loading the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.load_failed":
-                raise RuntimeError(str(event.get("error", "Pi session load failed")))
-            if event.get("type") == "session.loaded":
-                return dict(event)
+        with self._lifecycle_lock:
+            self._ensure_process(api_key=api_key)
+            command_id = uuid4().hex
+            event = self._await_command(
+                {
+                    "type": "session.load",
+                    "command_id": command_id,
+                    "session_id": logical_session_id,
+                    "session_file": session_file,
+                    "cwd": str(self.workspace.parent),
+                    "agent_dir": str(self.agent_dir),
+                    "provider_kind": provider_kind,
+                    "base_url": base_url,
+                    "model_id": model_id,
+                    "thinking_level": thinking_level,
+                    "mcp_servers": self._enabled_mcp_servers(),
+                    "disabled_tools": self._disabled_artifact_tools(),
+                },
+                terminal_types={"session.loaded", "session.load_failed"},
+                timeout_seconds=timeout_seconds,
+                session_lock_id=logical_session_id,
+                timeout_message="Loading the Pi session exceeded the timeout",
+            )
+        if event.get("type") == "session.load_failed":
+            raise RuntimeError(str(event.get("error", "Pi session load failed")))
+        return event
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
         """Unload a session while retaining its persisted JSONL file."""
 
-        if self._process is not None and self._process.poll() is None:
-            self._write({"type": "session.close", "session_id": session_id})
+        command_id = uuid4().hex
+        if self._process is None or self._process.poll() is not None:
+            return {
+                "type": "session.closed",
+                "command_id": command_id,
+                "session_id": str(session_id or ""),
+                "not_loaded": True,
+            }
+        event = self._await_command(
+            {
+                "type": "session.close",
+                "command_id": command_id,
+                "session_id": session_id,
+            },
+            terminal_types={"session.closed", "session.close_rejected"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=session_id,
+            timeout_message="Closing the Pi session exceeded the timeout",
+        )
+        if event.get("type") == "session.close_rejected":
+            raise RuntimeError(str(event.get("error", "Pi session close was rejected")))
+        return event
 
     def fork_session(
         self,
@@ -2096,38 +2761,27 @@ class PiAgentClient:
         if not source_id or not target_id:
             raise ValueError("Source and target session ids are required")
         command_id = uuid4().hex
-        self._write(
+        event = self._await_command(
             {
                 "type": "session.fork",
                 "command_id": command_id,
                 "source_session_id": source_id,
                 "target_session_id": target_id,
-            }
+            },
+            terminal_types={"session.forked", "session.fork_failed"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=source_id,
+            timeout_message="Forking the Pi session exceeded the timeout",
         )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Forking the Pi session exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while forking the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.fork_failed":
-                raise PiAgentRunError(
-                    str(event.get("error", "Pi session fork failed")),
-                    failure=dict(event.get("failure", {}) or {}),
-                )
-            if event.get("type") == "session.forked":
-                durable_file = str(event.get("session_file", ""))
-                if durable_file:
-                    self._save_session_registry({target_id: durable_file})
-                return dict(event)
+        if event.get("type") == "session.fork_failed":
+            raise PiAgentRunError(
+                str(event.get("error", "Pi session fork failed")),
+                failure=dict(event.get("failure", {}) or {}),
+            )
+        durable_file = str(event.get("session_file", ""))
+        if durable_file:
+            self._save_session_registry({target_id: durable_file})
+        return event
 
     def forget_session(self, session_id: str) -> None:
         """Forget a broken session mapping without deleting its audit file.
@@ -2154,20 +2808,21 @@ class PiAgentClient:
     def close(self) -> None:
         """Stop the sidecar; persisted sessions remain recoverable."""
 
-        process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                self._write({"type": "runtime.shutdown"})
-                process.wait(timeout=3)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                process.kill()
-                process.wait(timeout=5)
-        self._process = None
-        self._provider_key_fingerprint = ""
-        if self._gateway_adapter is not None:
-            self._gateway_adapter.close()
-            self._gateway_adapter = None
-            self._gateway_adapter_signature = ""
+        with self._lifecycle_lock:
+            process = self._process
+            if process is not None and process.poll() is None:
+                try:
+                    self._write({"type": "runtime.shutdown"})
+                    process.wait(timeout=3)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    process.kill()
+                    process.wait(timeout=5)
+            self._process = None
+            self._provider_key_fingerprint = ""
+            if self._gateway_adapter is not None:
+                self._gateway_adapter.close()
+                self._gateway_adapter = None
+                self._gateway_adapter_signature = ""
 
     def __enter__(self) -> "PiAgentClient":
         return self
@@ -2604,7 +3259,7 @@ class PiAgentClient:
                 workspace=self.workspace,
                 strategy=strategy,
                 timeout=timeout,
-                cancel_check=self._cancel_requested.is_set,
+                cancel_check=self._current_cancel_event().is_set,
             )
             reported_files = [
                 str(value)
@@ -3403,7 +4058,12 @@ class PiAgentClient:
                 workspace=self.workspace,
             )
         if name == "self_assess":
-            return _build_self_assessment(self._tool_history)
+            context = getattr(self._worker_context, "run_context", None)
+            if isinstance(context, _RunContext):
+                with context.history_lock:
+                    return _build_self_assessment(list(context.history))
+            with self._tool_history_lock:
+                return _build_self_assessment(list(self._tool_history))
         raise ValueError(f"Unsupported ScanSci Pi tool: {name}")
 
     def _selected_notebooks(self) -> list[dict[str, Any]]:

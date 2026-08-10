@@ -28,7 +28,11 @@ import {
   initialToolNames,
   type CatalogRisk,
 } from "./tool-catalog.js";
-import { createSearchToolsTool } from "./runtime-extension.js";
+import {
+  buildNonDestructiveContextView,
+  createSearchToolsTool,
+  registerRuntimeLifecycleHooks,
+} from "./runtime-extension.js";
 
 type JsonRecord = Record<string, unknown>;
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -88,6 +92,7 @@ interface SessionState {
   prefixShape: JsonRecord;
   sessionManager: SessionManager;
   loadedSkillsRef: { current: Map<string, LoadedSkill> };
+  lastContextReport: JsonRecord;
 }
 
 interface LoadedSkill extends JsonRecord {
@@ -114,6 +119,7 @@ interface ActiveRun {
   lastExtensionSuccesses: number;
   toolFingerprints: Map<string, number>;
   idempotentResults: Map<string, JsonRecord>;
+  inFlightReads: Map<string, Promise<JsonRecord>>;
   taskContract: NormalizedTaskContract;
   planApproved: boolean;
   askUserCount: number;
@@ -508,48 +514,6 @@ function buildPrefixShape(
     schema_version: "scansci.prefix-shape.v2",
     hash: stableHash(components),
     components,
-  };
-}
-
-function pruneStaleToolResults(state: SessionState, keepRecentTurns = 2): JsonRecord {
-  const messages = Array.isArray(state.session.messages) ? state.session.messages as JsonRecord[] : [];
-  let currentTurn = 0;
-  const locations: Array<{ message: JsonRecord; turn: number }> = [];
-  for (const message of messages) {
-    const role = String(message.role || "").toLowerCase();
-    if (role === "user") currentTurn += 1;
-    if (["tool", "toolresult", "tool_result"].includes(role)) locations.push({ message, turn: currentTurn });
-  }
-  let pruned = 0;
-  let originalChars = 0;
-  let retainedChars = 0;
-  for (const location of locations) {
-    const message = location.message;
-    const content = message.content;
-    const encoded = JSON.stringify(content ?? "");
-    const size = encoded.length;
-    originalChars += size;
-    if (currentTurn - location.turn >= Math.max(1, keepRecentTurns)) {
-      const notice = {
-        _scansci_pruned: true,
-        tool: String(message.toolName || message.tool_name || message.name || "tool").slice(0, 80),
-        original_chars: size,
-        notice: "Stale tool output was pruned before context compaction; rerun a focused tool if needed.",
-      };
-      message.content = [{ type: "text", text: JSON.stringify(notice) }];
-      message._scansci_context_pruned = true;
-      pruned += 1;
-    }
-    retainedChars += JSON.stringify(message.content ?? "").length;
-  }
-  return {
-    policy: "stale_tool_result_pruning",
-    examined_tool_results: locations.length,
-    pruned_tool_results: pruned,
-    preserved_tool_results: Math.max(0, locations.length - pruned),
-    original_chars: originalChars,
-    retained_chars: retainedChars,
-    saved_chars: Math.max(0, originalChars - retainedChars),
   };
 }
 
@@ -965,11 +929,17 @@ function claimToolCall(name: string, args: JsonRecord, mcpPolicy?: McpToolPolicy
   return activeRun;
 }
 
-async function callPythonTool(name: string, args: JsonRecord): Promise<JsonRecord> {
+async function callPythonTool(name: string, args: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
   const activeRun = activeRunStorage.getStore();
   if (!activeRun) throw new Error("No active Pi run owns this tool call");
   const fingerprint = toolFingerprint(name, args);
-  if (toolRisk(name) !== "read_only" && activeRun.idempotentResults.has(fingerprint)) {
+  const effectful = toolRisk(name) !== "read_only";
+  const coalescible = !effectful && executionModeForTool(name, toolRisk(name)) === "parallel";
+  // Budget and duplicate-strategy accounting are logical-call semantics: a
+  // reused or coalesced sibling still costs one model-requested call even when
+  // the host performs no additional physical operation.
+  claimToolCall(name, args);
+  if (effectful && activeRun.idempotentResults.has(fingerprint)) {
     emit({
       type: "status.update",
       request_id: activeRun.requestId,
@@ -978,19 +948,69 @@ async function callPythonTool(name: string, args: JsonRecord): Promise<JsonRecor
     });
     return activeRun.idempotentResults.get(fingerprint) as JsonRecord;
   }
-  claimToolCall(name, args);
+  if (coalescible) {
+    const existing = activeRun.inFlightReads.get(fingerprint);
+    if (existing) {
+      emit({
+        type: "status.update",
+        request_id: activeRun.requestId,
+        status: "tool_coalesced",
+        name,
+      });
+      return existing;
+    }
+  }
   const callId = crypto.randomUUID();
   const requestId = activeRun.requestId;
-  const effectful = toolRisk(name) !== "read_only";
   const forwardedArgs = effectful
     ? { ...args, _scansci_idempotency_key: `${activeRun.sessionId}:${fingerprint}` }
     : args;
-  emit({ type: "tool.call", request_id: requestId, call_id: callId, name, arguments: forwardedArgs });
-  const result = await new Promise<JsonRecord>((resolve, reject) => {
+  let abortListener: (() => void) | undefined;
+  const rawPhysical = new Promise<JsonRecord>((resolve, reject) => {
+    // Register before writing stdout so an immediate host response cannot beat
+    // the pending-call record.
     pendingTools.set(callId, { requestId, resolve, reject });
+    abortListener = () => {
+      const pending = pendingTools.get(callId);
+      if (pending?.requestId !== requestId) return;
+      pendingTools.delete(callId);
+      reject(new Error("Tool bridge call was aborted"));
+    };
+    if (signal?.aborted) {
+      abortListener();
+      return;
+    }
+    signal?.addEventListener("abort", abortListener, { once: true });
+    try {
+      emit({ type: "tool.call", request_id: requestId, call_id: callId, name, arguments: forwardedArgs });
+    } catch (error) {
+      pendingTools.delete(callId);
+      reject(error instanceof Error ? error : new Error(errorText(error)));
+    }
   });
-  if (effectful) activeRun.idempotentResults.set(fingerprint, result);
-  return result;
+  const physical = rawPhysical.then(
+    (result) => {
+      if (abortListener) signal?.removeEventListener("abort", abortListener);
+      return result;
+    },
+    (error) => {
+      if (abortListener) signal?.removeEventListener("abort", abortListener);
+      throw error;
+    },
+  );
+  if (!coalescible) {
+    const result = await physical;
+    if (effectful) activeRun.idempotentResults.set(fingerprint, result);
+    return result;
+  }
+  activeRun.inFlightReads.set(fingerprint, physical);
+  try {
+    return await physical;
+  } finally {
+    if (activeRun.inFlightReads.get(fingerprint) === physical) {
+      activeRun.inFlightReads.delete(fingerprint);
+    }
+  }
 }
 
 const SKILL_STATE_CUSTOM_TYPE = "scansci.skill-state.v1";
@@ -1342,8 +1362,8 @@ function bridgeTool(
     description,
     executionMode: executionModeForTool(name, toolRisk(name)),
     parameters,
-    execute: async (_toolCallId, params) => {
-      const result = boundedToolPayload(name, await callPythonTool(name, params as JsonRecord));
+    execute: async (_toolCallId, params, signal) => {
+      const result = boundedToolPayload(name, await callPythonTool(name, params as JsonRecord, signal));
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
         details: result,
@@ -2560,6 +2580,8 @@ async function createSession(
   const loadedSkillsRef = { current: new Map<string, LoadedSkill>() };
   const injectedSkillKeysRef = { current: new Set<string>() };
   let sessionManagerRef: SessionManager | undefined;
+  let sessionRef: AgentSession | undefined;
+  let stateRef: SessionState | undefined;
   const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
   runtime.registerProvider("scansci-pi", {
     name: "ScanSci Pi provider",
@@ -2587,59 +2609,77 @@ async function createSession(
     systemPromptOverride: () => sessionInvariantSystemPrompt(),
     appendSystemPromptOverride: () => [],
     extensionFactories: [{
-      name: "scansci-provider-request-guard",
+      name: "scansci-runtime-lifecycle",
       factory: (pi) => {
-        pi.on("before_agent_start", (event) => {
-          // Snapshot only the resources included in this agent-start prompt.
-          // A Skill loaded later in the same loop must remain in its first
-          // tool result so the very next provider call can read it once.
-          injectedSkillKeysRef.current = new Set(loadedSkillsRef.current.keys());
-          return {
-            // Compose from Pi's actual cached base prompt.  The loader base is
-            // deliberately session-invariant; all authority and date-sensitive
-            // content comes from the current request reference on every turn.
-            systemPrompt: `${event.systemPrompt}\n\n${currentTurnSystemPrompt(requestRef.current, loadedSkillsRef.current)}`,
-          };
-        });
-        pi.on("context", (event) => ({
-          messages: event.messages.map((message) => {
-            if (
-              message.role !== "toolResult"
-              || message.toolName !== "load_skill"
-              || !message.details
-              || typeof message.details !== "object"
-              || Array.isArray(message.details)
-            ) {
-              return message;
+        registerRuntimeLifecycleHooks(pi, {
+          current: () => requestRef.current,
+          emit,
+          beforeAgentStart: (event) => {
+            // Snapshot only the resources included in this agent-start prompt.
+            // A Skill loaded later in the same loop must remain in its first
+            // tool result so the very next provider call can read it once.
+            injectedSkillKeysRef.current = new Set(loadedSkillsRef.current.keys());
+            return {
+              // Compose from Pi's actual cached base prompt.  The loader base is
+              // deliberately session-invariant; all authority and date-sensitive
+              // content comes from the current request reference on every turn.
+              systemPrompt: `${event.systemPrompt}\n\n${currentTurnSystemPrompt(requestRef.current, loadedSkillsRef.current)}`,
+            };
+          },
+          context: (event) => {
+            const projected = buildNonDestructiveContextView(event.messages);
+            const messages = projected.messages.map((message) => {
+              if (
+                message.role !== "toolResult"
+                || message.toolName !== "load_skill"
+                || !message.details
+                || typeof message.details !== "object"
+                || Array.isArray(message.details)
+              ) {
+                return message;
+              }
+              try {
+                const metadata = skillMetadata(message.details as JsonRecord);
+                const key = `${metadata.skill_id}:${metadata.resource}`;
+                if (!injectedSkillKeysRef.current.has(key)) return message;
+                const payload = {
+                  ...metadata,
+                  already_loaded: true,
+                  instructions_in_system_prompt: true,
+                  authority: "instructions_only",
+                };
+                return {
+                  ...message,
+                  content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+                  details: payload,
+                };
+              } catch {
+                // Only host-created, hash-valid Skill results are eligible for
+                // deduplication; malformed records stay visible and fail closed.
+                return message;
+              }
+            });
+            return { messages, report: projected.report };
+          },
+          onContextReport: (report) => {
+            if (stateRef) stateRef.lastContextReport = { ...report };
+            if (Number(report.pruned_tool_results || 0) > 0) {
+              emit({
+                type: "status.update",
+                request_id: String(requestRef.current.request_id || ""),
+                status: "context_pruned",
+                name: "stale_tool_results",
+                details: report,
+              });
             }
-            try {
-              const metadata = skillMetadata(message.details as JsonRecord);
-              const key = `${metadata.skill_id}:${metadata.resource}`;
-              if (!injectedSkillKeysRef.current.has(key)) return message;
-              const payload = {
-                ...metadata,
-                already_loaded: true,
-                instructions_in_system_prompt: true,
-                authority: "instructions_only",
-              };
-              return {
-                ...message,
-                content: [{ type: "text" as const, text: JSON.stringify(payload) }],
-                details: payload,
-              };
-            } catch {
-              // Only host-created, hash-valid Skill results are eligible for
-              // deduplication; malformed records stay visible and fail closed.
-              return message;
-            }
-          }),
-        }));
-        pi.on("before_provider_request", (event) => {
-          const currentRequest = requestRef.current;
-          const payload = providerApi(currentRequest.provider_kind, currentRequest.api_surface) === "openai-completions"
-            ? normalizeTextOnlyOpenAIRequest(event.payload)
-            : event.payload;
-          return guardProviderRequest(payload, PROVIDER_INPUT_LIMIT);
+          },
+          beforeProviderRequest: (event) => {
+            const currentRequest = requestRef.current;
+            const payload = providerApi(currentRequest.provider_kind, currentRequest.api_surface) === "openai-completions"
+              ? normalizeTextOnlyOpenAIRequest(event.payload)
+              : event.payload;
+            return guardProviderRequest(payload, PROVIDER_INPUT_LIMIT);
+          },
         });
       },
     }],
@@ -2663,8 +2703,6 @@ async function createSession(
     })),
     (name): CatalogRisk => toolRisk(name, external.policies.get(name)),
   );
-  let sessionRef: AgentSession | undefined;
-  let stateRef: SessionState | undefined;
   const isAuthorized = (name: string): boolean => contractAllowsTool(
     normalizeTaskContract(requestRef.current),
     name,
@@ -2791,6 +2829,7 @@ async function createSession(
     prefixShape,
     sessionManager,
     loadedSkillsRef,
+    lastContextReport: {},
   };
   stateRef = state;
   state.unsubscribe = state.session.subscribe((event) => {
@@ -2937,6 +2976,7 @@ async function run(request: RunStart): Promise<void> {
     lastExtensionSuccesses: 0,
     toolFingerprints: new Map<string, number>(),
     idempotentResults: new Map<string, JsonRecord>(),
+    inFlightReads: new Map<string, Promise<JsonRecord>>(),
     taskContract,
     planApproved: false,
     askUserCount: 0,
@@ -2950,12 +2990,8 @@ async function run(request: RunStart): Promise<void> {
   try {
     await activeRunStorage.run(runState, async () => executeRun(request, runState));
   } finally {
-    for (const [callId, pending] of pendingSkills) {
-      if (pending.requestId === runState.requestId) {
-        pendingSkills.delete(callId);
-        pending.reject(new Error("Skill instruction call outlived its owning run"));
-      }
-    }
+    rejectPendingForRequest(runState.requestId, "Bridge operation outlived its owning run");
+    runState.inFlightReads.clear();
     activeRuns.delete(runState.requestId);
     if (activeSessionRequests.get(runState.sessionId) === runState.requestId) {
       activeSessionRequests.delete(runState.sessionId);
@@ -2974,6 +3010,9 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
     state = resolved.state;
     originalThinkingLevel = state.session.thinkingLevel;
     state.currentRequestId = request.request_id;
+    if (runState.cancelled) {
+      throw new Error("Run was cancelled while its session was being prepared");
+    }
     const unsubscribeRetry = state.session.subscribe((event) => {
       if (event.type === "auto_retry_start") lastRetryError = event.errorMessage;
       if (event.type === "message_end" && event.message.role === "assistant") {
@@ -3033,10 +3072,6 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
       context_policy: request.context_policy || {},
     });
     try {
-      const cleanup = pruneStaleToolResults(state);
-      if (Number(cleanup.pruned_tool_results || 0) > 0) {
-        emit({ type: "status.update", request_id: request.request_id, status: "context_pruned", name: "stale_tool_results", details: cleanup });
-      }
       try {
         await state.session.prompt(request.prompt);
       } catch (error) {
@@ -3103,10 +3138,6 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
             : requiredToolMissing ? "required_tool" : "incomplete_answer",
           attempt: continuation + 1,
         });
-        const cleanup = pruneStaleToolResults(state);
-        if (Number(cleanup.pruned_tool_results || 0) > 0) {
-          emit({ type: "status.update", request_id: request.request_id, status: "context_pruned", name: "stale_tool_results", details: cleanup });
-        }
         const strategyInstruction = stalledRecoveries > 0
           ? "The previous route made no progress. Do NOT repeat a tool with equivalent arguments. Switch source, narrow the query, change parameters, or use another permitted tool while preserving completed results. "
           : "";
@@ -3185,68 +3216,107 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
   }
 }
 
-async function cancelRun(message: JsonRecord): Promise<void> {
-  const requestId = String(message.request_id || "");
-  const activeRun = activeRuns.get(requestId);
-  if (!activeRun) {
-    emit({ type: "run.cancel_rejected", request_id: requestId, error: "Run is not active" });
-    return;
-  }
-  activeRun.cancelled = true;
+function rejectPendingForRequest(requestId: string, reason: string): void {
   for (const [callId, pending] of pendingTools) {
     if (pending.requestId === requestId) {
       pendingTools.delete(callId);
-      pending.reject(new Error("Run cancelled"));
+      pending.reject(new Error(reason));
     }
   }
   for (const [callId, pending] of pendingSkills) {
     if (pending.requestId === requestId) {
       pendingSkills.delete(callId);
-      pending.reject(new Error("Run cancelled"));
+      pending.reject(new Error(reason));
     }
   }
   for (const [interactionId, pending] of pendingInteractions) {
     if (pending.requestId === requestId) {
       pendingInteractions.delete(interactionId);
-      pending.reject(new Error("Run cancelled"));
+      pending.reject(new Error(reason));
     }
   }
+}
+
+async function cancelRun(message: JsonRecord): Promise<void> {
+  const requestId = String(message.request_id || "");
+  const commandId = String(message.command_id || "");
+  const activeRun = activeRuns.get(requestId);
+  if (!activeRun) {
+    emit({ type: "run.cancel_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
+    return;
+  }
+  activeRun.cancelled = true;
+  rejectPendingForRequest(requestId, "Run cancelled");
+  activeRun.inFlightReads.clear();
   const state = sessions.get(activeRun.sessionId);
-  await state?.session.abort();
-  emit({ type: "run.cancel_ack", request_id: requestId, session_id: activeRun.sessionId });
+  try {
+    await state?.session.abort();
+    emit({ type: "run.cancel_ack", request_id: requestId, command_id: commandId, session_id: activeRun.sessionId });
+  } catch (error) {
+    emit({
+      type: "run.cancel_rejected",
+      request_id: requestId,
+      command_id: commandId,
+      session_id: activeRun.sessionId,
+      error: errorText(error),
+    });
+  }
 }
 
 async function steerRun(message: JsonRecord): Promise<void> {
   const requestId = String(message.request_id || "");
+  const commandId = String(message.command_id || "");
   const activeRun = activeRuns.get(requestId);
   if (!activeRun) {
-    emit({ type: "run.steer_rejected", request_id: requestId, error: "Run is not active" });
+    emit({ type: "run.steer_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
     return;
   }
   const state = sessions.get(activeRun.sessionId);
-  if (!state) throw new Error("Active session is unavailable");
-  await state.session.steer(String(message.text || ""));
-  emit({ type: "run.steer_ack", request_id: requestId, session_id: activeRun.sessionId });
+  try {
+    if (!state) throw new Error("Active session is unavailable");
+    await state.session.steer(String(message.text || ""));
+    emit({ type: "run.steer_ack", request_id: requestId, command_id: commandId, session_id: activeRun.sessionId });
+  } catch (error) {
+    emit({
+      type: "run.steer_rejected",
+      request_id: requestId,
+      command_id: commandId,
+      session_id: activeRun.sessionId,
+      error: errorText(error),
+    });
+  }
 }
 
 async function followUpRun(message: JsonRecord): Promise<void> {
   const requestId = String(message.request_id || "");
+  const commandId = String(message.command_id || "");
   const activeRun = activeRuns.get(requestId);
   if (!activeRun) {
-    emit({ type: "run.follow_up_rejected", request_id: requestId, error: "Run is not active" });
+    emit({ type: "run.follow_up_rejected", request_id: requestId, command_id: commandId, error: "Run is not active" });
     return;
   }
   const state = sessions.get(activeRun.sessionId);
-  if (!state) throw new Error("Active session is unavailable");
   const text = String(message.text || "").trim();
-  if (!text) throw new Error("Follow-up text is required");
-  await state.session.followUp(text);
-  emit({
-    type: "run.follow_up_ack",
-    request_id: requestId,
-    session_id: activeRun.sessionId,
-    queued: state.session.pendingMessageCount,
-  });
+  try {
+    if (!state) throw new Error("Active session is unavailable");
+    if (!text) throw new Error("Follow-up text is required");
+    await state.session.followUp(text);
+    emit({
+      type: "run.follow_up_ack",
+      request_id: requestId,
+      command_id: commandId,
+      session_id: activeRun.sessionId,
+      queued: state.session.pendingMessageCount,
+    });
+  } catch (error) {
+    emit({
+      type: "run.follow_up_rejected",
+      request_id: requestId,
+      command_id: commandId,
+      session_id: activeRun.sessionId,
+      error: errorText(error),
+    });
+  }
 }
 
 function resolveInteraction(message: JsonRecord): void {
@@ -3310,14 +3380,13 @@ async function compactSession(message: JsonRecord): Promise<void> {
     return;
   }
   try {
-    const cleanup = pruneStaleToolResults(state);
     const result = await state.session.compact(String(message.instructions || "") || undefined);
     emit({
       type: "session.compact_completed",
       command_id: commandId,
       session_id: sessionId,
       result,
-      stats: { ...sessionStats(state), contextCleanup: cleanup },
+      stats: { ...sessionStats(state), contextCleanup: state.lastContextReport },
     });
   } catch (error) {
     emit({ type: "session.compact_failed", command_id: commandId, session_id: sessionId, error: errorText(error) });
@@ -3361,9 +3430,11 @@ async function loadSession(message: JsonRecord): Promise<void> {
 
 async function closeSession(message: JsonRecord): Promise<void> {
   const sessionId = String(message.session_id || "");
+  const commandId = String(message.command_id || "");
   if (activeSessionRequests.has(sessionId)) {
     emit({
       type: "session.close_rejected",
+      command_id: commandId,
       session_id: sessionId,
       request_id: activeSessionRequests.get(sessionId) || "",
       error: "Session has an active run",
@@ -3371,13 +3442,22 @@ async function closeSession(message: JsonRecord): Promise<void> {
     return;
   }
   const state = sessions.get(sessionId);
-  if (state) {
-    state.unsubscribe();
-    state.session.dispose();
-    await Promise.all(state.mcpClients.map((client) => client.close().catch(() => undefined)));
-    sessions.delete(sessionId);
+  try {
+    if (state) {
+      state.unsubscribe();
+      state.session.dispose();
+      await Promise.all(state.mcpClients.map((client) => client.close().catch(() => undefined)));
+      sessions.delete(sessionId);
+    }
+    emit({ type: "session.closed", command_id: commandId, session_id: sessionId });
+  } catch (error) {
+    emit({
+      type: "session.close_rejected",
+      command_id: commandId,
+      session_id: sessionId,
+      error: errorText(error),
+    });
   }
-  emit({ type: "session.closed", session_id: sessionId });
 }
 
 async function forkSession(message: JsonRecord): Promise<void> {
@@ -3492,7 +3572,7 @@ async function probeMcp(message: JsonRecord): Promise<void> {
 async function shutdown(): Promise<void> {
   for (const runState of activeRuns.values()) {
     runState.cancelled = true;
-    await sessions.get(runState.sessionId)?.session.abort().catch(() => undefined);
+    runState.inFlightReads.clear();
   }
   for (const pending of pendingInteractions.values()) pending.reject(new Error("Runtime shutting down"));
   pendingInteractions.clear();
@@ -3500,6 +3580,13 @@ async function shutdown(): Promise<void> {
   pendingSkills.clear();
   for (const pending of pendingTools.values()) pending.reject(new Error("Runtime shutting down"));
   pendingTools.clear();
+  // Reject bridge promises before awaiting abort: abort waits for agent idle,
+  // while an agent can be waiting on one of those very promises.
+  await Promise.all(
+    [...activeRuns.values()].map((runState) => (
+      sessions.get(runState.sessionId)?.session.abort().catch(() => undefined)
+    )),
+  );
   for (const state of sessions.values()) {
     state.unsubscribe();
     state.session.dispose();
@@ -3536,7 +3623,16 @@ input.on("line", (line) => {
   } else if (message.type === "tool.result") {
     const callId = String(message.call_id || "");
     const pending = pendingTools.get(callId);
-    if (!pending) return;
+    if (!pending) {
+      emit({
+        type: "status.update",
+        request_id: String(message.request_id || ""),
+        status: "late_tool_result_ignored",
+        name: "tool.result",
+        details: { call_id: callId.slice(0, 80) },
+      });
+      return;
+    }
     if (String(message.request_id || "") !== pending.requestId) {
       emit({
         type: "protocol.error",

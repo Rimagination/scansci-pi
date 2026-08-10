@@ -244,7 +244,16 @@ class _SiblingToolHandler(BaseHTTPRequestHandler):
                         "index": index,
                         "id": f"sibling-{index}",
                         "type": "function",
-                        "function": {"name": type(self).tool_name, "arguments": "{}"},
+                        "function": {
+                            "name": type(self).tool_name,
+                            "arguments": json.dumps(
+                                {"query": f"parallel fixture {index}"}
+                                if type(self).tool_name == "search_web"
+                                else {"notebook_id": f"fixture-{index}"}
+                                if type(self).tool_name == "inspect_workspace"
+                                else {}
+                            ),
+                        },
                     }
                     for index in range(2)
                 ],
@@ -421,7 +430,8 @@ def _sibling_calls_arrive_before_first_result(tmp_path: Path, tool_name: str) ->
 @pytest.mark.parametrize(
     ("tool_name", "expected_parallel"),
     [
-        ("inspect_workspace", True),
+        ("search_web", True),
+        ("inspect_workspace", False),
         ("self_assess", False),
     ],
 )
@@ -468,7 +478,13 @@ def test_sidecar_starts_bootstrap_only_then_additively_activates_an_authorized_t
 
     assert len(_DynamicToolHandler.request_payloads) == 3
     first, second, third = map(_tool_names, _DynamicToolHandler.request_payloads)
-    assert first == {"ask_user", "search_tools", "submit_plan"}
+    assert first == {
+        "ask_user",
+        "load_skill",
+        "search_skills",
+        "search_tools",
+        "submit_plan",
+    }
     assert second == first | {"inspect_workspace"}
     assert third == second
     assert "search_web" not in third
@@ -521,6 +537,8 @@ def test_explicit_empty_lease_keeps_loader_but_returns_an_empty_domain_inventory
 
     assert _tool_names(_InventoryCaptureHandler.request_payloads[0]) == {
         "ask_user",
+        "load_skill",
+        "search_skills",
         "search_tools",
         "submit_plan",
     }
@@ -620,7 +638,13 @@ def test_additive_activation_survives_the_next_turn_in_the_same_session(tmp_path
         _tool_names,
         _PersistentActivationHandler.request_payloads,
     )
-    assert first_surface == {"ask_user", "search_tools", "submit_plan"}
+    assert first_surface == {
+        "ask_user",
+        "load_skill",
+        "search_skills",
+        "search_tools",
+        "submit_plan",
+    }
     assert activated_surface == first_surface | {"inspect_workspace"}
     assert resumed_surface == activated_surface
     assert "search_web" not in resumed_surface
@@ -661,7 +685,13 @@ def test_empty_lease_loader_executes_but_cannot_activate_a_domain_tool(tmp_path:
         server.server_close()
 
     assert len(_EmptyLeaseSearchHandler.request_payloads) == 2
-    governance = {"ask_user", "search_tools", "submit_plan"}
+    governance = {
+        "ask_user",
+        "load_skill",
+        "search_skills",
+        "search_tools",
+        "submit_plan",
+    }
     assert _tool_names(_EmptyLeaseSearchHandler.request_payloads[0]) == governance
     assert _tool_names(_EmptyLeaseSearchHandler.request_payloads[1]) == governance
     tool_messages = [

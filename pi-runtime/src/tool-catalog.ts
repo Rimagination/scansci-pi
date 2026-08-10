@@ -84,12 +84,7 @@ const REVERSIBLE_TOOLS = new Set([
 // Keep this allow-list explicit: a read-only risk label does not prove that a
 // composite, control, plugin, or deferred MCP implementation is thread-safe.
 const THREAD_SAFE_READ_TOOLS = new Set([
-  "inspect_workspace",
   "inspect_available_tools",
-  "read_task_documents",
-  "search_local_evidence",
-  "kb_search",
-  "zotero_search",
   "zotero_status",
   "zotero_fulltext",
   "zotero_attachment",
@@ -100,10 +95,8 @@ const THREAD_SAFE_READ_TOOLS = new Set([
   "obsidian_read",
   "obsidian_backlinks",
   "verify_doi",
-  "discover_papers",
   "search_web",
   "agent_reach",
-  "browser_access",
   "search_journal",
   "audit_references",
 ]);

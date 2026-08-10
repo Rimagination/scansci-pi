@@ -17,6 +17,9 @@ export const PI_PROTOCOL_FEATURES = [
   "dynamic_tools",
   "ephemeral_sessions",
   "progressive_skills",
+  "parallel_tool_dispatch",
+  "lifecycle_hooks_v1",
+  "acked_session_commands",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;

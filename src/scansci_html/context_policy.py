@@ -58,7 +58,7 @@ def _pruned_content(message: Mapping[str, Any], original_chars: int) -> Any:
     return notice
 
 
-def prune_stale_tool_results(
+def context_view_with_stale_tool_pruning(
     messages: Sequence[Mapping[str, Any]],
     *,
     keep_recent_turns: int = 2,
@@ -100,4 +100,18 @@ def prune_stale_tool_results(
     return output, ContextPruneReport(examined, pruned, preserved, original_chars, retained_chars)
 
 
-__all__ = ["ContextPruneReport", "prune_stale_tool_results"]
+def prune_stale_tool_results(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    keep_recent_turns: int = 2,
+) -> tuple[list[dict[str, Any]], ContextPruneReport]:
+    """Compatibility wrapper for the non-destructive provider context view."""
+
+    return context_view_with_stale_tool_pruning(messages, keep_recent_turns=keep_recent_turns)
+
+
+__all__ = [
+    "ContextPruneReport",
+    "context_view_with_stale_tool_pruning",
+    "prune_stale_tool_results",
+]
