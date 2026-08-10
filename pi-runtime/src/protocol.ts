@@ -1,4 +1,6 @@
-export const PI_PROTOCOL_VERSION = 4;
+import type { ModelRuntimeDescriptor, PiImageContent } from "./multimodal.js";
+
+export const PI_PROTOCOL_VERSION = 5;
 
 export const PI_PROTOCOL_FEATURES = [
   "multi_session",
@@ -20,6 +22,9 @@ export const PI_PROTOCOL_FEATURES = [
   "parallel_tool_dispatch",
   "lifecycle_hooks_v1",
   "acked_session_commands",
+  "model_runtime_descriptor",
+  "token_envelope",
+  "multimodal_turns",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;
@@ -60,6 +65,8 @@ export interface RunStartMessage extends ProtocolRecord {
   thinking_level?: string;
   system_prompt: string;
   prompt: string;
+  images?: PiImageContent[];
+  model_runtime: ModelRuntimeDescriptor;
   task_mode?: string;
   task_contract?: ProtocolRecord;
   prefix_shape?: ProtocolRecord;

@@ -1,3 +1,4 @@
+import base64
 import json
 from dataclasses import replace
 from datetime import datetime
@@ -476,6 +477,9 @@ def test_direct_chat_jobs_are_conversation_scoped_and_keep_live_turn_controls(tm
     assert "job.queue.shift()" in script
     assert "void runDirectChatTurn(job, nextTurn)" in script
     assert 'request("/api/chat/steer"' in script
+    steer_function = script.split("async function steerDirectChat", 1)[1].split("function fallbackSteerDirectChat", 1)[0]
+    assert "turn.images.length" not in steer_function
+    assert "images: turn.images" in steer_function
     assert 'request("/api/chat/cancel"' in script
     assert 'request("/api/chat/pause"' in script
     assert "job.restartForSteer = true;" in script
@@ -521,6 +525,56 @@ def test_pause_routes_delegate_to_run_and_direct_chat_controls(tmp_path: Path, m
     assert chat_response.status == 200
     assert _payload(chat_response) == {"ok": True}
     assert calls == [("run", "run-pause-test"), ("chat", "chat-pause-test")]
+
+
+def test_chat_steer_and_follow_up_routes_forward_validated_images(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    raw = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+    )
+    data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    calls: list[tuple[str, str, list[dict[str, str]]]] = []
+
+    class ActivePi:
+        active_request_id = "active-request"
+
+        def steer(self, text, request_id, *, images):
+            calls.append(("steer", f"{request_id}:{text}", list(images)))
+            return True
+
+        def follow_up(self, text, request_id, *, images):
+            calls.append(("follow_up", f"{request_id}:{text}", list(images)))
+            return True
+
+    with app.research_agent._active_pi_lock:
+        app.research_agent._active_pi_clients["control-run"] = ActivePi()
+
+    steer = _payload(app.dispatch(
+        "POST",
+        "/api/chat/steer",
+        json.dumps({
+            "run_id": "control-run",
+            "text": "inspect this",
+            "images": [{"name": "steer.png", "data_url": data_url}],
+        }).encode("utf-8"),
+    ))
+    follow = _payload(app.dispatch(
+        "POST",
+        "/api/chat/follow-up",
+        json.dumps({
+            "run_id": "control-run",
+            "text": "compare this",
+            "images": [{"name": "follow.png", "data_url": data_url}],
+        }).encode("utf-8"),
+    ))
+
+    assert steer == {"ok": True, "image_count": 1}
+    assert follow == {"ok": True, "run_id": "control-run", "queued": True, "image_count": 1}
+    assert [kind for kind, _text, _images in calls] == ["steer", "follow_up"]
+    assert all(images[0]["type"] == "image" for _kind, _text, images in calls)
+    assert all(images[0]["mimeType"] == "image/png" for _kind, _text, images in calls)
+    assert all("data_url" not in images[0] for _kind, _text, images in calls)
 
 
 def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public_search(tmp_path: Path, monkeypatch):
@@ -2024,7 +2078,7 @@ def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch
     assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
 
 
-def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_image_question_with_web_tool_uses_pi_native_multimodal_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "workspace.sqlite"
     save_settings(
         workspace,
@@ -2038,6 +2092,7 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
                 "models": [{
                     "id": "vision-model",
                     "name": "Vision model",
+                    "context_window": "32K",
                     "capabilities": ["vision", "tool"],
                 }],
             }],
@@ -2050,17 +2105,22 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
         lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
     )
     monkeypatch.setattr(
-        "scansci_html.research_agent.vision_image_blocks",
-        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
     )
     observed: dict[str, object] = {}
 
-    def direct_model_stream(*_args, **kwargs):
-        observed["messages"] = kwargs["messages"]
+    def pi_model_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "tool.completed", "name": "search_web", "result": {"items": []}}
         yield {"type": "delta", "content": "图中有一条曲线。"}
-        yield {"type": "done", "usage": {"total_tokens": 8}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 8}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_model_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("vision must not use direct transport")),
+    )
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -2073,11 +2133,139 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
     assert events[-1]["type"] == "RUN_FINISHED"
     result = events[-1]["result"]
     assert result["message"]["content"] == "图中有一条曲线。"
-    assert result["agent_runtime"]["harness"] == "direct-provider"
-    assert result["agent_runtime"]["task_mode"] == "general"
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert result["agent_runtime"]["task_mode"] != "general"
     assert result["agent_runtime"]["vision_route"]["model_id"] == "vision-model"
+    assert result["agent_runtime"]["vision_route"]["route"] == "pi-native"
     assert result["user_images"] == [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}]
-    assert isinstance(observed["messages"][-1]["content"], list)
+    assert observed["images"] == [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}]
+    assert observed["model_runtime"]["input_modalities"] == ["text", "image"]
+    assert isinstance(observed["messages"][-1]["content"], str)
+
+
+def test_synchronous_image_chat_is_pi_first_and_never_uses_direct_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(workspace, {
+        "active_model": {"provider_id": "vision-provider", "model_id": "vision-model"},
+        "providers": [{
+            "id": "vision-provider",
+            "name": "Vision provider",
+            "kind": "openai-compatible",
+            "base_url": "https://vision.example/v1",
+            "models": [{
+                "id": "vision-model",
+                "context_window": "32K",
+                "capabilities": ["reasoning", "vision", "tool"],
+            }],
+        }],
+    })
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    image = {"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}
+    monkeypatch.setattr("scansci_html.research_agent.pi_image_blocks", lambda *_args: [image])
+    observed: dict[str, object] = {}
+
+    def pi_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "delta", "content": "Pi visual answer"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("vision must not use direct transport")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    result = runtime.chat({
+        "messages": [{"role": "user", "content": "Inspect this image."}],
+        "images": [{"name": "figure.png", "data_url": "ignored"}],
+    })
+
+    assert result["message"]["content"] == "Pi visual answer"
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert observed["images"] == [image]
+    assert observed["model_runtime"]["input_modalities"] == ["text", "image"]
+
+
+def test_unsupported_image_route_declares_ocr_degradation_and_still_uses_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    text_provider = {
+        "id": "text-provider",
+        "name": "Text provider",
+        "kind": "openai-compatible",
+        "base_url": "https://text.example/v1",
+        "enabled": True,
+        "models": [{
+            "id": "text-model",
+            "context_window": "32K",
+            "capabilities": ["reasoning", "tool"],
+        }],
+    }
+    save_settings(workspace, {
+        "active_model": {"provider_id": "text-provider", "model_id": "text-model"},
+        "providers": [text_provider],
+    })
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.research_agent.select_vision_route", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.select_text_route",
+        lambda *_args, **_kwargs: {
+            "provider": text_provider,
+            "provider_id": "text-provider",
+            "provider_kind": "openai-compatible",
+            "model_id": "text-model",
+        },
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "scan.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.ocr_image_blocks",
+        lambda *_args, **_kwargs: {"text": "OCR-SENTINEL", "backend": "fixture", "available": True},
+    )
+    observed: dict[str, object] = {}
+
+    def pi_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "delta", "content": "OCR-assisted answer"}
+        yield {"type": "done", "stats": {}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("OCR route must still use Pi")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    result = runtime.chat({
+        "messages": [{"role": "user", "content": "Read this scan."}],
+        "images": [{"name": "scan.png", "data_url": "ignored"}],
+    })
+
+    assert result["message"]["content"] == "OCR-assisted answer"
+    assert result["agent_runtime"]["vision_route"]["route"] == "pi-ocr-text"
+    assert result["agent_runtime"]["vision_route"]["degraded"] is True
+    assert observed["images"] == []
+    assert observed["model_runtime"]["input_modalities"] == ["text"]
+    assert observed["model_runtime"]["degraded"] is True
+    assert "vision_input_degraded_to_ocr_text" in observed["model_runtime"]["degradation_reasons"]
+    assert "OCR-SENTINEL" in str(observed["messages"][-1]["content"])
 
 
 def test_pi_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(

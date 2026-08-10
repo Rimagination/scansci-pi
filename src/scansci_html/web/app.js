@@ -5080,11 +5080,11 @@ function queueDirectChatTurn(job, turn, { front = false, announce = true } = {})
 }
 
 async function steerDirectChat(job, turn) {
-  if (!job?.runId || !turn?.question || turn.images.length || turn.audio.length || turn.sourceFiles.length) return false;
+  if (!job?.runId || !turn?.question || turn.audio.length || turn.sourceFiles.length) return false;
   try {
     const result = await request("/api/chat/steer", {
       method: "POST",
-      body: JSON.stringify({ run_id: job.runId, text: turn.question }),
+      body: JSON.stringify({ run_id: job.runId, text: turn.question, images: turn.images }),
     });
     if (!result?.ok) return false;
     job.pendingSteer = turn;

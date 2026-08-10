@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from scansci_html.model_metadata import ModelRuntimeDescriptor
 from scansci_html.pi_agent import (
+    _PI_REQUIRED_FEATURES,
     _PendingToolCall,
     PiAgentClient,
     _ProtocolDispatcher,
@@ -411,8 +413,8 @@ def test_identical_reads_only_coalesce_for_the_explicit_safe_allowlist(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 4,
-            "required_features": ["task_contract_v2", "parallel_tool_dispatch"],
+            "pi_protocol_version": 5,
+            "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
             "ephemeral_session": True,
@@ -424,6 +426,8 @@ def test_identical_reads_only_coalesce_for_the_explicit_safe_allowlist(
             "thinking_level": "off",
             "system_prompt": "",
             "prompt": "Make the two identical sibling calls.",
+            "images": [],
+            "model_runtime": ModelRuntimeDescriptor.for_testing().to_dict(),
             "task_mode": "general",
             "task_contract": _read_only_contract(tool_name),
             "mcp_servers": [],
@@ -512,12 +516,8 @@ def test_immediate_cancel_during_session_setup_never_reaches_the_provider(
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 4,
-            "required_features": [
-                "task_contract_v2",
-                "parallel_tool_dispatch",
-                "lifecycle_hooks_v1",
-            ],
+            "pi_protocol_version": 5,
+            "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
             "ephemeral_session": True,
@@ -529,6 +529,8 @@ def test_immediate_cancel_during_session_setup_never_reaches_the_provider(
             "thinking_level": "off",
             "system_prompt": "",
             "prompt": "This request must be cancelled before provider I/O.",
+            "images": [],
+            "model_runtime": ModelRuntimeDescriptor.for_testing().to_dict(),
             "task_mode": "general",
             "task_contract": _read_only_contract(),
             "mcp_servers": [],

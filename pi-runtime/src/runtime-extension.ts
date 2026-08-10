@@ -8,6 +8,7 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { estimatePiImageTokens, type PiImageContent } from "./multimodal.js";
 import { searchToolCatalog, type ToolCatalogEntry } from "./tool-catalog.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -15,6 +16,133 @@ type JsonRecord = Record<string, unknown>;
 export interface ContextViewResult {
   messages: ContextEvent["messages"];
   report?: JsonRecord;
+}
+
+function contextSafeValue(value: unknown, depth = 0): unknown {
+  if (depth > 32) return "[NESTED CONTENT]";
+  if (Array.isArray(value)) return value.map((item) => contextSafeValue(item, depth + 1));
+  if (!value || typeof value !== "object") return value;
+  const record = value as JsonRecord;
+  if (record.type === "image") {
+    return { type: "image", mimeType: String(record.mimeType || ""), data: "[IMAGE BYTES]" };
+  }
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [
+      key,
+      key === "data" && typeof item === "string" ? "[BINARY DATA]" : contextSafeValue(item, depth + 1),
+    ]),
+  );
+}
+
+function collectContextImages(value: unknown, images: PiImageContent[], depth = 0): void {
+  if (depth > 32 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectContextImages(item, images, depth + 1);
+    return;
+  }
+  if (typeof value !== "object") return;
+  const record = value as JsonRecord;
+  if (record.type === "image" && typeof record.data === "string" && typeof record.mimeType === "string") {
+    images.push({
+      type: "image",
+      data: record.data,
+      mimeType: record.mimeType as PiImageContent["mimeType"],
+    });
+    return;
+  }
+  for (const item of Object.values(record)) collectContextImages(item, images, depth + 1);
+}
+
+function conservativeContextTokens(value: unknown): number {
+  const text = JSON.stringify(contextSafeValue(value));
+  const images: PiImageContent[] = [];
+  collectContextImages(value, images);
+  let visualTokens = 0;
+  try {
+    visualTokens = estimatePiImageTokens(images);
+  } catch {
+    visualTokens = images.length * 1200;
+  }
+  return Math.ceil(Buffer.byteLength(text, "utf8") / 3) + visualTokens + 6;
+}
+
+export function buildTokenEnvelopeContextView(
+  messages: ContextEvent["messages"],
+  inputLimit: number,
+): ContextViewResult {
+  const clean = structuredClone(messages);
+  const limit = Math.max(4096, Math.floor(Number(inputLimit) || 0));
+  const finalUserIndex = (() => {
+    for (let index = clean.length - 1; index >= 0; index -= 1) {
+      const role = String((clean[index] as unknown as JsonRecord).role || "").toLowerCase();
+      if (role === "user") return index;
+    }
+    return -1;
+  })();
+  if (finalUserIndex < 0) return { messages: clean, report: { token_envelope: "no_user_message" } };
+  const originalTokens = clean.reduce((total, message) => total + conservativeContextTokens(message), 0);
+  const mandatoryTokens = conservativeContextTokens(clean[finalUserIndex]);
+  if (mandatoryTokens > limit) {
+    // Never clip the current user request. The non-swallowable provider gate
+    // below the extension layer will reject it before network transmission.
+    return {
+      messages: clean,
+      report: {
+        token_envelope: "mandatory_overflow",
+        provider_input_tokens: limit,
+        mandatory_tokens: mandatoryTokens,
+        estimated_tokens_before: originalTokens,
+      },
+    };
+  }
+
+  const units: Array<{ indices: number[]; priority: number; recency: number }> = [];
+  let turn = 0;
+  const dialogue = new Map<number, number[]>();
+  for (let index = 0; index < clean.length; index += 1) {
+    if (index === finalUserIndex) continue;
+    const message = clean[index] as unknown as JsonRecord;
+    const role = String(message.role || "").toLowerCase();
+    if (role === "user") turn += 1;
+    if (["tool", "toolresult", "tool_result"].includes(role)) {
+      units.push({ indices: [index], priority: 1, recency: index });
+    } else {
+      const indices = dialogue.get(turn) || [];
+      indices.push(index);
+      dialogue.set(turn, indices);
+    }
+  }
+  for (const indices of dialogue.values()) {
+    if (indices.length) units.push({ indices, priority: 4, recency: Math.max(...indices) });
+  }
+  units.sort((left, right) => right.priority - left.priority || right.recency - left.recency);
+
+  const retained = new Map<number, ContextEvent["messages"][number]>([[finalUserIndex, clean[finalUserIndex]]]);
+  let used = mandatoryTokens;
+  let omitted = 0;
+  for (const unit of units) {
+    const tokens = unit.indices.reduce((total, index) => total + conservativeContextTokens(clean[index]), 0);
+    if (used + tokens <= limit) {
+      for (const index of unit.indices) retained.set(index, clean[index]);
+      used += tokens;
+      continue;
+    }
+    omitted += unit.indices.length;
+  }
+  const output = [...retained.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, message]) => message) as ContextEvent["messages"];
+  return {
+    messages: output,
+    report: {
+      token_envelope: "model_aware_token_envelope_v1",
+      provider_input_tokens: limit,
+      estimated_tokens_before: originalTokens,
+      estimated_tokens: used,
+      retained_messages: output.length,
+      omitted_messages: omitted,
+    },
+  };
 }
 
 export function buildNonDestructiveContextView(

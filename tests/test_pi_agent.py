@@ -1433,7 +1433,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     assert status["ready"] is True
     assert status["runtime"] == "pi"
     assert status["version"] == "0.80.10"
-    assert status["protocol"] == 4
+    assert status["protocol"] == 5
     assert {
         "multi_session",
         "ask_user",
@@ -1446,6 +1446,9 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
         "structured_mcp_effects",
         "current_request_context",
         "progressive_skills",
+        "model_runtime_descriptor",
+        "token_envelope",
+        "multimodal_turns",
     }.issubset(set(status["capabilities"]))
 
 
@@ -1563,8 +1566,8 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
         assert process.stdout is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 4,
-            "required_features": ["task_contract_v2"],
+            "pi_protocol_version": 5,
+            "required_features": list(pi_agent._PI_REQUIRED_FEATURES),
             "request_id": "invalid-contract-version",
             "session_id": "invalid-contract-version",
             "cwd": str(tmp_path),
@@ -1575,6 +1578,8 @@ def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
             "thinking_level": "off",
             "system_prompt": "",
             "prompt": "Answer without tools.",
+            "images": [],
+            "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing().to_dict(),
             "task_mode": "knowledge",
             "task_contract": {
                 **invalid_contract,
@@ -1649,7 +1654,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert captured["task_contract"]["contract_id"] == "contract-test"
     assert captured["task_contract"]["allowed_tools"] == ["kb_search"]
     assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
-    assert captured["pi_protocol_version"] == 4
+    assert captured["pi_protocol_version"] == 5
     assert "host_tool_authorization" in captured["required_features"]
     assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True
@@ -1899,6 +1904,9 @@ def test_progressive_skill_sidecar_load_resume_and_compaction_preserve_hash_and_
         "base_url": f"http://127.0.0.1:{server.server_port}/v1",
         "api_key": "fixture-key",
         "model_id": "fixture-model",
+        "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing(
+            context_window_tokens=200 * 1024,
+        ).to_dict(),
         "thinking_level": "off",
         "task_mode": "general",
         "task_contract": {
@@ -3164,6 +3172,9 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    model_runtime = pi_agent.ModelRuntimeDescriptor.for_testing(
+        context_window_tokens=200 * 1024,
+    ).to_dict()
     try:
         events = list(
             client.stream_chat(
@@ -3171,6 +3182,7 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
                 api_key="fixture-key",
                 model_id="fixture-model",
+                model_runtime=model_runtime,
                 messages=[{"role": "user", "content": "a" * 100_000}],
                 thinking_level="off",
                 task_mode="web",
@@ -3204,7 +3216,7 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
     assert events[-1]["type"] == "done"
     assert len(_OpenAIPersistentHandler.request_payloads) == 1
     payload = _OpenAIPersistentHandler.request_payloads[0]
-    assert payload.get("max_tokens", payload.get("max_completion_tokens")) == 4096
+    assert payload.get("max_tokens", payload.get("max_completion_tokens")) == model_runtime["max_output_tokens"]
 
 
 def test_pi_extends_soft_model_token_lease_instead_of_failing_sound_answer(tmp_path: Path) -> None:
@@ -3604,6 +3616,9 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
             "base_url": f"http://127.0.0.1:{server.server_port}/v1",
             "api_key": "fixture-key",
             "model_id": "fixture-model",
+            "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing(
+                context_window_tokens=200 * 1024,
+            ).to_dict(),
             "thinking_level": "off",
             "task_mode": "general",
             "timeout_seconds": 30,

@@ -22,6 +22,13 @@ import {
   type RunStartMessage,
 } from "./protocol.js";
 import {
+  imageTelemetry,
+  validateModelRuntimeDescriptor,
+  validatePiImages,
+  type ModelRuntimeDescriptor,
+} from "./multimodal.js";
+import { scansciStreamSimple } from "./scansci-provider.js";
+import {
   boundedSkillCatalog,
   buildToolCatalog,
   executionModeForTool,
@@ -30,15 +37,21 @@ import {
 } from "./tool-catalog.js";
 import {
   buildNonDestructiveContextView,
+  buildTokenEnvelopeContextView,
   createSearchToolsTool,
   registerRuntimeLifecycleHooks,
 } from "./runtime-extension.js";
 
 type JsonRecord = Record<string, unknown>;
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
 type RunStart = RunStartMessage;
+type TaskContractRequest = Pick<RunStart, "request_id"> & Partial<Pick<
+  RunStart,
+  "prompt" | "task_contract" | "task_mode"
+>>;
+type McpRequest = TaskContractRequest & Pick<RunStart, "cwd"> & Partial<Pick<RunStart, "mcp_servers">>;
 
 type ToolRisk = "read_only" | "reversible" | "high";
 type McpEffect = "read" | "write" | "destructive" | "unknown";
@@ -129,10 +142,6 @@ interface ActiveRun {
   modelTokenBudgetExceeded: boolean;
 }
 
-const PROVIDER_CONTEXT_WINDOW = 128_000;
-const PROVIDER_COMPACTION_RESERVE = 16_384;
-const PROVIDER_INPUT_LIMIT = PROVIDER_CONTEXT_WINDOW - PROVIDER_COMPACTION_RESERVE;
-
 interface PendingTool {
   requestId: string;
   resolve: (value: JsonRecord) => void;
@@ -170,6 +179,8 @@ function redactSensitiveText(value: unknown): string {
   const providerKey = String(process.env.SCANSCIPI_PROVIDER_KEY || "").trim();
   if (providerKey) text = text.split(providerKey).join("[REDACTED]");
   return text
+    .replace(/data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi, "[REDACTED IMAGE]")
+    .replace(/[A-Za-z0-9+/]{128,}={0,2}/g, "[REDACTED BINARY]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
     .replace(/([?&](?:api[_-]?key|access[_-]?token|token|password|secret)=)[^&\s]+/gi, "$1[REDACTED]")
@@ -315,6 +326,7 @@ function estimateTokenText(value: unknown): number {
 }
 
 const MAX_TOOL_RESULT_BYTES = 16_000;
+const MAX_PROTOCOL_LINE_BYTES = 20 * 1024 * 1024;
 const MAX_MCP_SERVERS = 12;
 const MAX_MCP_TOOLS = 64;
 const MAX_MCP_TOOLS_PER_SERVER = 32;
@@ -632,7 +644,7 @@ function sessionStats(state: SessionState): JsonRecord {
 
 function thinkingLevel(value: unknown): ThinkingLevel {
   const normalized = String(value || "medium").toLowerCase();
-  if (["off", "minimal", "low", "medium", "high", "xhigh"].includes(normalized)) {
+  if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(normalized)) {
     return normalized as ThinkingLevel;
   }
   return "medium";
@@ -722,7 +734,7 @@ function taskContractVersion(raw: JsonRecord): { valid: boolean; schemaVersion: 
   return { valid: true, schemaVersion: `scansci.task-contract.v${resolved}` };
 }
 
-function normalizeTaskContract(request: RunStart): NormalizedTaskContract {
+function normalizeTaskContract(request: TaskContractRequest): NormalizedTaskContract {
   const raw = request.task_contract && typeof request.task_contract === "object"
     ? request.task_contract
     : {};
@@ -1490,7 +1502,7 @@ function mcpPolicyRecord(policy: McpToolPolicy): JsonRecord {
 
 type McpTransport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
 
-function createMcpTransport(raw: JsonRecord, request: RunStart): McpTransport | undefined {
+function createMcpTransport(raw: JsonRecord, request: Pick<McpRequest, "cwd">): McpTransport | undefined {
   const transportKind = String(raw.transport || "stdio").toLowerCase();
   if (transportKind === "streamable-http" || transportKind === "sse") {
     const endpoint = String(raw.endpoint || "").trim();
@@ -1511,7 +1523,7 @@ function createMcpTransport(raw: JsonRecord, request: RunStart): McpTransport | 
 
 function deferredMcpTools(
   raw: JsonRecord,
-  requestRef: { current: RunStart },
+  requestRef: { current: McpRequest },
   rawServerId: string,
   serverAlias: string,
   clients: McpClient[],
@@ -1711,7 +1723,7 @@ function deferredMcpTools(
 }
 
 async function externalMcpTools(
-  requestRef: { current: RunStart },
+  requestRef: { current: McpRequest },
   enforceLease = true,
 ): Promise<{
   tools: ReturnType<typeof defineTool>[];
@@ -2541,6 +2553,7 @@ function sessionSignature(request: RunStart): string {
     request.responses_enabled === true,
     request.base_url,
     request.model_id,
+    stableHash(request.model_runtime || {}),
     request.thinking_level || "medium",
     request.system_prompt,
     request.task_mode || "general",
@@ -2575,6 +2588,11 @@ async function createSession(
 ): Promise<SessionState> {
   const apiKey = process.env.SCANSCIPI_PROVIDER_KEY || "";
   if (!apiKey) throw new Error("Provider API key is unavailable");
+  const modelRuntime = validateModelRuntimeDescriptor(request.model_runtime, {
+    provider_kind: request.provider_kind,
+    model_id: request.model_id,
+    api_surface: request.api_surface || "chat_completions",
+  });
   const taskContract = normalizeTaskContract(request);
   const requestRef = { current: request };
   const loadedSkillsRef = { current: new Map<string, LoadedSkill>() };
@@ -2588,14 +2606,15 @@ async function createSession(
     baseUrl: request.base_url,
     apiKey: "$SCANSCIPI_PROVIDER_KEY",
     api: providerApi(request.provider_kind, request.api_surface),
+    streamSimple: scansciStreamSimple(modelRuntime),
     models: [{
       id: request.model_id,
       name: request.model_id,
-      reasoning: thinkingLevel(request.thinking_level) !== "off",
-      input: ["text"],
+      reasoning: modelRuntime.reasoning,
+      input: [...modelRuntime.input_modalities],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: PROVIDER_CONTEXT_WINDOW,
-      maxTokens: modelOutputBudget(String(request.task_mode || "general")),
+      contextWindow: modelRuntime.context_window_tokens,
+      maxTokens: modelRuntime.max_output_tokens,
       compat: modelCompat(request),
     }],
   });
@@ -2659,7 +2678,18 @@ async function createSession(
                 return message;
               }
             });
-            return { messages, report: projected.report };
+            const enveloped = buildTokenEnvelopeContextView(
+              messages,
+              modelRuntime.provider_input_tokens,
+            );
+            return {
+              messages: enveloped.messages,
+              report: {
+                ...(projected.report || {}),
+                ...((enveloped.report || {}) as JsonRecord),
+                composition_order: ["stale_tool_view", "loaded_skill_dedupe", "token_envelope", "report"],
+              },
+            };
           },
           onContextReport: (report) => {
             if (stateRef) stateRef.lastContextReport = { ...report };
@@ -2678,7 +2708,7 @@ async function createSession(
             const payload = providerApi(currentRequest.provider_kind, currentRequest.api_surface) === "openai-completions"
               ? normalizeTextOnlyOpenAIRequest(event.payload)
               : event.payload;
-            return guardProviderRequest(payload, PROVIDER_INPUT_LIMIT);
+            return guardProviderRequest(payload, modelRuntime.provider_input_tokens);
           },
         });
       },
@@ -2799,7 +2829,11 @@ async function createSession(
     sessionManager,
     settingsManager: SettingsManager.inMemory({
       httpIdleTimeoutMs: 120000,
-      compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+      compaction: {
+        enabled: true,
+        reserveTokens: modelRuntime.compaction_reserve_tokens,
+        keepRecentTokens: modelRuntime.keep_recent_tokens,
+      },
       retry: {
         // ScanSci owns cross-strategy recovery. Disabling nested SDK/provider
         // retries prevents one logical turn from multiplying paid requests.
@@ -3006,6 +3040,33 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
   let originalThinkingLevel: ThinkingLevel | undefined;
   let thinkingReduced = false;
   try {
+    const modelRuntime = validateModelRuntimeDescriptor(request.model_runtime, {
+      provider_kind: request.provider_kind,
+      model_id: request.model_id,
+      api_surface: request.api_surface || "chat_completions",
+    });
+    const images = validatePiImages(request.images);
+    if (images.length && !modelRuntime.input_modalities.includes("image")) {
+      throw new Error("The selected model runtime descriptor does not support image input");
+    }
+    request = { ...request, model_runtime: modelRuntime, images };
+    if (modelRuntime.degraded || images.length) {
+      emit({
+        type: "status.update",
+        request_id: request.request_id,
+        session_id: request.session_id,
+        status: modelRuntime.degraded ? "capability_degraded" : "multimodal_route",
+        name: modelRuntime.degraded ? "model_runtime_descriptor" : "pi_native_images",
+        details: {
+          route: "pi",
+          model_id: modelRuntime.model_id,
+          api_surface: modelRuntime.api_surface,
+          context_window_tokens: modelRuntime.context_window_tokens,
+          degradation_reasons: [...modelRuntime.degradation_reasons],
+          images: imageTelemetry(images),
+        },
+      });
+    }
     const resolved = await getSession(request);
     state = resolved.state;
     originalThinkingLevel = state.session.thinkingLevel;
@@ -3021,7 +3082,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
           const previousBudget = runState.modelTokenBudget;
           runState.modelTokenBudget = Math.min(
             runState.maxModelTokenBudget,
-            Math.max(previousBudget * 2, runState.modelTokens + PROVIDER_COMPACTION_RESERVE),
+            Math.max(previousBudget * 2, runState.modelTokens + modelRuntime.compaction_reserve_tokens),
           );
           emit({
             type: "status.update",
@@ -3073,7 +3134,7 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
     });
     try {
       try {
-        await state.session.prompt(request.prompt);
+        await state.session.prompt(request.prompt, images.length ? { images } : undefined);
       } catch (error) {
         if (runState.modelTokenBudgetExceeded) {
           throw new Error(
@@ -3274,7 +3335,16 @@ async function steerRun(message: JsonRecord): Promise<void> {
   const state = sessions.get(activeRun.sessionId);
   try {
     if (!state) throw new Error("Active session is unavailable");
-    await state.session.steer(String(message.text || ""));
+    const modelRuntime = validateModelRuntimeDescriptor(state.request.model_runtime, {
+      provider_kind: state.request.provider_kind,
+      model_id: state.request.model_id,
+      api_surface: state.request.api_surface || "chat_completions",
+    });
+    const images = validatePiImages(message.images);
+    if (images.length && !modelRuntime.input_modalities.includes("image")) {
+      throw new Error("The selected model runtime descriptor does not support image input");
+    }
+    await state.session.steer(String(message.text || ""), images);
     emit({ type: "run.steer_ack", request_id: requestId, command_id: commandId, session_id: activeRun.sessionId });
   } catch (error) {
     emit({
@@ -3300,7 +3370,16 @@ async function followUpRun(message: JsonRecord): Promise<void> {
   try {
     if (!state) throw new Error("Active session is unavailable");
     if (!text) throw new Error("Follow-up text is required");
-    await state.session.followUp(text);
+    const modelRuntime = validateModelRuntimeDescriptor(state.request.model_runtime, {
+      provider_kind: state.request.provider_kind,
+      model_id: state.request.model_id,
+      api_surface: state.request.api_surface || "chat_completions",
+    });
+    const images = validatePiImages(message.images);
+    if (images.length && !modelRuntime.input_modalities.includes("image")) {
+      throw new Error("The selected model runtime descriptor does not support image input");
+    }
+    await state.session.followUp(text, images);
     emit({
       type: "run.follow_up_ack",
       request_id: requestId,
@@ -3414,6 +3493,7 @@ async function loadSession(message: JsonRecord): Promise<void> {
       model_id: String(message.model_id || ""),
       api_surface: String(message.api_surface || "chat_completions"),
       responses_enabled: message.responses_enabled === true,
+      model_runtime: message.model_runtime as ModelRuntimeDescriptor,
       thinking_level: String(message.thinking_level || "medium"),
       system_prompt: "",
       prompt: "",
@@ -3528,15 +3608,8 @@ async function forkSession(message: JsonRecord): Promise<void> {
 async function probeMcp(message: JsonRecord): Promise<void> {
   const requestId = String(message.request_id || crypto.randomUUID());
   const request = {
-    type: "run.start",
     request_id: requestId,
-    session_id: `mcp-probe-${requestId}`,
     cwd: String(message.cwd || process.cwd()),
-    agent_dir: String(message.agent_dir || process.cwd()),
-    provider_kind: "openai",
-    base_url: "http://127.0.0.1",
-    model_id: "mcp-probe",
-    system_prompt: "",
     prompt: "",
     // A normal connection test must exercise the real server even when a
     // production session is configured for deferred activation.  Diagnostics
@@ -3547,7 +3620,7 @@ async function probeMcp(message: JsonRecord): Promise<void> {
         deferred: message.activation_mode === "deferred" ? server.deferred === true : false,
       }))
       : [],
-  } satisfies RunStart;
+  } satisfies McpRequest;
   const connected = await externalMcpTools({ current: request }, false);
   try {
     emit({
@@ -3599,6 +3672,10 @@ async function shutdown(): Promise<void> {
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", (line) => {
+  if (Buffer.byteLength(line, "utf8") > MAX_PROTOCOL_LINE_BYTES) {
+    emit({ type: "protocol.error", error: "Pi protocol JSONL line exceeds the bounded size limit" });
+    return;
+  }
   let message: JsonRecord;
   try {
     message = JSON.parse(line) as JsonRecord;

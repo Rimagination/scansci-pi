@@ -6,6 +6,7 @@ import pytest
 
 import scansci_html.research_agent as research_agent
 from scansci_html.deep_research_evidence import _evidence_level, build_task_fulltext_evidence
+from scansci_html.context_policy import build_token_envelope
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.pi_agent import PiAgentRunError
 from scansci_html.research_agent import ResearchAgentRuntime, _is_restart_request
@@ -2137,12 +2138,25 @@ def test_long_follow_up_history_is_compacted_without_losing_recent_turns():
         {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn-{index} " + "x" * 6000}
         for index in range(30)
     ]
-    compacted = ResearchAgentRuntime._follow_up_messages(messages, max_recent=10, max_chars=12_000)
-    assert compacted[0]["role"] == "system"
-    assert "turn-0" in compacted[0]["content"]
-    assert "turn-29" in compacted[-1]["content"]
-    assert len(compacted) == 11
-    assert sum(len(item["content"]) for item in compacted) <= 12_000
+    messages.append({"role": "user", "content": "turn-30 FINAL-SENTINEL"})
+    normalized = ResearchAgentRuntime._follow_up_messages(messages, max_recent=10, max_chars=12_000)
+    descriptor = research_agent.descriptor_from_model_record(
+        provider_id="fixture",
+        provider_kind="openai-compatible",
+        model_id="fixture",
+        model_record={"id": "fixture", "context_window": "32K", "capabilities": ["reasoning"]},
+    )
+    compacted, report = build_token_envelope(normalized, descriptor=descriptor)
+
+    assert "FINAL-SENTINEL" in compacted[-1]["content"]
+    assert report.estimated_tokens <= descriptor.provider_input_tokens
+    assert report.omitted_messages > 0
+    # Optional dialogue is admitted as whole user/assistant turns.
+    optional_roles = [item["role"] for item in compacted[:-1]]
+    assert all(
+        optional_roles[index : index + 2] == ["user", "assistant"]
+        for index in range(0, len(optional_roles), 2)
+    )
 
 
 def test_restart_request_restarts_terminal_run_in_place_without_model_call(tmp_path: Path, monkeypatch):
@@ -2280,6 +2294,31 @@ def test_research_run_follow_ups_reuse_the_same_persistent_pi_session(tmp_path: 
         "user",
         "assistant",
     ]
+
+
+def test_follow_up_final_user_turn_is_not_rejected_by_a_fixed_character_limit(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Long model-aware follow-up",
+        input_payload={"question": "Start"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    sentinel = "FINAL-LONG-FOLLOW-UP-SENTINEL"
+    question = sentinel + ("x" * 12_500)
+    observed: dict[str, object] = {}
+
+    def fake_complete(request, **_kwargs):
+        observed["messages"] = request.messages
+        return "accepted", {}, {"harness": "pi-agent-sdk", "tool_calls": []}
+
+    monkeypatch.setattr(runtime, "_complete_with_pi", fake_complete)
+
+    result = runtime.continue_run_conversation(run["run_id"], {"content": question})
+
+    assert result["message"]["content"] == "accepted"
+    assert sentinel in str(observed["messages"][-1]["content"])
 
 
 @pytest.mark.parametrize(

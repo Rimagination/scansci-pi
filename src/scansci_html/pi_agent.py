@@ -36,9 +36,11 @@ from .agent_skill_tools import ProgressiveSkillRuntime, SKILL_STATE_SCHEMA
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
 from .checkpoints import CheckpointError, CheckpointStore
-from .context_policy import prune_stale_tool_results
+from .context_policy import build_token_envelope, prune_stale_tool_results
+from .image_attachments import validate_pi_image_blocks
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
 from .library_manager import import_library_files
+from .model_metadata import ModelRuntimeDescriptor, descriptor_from_model_record
 from .qa.agent import answer_question
 from .research_runs import ResearchRunStore, StageSpec
 from .research_tools import (
@@ -82,6 +84,10 @@ class PiRuntimeUnavailable(RuntimeError):
     """Raised when the bundled Pi sidecar or Node runtime cannot be found."""
 
 
+class PiMultimodalUnavailable(PiRuntimeUnavailable):
+    """Raised when a validated image turn targets a text-only descriptor."""
+
+
 class PiAgentRunError(RuntimeError):
     """Structured Pi failure with machine-actionable recovery metadata."""
 
@@ -97,7 +103,7 @@ _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
 _GATEWAY_TRANSPORT_ATTEMPTS = 3
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
-_PI_PROTOCOL_VERSION = 4
+_PI_PROTOCOL_VERSION = 5
 _PI_REQUIRED_FEATURES = (
     "task_contract_v2",
     "explicit_empty_leases",
@@ -110,7 +116,11 @@ _PI_REQUIRED_FEATURES = (
     "parallel_tool_dispatch",
     "lifecycle_hooks_v1",
     "acked_session_commands",
+    "model_runtime_descriptor",
+    "token_envelope",
+    "multimodal_turns",
 )
+_MAX_JSONL_LINE_BYTES = 20 * 1024 * 1024
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
     r"tool_call\s*\(\s*name\s*=\s*[\"'](?P<name>[A-Za-z0-9_-]+)[\"']"
@@ -192,6 +202,7 @@ class _RunContext:
     request_id: str
     session_id: str
     generation: int
+    supports_images: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
     history: list[dict[str, Any]] = field(default_factory=list)
     history_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1481,12 +1492,40 @@ class PiAgentClient:
         task_mode: str = "general",
         task_contract: dict[str, Any] | None = None,
         selected_skills: list[dict[str, Any]] | None = None,
+        images: list[dict[str, Any]] | None = None,
+        model_runtime: dict[str, Any] | ModelRuntimeDescriptor | None = None,
         timeout_seconds: float = 900.0,
         session_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield normalized Pi events, optionally continuing a durable session."""
 
-        messages, context_report = prune_stale_tool_results(messages)
+        if isinstance(model_runtime, ModelRuntimeDescriptor):
+            descriptor = model_runtime
+        elif isinstance(model_runtime, dict):
+            descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
+        else:
+            descriptor = descriptor_from_model_record(
+                provider_id="runtime",
+                provider_kind=provider_kind,
+                model_id=model_id,
+                model_record=None,
+                api_surface=str(api_surface or "chat_completions"),
+            )
+        if (
+            descriptor.provider_kind != str(provider_kind)
+            or descriptor.model_id != str(model_id)
+            or descriptor.api_surface != str(api_surface or "chat_completions")
+        ):
+            raise ValueError(
+                "Model runtime descriptor does not match the final provider route"
+            )
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not descriptor.supports_images:
+            raise PiMultimodalUnavailable(
+                "The selected model runtime descriptor does not support image input"
+            )
+
+        messages, stale_context_report = prune_stale_tool_results(messages)
         system_parts: list[str] = []
         conversation: list[str] = []
         for item in messages:
@@ -1547,6 +1586,46 @@ class PiAgentClient:
                 request=final_request,
                 task_mode=task_mode,
             ).to_dict()
+        messages, token_envelope_report = build_token_envelope(
+            messages,
+            descriptor=descriptor,
+            host_contract=effective_contract,
+        )
+        system_parts = []
+        conversation = []
+        for item in messages:
+            role = str(item.get("role", "user")).strip().lower()
+            content = item.get("content", "")
+            if not isinstance(content, str):
+                if role in {"tool", "toolresult", "tool_result"}:
+                    content = json.dumps(content, ensure_ascii=False, default=str)
+                else:
+                    raise ValueError("Pi conversation text must be separate from canonical image blocks")
+            if role == "system":
+                system_parts.append(content)
+            else:
+                conversation.append(f"[{role.upper()}]\n{content}")
+        if not conversation:
+            raise ValueError("Pi requires at least one conversational message")
+        if is_recovery:
+            prompt = final_request or "Continue the persisted ScanSci session."
+        else:
+            prompt = (
+                "Continue the following ScanSci conversation. Reply to the final USER message.\n\n"
+                + "\n\n".join(conversation)
+            )
+        context_report = {
+            **stale_context_report.to_dict(),
+            "token_envelope": token_envelope_report.to_dict(),
+            "model_runtime": {
+                "schema_version": descriptor.schema_version,
+                "context_window_tokens": descriptor.context_window_tokens,
+                "provider_input_tokens": descriptor.provider_input_tokens,
+                "input_modalities": list(descriptor.input_modalities),
+                "degraded": descriptor.degraded,
+                "degradation_reasons": list(descriptor.degradation_reasons),
+            },
+        }
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
         skill_selection = [
             dict(item)
@@ -1627,6 +1706,7 @@ class PiAgentClient:
                 "allowed_tools", "pause_policy", "success_criteria",
             )
         }
+        contract_shape["model_runtime"] = descriptor.to_dict()
         prefix_shape = build_prefix_shape(
             provider=provider_kind,
             model=model_id,
@@ -1654,13 +1734,15 @@ class PiAgentClient:
             "thinking_level": thinking_level,
             "system_prompt": "\n\n".join(system_parts),
             "prompt": prompt,
+            "images": validated_images,
+            "model_runtime": descriptor.to_dict(),
             "task_mode": task_mode,
             "mcp_servers": self._enabled_mcp_servers(),
             "disabled_tools": self._disabled_artifact_tools(),
             "task_contract": effective_contract,
             "tool_set": tool_set,
             "prefix_shape": prefix_shape,
-            "context_policy": context_report.to_dict(),
+            "context_policy": context_report,
             "skill_catalog": skill_runtime.catalog(),
             "skill_selection": skill_selection,
             "skill_state": skill_runtime.state(),
@@ -1679,7 +1761,7 @@ class PiAgentClient:
                 timeout_seconds=timeout_seconds,
                 prefix_shape=prefix_shape,
                 task_contract=effective_contract,
-                context_policy=context_report.to_dict(),
+                context_policy=context_report,
             )
         except OSError:
             # Diagnostics are valuable but must never prevent a research run.
@@ -1832,7 +1914,10 @@ class PiAgentClient:
         if process is None or process.poll() is not None or process.stdin is None:
             raise PiRuntimeUnavailable("The ScanSci Pi sidecar is not running")
         with self._stdin_lock:
-            process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+            encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > _MAX_JSONL_LINE_BYTES:
+                raise ValueError("Pi protocol message exceeds the bounded JSONL line limit")
+            process.stdin.write(encoded + "\n")
             process.stdin.flush()
 
     def _session_command_lock(self, session_id: str) -> threading.Lock:
@@ -2275,6 +2360,9 @@ class PiAgentClient:
                 request_id=request_id,
                 session_id=session_id,
                 generation=self._request_generation,
+                supports_images="image" in set(
+                    dict(start_message.get("model_runtime", {}) or {}).get("input_modalities", [])
+                ),
             )
             with self._contexts_lock:
                 self._run_contexts[request_id] = context
@@ -2641,7 +2729,13 @@ class PiAgentClient:
 
         return self.cancel(request_id)
 
-    def steer(self, text: str, request_id: str | None = None) -> bool:
+    def steer(
+        self,
+        text: str,
+        request_id: str | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Queue steering text into the active Pi tool loop."""
 
         target = request_id or self._active_request_id
@@ -2651,15 +2745,25 @@ class PiAgentClient:
             context = self._run_contexts.get(target)
         if context is None or not context.active:
             return False
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not bool(getattr(context, "supports_images", False)):
+            raise PiMultimodalUnavailable("The active Pi session does not support image input")
         self._write({
             "type": "run.steer",
             "request_id": target,
             "command_id": uuid4().hex,
             "text": text,
+            "images": validated_images,
         })
         return True
 
-    def follow_up(self, text: str, request_id: str | None = None) -> bool:
+    def follow_up(
+        self,
+        text: str,
+        request_id: str | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Queue a message for the active session after its current turn."""
 
         target = request_id or self._active_request_id
@@ -2669,11 +2773,15 @@ class PiAgentClient:
             context = self._run_contexts.get(target)
         if context is None or not context.active:
             return False
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not bool(getattr(context, "supports_images", False)):
+            raise PiMultimodalUnavailable("The active Pi session does not support image input")
         self._write({
             "type": "run.follow_up",
             "request_id": target,
             "command_id": uuid4().hex,
             "text": str(text).strip(),
+            "images": validated_images,
         })
         return True
 
@@ -2788,6 +2896,9 @@ class PiAgentClient:
         base_url: str,
         api_key: str,
         model_id: str,
+        api_surface: str = "chat_completions",
+        responses_enabled: bool = False,
+        model_runtime: dict[str, Any] | ModelRuntimeDescriptor | None = None,
         thinking_level: str = "medium",
         timeout_seconds: float = 60.0,
     ) -> dict[str, Any]:
@@ -2799,6 +2910,26 @@ class PiAgentClient:
         session_file = str(self._load_session_registry().get(logical_session_id, ""))
         if not logical_session_id or not session_file or not Path(session_file).is_file():
             raise PiRuntimeUnavailable("The durable Pi session file is unavailable")
+        if isinstance(model_runtime, ModelRuntimeDescriptor):
+            descriptor = model_runtime
+        elif isinstance(model_runtime, dict):
+            descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
+        else:
+            descriptor = descriptor_from_model_record(
+                provider_id="runtime",
+                provider_kind=provider_kind,
+                model_id=model_id,
+                model_record=None,
+                api_surface=api_surface,
+            )
+        if (
+            descriptor.provider_kind != str(provider_kind)
+            or descriptor.model_id != str(model_id)
+            or descriptor.api_surface != str(api_surface or "chat_completions")
+        ):
+            raise ValueError(
+                "Model runtime descriptor does not match the final provider route"
+            )
         with self._lifecycle_lock:
             self._ensure_process(api_key=api_key)
             command_id = uuid4().hex
@@ -2813,6 +2944,9 @@ class PiAgentClient:
                     "provider_kind": provider_kind,
                     "base_url": base_url,
                     "model_id": model_id,
+                    "api_surface": api_surface,
+                    "responses_enabled": responses_enabled,
+                    "model_runtime": descriptor.to_dict(),
                     "thinking_level": thinking_level,
                     "mcp_servers": self._enabled_mcp_servers(),
                     "disabled_tools": self._disabled_artifact_tools(),

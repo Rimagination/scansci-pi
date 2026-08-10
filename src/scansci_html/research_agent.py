@@ -43,7 +43,7 @@ from .deep_research_evidence import (
 )
 from .deep_agent import ScanSciDeepAgent, build_deep_agent_model
 from .evidence_store import ensure_library_overview, knowledge_base_snapshot
-from .image_attachments import persist_image_attachments, vision_image_blocks
+from .image_attachments import persist_image_attachments, pi_image_blocks, vision_image_blocks
 from .audio_attachments import audio_attachment_asset, persist_audio_attachments
 from .capability_ledger import CapabilityDeliveryError, CapabilityLedger
 from .ingestion import ingest_sources, ingestion_context
@@ -83,7 +83,8 @@ from .local_transformers_runtime import ensure_local_transformers_runtime
 from .local_asr import transcribe_local_audio
 from .local_model_market import QWEN3_ASR_LEGACY_MODEL_ID, installed_models
 from .ollama_runtime import ollama_status
-from .pi_agent import PiAgentClient, PiAgentRunError
+from .model_metadata import ModelRuntimeDescriptor, descriptor_from_model_record
+from .pi_agent import PiAgentClient, PiAgentRunError, PiMultimodalUnavailable
 from .run_manifest import RunManifest
 from .qa.agent import answer_question
 from .research_runs import ResearchRunStore, StageSpec, classify_error, redact_sensitive_text
@@ -216,8 +217,6 @@ _RESTART_REQUEST_RE = re.compile(
     r"start\s+over|restart|redo|retry(?:\s+from\s+scratch)?)(?:$|\s|[，。！？,.!?])",
     re.IGNORECASE,
 )
-_FOLLOW_UP_CONTEXT_LIMIT = 48_000
-_FOLLOW_UP_RECENT_MESSAGES = 10
 _TOOL_MODE_PARTS = {
     "knowledge",
     "research",
@@ -1381,6 +1380,8 @@ class _DirectChatRequest:
     manifest: RunManifest | None = None
     vision_route: dict[str, Any] = field(default_factory=dict)
     image_attachments: list[dict[str, Any]] = field(default_factory=list)
+    pi_images: list[dict[str, str]] = field(default_factory=list)
+    model_runtime: dict[str, Any] = field(default_factory=dict)
 
 
 class _DurableModelClient:
@@ -1507,6 +1508,7 @@ class _PiBackedChatJsonClient:
         responses_enabled: bool,
         role: str,
         timeout_seconds: float,
+        model_runtime: dict[str, Any] | ModelRuntimeDescriptor | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.evidence_db = Path(evidence_db)
@@ -1519,6 +1521,19 @@ class _PiBackedChatJsonClient:
         self.responses_enabled = bool(responses_enabled)
         self.role = str(role or "workflow")
         self.timeout_seconds = float(timeout_seconds)
+        if isinstance(model_runtime, ModelRuntimeDescriptor):
+            descriptor = model_runtime
+        elif isinstance(model_runtime, dict):
+            descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
+        else:
+            descriptor = descriptor_from_model_record(
+                provider_id=self.provider_id,
+                provider_kind=self.provider_kind,
+                model_id=self.model,
+                model_record=None,
+                api_surface=self.api_surface,
+            )
+        self.model_runtime = descriptor.to_dict()
 
     def _contract(self, *, schema_name: str, output_format: str) -> dict[str, Any]:
         return {
@@ -1585,6 +1600,7 @@ class _PiBackedChatJsonClient:
                     schema_name=schema_name,
                     output_format="strict JSON object" if json_only else "text",
                 ),
+                model_runtime=self.model_runtime,
                 timeout_seconds=self.timeout_seconds,
                 # Transient and independent by construction: never wait on or
                 # mutate a parent durable session that may currently own a
@@ -2582,6 +2598,119 @@ class ResearchAgentRuntime:
             return self.store.mark_paused(run_id)
         return run
 
+    def _pi_image_analysis(
+        self,
+        *,
+        question: str,
+        evidence_db: Path,
+        provider: dict[str, Any],
+        model_id: str,
+        api_key: str,
+        image_attachments: list[dict[str, Any]],
+    ) -> str:
+        """Analyze evidence images through one bounded native Pi turn."""
+
+        provider_id = str(provider.get("id", ""))
+        provider_kind = str(provider.get("kind", ""))
+        base_url = str(provider.get("base_url", ""))
+        if provider_id == "local-huggingface":
+            base_url = ensure_local_transformers_runtime(model_id)
+            provider_kind = "openai-compatible"
+        responses_enabled = bool(provider.get("responses_enabled", False))
+        api_surface = select_api_surface(
+            str(provider.get("api_surface", "chat_completions")),
+            provider_kind=provider_kind,
+            provider_id=provider_id,
+            model=model_id,
+            responses_enabled=responses_enabled,
+        )
+        model_record = next(
+            (
+                dict(item)
+                for item in list(provider.get("models", []) or [])
+                if isinstance(item, dict) and str(item.get("id", "")) == model_id
+            ),
+            {},
+        )
+        descriptor = descriptor_from_model_record(
+            provider_id=provider_id,
+            provider_kind=provider_kind,
+            model_id=model_id,
+            model_record=model_record,
+            api_surface=api_surface,
+        )
+        images = pi_image_blocks(self.workspace, image_attachments)
+        if not images or not descriptor.supports_images:
+            raise PiMultimodalUnavailable(
+                "The selected evidence vision route does not declare native image input"
+            )
+        contract = {
+            "schema_version": "scansci.task-contract.v2",
+            "version": 2,
+            "contract_id": f"evidence-vision-{uuid4().hex[:12]}",
+            "goal": "Analyze only the attached evidence images for the user's question",
+            "request": question,
+            "constraints": [
+                "Do not call tools or request interactions",
+                "Do not infer facts that are not visible in the supplied images",
+            ],
+            "required_evidence": [],
+            "allowed_tools": [],
+            "initial_tools": [],
+            "allowed_mcp_servers": [],
+            "required_tool_groups": [],
+            "risk_level": "none",
+            "autonomy": "none",
+            "requires_plan": False,
+            "allow_external_write": False,
+            "initial_tool_budget": 1,
+            "max_tool_budget": 1,
+            "model_token_budget": min(16_000, descriptor.max_output_tokens * 2),
+            "max_model_token_budget": min(32_000, descriptor.context_window_tokens),
+            "success_criteria": ["Return a concise image-grounded analysis"],
+        }
+        client = PiAgentClient(workspace=self.workspace, evidence_db=evidence_db)
+        fragments: list[str] = []
+        try:
+            for event in client.stream_chat(
+                provider_kind=provider_kind,
+                base_url=base_url,
+                api_key=api_key,
+                model_id=model_id,
+                api_surface=api_surface,
+                responses_enabled=responses_enabled,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Analyze the attached images for the final user question. "
+                            "Describe only visible evidence, preserve uncertainty, and do not call tools."
+                        ),
+                    },
+                    {"role": "user", "content": question},
+                ],
+                images=images,
+                model_runtime=descriptor.to_dict(),
+                thinking_level="off",
+                task_mode="vision",
+                task_contract=contract,
+                timeout_seconds=120.0,
+                session_id=None,
+            ):
+                event_type = str(event.get("type", ""))
+                if event_type == "delta":
+                    fragments.append(str(event.get("content", "")))
+                elif event_type in {"tool.completed", "tool.failed", "interaction"}:
+                    raise RuntimeError("Evidence vision Pi turn attempted to expand its empty authority lease")
+                elif event_type == "cancelled":
+                    raise RuntimeError("Evidence vision Pi turn was cancelled")
+        finally:
+            client.close()
+        text = "".join(fragments).strip()
+        if not text:
+            raise RuntimeError("Evidence vision Pi turn returned an empty response")
+        return text
+
     def answer_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         question = str(payload.get("question", "")).strip()
         if not question:
@@ -2693,20 +2822,14 @@ class ResearchAgentRuntime:
                     vision_api_key = str(selected_vision.get("api_key", ""))
             if vision_provider is not None and vision_api_key:
                 try:
-                    if str(vision_provider.get("id", "")) == "local-huggingface":
-                        # The loopback server is lazy by design.  Start the
-                        # selected local vision snapshot before the generic
-                        # OpenAI-compatible vision transport sends its first
-                        # request.
-                        ensure_local_transformers_runtime(vision_model_id)
                     image_analysis = {
-                        "text": analyze_vision_images(
-                            str(vision_provider.get("kind", "")),
-                            base_url=str(vision_provider.get("base_url", "")),
-                            api_key=vision_api_key,
-                            model=vision_model_id,
+                        "text": self._pi_image_analysis(
                             question=question,
-                            images=blocks,
+                            evidence_db=evidence_db,
+                            provider=vision_provider,
+                            model_id=vision_model_id,
+                            api_key=vision_api_key,
+                            image_attachments=image_attachments,
                         ),
                         "image_count": len(image_attachments),
                         "model": vision_model_id,
@@ -2783,6 +2906,29 @@ class ResearchAgentRuntime:
                     agent_fallback_error = f"{type(error).__name__}: {error}"
             elif use_native_tool_loop:
                 try:
+                    active_model_id = str(active.get("model_id", ""))
+                    native_api_surface = select_api_surface(
+                        str(provider.get("api_surface", "chat_completions")),
+                        provider_kind=str(provider.get("kind", "")),
+                        provider_id=str(provider.get("id", "")),
+                        model=active_model_id,
+                        responses_enabled=bool(provider.get("responses_enabled", False)),
+                    )
+                    native_model_record = next(
+                        (
+                            dict(item)
+                            for item in list(provider.get("models", []) or [])
+                            if isinstance(item, dict) and str(item.get("id", "")) == active_model_id
+                        ),
+                        {},
+                    )
+                    native_model_runtime = descriptor_from_model_record(
+                        provider_id=str(provider.get("id", "")),
+                        provider_kind=str(provider.get("kind", "")),
+                        model_id=active_model_id,
+                        model_record=native_model_record,
+                        api_surface=native_api_surface,
+                    )
                     pi_agent = PiAgentClient(
                         workspace=self.workspace,
                         evidence_db=evidence_db,
@@ -2801,15 +2947,10 @@ class ResearchAgentRuntime:
                             provider_kind=str(provider.get("kind", "")),
                             base_url=str(provider.get("base_url", "")),
                             api_key=api_key,
-                            model_id=str(active.get("model_id", "")),
-                            api_surface=select_api_surface(
-                                str(provider.get("api_surface", "chat_completions")),
-                                provider_kind=str(provider.get("kind", "")),
-                                provider_id=str(provider.get("id", "")),
-                                model=str(active.get("model_id", "")),
-                                responses_enabled=bool(provider.get("responses_enabled", False)),
-                            ),
+                            model_id=active_model_id,
+                            api_surface=native_api_surface,
                             responses_enabled=bool(provider.get("responses_enabled", False)),
+                            model_runtime=native_model_runtime,
                             messages=[
                                 {
                                     "role": "system",
@@ -2984,42 +3125,6 @@ class ResearchAgentRuntime:
         # for now every text-only request is Pi eligible, including local
         # OpenAI-compatible models.
         return all(isinstance(item.get("content"), str) for item in chat_request.messages)
-
-    @classmethod
-    def _vision_direct_fallback(
-        cls,
-        chat_request: _DirectChatRequest,
-        *,
-        task_mode: str,
-        user_text: str,
-    ) -> bool:
-        """Keep ordinary image questions on the multimodal direct path.
-
-        ``_direct_chat_request`` deliberately converts images into provider
-        message blocks.  Pi's bridge is text-only, so such a request cannot be
-        sent through the tool loop even when the selected model is otherwise
-        tool-capable.  A visual question does not by itself authorize a web,
-        knowledge-base, or artifact action; when no concrete tool is required,
-        direct vision completion is the correct route.
-        """
-
-        if not chat_request.vision_route:
-            return False
-
-        # ``task_mode`` also contains capabilities enabled by ambient UI state
-        # (for example, the global web toggle or the selected knowledge chat
-        # mode).  Those capabilities must remain available to an ordinary text
-        # turn, but they are not an explicit request to search or inspect data.
-        # Reclassify the *visible user text* with ambient capabilities disabled;
-        # only a concrete request such as "search the web for this image" or
-        # "verify this against my knowledge base" should leave the direct
-        # multimodal transport.
-        explicit_mode = cls._direct_pi_task_mode(
-            "general",
-            "off",
-            messages=[{"role": "user", "content": user_text}],
-        )
-        return not _pi_requires_tools(explicit_mode, user_text)
 
     @staticmethod
     def _pi_task_mode(chat_mode: str) -> str:
@@ -3480,6 +3585,8 @@ class ResearchAgentRuntime:
                 task_mode=resolved_task_mode,
                 task_contract=turn_contract,
                 selected_skills=chat_request.selected_skills,
+                images=chat_request.pi_images,
+                model_runtime=chat_request.model_runtime,
                 timeout_seconds=120.0 if _pi_mode_parts(resolved_task_mode) <= {"web", "web-auto"} else 900.0,
                 session_id=session_id,
             )
@@ -3547,9 +3654,27 @@ class ResearchAgentRuntime:
         )
         if not fallback_id:
             return None
+        model_record = next(
+            (
+                dict(item)
+                for item in list(provider.get("models", []) or [])
+                if isinstance(item, dict) and str(item.get("id", "")) == fallback_id
+            ),
+            {},
+        )
+        descriptor = descriptor_from_model_record(
+            provider_id=str(provider.get("id", "")),
+            provider_kind=str(provider.get("kind", chat_request.provider_kind)),
+            model_id=fallback_id,
+            model_record=model_record,
+            api_surface=chat_request.api_surface,
+        )
+        if chat_request.pi_images and not descriptor.supports_images:
+            return None
         return replace(
             chat_request,
             model_id=fallback_id,
+            model_runtime=descriptor.to_dict(),
             # GLM's optional thinking control is not a portable provider
             # parameter.  Never send it to the Qwen gateway route.
             thinking_mode=None,
@@ -3865,6 +3990,13 @@ class ResearchAgentRuntime:
                 and not capability_ledger.ready
             ):
                 raise capability_ledger.delivery_error(cause=error)
+            if chat_request.vision_route:
+                # Images never cross the legacy direct-provider compatibility
+                # path. A declared alternate vision descriptor, OCR text-only
+                # route, or typed Pi failure is the complete routing surface.
+                raise PiMultimodalUnavailable(
+                    "Pi could not complete the declared multimodal/OCR route"
+                ) from error
             yield {
                 "type": "compatibility.fallback",
                 "error": f"{type(error).__name__}: {error}"[:500],
@@ -4035,6 +4167,9 @@ class ResearchAgentRuntime:
                 base_url=chat_request.base_url,
                 api_key=chat_request.api_key,
                 model_id=chat_request.model_id,
+                api_surface=chat_request.api_surface,
+                responses_enabled=chat_request.responses_enabled,
+                model_runtime=chat_request.model_runtime,
                 thinking_level=chat_request.thinking_level,
             )
             result = client.compact(session_id, instructions=str(payload.get("instructions", "")))
@@ -4134,6 +4269,9 @@ class ResearchAgentRuntime:
                 base_url=chat_request.base_url,
                 api_key=chat_request.api_key,
                 model_id=chat_request.model_id,
+                api_surface=chat_request.api_surface,
+                responses_enabled=chat_request.responses_enabled,
+                model_runtime=chat_request.model_runtime,
                 thinking_level=chat_request.thinking_level,
             )
             stats = loaded.get("stats") if isinstance(loaded, dict) else None
@@ -4163,8 +4301,14 @@ class ResearchAgentRuntime:
             )
         if client is None or not client.active_request_id:
             return {"ok": False, "error": "无活跃对话"}
-        ok = client.steer(str(payload.get("text", "")), client.active_request_id)
-        return {"ok": ok}
+        attachments = persist_image_attachments(self.workspace, payload.get("images", []))
+        images = pi_image_blocks(self.workspace, attachments)
+        ok = client.steer(
+            str(payload.get("text", "")),
+            client.active_request_id,
+            images=images,
+        )
+        return {"ok": ok, "image_count": len(images)}
 
     def follow_up_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Queue a non-interrupting follow-up for one active Pi run."""
@@ -4177,8 +4321,19 @@ class ResearchAgentRuntime:
             )
         if client is None or not client.active_request_id:
             return {"ok": False, "error": "目标任务当前没有活跃的 Pi 会话"}
-        ok = client.follow_up(str(payload.get("text", "")), client.active_request_id)
-        return {"ok": ok, "run_id": control_id, "queued": ok}
+        attachments = persist_image_attachments(self.workspace, payload.get("images", []))
+        images = pi_image_blocks(self.workspace, attachments)
+        ok = client.follow_up(
+            str(payload.get("text", "")),
+            client.active_request_id,
+            images=images,
+        )
+        return {
+            "ok": ok,
+            "run_id": control_id,
+            "queued": ok,
+            "image_count": len(images),
+        }
 
     def respond_chat_interaction(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Resolve a pending universal AskUser or plan-approval request."""
@@ -4229,31 +4384,10 @@ class ResearchAgentRuntime:
             ),
         )
         task_profile = dict(task_contract.get("task_profile", {}) or {})
-        vision_direct = self._vision_direct_fallback(
-            chat_request,
-            task_mode=pi_task_mode,
-            user_text=user_text,
-        )
-        if vision_direct:
-            # A selected knowledge composer or web toggle must not turn a
-            # plain "explain this image" request into a tool task.  There is
-            # no explicit evidence/search action to complete in this turn.
-            pi_task_mode = "general"
-            task_contract = self._compile_contract(
-                task_mode=pi_task_mode,
-                user_text=user_text,
-                mcp_scope=(
-                    "selected-library"
-                    if chat_request.notebook_id or chat_request.notebook_ids
-                    else "default"
-                ),
-            )
-            task_profile = dict(task_contract.get("task_profile", {}) or {})
         _required_capability_preflight(task_contract)
         pi_eligible = not local_facts and self._pi_eligible(chat_request, payload)
         pi_needed = (
             not local_facts
-            and not vision_direct
             and _pi_should_run(pi_task_mode, user_text, task_profile)
         )
         if pi_needed and not pi_eligible:
@@ -4292,6 +4426,10 @@ class ResearchAgentRuntime:
             except _RunCancelled:
                 raise
             except Exception as error:
+                if chat_request.vision_route:
+                    raise PiMultimodalUnavailable(
+                        "Pi could not complete the declared multimodal/OCR route"
+                    ) from error
                 if _pi_requires_tools(pi_task_mode, user_text):
                     raise RuntimeError(
                         "ScanSci 未能完成本轮必需的工具调用；为避免编造能力或结果，本轮不会退化为裸模型回答"
@@ -4403,9 +4541,6 @@ class ResearchAgentRuntime:
         question = str(payload.get("content", payload.get("question", ""))).strip()
         if not question:
             raise ValueError("Follow-up message is required")
-        if len(question) > 12_000:
-            raise ValueError("Follow-up message is too long")
-
         restart_requested = _is_restart_request(question)
 
         # Persist the request first. If the model is temporarily unavailable,
@@ -4739,10 +4874,18 @@ class ResearchAgentRuntime:
         messages: list[dict[str, Any]],
         *,
         restart_requested: bool = False,
-        max_recent: int = _FOLLOW_UP_RECENT_MESSAGES,
-        max_chars: int = _FOLLOW_UP_CONTEXT_LIMIT,
+        max_recent: int | None = None,
+        max_chars: int | None = None,
     ) -> list[dict[str, str]]:
-        """Bound long task histories while retaining a readable deterministic recap."""
+        """Normalize durable history; the model-aware envelope owns admission.
+
+        ``max_recent`` and ``max_chars`` remain accepted for API compatibility
+        with older callers, but fixed character slices are no longer an
+        authority boundary. The final selected model descriptor determines
+        what fits, and Pi's native compactor preserves durable session state.
+        """
+
+        del max_recent, max_chars
 
         clean = [
             {"role": str(item.get("role", "")), "content": str(item.get("content", "")).strip()}
@@ -4751,41 +4894,16 @@ class ResearchAgentRuntime:
             and item.get("role") in {"user", "assistant"}
             and str(item.get("content", "")).strip()
         ]
-        if len(clean) <= max_recent:
-            return clean
-
-        older = clean[:-max_recent]
-        digest_parts = []
-        for item in older:
-            content = re.sub(r"\s+", " ", item["content"])
-            digest_parts.append(f"{item['role']}: {content[:420]}")
-        digest = "Earlier task conversation (deterministic recap): " + " | ".join(digest_parts)
         if restart_requested:
-            digest += " | The latest user turn asks to restart the original task."
-        result = [{"role": "system", "content": digest}, *clean[-max_recent:]]
-
-        # Keep the serialized request below a safe provider budget even when a
-        # user pasted a very large document into several turns. The recap gets
-        # a larger share because it is the only durable record of older turns;
-        # recent turns are still retained in chronological order.
-        total = sum(len(item["content"]) for item in result)
-        if total > max_chars:
-            recap = result[0]
-            recap_budget = min(len(recap["content"]), max(1_000, max_chars // 2))
-            recap["content"] = recap["content"][:recap_budget]
-            recent = result[1:]
-            remaining = max(0, max_chars - len(recap["content"]))
-            per_message = remaining // max(1, len(recent))
-            for item in recent:
-                item["content"] = item["content"][:per_message]
-            # Account for any integer division remainder without allowing the
-            # budget to drift above the hard ceiling.
-            while sum(len(item["content"]) for item in result) > max_chars:
-                candidate = next((item for item in reversed(recent) if item["content"]), None)
-                if candidate is None:
-                    break
-                candidate["content"] = candidate["content"][:-1]
-        return result
+            clean.insert(
+                max(0, len(clean) - 1),
+                {
+                    "role": "system",
+                    "content": "The latest user turn asks to restart the original task.",
+                    "context_kind": "recap",
+                },
+            )
+        return clean
 
     @staticmethod
     def _run_conversation_context(run: dict[str, Any]) -> str:
@@ -5016,26 +5134,6 @@ class ResearchAgentRuntime:
                 ),
             )
             task_profile = dict(task_contract.get("task_profile", {}) or {})
-            vision_direct = self._vision_direct_fallback(
-                chat_request,
-                task_mode=pi_task_mode,
-                user_text=user_text,
-            )
-            if vision_direct:
-                # See the synchronous path above: a visual answer is a
-                # direct multimodal completion unless the user explicitly
-                # requested a tool-backed action.
-                pi_task_mode = "general"
-                task_contract = self._compile_contract(
-                    task_mode=pi_task_mode,
-                    user_text=user_text,
-                    mcp_scope=(
-                        "selected-library"
-                        if chat_request.notebook_id or chat_request.notebook_ids
-                        else "default"
-                    ),
-                )
-                task_profile = dict(task_contract.get("task_profile", {}) or {})
             _required_capability_preflight(task_contract)
             pi_eligible = (
                 not local_facts
@@ -5043,7 +5141,6 @@ class ResearchAgentRuntime:
             )
             pi_needed = (
                 not local_facts
-                and not vision_direct
                 and _pi_should_run(pi_task_mode, user_text, task_profile)
             )
             if pi_needed and not pi_eligible:
@@ -5126,8 +5223,8 @@ class ResearchAgentRuntime:
                     active_run_id=run_id,
                 )
             else:
-                # Vision message blocks and explicitly requested legacy runs
-                # retain direct transport because Pi's bridge is text-only.
+                # Only deterministic local facts bypass Pi. Model-mediated
+                # image turns use the canonical Pi multimodal channel above.
                 model_events = self._direct_events_with_managed_fallback(chat_request)
             for model_event in model_events:
                 if model_event.get("type") == "delta":
@@ -7312,7 +7409,7 @@ class ResearchAgentRuntime:
         if not transcript_text:
             raise ValueError("语音识别没有得到可用文字，请重新录音或选择其他音频文件")
         prefix = f"{original}\n\n" if original else "请根据下面的语音内容回答：\n\n"
-        messages[user_index]["content"] = f"{prefix}[本地语音转写]\n{transcript_text}"[:12_000]
+        messages[user_index]["content"] = f"{prefix}[本地语音转写]\n{transcript_text}"
         prepared = dict(payload)
         prepared["messages"] = messages
         return prepared, {
@@ -7323,25 +7420,33 @@ class ResearchAgentRuntime:
 
     def _direct_chat_request(self, payload: dict[str, Any], *, attachment_context: str = "") -> _DirectChatRequest:
         raw_messages = list(payload.get("messages", []) or [])
-        candidates: list[dict[str, Any]] = []
-        for item in raw_messages[-12:]:
+        messages: list[dict[str, Any]] = []
+        for item in raw_messages:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role", "")).strip().lower()
-            content = str(item.get("content", "")).strip()
+            raw_content = item.get("content", "")
+            if isinstance(raw_content, str):
+                content = raw_content.strip()
+            elif isinstance(raw_content, list):
+                # Historical provider-specific image blocks are never carried
+                # forward. Preserve only their explicit text; current-turn
+                # images travel in the separate canonical Pi field.
+                content = "\n".join(
+                    str(block.get("text", "")).strip()
+                    for block in raw_content
+                    if isinstance(block, dict)
+                    and str(block.get("type", "")) == "text"
+                    and str(block.get("text", "")).strip()
+                )
+            else:
+                content = ""
             if role in {"system", "user", "assistant"} and content:
-                candidates.append({"role": role, "content": content[:8_000]})
-        messages: list[dict[str, Any]] = []
-        remaining_chars = 24_000
-        for item in reversed(candidates):
-            if remaining_chars <= 0:
-                break
-            content = str(item["content"])
-            kept = content[:remaining_chars]
-            if kept:
-                messages.append({"role": item["role"], "content": kept})
-                remaining_chars -= len(kept)
-        messages.reverse()
+                message = {"role": role, "content": content}
+                for key in ("message_id", "id", "context_ref", "context_kind"):
+                    if item.get(key):
+                        message[key] = item[key]
+                messages.append(message)
         if not messages or messages[-1]["role"] != "user":
             raise ValueError("messages must end with a user message")
 
@@ -7353,8 +7458,10 @@ class ResearchAgentRuntime:
                     "content": (
                         "The user attached the following local material. Answer from it when relevant, "
                         "name the attachment and preserve any page labels. Do not invent missing facts.\n\n"
-                        + attachment_context[:16_000]
+                        + attachment_context
                     ),
+                    "context_kind": "attachment",
+                    "context_ref": f"attachment:{hashlib.sha256(attachment_context.encode('utf-8')).hexdigest()}",
                 },
             )
 
@@ -7458,7 +7565,7 @@ class ResearchAgentRuntime:
         try:
             manifest = RunManifest.start(
                 self.workspace,
-                harness="direct-provider",
+                harness="pi",
                 provider=provider_id,
                 model=model_id,
                 api_surface=api_surface,
@@ -7500,6 +7607,7 @@ class ResearchAgentRuntime:
         )
         messages.insert(0, {"role": "system", "content": system_context})
         image_attachments: list[dict[str, Any]] = []
+        pi_images: list[dict[str, str]] = []
         if provider_id == "local-huggingface":
             # Registering the selected snapshot starts only a loopback server;
             # weights are loaded lazily by the first completion request so the
@@ -7509,45 +7617,71 @@ class ResearchAgentRuntime:
             provider["base_url"] = ensure_local_transformers_runtime(model_id)
         if raw_images:
             image_attachments = persist_image_attachments(self.workspace, raw_images)
-            blocks = vision_image_blocks(self.workspace, image_attachments)
             text = str(messages[-1].get("content", ""))
             if vision_route.get("mode") == "ocr-fallback":
+                blocks = vision_image_blocks(self.workspace, image_attachments)
                 ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
                 ocr_text = str(ocr.get("text", "")).strip()
                 vision_route.update(
                     {
+                        "route": "pi-ocr-text",
+                        "degraded": True,
+                        "image_count": len(image_attachments),
                         "ocr_backend": str(ocr.get("backend", "unavailable")),
                         "ocr_available": bool(ocr.get("available")),
                         "ocr_message": str(ocr.get("message", ""))[:500],
                     }
                 )
                 if ocr_text:
-                    image_context = f"[本地 OCR 图片文字]\n{ocr_text[:12_000]}"
+                    image_context = f"[本地 OCR 图片文字]\n{ocr_text}"
                 else:
                     image_context = (
                         "[图片处理提示]\n当前没有可用的视觉模型，且本机 OCR 未提取到文字。"
                         "请明确告诉用户无法可靠读取图片内容，不要猜测图像中的事实。"
                     )
                 messages[-1]["content"] = f"{text}\n\n{image_context}".strip()
-            elif provider_kind in {"anthropic-compatible", "anthropic"}:
-                content: list[dict[str, Any]] = [{"type": "text", "text": text}]
-                content.extend(
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": block["mime_type"], "data": block["data"]},
-                    }
-                    for block in blocks
-                )
             else:
-                content = [{"type": "text", "text": text}]
-                content.extend(
+                pi_images = pi_image_blocks(self.workspace, image_attachments)
+                vision_route.update(
                     {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{block['mime_type']};base64,{block['data']}"},
+                        "route": "pi-native",
+                        "degraded": str(vision_route.get("mode", "")) != "selected",
+                        "image_count": len(pi_images),
                     }
-                    for block in blocks
                 )
-            messages[-1]["content"] = content
+        model_record = next(
+            (
+                dict(item)
+                for item in list(provider.get("models", []) or [])
+                if isinstance(item, dict) and str(item.get("id", "")) == model_id
+            ),
+            {},
+        )
+        model_runtime = descriptor_from_model_record(
+            provider_id=provider_id,
+            provider_kind=provider_kind,
+            model_id=model_id,
+            model_record=model_record,
+            api_surface=api_surface,
+        )
+        if bool(vision_route.get("degraded")):
+            route_reason = (
+                "vision_input_degraded_to_ocr_text"
+                if str(vision_route.get("route", "")) == "pi-ocr-text"
+                else "vision_input_routed_to_alternate_model"
+            )
+            model_runtime = replace(
+                model_runtime,
+                degraded=True,
+                degradation_reasons=tuple(dict.fromkeys([
+                    *model_runtime.degradation_reasons,
+                    route_reason,
+                ])),
+            )
+        if pi_images and not model_runtime.supports_images:
+            raise PiMultimodalUnavailable(
+                "The declared alternate model descriptor does not support image input"
+            )
         thinking_mode = (
             managed_glm_thinking_mode(
                 thinking_level=payload.get("thinking_level"),
@@ -7582,6 +7716,8 @@ class ResearchAgentRuntime:
             manifest=manifest,
             vision_route=vision_route,
             image_attachments=image_attachments,
+            pi_images=pi_images,
+            model_runtime=model_runtime.to_dict(),
         )
 
     @staticmethod
@@ -9455,6 +9591,47 @@ class ResearchAgentRuntime:
         api_surface: str = "chat_completions",
         responses_enabled: bool = False,
     ) -> _PiBackedChatJsonClient:
+        selected_api_surface = select_api_surface(
+            api_surface,
+            provider_kind=provider_kind,
+            provider_id=provider_id,
+            model=model_id,
+            responses_enabled=responses_enabled,
+        )
+        settings = load_settings(self.workspace)
+        provider_record = next(
+            (
+                dict(item)
+                for item in list(settings.get("providers", []) or [])
+                if isinstance(item, dict) and str(item.get("id", "")) == provider_id
+            ),
+            {},
+        )
+        model_record = next(
+            (
+                dict(item)
+                for item in list(provider_record.get("models", []) or [])
+                if isinstance(item, dict) and str(item.get("id", "")) == model_id
+            ),
+            {},
+        )
+        if not model_record and provider_id.startswith("local:"):
+            local_id = provider_id.removeprefix("local:")
+            model_record = next(
+                (
+                    dict(item)
+                    for item in list(settings.get("local_models", []) or [])
+                    if isinstance(item, dict) and str(item.get("id", "")) == local_id
+                ),
+                {},
+            )
+        descriptor = descriptor_from_model_record(
+            provider_id=provider_id,
+            provider_kind=provider_kind,
+            model_id=model_id,
+            model_record=model_record,
+            api_surface=selected_api_surface,
+        )
         return _PiBackedChatJsonClient(
             workspace=self.workspace,
             evidence_db=self.evidence_db,
@@ -9463,16 +9640,11 @@ class ResearchAgentRuntime:
             base_url=base_url,
             api_key=api_key,
             model=model_id,
-            api_surface=select_api_surface(
-                api_surface,
-                provider_kind=provider_kind,
-                provider_id=provider_id,
-                model=model_id,
-                responses_enabled=responses_enabled,
-            ),
+            api_surface=selected_api_surface,
             responses_enabled=responses_enabled,
             role=role,
             timeout_seconds=timeout_seconds,
+            model_runtime=descriptor,
         )
 
     def _writing_chat_client(self) -> Any:

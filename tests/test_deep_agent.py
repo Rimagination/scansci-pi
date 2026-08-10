@@ -399,10 +399,12 @@ def test_evidence_answer_keeps_product_owned_retrieval_but_routes_generation_thr
     assert observed["generated"] == {"answer": "Grounded answer"}
     assert observed["pi_request"]["session_id"] is None
     assert observed["pi_request"]["task_contract"]["allowed_tools"] == []
+    assert observed["pi_request"]["model_runtime"]["context_window_tokens"] == 32 * 1024
+    assert observed["pi_request"]["model_runtime"]["degraded"] is True
     assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
 
 
-def test_research_runtime_uses_the_selected_vision_model_for_image_inputs(tmp_path: Path, monkeypatch):
+def test_research_runtime_uses_pi_with_the_selected_vision_model_for_image_inputs(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace.sqlite"
     evidence_db = tmp_path / "evidence.sqlite"
     evidence_db.write_bytes(b"placeholder")
@@ -417,6 +419,34 @@ def test_research_runtime_uses_the_selected_vision_model_for_image_inputs(tmp_pa
     monkeypatch.setattr(research_agent_module, "vision_image_blocks", lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}])
     monkeypatch.setattr(research_agent_module, "analyze_vision_images", lambda *_args, **kwargs: f"视觉：{kwargs['question']}")
     monkeypatch.setattr(research_agent_module, "answer_question", lambda *_args, **_kwargs: {"reader_answer": {"citations": []}})
+    expected_analysis = research_agent_module.analyze_vision_images
+    monkeypatch.setattr(
+        research_agent_module,
+        "analyze_vision_images",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("evidence image analysis must not bypass Pi")
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent_module,
+        "pi_image_blocks",
+        lambda *_args: [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}],
+    )
+    observed_pi: dict[str, object] = {}
+
+    def fake_pi_stream(self, **kwargs):
+        del self
+        observed_pi.update(kwargs)
+        assert kwargs["images"] == [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]
+        assert kwargs["model_runtime"]["input_modalities"] == ["text", "image"]
+        assert kwargs["task_contract"]["allowed_tools"] == []
+        yield {
+            "type": "delta",
+            "content": expected_analysis(question=str(kwargs["messages"][-1]["content"])),
+        }
+        yield {"type": "done", "stats": {}}
+
+    monkeypatch.setattr(research_agent_module.PiAgentClient, "stream_chat", fake_pi_stream)
 
     result = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db).answer_sync(
         {"question": "解释这张图", "images": [{"id": "image-0123456789abcdef0123456789abcdef", "mime_type": "image/png"}]}

@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from scansci_html.model_metadata import ModelRuntimeDescriptor
 from scansci_html.pi_agent import PiAgentClient, _PI_REQUIRED_FEATURES
 
 
@@ -330,10 +331,11 @@ def _sibling_calls_arrive_before_first_result(tmp_path: Path, tool_name: str) ->
         assert process.stdin is not None
         process.stdin.write(json.dumps({
             "type": "run.start",
-            "pi_protocol_version": 4,
-            "required_features": ["task_contract_v2", "dynamic_tools"],
+            "pi_protocol_version": 5,
+            "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": request_id,
+            "ephemeral_session": True,
             "cwd": str(tmp_path),
             "agent_dir": str(tmp_path / ".agent"),
             "provider_kind": "openai-compatible",
@@ -343,6 +345,8 @@ def _sibling_calls_arrive_before_first_result(tmp_path: Path, tool_name: str) ->
             "thinking_level": "off",
             "system_prompt": "",
             "prompt": "Call both supplied sibling tools exactly once.",
+            "images": [],
+            "model_runtime": ModelRuntimeDescriptor.for_testing().to_dict(),
             "task_mode": "general",
             "task_contract": {
                 **_TASK_CONTRACT_V2,
