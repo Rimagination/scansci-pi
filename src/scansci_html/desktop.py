@@ -773,14 +773,34 @@ def desktop_diagnostics(workspace: str | Path, evidence_db: str | Path) -> dict[
         pi_runtime = PiAgentClient.runtime_status()
     except Exception as error:
         pi_runtime = {"ready": False, "error": f"{type(error).__name__}: {error}"[:500]}
+    try:
+        pi_tool_loop = PiAgentClient.diagnostic_tool_loop(
+            workspace=workspace_path,
+            evidence_db=evidence_path,
+            timeout_seconds=30.0,
+        )
+    except Exception as error:
+        pi_tool_loop = {
+            "ok": False,
+            "tool_calls": 0,
+            "done": False,
+            "fallback_count": 0,
+            "error": f"{type(error).__name__}: {error}"[:500],
+        }
     vector_identity = default_vector_cache_identity()
     report = {
-        "ok": all(assets.values()) and all(modules.values()) and bool(pi_runtime.get("ready")),
+        "ok": (
+            all(assets.values())
+            and all(modules.values())
+            and bool(pi_runtime.get("ready"))
+            and bool(pi_tool_loop.get("ok"))
+        ),
         "build": current_build_info(),
         "assets": assets,
         "modules": modules,
         "module_errors": module_errors,
         "pi_runtime": pi_runtime,
+        "pi_tool_loop": pi_tool_loop,
         "telemetry": diagnostics_summary(workspace_path),
         "vector_cache": vector_cache_status(
             evidence_path,

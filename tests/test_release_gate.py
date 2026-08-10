@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import time
 from zipfile import ZipFile
 
 import pytest
@@ -52,6 +53,193 @@ def _contract(command: list[str] | None = None) -> dict:
             "required_screenshots": ["home.png"],
         },
     }
+
+
+def _valid_pi_report(tmp_path: Path, *, source_sha256: str, bundle_path: Path) -> Path:
+    manifest = _write_json(
+        tmp_path / "run-manifest.json",
+        {"run_id": "run-test", "status": "completed", "metrics": {"tool_calls": 1}},
+    )
+    matrix = Path(release_gate.PROJECT_ROOT) / "bench" / "pi_capability_tasks.json"
+    matrix_payload = json.loads(matrix.read_text(encoding="utf-8"))
+    axes = []
+    for matrix_axis in matrix_payload["axes"]:
+        case_ids = [str(case["id"]) for case in matrix_axis["cases"]]
+        axes.append({
+            "id": str(matrix_axis["id"]),
+            "cases": len(case_ids),
+            "threshold": int(matrix_axis["threshold"]),
+            "passed": len(case_ids),
+            "status": "passed",
+            "evidence_matches": 0,
+            "verified_case_ids": case_ids,
+        })
+    node_ids = [
+        *[
+            f"tests.test_pi_capability_matrix::test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory[case-{index}]"
+            for index in range(40)
+        ],
+        *[
+            f"tests.test_pi_parallel::test_three_two_second_safe_reads_overlap_end_to_end[round-{index}]"
+            for index in range(1, 4)
+        ],
+        "tests.test_context_policy::test_long_context_twenty_turn_batch_recovers_every_sentinel",
+        *[f"tests.test_skill_runtime::test_skill_case_{index}" for index in range(20)],
+        "tests.test_pi_subagents::test_atomic_delegation_reserves_at_most_three_under_ten_concurrent_requests",
+        "tests.test_mcp_bridge::test_deferred_mcp_registers_and_calls_native_remote_schema_after_search",
+        "tests.test_mcp_bridge::test_deferred_streamable_http_stays_disconnected_until_search_then_calls_native_schema",
+        "tests.test_pi_security::test_mcp_policy_endpoint_audit_and_cache_are_fail_closed",
+        "tests.test_pi_observability::test_runtime_hooks_emit_bounded_ordered_current_turn_audit",
+        "tests.test_pi_agent::test_pi_manual_compaction_is_persisted",
+        *[f"tests.test_other::test_unrelated_{index}" for index in range(30)],
+    ]
+    assert len(node_ids) == 100
+    junit = tmp_path / "pi-targeted-junit.xml"
+    testcases = "".join(
+        f'<testcase classname="{node_id.split("::", 1)[0]}" name="{node_id.split("::", 1)[1]}" time="0.1"/>'
+        for node_id in node_ids
+    )
+    junit.write_text(
+        f'<testsuite tests="100" failures="0" errors="0" skipped="0">{testcases}</testsuite>',
+        encoding="utf-8",
+    )
+    batch_matches: dict[str, dict[str, list[str]]] = {}
+    selector_matches: dict[str, int] = {}
+    matched_timings: dict[str, float] = {}
+    for matrix_axis, report_axis in zip(matrix_payload["axes"], axes, strict=True):
+        axis_batches: dict[str, list[str]] = {}
+        axis_nodes: set[str] = set()
+        proof_count = 0
+        for batch in matrix_axis["requirements"]["proof_batches"]:
+            if batch["source"] == "runtime":
+                proof_count += 10
+                continue
+            matches = [node_id for node_id in node_ids if batch["selector"] in node_id]
+            axis_batches[batch["id"]] = matches
+            axis_nodes.update(matches)
+            proof_count += len(matches)
+            matched_timings.update({node_id: 0.1 for node_id in matches})
+        batch_matches[matrix_axis["id"]] = axis_batches
+        selector_matches[matrix_axis["id"]] = len(axis_nodes)
+        report_axis["evidence_matches"] = proof_count
+    observability_axis = next(axis for axis in matrix_payload["axes"] if axis["id"] == "observability")
+    observability_matches = {
+        kind: sum(1 for node_id in node_ids if any(selector in node_id for selector in selectors))
+        for kind, selectors in observability_axis["requirements"]["kind_selectors"].items()
+    }
+    mutation_proofs = [
+        {
+            "turn": index + 1,
+            "session_id": f"mutation-{index + 1}",
+            "target_tool": "inspect_workspace" if index % 2 == 0 else "self_assess",
+            "search_tools_completed": True,
+            "target_activated": True,
+            "target_completed": True,
+        }
+        for index in range(10)
+    ]
+    base_loop = {
+        "ok": True,
+        "tool_calls": 1,
+        "done": True,
+        "marker_seen": True,
+        "fallback_count": 0,
+        "provider_requests": 2,
+        "dynamic_mutations": 0,
+        "mutation_evidence": [],
+        "image_tool_tasks": 0,
+        "image_serialized_tasks": 0,
+        "duration_seconds": 0.1,
+    }
+    dynamic_loop = {
+        **base_loop,
+        "tool_calls": 10,
+        "provider_requests": 30,
+        "dynamic_mutations": 10,
+        "mutation_evidence": mutation_proofs,
+    }
+    image_loop = {
+        **base_loop,
+        "tool_calls": 10,
+        "provider_requests": 20,
+        "image_tool_tasks": 10,
+        "image_serialized_tasks": 10,
+    }
+    required_features = sorted(release_gate._PI_REQUIRED_RUNTIME_FEATURES)
+    observability_records = []
+    observability_cases = {case["id"]: case for case in observability_axis["cases"]}
+    for batch in observability_axis["requirements"]["proof_batches"]:
+        matches = batch_matches["observability"][batch["id"]]
+        selected = [case for case in observability_axis["cases"] if case["probe"] == batch["case_probe"]]
+        for index, case in enumerate(selected):
+            node_id = matches[index % len(matches)]
+            observability_records.append({
+                "id": case["id"],
+                "kind": observability_cases[case["id"]]["probe"],
+                "timing": {"source": "junit", "duration_seconds": 0.1},
+                "decision": "passed",
+                "result_reference": {
+                    "junit_sha256": release_gate._sha256(junit),
+                    "node_id": node_id,
+                },
+            })
+    report = {
+        "schema_version": 2,
+        "report_kind": "scansci.pi-capabilities",
+        "mode": "deterministic",
+        "status": "passed",
+        "protocol_version": 7,
+        "sdk_version": "0.80.10",
+        "source_sha256": source_sha256,
+        "bundle": {"path": str(bundle_path), "sha256": release_gate._sha256(bundle_path), "bytes": bundle_path.stat().st_size},
+        "matrix": {
+            "path": str(matrix),
+            "sha256": release_gate._sha256(matrix),
+            "bytes": matrix.stat().st_size,
+            "schema_version": 2,
+        },
+        "fallback_count": 0,
+        "run_manifests": [{
+            "path": str(manifest),
+            "sha256": release_gate._sha256(manifest),
+            "bytes": manifest.stat().st_size,
+            "run_id": "run-test",
+        }],
+        "axes": axes,
+        "provider": {"configured": False, "provider_id": "deterministic-loopback"},
+        "evidence": {
+            "ping": {"ready": True, "protocol": 7},
+            "protocol_probe": {
+                "ready": True,
+                "protocol": 7,
+                "required_features": required_features,
+                "capabilities": required_features,
+            },
+            "tool_loop": base_loop,
+            "targeted_tests": {
+                "path": str(junit),
+                "sha256": release_gate._sha256(junit),
+                "bytes": junit.stat().st_size,
+                "tests": 100,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0,
+                "axis_selector_matches": selector_matches,
+                "observability_selector_matches": observability_matches,
+                "batch_matches": batch_matches,
+                "matched_testcase_timings": matched_timings,
+            },
+            "dynamic_mutations": dynamic_loop,
+            "image_tool_tasks": image_loop,
+            "observability": {
+                "required_fields": ["id", "timing", "decision", "result_reference"],
+                "kind_matches": observability_matches,
+                "run_manifest_count": 1,
+                "records": observability_records,
+            },
+        },
+    }
+    return _write_json(tmp_path / "pi-capabilities.json", report)
 
 
 def test_release_contract_requires_one_p0_with_acceptance_and_non_goals() -> None:
@@ -551,6 +739,59 @@ def test_core_package_rejects_bundled_model_runtime_or_huggingface_snapshot(
         gate.verify_package()
 
 
+def test_release_package_requires_pi_bundle_and_matching_build_info_hash(tmp_path: Path) -> None:
+    contract = _contract()
+    contract["package"]["required_resources"] = ["pi_runtime/main.mjs"]
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="pi-bundle-binding",
+    )
+    internal = gate.package_dir / "_internal"
+    build_info = internal / "scansci_html" / "build-info.json"
+    build_info.parent.mkdir(parents=True)
+    gate.executable.write_bytes(b"scan-sci")
+    _write_json(build_info, {
+        "build_id": gate.build_id,
+        "package_profile": "core",
+        "release_source_sha256": gate.source_sha256,
+        "pi_bundle_sha256": "0" * 64,
+    })
+
+    with pytest.raises(release_gate.GateFailure, match="pi_runtime/main.mjs"):
+        gate.verify_package()
+
+    bundle = internal / "pi_runtime" / "main.mjs"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("export {};", encoding="utf-8")
+    with pytest.raises(release_gate.GateFailure, match="Pi bundle SHA256"):
+        gate.verify_package()
+
+
+def test_packaged_diagnostics_requires_a_completed_pi_tool_loop(tmp_path: Path, monkeypatch) -> None:
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", _contract()),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="diagnostic-tool-loop",
+    )
+    output = gate.diagnostics_dir / "packaged-runtime.json"
+
+    def fake_command_step(**_kwargs):
+        _write_json(output, {"ok": True, "pi_tool_loop": {"ok": False, "tool_calls": 0, "done": False}})
+        return {"status": "passed"}
+
+    monkeypatch.setattr(gate, "command_step", fake_command_step)
+
+    with pytest.raises(release_gate.GateFailure, match="tool loop"):
+        gate.packaged_diagnostics()
+
+
 def test_release_build_keeps_long_pyinstaller_output_in_its_artifact_log(tmp_path: Path, monkeypatch) -> None:
     contract = _contract()
     contract["package"]["runtime_manifest_url"] = "https://downloads.example.com/runtime.json"
@@ -771,7 +1012,332 @@ def test_formal_release_rejects_a_manifest_with_an_unsigned_packaged_executable(
 def test_release_source_fingerprint_includes_the_installer_and_gateway_definitions() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
 
-    assert '("src", "scripts", "tests", "config", "installer", "services")' in source
+    assert '"pi-runtime"' in source
+    assert '"bench"' in source
+    assert '"AGENTS.md"' in source
+    assert '"docs/project-governance.zh.md"' in source
+
+
+def test_release_source_fingerprint_changes_for_pi_runtime_bench_and_architecture_docs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for relative in (
+        "pi-runtime/src/main.ts",
+        "pi-runtime/package-lock.json",
+        "bench/pi_capability_tasks.json",
+        "AGENTS.md",
+        "docs/project-governance.zh.md",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("before", encoding="utf-8")
+    monkeypatch.setattr(release_gate, "PROJECT_ROOT", tmp_path)
+    before = release_gate._source_fingerprint()
+
+    for relative in (
+        "pi-runtime/src/main.ts",
+        "bench/pi_capability_tasks.json",
+        "AGENTS.md",
+        "docs/project-governance.zh.md",
+    ):
+        path = tmp_path / relative
+        path.write_text(path.read_text(encoding="utf-8") + "-after", encoding="utf-8")
+        after = release_gate._source_fingerprint()
+        assert after != before, relative
+        path.write_text("before", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda report: report.update(schema_version=1), "schema_version"),
+        (lambda report: report["axes"].pop(), "axes"),
+        (lambda report: report["axes"][0].update(status="failed"), "axis"),
+        (lambda report: report.update(fallback_count=1), "fallback"),
+        (lambda report: report.update(source_sha256="0" * 64), "source"),
+        (lambda report: report["bundle"].update(sha256="0" * 64), "bundle"),
+        (lambda report: report["run_manifests"][0].update(sha256="0" * 64), "manifest"),
+        (lambda report: report["run_manifests"][0].update(run_id="invented-run"), "run_id"),
+        (lambda report: report["axes"][0].update(threshold=39), "matrix|threshold"),
+        (lambda report: report.update(unexpected="not allowed"), "unknown|unexpected|schema"),
+        (lambda report: report["axes"][0].update(unexpected="not allowed"), "unknown"),
+        (lambda report: report["provider"].update(unexpected="not allowed"), "unknown"),
+        (lambda report: report["evidence"].update(unexpected="not allowed"), "unknown"),
+    ],
+)
+def test_release_gate_strictly_validates_pi_capability_report(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    bundle = tmp_path / "main.mjs"
+    bundle.write_text("export {};", encoding="utf-8")
+    report_path = _valid_pi_report(tmp_path, source_sha256="a" * 64, bundle_path=bundle)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    mutation(report)
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match=message):
+        release_gate.validate_pi_capability_report(
+            report_path,
+            expected_source_sha256="a" * 64,
+            expected_bundle_path=bundle,
+            required_mode="deterministic",
+        )
+
+
+def test_release_gate_parses_manifest_status_and_tool_call_evidence(tmp_path: Path) -> None:
+    bundle = tmp_path / "main.mjs"
+    bundle.write_text("export {};", encoding="utf-8")
+    report_path = _valid_pi_report(tmp_path, source_sha256="a" * 64, bundle_path=bundle)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest_path = Path(report["run_manifests"][0]["path"])
+    _write_json(manifest_path, {"run_id": "run-test", "status": "failed", "metrics": {"tool_calls": 0}})
+    report["run_manifests"][0]["sha256"] = release_gate._sha256(manifest_path)
+    report["run_manifests"][0]["bytes"] = manifest_path.stat().st_size
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match="completed|tool call|status"):
+        release_gate.validate_pi_capability_report(
+            report_path,
+            expected_source_sha256="a" * 64,
+            expected_bundle_path=bundle,
+            required_mode="deterministic",
+        )
+
+
+def test_release_gate_rejects_manifest_outside_current_diagnostics(tmp_path: Path) -> None:
+    report_dir = tmp_path / "diagnostics"
+    report_dir.mkdir()
+    bundle = tmp_path / "main.mjs"
+    bundle.write_text("export {};", encoding="utf-8")
+    report_path = _valid_pi_report(report_dir, source_sha256="a" * 64, bundle_path=bundle)
+    outside = _write_json(
+        tmp_path / "outside-manifest.json",
+        {"run_id": "outside", "status": "completed", "metrics": {"tool_calls": 1}},
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["run_manifests"] = [{
+        "path": str(outside),
+        "sha256": release_gate._sha256(outside),
+        "bytes": outside.stat().st_size,
+        "run_id": "outside",
+    }]
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match="outside"):
+        release_gate.validate_pi_capability_report(
+            report_path,
+            expected_source_sha256="a" * 64,
+            expected_bundle_path=bundle,
+            required_mode="deterministic",
+        )
+
+
+def test_release_gate_recomputes_case_proofs_from_concrete_junit_nodes(tmp_path: Path) -> None:
+    bundle = tmp_path / "main.mjs"
+    bundle.write_text("export {};", encoding="utf-8")
+    report_path = _valid_pi_report(tmp_path, source_sha256="a" * 64, bundle_path=bundle)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    junit = Path(report["evidence"]["targeted_tests"]["path"])
+    unrelated = "".join(
+        f'<testcase classname="tests.test_unrelated" name="test_case_{index}" time="0.1"/>'
+        for index in range(100)
+    )
+    junit.write_text(
+        f'<testsuite tests="100" failures="0" errors="0" skipped="0">{unrelated}</testsuite>',
+        encoding="utf-8",
+    )
+    report["evidence"]["targeted_tests"].update(
+        sha256=release_gate._sha256(junit),
+        bytes=junit.stat().st_size,
+    )
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match="proof batch|selector|JUnit"):
+        release_gate.validate_pi_capability_report(
+            report_path,
+            expected_source_sha256="a" * 64,
+            expected_bundle_path=bundle,
+            required_mode="deterministic",
+        )
+
+
+def test_release_gate_requires_observability_records_bound_to_passed_nodes(tmp_path: Path) -> None:
+    bundle = tmp_path / "main.mjs"
+    bundle.write_text("export {};", encoding="utf-8")
+    report_path = _valid_pi_report(tmp_path, source_sha256="a" * 64, bundle_path=bundle)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["evidence"]["observability"]["records"][0]["result_reference"]["node_id"] = (
+        "tests.test_unrelated::test_not_a_proof"
+    )
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match="observability record"):
+        release_gate.validate_pi_capability_report(
+            report_path,
+            expected_source_sha256="a" * 64,
+            expected_bundle_path=bundle,
+            required_mode="deterministic",
+        )
+
+
+def test_command_step_rejects_success_with_an_invalid_pi_report(tmp_path: Path) -> None:
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", _contract()),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="targeted",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="invalid-pi-report",
+    )
+    output = gate.diagnostics_dir / "pi-capabilities.json"
+    command = [sys.executable, "-c", f"from pathlib import Path; Path({str(output)!r}).write_text('{{}}')"]
+
+    with pytest.raises(release_gate.GateFailure, match="capability report"):
+        gate.command_step(
+            step_id="pi-capabilities-deterministic",
+            title="Pi capability report",
+            command=command,
+            required_result=output,
+            result_kind="pi_capability_report",
+        )
+
+
+def test_promotion_revalidates_tampered_pi_capability_evidence(tmp_path: Path) -> None:
+    contract = _contract()
+    contract["targeted_commands"] = [{
+        "id": "pi-capabilities-deterministic",
+        "title": "Pi deterministic",
+        "command": [sys.executable, "-c", "pass"],
+        "result_file": "pi-capabilities.json",
+        "result_kind": "pi_capability_report",
+    }]
+    contract_path = _write_json(tmp_path / "contract.json", contract)
+    scope_path = _write_json(tmp_path / "scope.json", _scope())
+    targeted = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="targeted",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "targeted",
+        build_id="targeted",
+    )
+    bundle = Path(release_gate.PROJECT_ROOT) / "pi-runtime" / "dist" / "main.mjs"
+    report_path = _valid_pi_report(targeted.diagnostics_dir, source_sha256=targeted.source_sha256, bundle_path=bundle)
+    targeted._record({
+        "id": "pi-capabilities-deterministic",
+        "title": "Pi deterministic",
+        "status": "passed",
+        "result_file": str(report_path),
+        "result_sha256": release_gate._sha256(report_path),
+    })
+    targeted.report["status"] = "passed"
+    targeted._persist()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["fallback_count"] = 1
+    _write_json(report_path, report)
+
+    with pytest.raises(release_gate.GateFailure, match="evidence|fallback"):
+        release_gate.ReleaseGate(
+            contract_path=contract_path,
+            scope_path=scope_path,
+            profile="source",
+            knowledge_source=tmp_path,
+            output_root=tmp_path / "source",
+            build_id="source",
+            promote_report=targeted.report_path,
+        )
+
+
+def test_promotion_rewrites_and_revalidates_internal_pi_evidence_paths(tmp_path: Path) -> None:
+    contract = _contract()
+    contract["targeted_commands"] = [{
+        "id": "pi-capabilities-deterministic",
+        "title": "Pi deterministic",
+        "command": [sys.executable, "-c", "pass"],
+        "result_file": "pi-capabilities.json",
+        "result_kind": "pi_capability_report",
+    }]
+    contract_path = _write_json(tmp_path / "contract.json", contract)
+    scope_path = _write_json(tmp_path / "scope.json", _scope())
+    targeted = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="targeted",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "targeted",
+        build_id="targeted-remap",
+    )
+    bundle = Path(release_gate.PROJECT_ROOT) / "pi-runtime" / "dist" / "main.mjs"
+    report_path = _valid_pi_report(
+        targeted.diagnostics_dir,
+        source_sha256=targeted.source_sha256,
+        bundle_path=bundle,
+    )
+    targeted._record({
+        "id": "pi-capabilities-deterministic",
+        "title": "Pi deterministic",
+        "status": "passed",
+        "result_file": str(report_path),
+        "result_sha256": release_gate._sha256(report_path),
+    })
+    targeted.report["status"] = "passed"
+    targeted._persist()
+
+    promoted = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="source",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "source",
+        build_id="source-remap",
+        promote_report=targeted.report_path,
+    )
+
+    step = next(item for item in promoted.report["steps"] if item["id"] == "pi-capabilities-deterministic")
+    promoted_report = json.loads(Path(step["result_file"]).read_text(encoding="utf-8"))
+    manifest_path = Path(promoted_report["run_manifests"][0]["path"])
+    junit_path = Path(promoted_report["evidence"]["targeted_tests"]["path"])
+    assert manifest_path.is_relative_to(promoted.diagnostics_dir)
+    assert junit_path.is_relative_to(promoted.diagnostics_dir)
+    assert not manifest_path.is_relative_to(targeted.diagnostics_dir)
+    assert not junit_path.is_relative_to(targeted.diagnostics_dir)
+    assert step["result_sha256"] == release_gate._sha256(Path(step["result_file"]))
+    promoted_summary = promoted.report["artifacts"]["pi_capabilities"]["deterministic"]
+    assert Path(promoted_summary["report"]) == Path(step["result_file"])
+    assert promoted_summary["report_sha256"] == step["result_sha256"]
+
+
+def test_release_gate_timeout_terminates_the_nested_process_tree(tmp_path: Path) -> None:
+    marker = tmp_path / "orphan-marker.txt"
+    child_code = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).write_text('orphan')"
+    parent_code = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+        "time.sleep(10)"
+    )
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract-tree.json", _contract()),
+        scope_path=_write_json(tmp_path / "scope-tree.json", _scope()),
+        profile="source",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports-tree",
+        build_id="process-tree-timeout",
+    )
+
+    with pytest.raises(release_gate.GateFailure, match="process tree"):
+        gate.command_step(
+            step_id="process-tree",
+            title="process tree",
+            command=[sys.executable, "-c", parent_code],
+            echo_output=False,
+            timeout_seconds=0.2,
+        )
+
+    time.sleep(1.4)
+    assert not marker.exists()
 
 
 def test_release_plan_requires_a_built_and_exercised_windows_installer(tmp_path: Path) -> None:

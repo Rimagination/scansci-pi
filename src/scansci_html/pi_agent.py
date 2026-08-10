@@ -1422,6 +1422,239 @@ class PiAgentClient:
             process.wait(timeout=5)
 
     @classmethod
+    def diagnostic_tool_loop(
+        cls,
+        *,
+        workspace: str | Path,
+        evidence_db: str | Path,
+        timeout_seconds: float = 30.0,
+        task_count: int = 1,
+        dynamic_activation: bool = False,
+        include_image: bool = False,
+    ) -> dict[str, Any]:
+        """Exercise provider serialization, Pi dispatch, and one host tool.
+
+        The loopback provider is deterministic and binds only to localhost. It
+        still drives the production Node bundle and production Python tool
+        dispatcher; unlike ``runtime_status()``, this proves a complete
+        model->tool.call->tool.result->model completion cycle without needing
+        an external credential or network request.
+        """
+
+        class _DiagnosticHandler(BaseHTTPRequestHandler):
+            request_count = 0
+            target_tool = "inspect_workspace"
+            image_task_ids: set[int] = set()
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 2_000_000:
+                    self.send_error(400)
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                except (ValueError, UnicodeDecodeError):
+                    self.send_error(400)
+                    return
+                type(self).request_count += 1
+                turn = type(self).request_count
+                phase_count = 3 if dynamic_activation else 2
+                phase = (turn - 1) % phase_count
+                if include_image:
+                    serialized = json.dumps(payload.get("messages", []), ensure_ascii=False)
+                    if "image_url" in serialized and "data:image/png" in serialized:
+                        type(self).image_task_ids.add(((turn - 1) // phase_count) + 1)
+                if dynamic_activation and phase == 0:
+                    delta = {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"diagnostic-search-tools-{turn}",
+                            "type": "function",
+                            "function": {
+                                "name": "search_tools",
+                                "arguments": json.dumps({
+                                    "names": [type(self).target_tool],
+                                    "activate": True,
+                                }),
+                            },
+                        }],
+                    }
+                    finish = "tool_calls"
+                elif (dynamic_activation and phase == 1) or (not dynamic_activation and phase == 0):
+                    delta: dict[str, Any] = {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"diagnostic-host-tool-{turn}",
+                            "type": "function",
+                            "function": {"name": type(self).target_tool, "arguments": "{}"},
+                        }],
+                    }
+                    finish = "tool_calls"
+                else:
+                    delta = {"role": "assistant", "content": "PI_DIAGNOSTIC_TOOL_LOOP_OK"}
+                    finish = "stop"
+                chunks = [
+                    {
+                        "id": f"chatcmpl-diagnostic-{turn}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "fixture-model",
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    },
+                    {
+                        "id": f"chatcmpl-diagnostic-{turn}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "fixture-model",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    },
+                ]
+                body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+                encoded = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        workspace_path = Path(workspace).resolve()
+        evidence_path = Path(evidence_db).resolve()
+        workspace_path.parent.mkdir(parents=True, exist_ok=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _DiagnosticHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = cls(workspace=workspace_path, evidence_db=evidence_path)
+        descriptor = descriptor_from_model_record(
+            provider_id="deterministic-loopback",
+            provider_kind="openai-compatible",
+            model_id="fixture-model",
+            model_record={
+                "context_window": "32K",
+                "capabilities": ["reasoning", "tool", *( ["vision"] if include_image else [] )],
+            },
+            api_surface="chat_completions",
+        )
+        started = time.monotonic()
+        events: list[dict[str, Any]] = []
+        mutation_evidence: list[dict[str, Any]] = []
+        count = max(1, min(int(task_count), 10))
+        image = {
+            "type": "image",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+            "mimeType": "image/png",
+        }
+        try:
+            for index in range(count):
+                target_tool = "inspect_workspace" if index % 2 == 0 else "self_assess"
+                _DiagnosticHandler.target_tool = target_tool
+                contract = compile_host_task_contract(
+                    task_mode="general",
+                    user_text="Run the bounded packaged runtime diagnostic.",
+                    available_tool_ids=[target_tool],
+                    required_tool_groups=[[target_tool]],
+                )
+                contract["allowed_tools"] = [target_tool]
+                contract["initial_tools"] = [] if dynamic_activation else [target_tool]
+                if dynamic_activation:
+                    contract["required_tool_groups"] = []
+                turn_session_id = f"diagnostic-tool-loop-session-{index + 1}" if dynamic_activation else None
+                turn_events = list(client.stream_chat(
+                    provider_kind="openai-compatible",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    api_key="diagnostic-loopback-key",
+                    model_id="fixture-model",
+                    messages=[{
+                        "role": "user",
+                        "content": f"Run diagnostic task {index + 1}/{count}, call {target_tool} once, then finish.",
+                    }],
+                    images=[image] if include_image else [],
+                    thinking_level="off",
+                    task_mode="general",
+                    task_contract=contract,
+                    model_runtime=descriptor,
+                    timeout_seconds=max(5.0, float(timeout_seconds)),
+                    session_id=turn_session_id,
+                ))
+                if dynamic_activation:
+                    searches = [
+                        event
+                        for event in turn_events
+                        if event.get("type") == "status"
+                        and event.get("status") == "tool_catalog_searched"
+                        and event.get("name") == "search_tools"
+                    ]
+                    activated = [
+                        str(name)
+                        for event in searches
+                        for name in list(dict(event.get("details", {}) or {}).get("activated", []) or [])
+                    ]
+                    target_completed = any(
+                        event.get("type") == "tool.completed" and event.get("name") == target_tool
+                        for event in turn_events
+                    )
+                    mutation_evidence.append({
+                        "turn": index + 1,
+                        "session_id": str(turn_session_id or ""),
+                        "target_tool": target_tool,
+                        "search_tools_completed": bool(searches),
+                        "target_activated": target_tool in activated,
+                        "target_completed": target_completed,
+                    })
+                events.extend(turn_events)
+        finally:
+            client.close()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        tool_calls = sum(1 for event in events if event.get("type") == "tool.completed")
+        done_count = sum(1 for event in events if event.get("type") == "done")
+        marker_count = sum(
+            1
+            for event in events
+            if event.get("type") == "delta"
+            and "PI_DIAGNOSTIC_TOOL_LOOP_OK" in str(event.get("content", ""))
+        )
+        fallback_count = sum(
+            1
+            for event in events
+            if "fallback" in str(event.get("type", "")).casefold()
+            or "degrad" in str(event.get("type", "")).casefold()
+            or "fallback" in str(event.get("status", "")).casefold()
+            or "degrad" in str(event.get("status", "")).casefold()
+        )
+        image_serialized_tasks = len(_DiagnosticHandler.image_task_ids) if include_image else 0
+        verified_mutations = sum(
+            1
+            for item in mutation_evidence
+            if item["search_tools_completed"] and item["target_activated"] and item["target_completed"]
+        )
+        return {
+            "ok": (
+                tool_calls == count
+                and done_count == count
+                and marker_count == count
+                and fallback_count == 0
+                and (not dynamic_activation or verified_mutations == count)
+                and (not include_image or image_serialized_tasks == count)
+            ),
+            "tool_calls": tool_calls,
+            "done": done_count == count,
+            "marker_seen": marker_count == count,
+            "fallback_count": fallback_count,
+            "provider_requests": _DiagnosticHandler.request_count,
+            "dynamic_mutations": verified_mutations if dynamic_activation else 0,
+            "mutation_evidence": mutation_evidence,
+            "image_tool_tasks": count if include_image else 0,
+            "image_serialized_tasks": image_serialized_tasks,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
+
+    @classmethod
     def probe_mcp_server(
         cls,
         *,

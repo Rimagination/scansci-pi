@@ -358,3 +358,7 @@ def test_desktop_diagnostics_verify_packaged_runtime_dependencies(tmp_path: Path
     assert all(report["assets"].values())
     assert all(report["modules"].values())
     assert report["build"]["build_id"] == "source"
+    assert report["pi_tool_loop"]["ok"] is True
+    assert report["pi_tool_loop"]["tool_calls"] >= 1
+    assert report["pi_tool_loop"]["done"] is True
+    assert report["pi_tool_loop"]["fallback_count"] == 0

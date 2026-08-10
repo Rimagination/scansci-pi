@@ -151,6 +151,7 @@ $buildInfo = [ordered]@{
     cache_key = $CacheKey
     source_tree_sha256 = $sourceTreeHash
     release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()
+    pi_bundle_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $piBundle).Hash.ToLowerInvariant()
 }
 $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $auditBuildInfoPath -Encoding utf8
 

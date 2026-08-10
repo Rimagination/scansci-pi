@@ -172,10 +172,13 @@ class _DelayedProcess:
         self.returncode = -9
 
 
+@pytest.mark.parametrize("timing_round", range(3), ids=lambda value: f"round-{value + 1}")
 def test_three_two_second_safe_reads_overlap_end_to_end(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    timing_round: int,
 ) -> None:
+    del timing_round
     client = PiAgentClient(
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",

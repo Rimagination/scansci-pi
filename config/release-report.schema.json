@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scansci.local/schemas/pi-capability-release-report-v2.json",
+  "title": "ScanSci Pi capability release evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "report_kind", "mode", "status", "protocol_version",
+    "sdk_version", "source_sha256", "bundle", "matrix", "fallback_count",
+    "run_manifests", "axes", "provider"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "report_kind": {"const": "scansci.pi-capabilities"},
+    "mode": {"enum": ["deterministic", "real"]},
+    "status": {"enum": ["passed", "failed", "not_run"]},
+    "reason": {"type": "string", "maxLength": 500},
+    "protocol_version": {"const": 7},
+    "sdk_version": {"type": "string", "minLength": 1, "maxLength": 80},
+    "source_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "bundle": {"$ref": "#/$defs/fileEvidence"},
+    "matrix": {"$ref": "#/$defs/matrixEvidence"},
+    "fallback_count": {"const": 0},
+    "run_manifests": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/manifestEvidence"}
+    },
+    "axes": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {"$ref": "#/$defs/axisEvidence"}
+    },
+    "provider": {"$ref": "#/$defs/providerEvidence"},
+    "evidence": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "passed"}}, "required": ["status"]},
+      "then": {
+        "required": ["evidence"],
+        "properties": {"run_manifests": {"minItems": 1}}
+      },
+      "else": {"required": ["reason"]}
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "passed"}, "mode": {"const": "deterministic"}},
+        "required": ["status", "mode"]
+      },
+      "then": {"properties": {"evidence": {"$ref": "#/$defs/deterministicEvidence"}}}
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "passed"}, "mode": {"const": "real"}},
+        "required": ["status", "mode"]
+      },
+      "then": {"properties": {"evidence": {"$ref": "#/$defs/realEvidence"}}}
+    }
+  ],
+  "$defs": {
+    "fileEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "matrixEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "schema_version"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "schema_version": {"const": 2}
+      }
+    },
+    "manifestEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "run_id"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 160}
+      }
+    },
+    "axisEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cases", "threshold", "passed", "status", "evidence_matches", "verified_case_ids"],
+      "properties": {
+        "id": {"enum": ["routing", "dynamic_tools", "parallelism", "long_context", "skills", "subagents", "mcp", "multimodal", "safety", "observability"]},
+        "cases": {"type": "integer", "minimum": 1},
+        "threshold": {"type": "integer", "minimum": 1},
+        "passed": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["passed", "failed", "not_run"]},
+        "evidence_matches": {"type": "integer", "minimum": 0},
+        "verified_case_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "providerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configured", "provider_id"],
+      "properties": {
+        "configured": {"type": "boolean"},
+        "provider_id": {"type": "string", "maxLength": 160}
+      }
+    },
+    "targetedTests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "tests", "failures", "errors", "skipped", "axis_selector_matches", "observability_selector_matches", "batch_matches", "matched_testcase_timings"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "tests": {"type": "integer", "minimum": 100},
+        "failures": {"const": 0},
+        "errors": {"const": 0},
+        "skipped": {"type": "integer", "minimum": 0},
+        "axis_selector_matches": {"$ref": "#/$defs/countMap"},
+        "observability_selector_matches": {"$ref": "#/$defs/countMap"},
+        "batch_matches": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "matched_testcase_timings": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "countMap": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "protocolProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "protocol", "required_features", "capabilities"],
+      "properties": {
+        "ready": {"const": true},
+        "protocol": {"const": 7},
+        "required_features": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "observabilityEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_fields", "kind_matches", "run_manifest_count", "records"],
+      "properties": {
+        "required_fields": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "kind_matches": {"$ref": "#/$defs/countMap"},
+        "run_manifest_count": {"type": "integer", "minimum": 1},
+        "records": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": {"$ref": "#/$defs/observabilityRecord"}
+        }
+      }
+    },
+    "observabilityRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "timing", "decision", "result_reference"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["run", "effect", "subagent", "compaction"]},
+        "timing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "duration_seconds"],
+          "properties": {
+            "source": {"const": "junit"},
+            "duration_seconds": {"type": "number", "minimum": 0}
+          }
+        },
+        "decision": {"const": "passed"},
+        "result_reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["junit_sha256", "node_id"],
+          "properties": {
+            "junit_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "node_id": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "mutationProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "target_tool", "search_tools_completed", "target_activated", "target_completed"],
+      "properties": {
+        "turn": {"type": "integer", "minimum": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "target_tool": {"type": "string", "minLength": 1},
+        "search_tools_completed": {"const": true},
+        "target_activated": {"const": true},
+        "target_completed": {"const": true}
+      }
+    },
+    "toolLoop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "tool_calls", "done", "marker_seen", "fallback_count", "provider_requests", "dynamic_mutations", "mutation_evidence", "image_tool_tasks", "image_serialized_tasks", "duration_seconds"],
+      "properties": {
+        "ok": {"const": true},
+        "tool_calls": {"type": "integer", "minimum": 1},
+        "done": {"const": true},
+        "marker_seen": {"const": true},
+        "fallback_count": {"const": 0},
+        "provider_requests": {"type": "integer", "minimum": 1},
+        "dynamic_mutations": {"type": "integer", "minimum": 0},
+        "mutation_evidence": {"type": "array", "items": {"$ref": "#/$defs/mutationProof"}},
+        "image_tool_tasks": {"type": "integer", "minimum": 0},
+        "image_serialized_tasks": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "ping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "protocol"],
+      "properties": {"ready": {"const": true}, "protocol": {"const": 7}}
+    },
+    "providerReal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dynamic_mutations", "image_tool_tasks", "mutation_evidence"],
+      "properties": {
+        "dynamic_mutations": {"const": 10},
+        "image_tool_tasks": {"const": 10},
+        "mutation_evidence": {"type": "array", "minItems": 10, "maxItems": 10, "items": {"$ref": "#/$defs/mutationProof"}}
+      }
+    },
+    "deterministicEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ping", "protocol_probe", "tool_loop", "targeted_tests", "dynamic_mutations", "image_tool_tasks", "observability"],
+      "properties": {
+        "ping": {"$ref": "#/$defs/ping"},
+        "protocol_probe": {"$ref": "#/$defs/protocolProbe"},
+        "tool_loop": {"$ref": "#/$defs/toolLoop"},
+        "targeted_tests": {"$ref": "#/$defs/targetedTests"},
+        "dynamic_mutations": {"$ref": "#/$defs/toolLoop"},
+        "image_tool_tasks": {"$ref": "#/$defs/toolLoop"},
+        "observability": {"$ref": "#/$defs/observabilityEvidence"}
+      }
+    },
+    "realEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targeted_tests", "protocol_probe", "observability", "deterministic_tool_loop", "provider_real"],
+      "properties": {
+        "targeted_tests": {"$ref": "#/$defs/targetedTests"},
+        "protocol_probe": {"$ref": "#/$defs/protocolProbe"},
+        "observability": {"$ref": "#/$defs/observabilityEvidence"},
+        "deterministic_tool_loop": {"$ref": "#/$defs/toolLoop"},
+        "provider_real": {"$ref": "#/$defs/providerReal"}
+      }
+    }
+  }
+}

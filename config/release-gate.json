@@ -6,6 +6,81 @@
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [
     {
+      "id": "pi-runtime-build",
+      "title": "构建当前 worktree 的 Pi sidecar bundle",
+      "command": [
+        "npm.cmd",
+        "run",
+        "build:pi-runtime"
+      ],
+      "console": "log"
+    },
+    {
+      "id": "pi-targeted-python",
+      "title": "Pi 协议、工具、Skill、上下文、子代理、MCP 与安全回归",
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "tests/test_agent_contract.py",
+        "tests/test_task_contract.py",
+        "tests/test_agent_capabilities.py",
+        "tests/test_pi_capability_matrix.py",
+        "tests/test_pi_runtime_protocol.py",
+        "tests/test_skill_runtime.py",
+        "tests/test_pi_parallel.py",
+        "tests/test_pi_observability.py",
+        "tests/test_context_policy.py",
+        "tests/test_pi_multimodal.py",
+        "tests/test_image_attachments.py",
+        "tests/test_vision_routing.py",
+        "tests/test_pi_subagents.py",
+        "tests/test_mcp_bridge.py",
+        "tests/test_pi_security.py",
+        "tests/test_pi_agent.py",
+        "-q",
+        "--junitxml",
+        "{diagnostics}/pi-targeted-junit.xml"
+      ],
+      "result_file": "pi-targeted-junit.xml",
+      "result_kind": "pytest_junit",
+      "output": "file"
+    },
+    {
+      "id": "pi-capability-matrix",
+      "title": "Pi 10 轴能力矩阵结构与门槛",
+      "command": [
+        "{python}",
+        "scripts/verify_pi_capabilities.py",
+        "--validate-matrix-only",
+        "--output",
+        "{diagnostics}/pi-capability-matrix.json"
+      ],
+      "result_file": "pi-capability-matrix.json",
+      "result_kind": "pi_matrix_validation",
+      "console": "log"
+    },
+    {
+      "id": "pi-capabilities-deterministic",
+      "title": "真实 Pi sidecar 确定性工具循环与能力证据",
+      "command": [
+        "{python}",
+        "scripts/verify_pi_capabilities.py",
+        "--mode",
+        "deterministic",
+        "--workspace",
+        "{diagnostics}/pi-capability-workspace.sqlite",
+        "--test-evidence",
+        "{diagnostics}/pi-targeted-junit.xml",
+        "--output",
+        "{diagnostics}/pi-capabilities-deterministic.json"
+      ],
+      "result_file": "pi-capabilities-deterministic.json",
+      "result_kind": "pi_capability_report",
+      "console": "log",
+      "timeout_seconds": 180
+    },
+    {
       "id": "targeted-python",
       "title": "桌面、对话、模型、Skill 与交付路径针对性测试",
       "command": [
@@ -127,6 +202,26 @@
   ],
   "real_verifications": [
     {
+      "id": "pi-capabilities-real",
+      "title": "真实 provider 动态工具序列化与多模态 Pi 证据",
+      "command": [
+        "{python}",
+        "scripts/verify_pi_capabilities.py",
+        "--mode",
+        "real",
+        "--workspace",
+        "{diagnostics}/pi-capability-real-workspace.sqlite",
+        "--test-evidence",
+        "{diagnostics}/pi-targeted-junit.xml",
+        "--output",
+        "{diagnostics}/pi-capabilities-real.json"
+      ],
+      "result_file": "pi-capabilities-real.json",
+      "result_kind": "pi_capability_report",
+      "console": "log",
+      "timeout_seconds": 300
+    },
+    {
       "id": "dual-model-agent",
       "title": "ScanSci 托管默认模型、流式输出与 Skill 验证",
       "command": [
@@ -195,7 +290,8 @@
       "scansci_html/builtin_skill_assets/good-question/SKILL.md",
       "scansci_html/builtin_skill_assets/good-story/SKILL.md",
       "scansci_html/builtin_skill_assets/web-access/SKILL.md",
-      "scansci_html/build-info.json"
+      "scansci_html/build-info.json",
+      "pi_runtime/main.mjs"
     ]
   },
   "visual_acceptance": {

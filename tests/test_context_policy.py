@@ -256,6 +256,24 @@ def test_token_envelope_keeps_host_contract_explicit_skill_and_final_user_sentin
     assert "omission_sha256" in encoded
 
 
+def test_long_context_twenty_turn_batch_recovers_every_sentinel() -> None:
+    descriptor = ModelRuntimeDescriptor.for_testing(context_window_tokens=768_000)
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"LONG-CONTEXT-SENTINEL-{index:02d} " + (chr(65 + index) * 5_000),
+        }
+        for index in range(20)
+    ]
+
+    projected, report = build_token_envelope(messages, descriptor=descriptor)
+
+    encoded = json.dumps(projected, ensure_ascii=False)
+    assert sum(len(str(message["content"])) for message in messages) >= 100_000
+    assert all(f"LONG-CONTEXT-SENTINEL-{index:02d}" in encoded for index in range(20))
+    assert report.estimated_tokens <= descriptor.provider_input_tokens
+
+
 def test_token_envelope_never_truncates_mandatory_final_user_request() -> None:
     descriptor = ModelRuntimeDescriptor.for_testing(context_window_tokens=32_768)
     final_request = "FINAL-SENTINEL " + ("重要" * 20_000)

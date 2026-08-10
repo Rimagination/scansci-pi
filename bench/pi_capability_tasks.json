@@ -1,0 +1,1292 @@
+{
+  "schema_version": 2,
+  "report_kind": "scansci.pi-capability-matrix",
+  "axes": [
+    {
+      "id": "routing",
+      "threshold": 40,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_pi_capability_matrix", "test_agent_contract"],
+      "requirements": {
+        "bilingual": true,
+        "pi_reachability_percent": 100,
+        "maximum_silent_fallbacks": 0,
+        "proof_batches": [{
+          "id": "routing-bilingual-40",
+          "source": "junit",
+          "selector": "test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory",
+          "case_prefix": "routing-",
+          "case_count": 40,
+          "minimum_matches": 40
+        }]
+      },
+      "cases": [
+        {
+          "id": "routing-001",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-002",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-003",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-004",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-005",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-006",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-007",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-008",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-009",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-010",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-011",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-012",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-013",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-014",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-015",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-016",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-017",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-018",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-019",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-020",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-021",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-022",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-023",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-024",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-025",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-026",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-027",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-028",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-029",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-030",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-031",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-032",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-033",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-034",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-035",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-036",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-037",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-038",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-039",
+          "probe": "bilingual_pi_routing"
+        },
+        {
+          "id": "routing-040",
+          "probe": "bilingual_pi_routing"
+        }
+      ]
+    },
+    {
+      "id": "dynamic_tools",
+      "threshold": 10,
+      "provider_real_required": true,
+      "evidence_selectors": ["test_pi_runtime_protocol"],
+      "requirements": {
+        "session_mutations": 10,
+        "revoked_call_rejection_percent": 100,
+        "proof_batches": [{
+          "id": "dynamic-live-10",
+          "source": "runtime",
+          "selector": "dynamic_mutations",
+          "case_prefix": "dynamic-tools-",
+          "case_count": 10,
+          "minimum_matches": 10
+        }]
+      },
+      "cases": [
+        {
+          "id": "dynamic-tools-001",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-002",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-003",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-004",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-005",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-006",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-007",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-008",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-009",
+          "probe": "session_tool_mutation"
+        },
+        {
+          "id": "dynamic-tools-010",
+          "probe": "session_tool_mutation"
+        }
+      ]
+    },
+    {
+      "id": "parallelism",
+      "threshold": 3,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_pi_parallel"],
+      "requirements": {
+        "timing_rounds": 3,
+        "read_calls_per_round": 3,
+        "read_delay_seconds": 2,
+        "maximum_round_seconds": 3.5,
+        "minimum_concurrency": 3,
+        "maximum_cancel_seconds": 2,
+        "proof_batches": [{
+          "id": "parallel-timing-3",
+          "source": "junit",
+          "selector": "test_three_two_second_safe_reads_overlap_end_to_end",
+          "case_prefix": "parallelism-",
+          "case_count": 3,
+          "minimum_matches": 3
+        }]
+      },
+      "cases": [
+        {
+          "id": "parallelism-001",
+          "probe": "parallel_three_reads"
+        },
+        {
+          "id": "parallelism-002",
+          "probe": "parallel_three_reads"
+        },
+        {
+          "id": "parallelism-003",
+          "probe": "parallel_three_reads"
+        }
+      ]
+    },
+    {
+      "id": "long_context",
+      "threshold": 20,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_context_policy", "test_pi_multimodal"],
+      "requirements": {
+        "minimum_tokens": 100000,
+        "minimum_turns": 20,
+        "sentinel_recovery": "20/20",
+        "proof_batches": [{
+          "id": "long-context-100k-20",
+          "source": "junit",
+          "selector": "test_long_context_twenty_turn_batch_recovers_every_sentinel",
+          "case_prefix": "long-context-",
+          "case_count": 20,
+          "minimum_matches": 1
+        }]
+      },
+      "cases": [
+        {
+          "id": "long-context-001",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-002",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-003",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-004",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-005",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-006",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-007",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-008",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-009",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-010",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-011",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-012",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-013",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-014",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-015",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-016",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-017",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-018",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-019",
+          "probe": "context_sentinel_turn"
+        },
+        {
+          "id": "long-context-020",
+          "probe": "context_sentinel_turn"
+        }
+      ]
+    },
+    {
+      "id": "skills",
+      "threshold": 20,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_skill_runtime"],
+      "requirements": {
+        "minimum_selection_load_cases": 20,
+        "lease_expansions": 0,
+        "proof_batches": [{
+          "id": "skill-runtime-20",
+          "source": "junit",
+          "selector": "tests.test_skill_runtime::test_",
+          "case_prefix": "skills-",
+          "case_count": 20,
+          "minimum_matches": 20
+        }]
+      },
+      "cases": [
+        {
+          "id": "skills-001",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-002",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-003",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-004",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-005",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-006",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-007",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-008",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-009",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-010",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-011",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-012",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-013",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-014",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-015",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-016",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-017",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-018",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-019",
+          "probe": "skill_selection_load"
+        },
+        {
+          "id": "skills-020",
+          "probe": "skill_selection_load"
+        }
+      ]
+    },
+    {
+      "id": "subagents",
+      "threshold": 3,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_pi_subagents"],
+      "requirements": {
+        "children": 3,
+        "lease_subset_percent": 100,
+        "failure_isolation": true,
+        "cancellation": true,
+        "proof_batches": [{
+          "id": "subagent-children-3",
+          "source": "junit",
+          "selector": "test_atomic_delegation_reserves_at_most_three_under_ten_concurrent_requests",
+          "case_prefix": "subagents-",
+          "case_count": 3,
+          "minimum_matches": 1
+        }]
+      },
+      "cases": [
+        {
+          "id": "subagents-001",
+          "probe": "scientific_child"
+        },
+        {
+          "id": "subagents-002",
+          "probe": "scientific_child"
+        },
+        {
+          "id": "subagents-003",
+          "probe": "scientific_child"
+        }
+      ]
+    },
+    {
+      "id": "mcp",
+      "threshold": 10,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_mcp_bridge"],
+      "requirements": {
+        "transports": [
+          "stdio",
+          "streamable_http"
+        ],
+        "initial_connections": 0,
+        "search_activate_call": "10/10",
+        "unauthorized_writes": 0,
+        "adversarial_cases": 128,
+        "proof_batches": [
+          {
+            "id": "mcp-stdio-5",
+            "source": "junit",
+            "selector": "test_deferred_mcp_registers_and_calls_native_remote_schema_after_search",
+            "case_prefix": "mcp-",
+            "case_start": 1,
+            "case_count": 5,
+            "minimum_matches": 1
+          },
+          {
+            "id": "mcp-http-5",
+            "source": "junit",
+            "selector": "test_deferred_streamable_http_stays_disconnected_until_search_then_calls_native_schema",
+            "case_prefix": "mcp-",
+            "case_start": 6,
+            "case_count": 5,
+            "minimum_matches": 1
+          }
+        ]
+      },
+      "cases": [
+        {
+          "id": "mcp-001",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-002",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-003",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-004",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-005",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-006",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-007",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-008",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-009",
+          "probe": "mcp_search_activate_call"
+        },
+        {
+          "id": "mcp-010",
+          "probe": "mcp_search_activate_call"
+        }
+      ]
+    },
+    {
+      "id": "multimodal",
+      "threshold": 10,
+      "provider_real_required": true,
+      "evidence_selectors": ["test_pi_multimodal", "test_image_attachments", "test_vision_routing"],
+      "requirements": {
+        "image_tool_tasks": 10,
+        "explicit_unsupported_degradation": true,
+        "proof_batches": [{
+          "id": "multimodal-live-10",
+          "source": "runtime",
+          "selector": "image_tool_tasks",
+          "case_prefix": "multimodal-",
+          "case_count": 10,
+          "minimum_matches": 10
+        }]
+      },
+      "cases": [
+        {
+          "id": "multimodal-001",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-002",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-003",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-004",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-005",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-006",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-007",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-008",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-009",
+          "probe": "image_tool_turn"
+        },
+        {
+          "id": "multimodal-010",
+          "probe": "image_tool_turn"
+        }
+      ]
+    },
+    {
+      "id": "safety",
+      "threshold": 128,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_pi_security"],
+      "requirements": {
+        "minimum_adversarial_cases": 100,
+        "unauthorized_writes": 0,
+        "path_traversals": 0,
+        "secret_leaks": 0,
+        "proof_batches": [{
+          "id": "safety-hostile-128",
+          "source": "junit",
+          "selector": "test_mcp_policy_endpoint_audit_and_cache_are_fail_closed",
+          "case_prefix": "safety-",
+          "case_count": 128,
+          "minimum_matches": 1
+        }]
+      },
+      "cases": [
+        {
+          "id": "safety-001",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-002",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-003",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-004",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-005",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-006",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-007",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-008",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-009",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-010",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-011",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-012",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-013",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-014",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-015",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-016",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-017",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-018",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-019",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-020",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-021",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-022",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-023",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-024",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-025",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-026",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-027",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-028",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-029",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-030",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-031",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-032",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-033",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-034",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-035",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-036",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-037",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-038",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-039",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-040",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-041",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-042",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-043",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-044",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-045",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-046",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-047",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-048",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-049",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-050",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-051",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-052",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-053",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-054",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-055",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-056",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-057",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-058",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-059",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-060",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-061",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-062",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-063",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-064",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-065",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-066",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-067",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-068",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-069",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-070",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-071",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-072",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-073",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-074",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-075",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-076",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-077",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-078",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-079",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-080",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-081",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-082",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-083",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-084",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-085",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-086",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-087",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-088",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-089",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-090",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-091",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-092",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-093",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-094",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-095",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-096",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-097",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-098",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-099",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-100",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-101",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-102",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-103",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-104",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-105",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-106",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-107",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-108",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-109",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-110",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-111",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-112",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-113",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-114",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-115",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-116",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-117",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-118",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-119",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-120",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-121",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-122",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-123",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-124",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-125",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-126",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-127",
+          "probe": "adversarial_authorization"
+        },
+        {
+          "id": "safety-128",
+          "probe": "adversarial_authorization"
+        }
+      ]
+    },
+    {
+      "id": "observability",
+      "threshold": 10,
+      "provider_real_required": false,
+      "evidence_selectors": ["test_pi_observability"],
+      "requirements": {
+        "required_kinds": [
+          "run",
+          "effect",
+          "subagent",
+          "compaction"
+        ],
+        "required_fields": [
+          "id",
+          "timing",
+          "decision",
+          "result_reference"
+        ],
+        "kind_selectors": {
+          "run": ["test_pi_observability"],
+          "effect": ["test_mcp_policy_endpoint_audit_and_cache_are_fail_closed"],
+          "subagent": ["test_pi_subagents"],
+          "compaction": ["test_pi_manual_compaction_is_persisted"]
+        },
+        "proof_batches": [
+          {
+            "id": "observability-run-3",
+            "source": "junit",
+            "selector": "test_runtime_hooks_emit_bounded_ordered_current_turn_audit",
+            "case_probe": "run",
+            "case_count": 3,
+            "minimum_matches": 1
+          },
+          {
+            "id": "observability-effect-3",
+            "source": "junit",
+            "selector": "test_mcp_policy_endpoint_audit_and_cache_are_fail_closed",
+            "case_probe": "effect",
+            "case_count": 3,
+            "minimum_matches": 1
+          },
+          {
+            "id": "observability-subagent-2",
+            "source": "junit",
+            "selector": "test_atomic_delegation_reserves_at_most_three_under_ten_concurrent_requests",
+            "case_probe": "subagent",
+            "case_count": 2,
+            "minimum_matches": 1
+          },
+          {
+            "id": "observability-compaction-2",
+            "source": "junit",
+            "selector": "test_pi_manual_compaction_is_persisted",
+            "case_probe": "compaction",
+            "case_count": 2,
+            "minimum_matches": 1
+          }
+        ]
+      },
+      "cases": [
+        {
+          "id": "observability-001",
+          "probe": "run"
+        },
+        {
+          "id": "observability-002",
+          "probe": "run"
+        },
+        {
+          "id": "observability-003",
+          "probe": "run"
+        },
+        {
+          "id": "observability-004",
+          "probe": "effect"
+        },
+        {
+          "id": "observability-005",
+          "probe": "effect"
+        },
+        {
+          "id": "observability-006",
+          "probe": "effect"
+        },
+        {
+          "id": "observability-007",
+          "probe": "subagent"
+        },
+        {
+          "id": "observability-008",
+          "probe": "subagent"
+        },
+        {
+          "id": "observability-009",
+          "probe": "compaction"
+        },
+        {
+          "id": "observability-010",
+          "probe": "compaction"
+        }
+      ]
+    }
+  ]
+}
