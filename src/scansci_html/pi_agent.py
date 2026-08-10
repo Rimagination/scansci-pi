@@ -101,6 +101,7 @@ _PI_REQUIRED_FEATURES = (
     "structured_mcp_effects",
     "current_request_context",
     "dynamic_tools",
+    "ephemeral_sessions",
 )
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(

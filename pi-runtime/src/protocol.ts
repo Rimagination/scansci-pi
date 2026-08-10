@@ -15,6 +15,7 @@ export const PI_PROTOCOL_FEATURES = [
   "structured_mcp_effects",
   "current_request_context",
   "dynamic_tools",
+  "ephemeral_sessions",
 ] as const;
 
 type ProtocolRecord = Record<string, unknown>;

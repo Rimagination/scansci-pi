@@ -1236,6 +1236,50 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     }.issubset(set(status["capabilities"]))
 
 
+def test_python_host_rejects_protocol_v4_sidecar_without_ephemeral_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node, _current_sidecar = PiAgentClient.runtime_paths()
+    old_sidecar = tmp_path / "old-pi-sidecar.mjs"
+    old_sidecar.write_text(
+        """
+import * as readline from "node:readline";
+const capabilities = [
+  "task_contract_v2",
+  "explicit_empty_leases",
+  "host_tool_authorization",
+  "structured_mcp_effects",
+  "current_request_context",
+  "dynamic_tools",
+];
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  const required = Array.isArray(message.required_features) ? message.required_features : [];
+  process.stdout.write(JSON.stringify({
+    type: "pong",
+    runtime: "pi",
+    version: "old-fixture",
+    protocol: 4,
+    capabilities,
+    negotiated_features: required.filter((feature) => capabilities.includes(feature)),
+    missing_features: required.filter((feature) => !capabilities.includes(feature)),
+  }) + "\\n");
+});
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        PiAgentClient,
+        "runtime_paths",
+        staticmethod(lambda: (node, old_sidecar)),
+    )
+
+    with pytest.raises(pi_agent.PiRuntimeUnavailable, match="ephemeral_sessions"):
+        PiAgentClient.runtime_status()
+
+
 def test_pi_sidecar_rejects_incompatible_protocol_before_starting_a_run() -> None:
     node, sidecar = PiAgentClient.runtime_paths()
     process = subprocess.Popen(
@@ -1387,6 +1431,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
     assert captured["pi_protocol_version"] == 4
     assert "host_tool_authorization" in captured["required_features"]
+    assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True
 
 

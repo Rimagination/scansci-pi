@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from scansci_html.pi_agent import PiAgentClient
+from scansci_html.pi_agent import PiAgentClient, _PI_REQUIRED_FEATURES
 
 
 _TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
@@ -691,3 +691,6 @@ def test_ping_advertises_dynamic_tool_discovery() -> None:
     status = PiAgentClient.runtime_status()
 
     assert "dynamic_tools" in status["capabilities"]
+    assert "ephemeral_sessions" in status["capabilities"]
+    assert "ephemeral_sessions" in _PI_REQUIRED_FEATURES
+    assert set(_PI_REQUIRED_FEATURES) <= set(status["capabilities"])
