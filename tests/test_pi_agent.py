@@ -2614,6 +2614,22 @@ def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
     ) == [("build_verified_answer", {"question": "q"})]
 
 
+def test_managed_gateway_adapter_normalizes_glm_legacy_tool_call_for_offered_tool() -> None:
+    content = "<tool_call>agent-reach\nquery=\u54c8\u5c14\u6ee8\u91d1\u878d\u5b66\u9662\nsource=public_web"
+
+    assert _parse_text_tool_intents(content, allowed_tool_names={"agent_reach"}) == [
+        (
+            "agent_reach",
+            {
+                "operation": "search",
+                "query": "\u54c8\u5c14\u6ee8\u91d1\u878d\u5b66\u9662",
+                "channel": "web",
+            },
+        )
+    ]
+    assert _parse_text_tool_intents(content, allowed_tool_names={"search_web"}) == []
+
+
 def test_managed_gateway_adapter_names_the_single_mandatory_tool_exactly() -> None:
     payload = _ManagedGatewayAdapter._normalize_payload(
         {

@@ -134,6 +134,10 @@ _TOOL_CALL_PATTERN = re.compile(
     r"(?:\s*,\s*arguments\s*=\s*(?P<arguments>\{.*?\}))?\s*\)",
     re.DOTALL,
 )
+_LEGACY_TOOL_TAG_PATTERN = re.compile(
+    r"<tool_call>\s*(?P<name>[A-Za-z0-9][A-Za-z0-9_-]{0,63})(?P<body>.*?)(?:</tool_call>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 _DOI_IN_TEXT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])10\.\d{4,9}/[A-Za-z0-9._;()/:+-]+",
     re.IGNORECASE,
@@ -712,7 +716,17 @@ class _ManagedGatewayAdapter:
                 started=started,
                 usage=dict(body.get("usage", {}) or {}),
             )
-            self._write_openai_response(handler, body, stream=expects_stream)
+            allowed_tool_names = {
+                str(dict(item.get("function", {}) or {}).get("name", ""))
+                for item in list(payload.get("tools", []) or [])
+                if isinstance(item, dict) and str(dict(item.get("function", {}) or {}).get("name", ""))
+            }
+            self._write_openai_response(
+                handler,
+                body,
+                stream=expects_stream,
+                allowed_tool_names=allowed_tool_names,
+            )
         except Exception as error:  # noqa: BLE001 - protocol adapter must return an HTTP error
             self._record_transport(request_summary, status=502, started=started, error=f"{type(error).__name__}: {error}")
             self._write_json(
@@ -1117,7 +1131,13 @@ class _ManagedGatewayAdapter:
         handler.wfile.write(encoded)
 
     @staticmethod
-    def _write_openai_response(handler: BaseHTTPRequestHandler, body: dict[str, Any], *, stream: bool) -> None:
+    def _write_openai_response(
+        handler: BaseHTTPRequestHandler,
+        body: dict[str, Any],
+        *,
+        stream: bool,
+        allowed_tool_names: set[str] | None = None,
+    ) -> None:
         choice = dict((body.get("choices") or [{}])[0] or {})
         message = dict(choice.get("message") or {})
         model = str(body.get("model", ""))
@@ -1127,7 +1147,9 @@ class _ManagedGatewayAdapter:
         content = str(message.get("content") or "")
         if not tool_calls:
             parsed_calls: list[dict[str, Any]] = []
-            for index, (name, arguments_value) in enumerate(_parse_text_tool_intents(content)):
+            for index, (name, arguments_value) in enumerate(
+                _parse_text_tool_intents(content, allowed_tool_names=allowed_tool_names)
+            ):
                 arguments = json.dumps(arguments_value, ensure_ascii=False, separators=(",", ":"))
                 parsed_calls.append(
                     {
@@ -1182,7 +1204,26 @@ class _ManagedGatewayAdapter:
         handler.wfile.write(encoded)
 
 
-def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
+def _parse_text_tool_intents(
+    content: str,
+    *,
+    allowed_tool_names: set[str] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    allowed = {str(name).strip() for name in (allowed_tool_names or set()) if str(name).strip()}
+
+    def canonical_name(raw_name: str) -> str:
+        name = str(raw_name).strip()
+        if not allowed:
+            return name
+        if name in allowed:
+            return name
+        normalized = name.replace("-", "_")
+        return normalized if normalized in allowed else ""
+
+    def filter_call(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        canonical = canonical_name(name)
+        return (canonical, arguments) if canonical else None
+
     calls: list[tuple[str, dict[str, Any]]] = []
     stripped = content.strip()
     if stripped.startswith("```") and stripped.endswith("```"):
@@ -1194,7 +1235,8 @@ def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
     if isinstance(payload, dict) and re.fullmatch(r"[A-Za-z0-9_-]+", str(payload.get("name", ""))):
         arguments = _coerce_tool_arguments(payload.get("arguments", {}))
         if arguments is not None:
-            return [(str(payload["name"]), arguments)]
+            call = filter_call(str(payload["name"]), arguments)
+            return [call] if call else []
     for match in _TOOL_TAG_PATTERN.finditer(content):
         try:
             payload = json.loads(match.group("body"))
@@ -1204,15 +1246,48 @@ def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
             continue
         arguments = _coerce_tool_arguments(payload.get("arguments", {}))
         if arguments is not None:
-            calls.append((str(payload["name"]), arguments))
+            call = filter_call(str(payload["name"]), arguments)
+            if call:
+                calls.append(call)
     if calls:
         return calls
+    legacy_match = _LEGACY_TOOL_TAG_PATTERN.search(content)
+    if legacy_match:
+        call_name = canonical_name(legacy_match.group("name"))
+        if call_name:
+            arguments: dict[str, Any] = {}
+            for line in str(legacy_match.group("body") or "").splitlines():
+                line = line.strip().strip("`")
+                if not line or line.startswith("</"):
+                    continue
+                key_value = re.match(r"^(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})\s*[:=]\s*(?P<value>.*)$", line)
+                if not key_value:
+                    continue
+                key = key_value.group("key")
+                value = key_value.group("value").strip().strip("`").strip()
+                if value[:1] == value[-1:] and value[:1] in {"'", '"'} and len(value) >= 2:
+                    value = value[1:-1]
+                arguments[key] = value
+            if call_name == "agent_reach":
+                source = str(arguments.pop("source", "")).strip().casefold()
+                if "operation" not in arguments:
+                    arguments["operation"] = "read" if arguments.get("target") else "search" if arguments.get("query") else "status"
+                if source == "public_web" and "channel" not in arguments:
+                    arguments["channel"] = "web"
+                arguments = {
+                    key: value
+                    for key, value in arguments.items()
+                    if key in {"operation", "target", "query", "channel", "limit", "timeout_seconds"}
+                }
+            return [(call_name, arguments)]
     for match in _TOOL_CALL_PATTERN.finditer(content):
         try:
             arguments = json.loads(match.group("arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
-        calls.append((match.group("name"), dict(arguments) if isinstance(arguments, dict) else {}))
+        call = filter_call(match.group("name"), dict(arguments) if isinstance(arguments, dict) else {})
+        if call:
+            calls.append(call)
     return calls
 
 
