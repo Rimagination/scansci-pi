@@ -3452,6 +3452,15 @@ function composerModelMenuMarkup(current = {}) {
     ["on", "开启"],
     ["off", "关闭"],
   ].map(([value, label]) => `<button type="button" class="web-search-option ${webMode === value ? "is-selected" : ""}" data-action="select-web-search" data-web-search-value="${value}" role="option" aria-selected="${webMode === value ? "true" : "false"}">${label}</button>`).join("");
+  const installedSnapshots = Array.isArray(state.localModelMarket?.installed) ? state.localModelMarket.installed : [];
+  const readyConversationSnapshots = installedSnapshots.filter((item) => {
+    if (!item?.ready || item?.runtime_compatible === false) return false;
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
+    return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
+  }).length;
+  const localInventoryNote = installedSnapshots.length
+    ? `<p class="composer-model-note">本机已发现 ${installedSnapshots.length} 个模型快照；其中 ${readyConversationSnapshots} 个可作为对话/视觉入口。一个模型可以同时拥有多项能力，其他已安装能力会由 Agent 按需调用。</p>`
+    : "";
   return `<div class="composer-settings-panel">
     <section class="composer-settings-section web-search-picker" data-web-search-picker>
       <header><span data-ui-icon="globe"></span><span>联网搜索</span></header>
@@ -3466,7 +3475,7 @@ function composerModelMenuMarkup(current = {}) {
       ${empty}
       <div class="composer-model-manage"><button type="button" data-action="open-settings" data-settings-panel="models">${uiIcon("plus")}管理模型</button></div>
     </section>
-  </div>`;
+  </div>`.replace('<div class="composer-model-manage">', `${localInventoryNote}<div class="composer-model-manage">`);
 }
 
 async function setActiveComposerModel(value) {
@@ -10459,7 +10468,7 @@ function renderSettings() {
   if (state.activeSettings === "knowledge-preview") settingsMarkup = renderKnowledgeSettingsPreview();
   else if (state.activeSettings === "defaults") settingsMarkup = renderDefaultCapabilitiesSettings();
   else if (state.activeSettings === "models") settingsMarkup = renderModelsSettings();
-  else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettings();
+  else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettingsPage();
   else if (state.activeSettings === "document-processing") settingsMarkup = renderDocumentProcessingSettings();
   else if (state.activeSettings === "skills") settingsMarkup = renderRecordsSettings("skills");
   else if (state.activeSettings === "mcp") settingsMarkup = renderMcpMarketplaceSettings();
@@ -11307,6 +11316,34 @@ function renderLocalModelsSettings() {
     <details class="local-model-disclosure local-model-market-disclosure"><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
     <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
     <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
+}
+
+// Local model routing is automatic and is already represented by the default
+// capabilities page. Keep the local-model page focused on installation and
+// runtime management instead of rendering the same routing matrix twice.
+function renderLocalModelsSettingsPage() {
+  const page = renderLocalModelsSettings();
+  const installed = Array.isArray(state.localModelMarket?.installed)
+    ? state.localModelMarket.installed
+    : [];
+  const ready = installed.filter((item) => item?.ready && item?.runtime_compatible !== false);
+  const conversationReady = ready.filter((item) => {
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
+    return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
+  }).length;
+  const auxiliaryReady = ready.filter((item) => {
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [item?.kind];
+    return capabilities.some((capability) => ["embedding", "reranking", "audio"].includes(String(capability)));
+  }).length;
+  const detectionNote = installed.length
+    ? `已发现 ${installed.length} 个本地模型快照；${conversationReady} 个可进入对话/视觉入口，${auxiliaryReady} 个用于检索、重排或语音。一个模型可以同时拥有多项能力，聊天下拉框只筛选当前入口可用的模型。`
+    : "尚未发现本地模型快照；下载完成后点击刷新，Agent 会按能力入口自动识别。";
+  return page
+    .replace(/<section class="local-agent-routing-card">[\s\S]*?<\/section>\s*/, "")
+    .replace(
+      '<section class="local-installed-panel">',
+      `<section class="local-model-detection-note">${escapeHtml(detectionNote)}</section><section class="local-installed-panel">`,
+    );
 }
 
 function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", embedded = false) {

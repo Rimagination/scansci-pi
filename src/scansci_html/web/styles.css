@@ -4236,6 +4236,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-model-manage { margin: 4px 0 0; padding-top: 6px; }
 .composer-model-manage button { min-height: 38px; font-size: 12px; font-weight: var(--weight-regular); }
 .composer-model-manage button:hover { color: #2d5d46; background: #f4f7f5; }
+.composer-model-note {
+  margin: 6px 9px 2px;
+  padding: 8px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--surface-elevated);
+  font-size: 10px;
+  line-height: 15px;
+}
 .home-capability-shortcuts {
   display: flex;
   width: var(--home-composer-width);
@@ -8449,10 +8459,10 @@ html[data-theme="dark"] .runtime-components-panel > header {
   gap: 9px;
   padding: 0;
   overflow: hidden;
-  border: 1px solid transparent;
+  border: 1px solid var(--rule);
   border-radius: 50%;
-  color: #55585d;
-  background: #f3f4f4;
+  color: var(--ink);
+  background: var(--control-background);
   cursor: pointer;
   font-size: 12px;
   line-height: 1;
@@ -8461,8 +8471,8 @@ html[data-theme="dark"] .runtime-components-panel > header {
 }
 .prompt-card button.composer-record-button:hover,
 .chat-composer button.composer-record-button:hover {
-  color: #23262a;
-  background: #e9ebeb;
+  color: var(--ink);
+  background: var(--control-background-hover);
 }
 .composer-record-button:focus-visible {
   outline: 0;
@@ -8480,12 +8490,12 @@ html[data-theme="dark"] .runtime-components-panel > header {
 .prompt-card button.composer-record-button.is-recording,
 .chat-composer button.composer-record-button.is-recording {
   width: 182px;
-  border-color: #efc4c4;
+  border-color: var(--rule-strong);
   border-radius: 999px;
-  color: #a94343;
-  background: #fff5f5;
+  color: var(--ink);
+  background: var(--surface-elevated);
 }
-.composer-record-button.is-recording:hover { color: #8c3030; background: #ffeded; }
+.composer-record-button.is-recording:hover { color: var(--ink); background: var(--control-background-hover); }
 .composer-record-active { min-width: 0; }
 .composer-recording-wave {
   display: inline-flex;
@@ -8549,6 +8559,17 @@ html[data-theme="dark"] .runtime-components-panel > header {
 }
 .chat-composer button.composer-record-button { width: 34px; height: 34px; }
 .chat-composer button.composer-record-button.is-recording { width: 174px; }
+
+.local-model-detection-note {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--surface-elevated);
+  font-size: 12px;
+  line-height: 18px;
+}
 
 @media (max-width: 560px) {
   .prompt-card button.composer-record-button.is-recording,

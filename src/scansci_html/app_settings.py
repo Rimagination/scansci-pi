@@ -840,7 +840,17 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
         )
 
     def capabilities_for(item: dict[str, Any]) -> list[str]:
-        capabilities = ["reasoning", "coding"]
+        # Preserve every capability discovered from the local snapshot.  A
+        # vision-language model is usually also a conversation model; do not
+        # collapse it to a single exclusive ``kind`` when building the local
+        # provider catalog.
+        discovered = item.get("capabilities") if isinstance(item.get("capabilities"), list) else []
+        capabilities = [
+            str(value).strip().lower()
+            for value in discovered
+            if str(value).strip().lower() in {"chat", "vision", "audio", "embedding", "reranking"}
+        ]
+        capabilities.extend(["reasoning", "coding"])
         marker = " ".join(
             [
                 str(item.get("id", "")),
@@ -851,7 +861,7 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
         architecture = str(item.get("architecture", "")).casefold()
         if str(item.get("kind", "")).casefold() == "vision" or "minicpmv" in marker or "vision" in marker or "image" in architecture:
             capabilities.append("vision")
-        return capabilities
+        return list(dict.fromkeys(capabilities))
 
     models = [
         {
