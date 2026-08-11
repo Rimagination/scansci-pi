@@ -2931,6 +2931,18 @@ class PiAgentClient:
                         "duration_ms": event.get("duration_ms"),
                         "details": dict(event.get("details", {}) or {}),
                     }
+                elif event_type in {"subagent.started", "subagent.completed", "subagent.failed"}:
+                    yield {
+                        "type": "subagent",
+                        "event": event_type.removeprefix("subagent."),
+                        "request_id": event_request_id or request_id,
+                        "session_id": str(event.get("session_id", "")),
+                        "parent_session_id": str(event.get("parent_session_id", session_id)),
+                        "role": str(event.get("role", "")),
+                        "backend": str(event.get("backend", "pi-native")),
+                        "error": str(event.get("error", "")),
+                        "tool_calls": int(event.get("tool_calls", 0) or 0),
+                    }
                 elif event_type == "agent.queue_updated":
                     steering = [str(item) for item in list(event.get("steering", []) or [])]
                     follow_up = [str(item) for item in list(event.get("follow_up", []) or [])]

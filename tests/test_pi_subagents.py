@@ -115,6 +115,80 @@ class _OpenAIScientificAgentsHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAINativeScientificAgentsHandler(BaseHTTPRequestHandler):
+    """Fixture that distinguishes the parent Pi session from native children."""
+
+    request_payloads: list[dict] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        messages = list(payload.get("messages", []) or [])
+        joined = json.dumps(messages, ensure_ascii=False)
+        is_child = "NATIVE_PI_CHILD_ROLE=" in joined
+        has_native_result = any(
+            message.get("role") == "tool"
+            and "pi-native" in str(message.get("content", ""))
+            for message in messages
+        )
+        if is_child:
+            role = "unknown"
+            for marker in ("literature_scout", "fulltext_analyst", "evidence_auditor", "synthesis_writer"):
+                if marker in joined:
+                    role = marker
+                    break
+            delta = {"role": "assistant", "content": f"NATIVE_CHILD_RESULT:{role}"}
+            finish = "stop"
+        elif not has_native_result:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-native-delegate",
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_scientific_agents",
+                        "arguments": json.dumps({
+                            "roles": ["literature_scout", "fulltext_analyst"],
+                            "instruction": "Use the Pi child sessions and return their findings.",
+                            "idempotency_key": "native-e2e",
+                        }),
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "PARENT_USED_NATIVE_CHILD_RESULTS"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": "chatcmpl-native-scientific",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-native-scientific",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 def test_pi_scientific_control_tools_have_host_owned_effect_metadata() -> None:
     expected = {
         "delegate_scientific_agents": ("reversible", False),
@@ -1180,22 +1254,102 @@ def test_model_scientific_calls_round_trip_to_host_and_partial_collect(
         thread.join(timeout=2)
         server.server_close()
 
-    completed = [event for event in events if event.get("type") == "tool.completed"]
+    completed = [
+        event for event in events
+        if event.get("type") == "status" and event.get("status") == "tool_completed"
+    ]
     assert [event["name"] for event in completed] == [
         "delegate_scientific_agents",
         "collect_scientific_agents",
     ]
-    assert len(completed[0]["result"]["children"]) == 2
-    assert completed[1]["result"]["counts"] == {
-        "valid": 0,
-        "running": 2,
-        "failed": 0,
-        "cancelled": 0,
-        "invalid": 0,
-        "total": 2,
-    }
+    tool_results = [
+        message
+        for payload in _OpenAIScientificAgentsHandler.request_payloads
+        for message in list(payload.get("messages", []) or [])
+        if message.get("role") == "tool"
+    ]
+    assert any("pi-native" in str(message.get("content", "")) for message in tool_results)
+    assert not any(
+        event.get("type") == "tool.call" and event.get("name") == "delegate_scientific_agents"
+        for event in events
+    )
     advertised = {
         str(dict(tool.get("function", {})).get("name", ""))
         for tool in _OpenAIScientificAgentsHandler.request_payloads[0]["tools"]
     }
     assert set(controls) <= advertised
+
+
+def test_model_scientific_delegate_runs_native_pi_child_sessions(
+    tmp_path: Path,
+) -> None:
+    """The model-visible delegate must be implemented by nested Pi sessions."""
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    parent = _parent(runtime, allowed_tools=[
+        "delegate_scientific_agents",
+        "search_web",
+        "discover_papers",
+    ])
+    _OpenAINativeScientificAgentsHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAINativeScientificAgentsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=runtime.workspace,
+        evidence_db=runtime.evidence_db,
+        active_run_id=parent["run_id"],
+        scientific_agent_control=runtime._scientific_agent_control,
+    )
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                model_runtime=pi_agent_module.ModelRuntimeDescriptor.for_testing(
+                    context_window_tokens=200 * 1024,
+                ).to_dict(),
+                messages=[{"role": "user", "content": "delegate with native Pi children"}],
+                thinking_level="off",
+                task_mode="research",
+                task_contract=parent["task_contract"],
+                timeout_seconds=30,
+                session_id="native-scientific-e2e",
+            )
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    tool_results = [
+        message
+        for payload in _OpenAINativeScientificAgentsHandler.request_payloads
+        for message in list(payload.get("messages", []) or [])
+        if message.get("role") == "tool"
+    ]
+    assert any("pi-native" in str(message.get("content", "")) for message in tool_results)
+    assert "PARENT_USED_NATIVE_CHILD_RESULTS" in "".join(
+        str(event.get("content", "")) for event in events if event.get("type") == "delta"
+    )
+    assert any("NATIVE_PI_CHILD_ROLE=literature_scout" in json.dumps(payload, ensure_ascii=False)
+               for payload in _OpenAINativeScientificAgentsHandler.request_payloads)
+    assert any("NATIVE_PI_CHILD_ROLE=fulltext_analyst" in json.dumps(payload, ensure_ascii=False)
+               for payload in _OpenAINativeScientificAgentsHandler.request_payloads)
+    assert len(_OpenAINativeScientificAgentsHandler.request_payloads) >= 4
+    subagents = [event for event in events if event.get("type") == "subagent"]
+    assert {event.get("event") for event in subagents} >= {"started", "completed"}
+    assert {event.get("role") for event in subagents if event.get("event") == "completed"} >= {
+        "literature_scout",
+        "fulltext_analyst",
+    }
+    assert not any(
+        event.get("type") == "tool.call" and event.get("name") == "delegate_scientific_agents"
+        for event in events
+    )
