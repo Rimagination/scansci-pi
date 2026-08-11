@@ -63,6 +63,7 @@ def test_local_asr_transcribes_a_ready_snapshot_without_reloading(monkeypatch, t
         "format": "transformers",
     }
     monkeypatch.setattr(local_asr, "installed_models", lambda: [record])
+    monkeypatch.setattr(local_asr, "_installed_runtime_component_available", lambda: False)
     runtime = local_asr.LocalASRRuntime()
     runtime._model_id = record["id"]
     runtime._model_path = model_path.resolve()
@@ -71,6 +72,50 @@ def test_local_asr_transcribes_a_ready_snapshot_without_reloading(monkeypatch, t
     )
 
     assert runtime.transcribe(record["id"], audio) == "这是一段本地语音转写"
+
+
+def test_local_asr_prefers_installed_isolated_runtime_over_in_process_weights(
+    monkeypatch, tmp_path: Path
+):
+    """The desktop process must not map the 1.5 GB ASR checkpoint itself."""
+
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    record = {
+        "id": QWEN3_ASR_NATIVE_MODEL_ID,
+        "path": str(tmp_path / "model"),
+        "ready": True,
+        "kind": "audio",
+        "format": "transformers",
+    }
+    component_executable = tmp_path / "ScanSciLocalRuntime.exe"
+    component_executable.write_bytes(b"runtime")
+
+    class _Component:
+        def executable(self):
+            return component_executable
+
+    calls = []
+    monkeypatch.setattr(local_asr, "installed_models", lambda: [record])
+    monkeypatch.setattr(local_asr, "default_local_runtime_component", lambda: _Component())
+    monkeypatch.setattr(local_asr, "_in_process_dependencies_available", lambda: True)
+    monkeypatch.setattr(
+        local_asr,
+        "_transcribe_with_component",
+        lambda model_id, audio_path, *, language="": calls.append(
+            (model_id, audio_path, language)
+        ) or "component transcript",
+    )
+
+    runtime = local_asr.LocalASRRuntime()
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_model",
+        lambda *_args: pytest.fail("must not load ASR weights in the web process"),
+    )
+
+    assert runtime.transcribe(record["id"], audio, language="zh") == "component transcript"
+    assert calls == [(record["id"], audio.resolve(), "zh")]
 
 
 def test_move_inputs_casts_floating_features_to_model_dtype():
