@@ -153,6 +153,27 @@ def test_tool_authorization_denies_missing_empty_spoofed_and_over_budget_calls()
         )
 
 
+def test_legacy_scientific_tool_contracts_remain_authorizable_for_migration() -> None:
+    decision = authorize_tool_call(
+        tool_name="list_scientific_agents",
+        contract={
+            "allowed_tools": ["list_scientific_agents"],
+            "risk_level": "read_only",
+            "max_tool_budget": 2,
+        },
+        descriptor={
+            "id": "list_scientific_agents",
+            "status": "legacy",
+            "risk_level": "read_only",
+            "idempotent": True,
+        },
+        request_id="legacy-request",
+        active_request_id="legacy-request",
+        call_count=0,
+    )
+    assert decision.allowed is True
+
+
 def test_approval_token_is_created_only_for_explicit_request_scoped_approve() -> None:
     assert approval_token_from_response("request-a", {}) is None
     assert approval_token_from_response("request-a", {"decision": "approved"}) is None

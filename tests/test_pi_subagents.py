@@ -189,6 +189,82 @@ class _OpenAINativeScientificAgentsHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIGenericSubagentHandler(BaseHTTPRequestHandler):
+    """Fixture for the generic Pi-style subagent API."""
+
+    request_payloads: list[dict] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        messages = list(payload.get("messages", []) or [])
+        joined = json.dumps(messages, ensure_ascii=False)
+        is_child = "NATIVE_PI_CHILD_PROFILE=" in joined
+        has_native_result = any(
+            message.get("role") == "tool"
+            and "pi-native" in str(message.get("content", ""))
+            for message in messages
+        )
+        if is_child:
+            profile = "default"
+            for marker in ("explore", "review", "research"):
+                if f"NATIVE_PI_CHILD_PROFILE={marker}" in joined:
+                    profile = marker
+                    break
+            delta = {"role": "assistant", "content": f"GENERIC_CHILD_RESULT:{profile}"}
+            finish = "stop"
+        elif not has_native_result:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-generic-subagent",
+                    "type": "function",
+                    "function": {
+                        "name": "subagent",
+                        "arguments": json.dumps({
+                            "calls": [
+                                {"agent": "explore", "prompt": "GENERIC_TASK_ONE: inspect the evidence surface."},
+                                {"agent": "review", "prompt": "GENERIC_TASK_TWO: challenge the proposed conclusion."},
+                            ],
+                            "idempotency_key": "generic-e2e",
+                        }),
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "GENERIC_PARENT_USED_CHILD_RESULTS"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": "chatcmpl-generic-subagent",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-generic-subagent",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 def test_pi_scientific_control_tools_have_host_owned_effect_metadata() -> None:
     expected = {
         "delegate_scientific_agents": ("reversible", False),
@@ -214,7 +290,7 @@ def test_scientific_read_controls_are_actually_parallel_safe_in_python_host() ->
     }.isdisjoint(pi_agent_module._PARALLEL_SAFE_TOOL_NAMES)
 
 
-def test_research_contract_exposes_all_scientific_controls_to_parent_pi() -> None:
+def test_research_contract_exposes_all_generic_subagent_controls_to_parent_pi() -> None:
     contract = compile_task_contract(
         task_mode="research",
         user_text="Coordinate independent scientific agents for this review.",
@@ -222,11 +298,28 @@ def test_research_contract_exposes_all_scientific_controls_to_parent_pi() -> Non
     )
 
     assert {
+        "subagent",
+        "list_subagents",
+        "collect_subagents",
+        "cancel_subagents",
+    } <= set(contract["allowed_tools"])
+
+
+def test_research_contract_exposes_generic_subagent_controls_not_domain_roles() -> None:
+    contract = compile_task_contract(
+        task_mode="research",
+        user_text="Coordinate independent child sessions for this review.",
+        workflow_type="deep_research",
+    )
+
+    allowed = set(contract["allowed_tools"])
+    assert {"subagent", "list_subagents", "collect_subagents", "cancel_subagents"} <= allowed
+    assert not ({
         "delegate_scientific_agents",
         "list_scientific_agents",
         "collect_scientific_agents",
         "cancel_scientific_agents",
-    } <= set(contract["allowed_tools"])
+    } & allowed)
 
 
 def test_atomic_delegation_reserves_at_most_three_under_ten_concurrent_requests(
@@ -1353,3 +1446,85 @@ def test_model_scientific_delegate_runs_native_pi_child_sessions(
         event.get("type") == "tool.call" and event.get("name") == "delegate_scientific_agents"
         for event in events
     )
+
+
+def test_model_subagent_api_uses_generic_profiles_and_task_prompts(
+    tmp_path: Path,
+) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    parent = _parent(runtime, allowed_tools=[
+        "subagent",
+        "list_subagents",
+        "collect_subagents",
+        "cancel_subagents",
+        "search_web",
+        "discover_papers",
+    ])
+    _OpenAIGenericSubagentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIGenericSubagentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=runtime.workspace,
+        evidence_db=runtime.evidence_db,
+        active_run_id=parent["run_id"],
+        scientific_agent_control=runtime._scientific_agent_control,
+    )
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                model_runtime=pi_agent_module.ModelRuntimeDescriptor.for_testing(
+                    context_window_tokens=200 * 1024,
+                ).to_dict(),
+                messages=[{"role": "user", "content": "Use generic child sessions for this review."}],
+                thinking_level="off",
+                task_mode="research",
+                task_contract=parent["task_contract"],
+                timeout_seconds=30,
+                session_id="generic-subagent-e2e",
+            )
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    first_tools = {
+        str(dict(tool.get("function", {})).get("name", ""))
+        for tool in _OpenAIGenericSubagentHandler.request_payloads[0]["tools"]
+    }
+    assert {"subagent", "list_subagents", "collect_subagents", "cancel_subagents"} <= first_tools
+    assert not (first_tools & {
+        "delegate_scientific_agents",
+        "list_scientific_agents",
+        "collect_scientific_agents",
+        "cancel_scientific_agents",
+    })
+    subagent_schema = next(
+        dict(tool.get("function", {}))
+        for tool in _OpenAIGenericSubagentHandler.request_payloads[0]["tools"]
+        if dict(tool.get("function", {})).get("name") == "subagent"
+    )
+    assert subagent_schema["parameters"]["properties"]["calls"]["maxItems"] == 3
+    joined = json.dumps(_OpenAIGenericSubagentHandler.request_payloads, ensure_ascii=False)
+    assert "NATIVE_PI_CHILD_PROFILE=explore" in joined
+    assert "NATIVE_PI_CHILD_PROFILE=review" in joined
+    assert "GENERIC_TASK_ONE" in joined
+    assert "GENERIC_TASK_TWO" in joined
+    assert "GENERIC_PARENT_USED_CHILD_RESULTS" in "".join(
+        str(event.get("content", "")) for event in events if event.get("type") == "delta"
+    )
+    completed_profiles = {
+        event.get("profile")
+        for event in events
+        if event.get("type") == "subagent" and event.get("event") == "completed"
+    }
+    assert {"explore", "review"} <= completed_profiles

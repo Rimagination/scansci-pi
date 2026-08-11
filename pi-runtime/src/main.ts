@@ -123,14 +123,17 @@ interface NativeScientificChild {
   childId: string;
   parentSessionId: string;
   role: string;
+  task?: string;
   status: "running" | "completed" | "failed" | "cancelled";
   session?: AgentSession;
   result?: JsonRecord;
   error?: string;
+  cancelRequested?: boolean;
 }
 
 const nativeScientificChildren = new Map<string, Map<string, NativeScientificChild>>();
 const nativeScientificBatches = new Map<string, string[]>();
+const nativeSubagentBatchDigests = new Map<string, string>();
 const NATIVE_SCIENTIFIC_ROLES: Record<string, { label: string; objective: string }> = {
   literature_scout: {
     label: "literature scout",
@@ -149,6 +152,24 @@ const NATIVE_SCIENTIFIC_ROLES: Record<string, { label: string; objective: string
     objective: "Synthesize only verified findings from the shared evidence surface with appropriately calibrated claim strength.",
   },
 };
+const NATIVE_SUBAGENT_PROFILES: Record<string, { label: string; objective: string }> = {
+  explore: {
+    label: "explore",
+    objective: "Investigate the assigned question independently and return the most relevant verified findings.",
+  },
+  review: {
+    label: "review",
+    objective: "Independently check the assigned question for omissions, contradictions, and unsupported conclusions.",
+  },
+  research: {
+    label: "research",
+    objective: "Research the assigned question using the available evidence surface and return a bounded handoff.",
+  },
+  default: {
+    label: "subagent",
+    objective: "Complete the assigned bounded task independently and return a concise, evidence-bounded handoff.",
+  },
+};
 const NATIVE_SCIENTIFIC_CHILD_READ_TOOLS = new Set([
   "inspect_workspace", "inspect_available_tools", "read_task_documents", "summarize_documents",
   "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext",
@@ -158,6 +179,7 @@ const NATIVE_SCIENTIFIC_CHILD_READ_TOOLS = new Set([
 ]);
 const NATIVE_SCIENTIFIC_CONTROL_NAMES = new Set([
   "delegate_scientific_agents", "list_scientific_agents", "collect_scientific_agents", "cancel_scientific_agents",
+  "subagent", "list_subagents", "collect_subagents", "cancel_subagents",
 ]);
 
 interface LoadedSkill extends JsonRecord {
@@ -944,6 +966,8 @@ function toolRisk(name: string, mcpPolicy?: McpToolPolicy): ToolRisk {
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "subagent",
+    "cancel_subagents",
   ]).has(normalized)) return "reversible";
   return "read_only";
 }
@@ -1499,7 +1523,9 @@ function bridgeTool(
 function nativeScientificChildSummary(child: NativeScientificChild): JsonRecord {
   return {
     child_run_id: child.childId,
-    role: child.role,
+    profile: child.role,
+    ...(child.task ? { task: child.task } : {}),
+    ...(NATIVE_SCIENTIFIC_ROLES[child.role] ? { role: child.role } : {}),
     status: child.status,
     ...(child.result || {}),
     ...(child.error ? { error: child.error } : {}),
@@ -1524,8 +1550,9 @@ async function runNativeScientificChild(
   instruction: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const role = NATIVE_SCIENTIFIC_ROLES[child.role];
-  if (!role) throw new Error(`Unsupported native scientific role: ${child.role}`);
+  const role = NATIVE_SCIENTIFIC_ROLES[child.role]
+    || NATIVE_SUBAGENT_PROFILES[child.role]
+    || NATIVE_SUBAGENT_PROFILES.default;
   const parentContract = parentRun.taskContract;
   const childAllowedTools = [...parentContract.allowedTools]
     .filter((name) => NATIVE_SCIENTIFIC_CHILD_READ_TOOLS.has(name))
@@ -1569,15 +1596,20 @@ async function runNativeScientificChild(
     maxModelTokenBudget: childContract.maxModelTokenBudget,
     modelTokenBudgetExceeded: false,
   };
+  const isLegacyRole = Boolean(NATIVE_SCIENTIFIC_ROLES[child.role]);
   const childLoader = new DefaultResourceLoader({
     cwd: parentState.request.cwd,
     agentDir: parentState.request.agent_dir,
     systemPromptOverride: () => [
       sessionInvariantSystemPrompt(),
       "You are a native Pi child session inside ScanSci.",
+      "The parent chose your profile as a capability hint, not as a fixed domain role. Follow the task text as the source of truth.",
+      `NATIVE_PI_CHILD_PROFILE=${child.role}`,
       `NATIVE_PI_CHILD_ROLE=${child.role}`,
       `Role: ${role.label}. Objective: ${role.objective}`,
-      `Parent research goal: ${parentContract.goal}`,
+      ...(isLegacyRole
+        ? [`Parent research goal: ${parentContract.goal}`]
+        : ["Do not infer an assignment from parent metadata; follow the task text supplied for this child."]),
       "You are read-only. Use only the explicitly registered retrieval tools; never delegate, write files, mutate external state, or invent evidence.",
       "Return a concise evidence-bounded handoff for the parent Pi session. Do not emit pseudo tool calls or a plan instead of results.",
     ].join("\n"),
@@ -1621,15 +1653,17 @@ async function runNativeScientificChild(
     request_id: parentRun.requestId,
     session_id: child.childId,
     parent_session_id: parentRun.sessionId,
+    profile: child.role,
     role: child.role,
     backend: "pi-native",
     active_tools: childTools.map((tool) => String(tool.name)).sort(),
   });
   try {
     const prompt = [
+      `NATIVE_PI_CHILD_PROFILE=${child.role}`,
       `NATIVE_PI_CHILD_ROLE=${child.role}`,
-      `Parent question: ${parentContract.goal}`,
-      instruction ? `Additional parent instruction: ${instruction}` : "",
+      isLegacyRole ? `Parent question: ${parentContract.goal}` : "Task prompt (source of truth):",
+      instruction ? instruction : "",
       "Work independently now using the permitted retrieval tools, then return the structured handoff in prose.",
     ].filter(Boolean).join("\n");
     await activeRunStorage.run(childRun, () => childSession.prompt(prompt));
@@ -1639,9 +1673,15 @@ async function runNativeScientificChild(
     }
     const text = String(childSession.getLastAssistantText() || "").trim();
     if (!text) throw new Error("Native Pi child returned an empty handoff");
+    if (child.cancelRequested || signal?.aborted || parentRun.cancelled) {
+      child.status = "cancelled";
+      return;
+    }
     child.status = "completed";
     child.result = {
       backend: "pi-native",
+      profile: child.role,
+      task: child.task || instruction,
       session_id: child.childId,
       text: text.slice(0, 12000),
       tool_calls: childRun.toolCalls,
@@ -1652,18 +1692,20 @@ async function runNativeScientificChild(
       request_id: parentRun.requestId,
       session_id: child.childId,
       parent_session_id: parentRun.sessionId,
+      profile: child.role,
       role: child.role,
       backend: "pi-native",
       tool_calls: childRun.toolCalls,
     });
   } catch (error) {
-    child.status = signal?.aborted || parentRun.cancelled ? "cancelled" : "failed";
+    child.status = child.cancelRequested || signal?.aborted || parentRun.cancelled ? "cancelled" : "failed";
     child.error = redactSensitiveText(error).slice(0, 500);
     emit({
       type: "subagent.failed",
       request_id: parentRun.requestId,
       session_id: child.childId,
       parent_session_id: parentRun.sessionId,
+      profile: child.role,
       role: child.role,
       backend: "pi-native",
       error: child.error,
@@ -1739,13 +1781,14 @@ function nativeScientificDelegateTool() {
           // its normal try/finally (for example, a missing model or loader
           // failure). Keep the batch observable and make the failed child
           // collectable instead of leaving it permanently "running".
-          child.status = signal?.aborted || activeRun.cancelled ? "cancelled" : "failed";
+          child.status = child.cancelRequested || signal?.aborted || activeRun.cancelled ? "cancelled" : "failed";
           child.error = redactSensitiveText(error).slice(0, 500);
           emit({
             type: "subagent.failed",
             request_id: activeRun.requestId,
             session_id: child.childId,
             parent_session_id: activeRun.sessionId,
+            profile: child.role,
             role: child.role,
             backend: "pi-native",
             error: child.error,
@@ -1829,8 +1872,183 @@ function nativeScientificCancelTool() {
       let cancelled = 0;
       for (const child of selected) {
         if (child.status !== "running") continue;
+        child.cancelRequested = true;
         if (child.session) await child.session.abort().catch(() => undefined);
-        child.status = "cancelled";
+        if (child.status === "running") child.status = "cancelled";
+        cancelled += 1;
+      }
+      const result = { backend: "pi-native", selected: selected.length, cancelled, children: selected.map(nativeScientificChildSummary) };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+    },
+  });
+}
+
+function nativeSubagentProfile(value: unknown): string {
+  const profile = String(value || "default")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return profile || "default";
+}
+
+function nativeSubagentTool() {
+  return defineTool({
+    name: "subagent",
+    label: "Run native Pi child sessions",
+    description: "Run one or more independent native Pi child sessions. Give each child a bounded task in natural language; the optional profile is only a capability hint and never a fixed domain role.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      calls: Type.Array(Type.Object({
+        agent: Type.Optional(Type.String({ maxLength: 80 })),
+        prompt: Type.String({ minLength: 1, maxLength: 8000 }),
+      }), { minItems: 1, maxItems: 3 }),
+      idempotency_key: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+    }),
+    execute: async (_toolCallId, params, signal) => {
+      const activeRun = activeRunStorage.getStore();
+      if (!activeRun) throw new Error("No active Pi run owns subagent delegation");
+      claimToolCall("subagent", params as JsonRecord);
+      const parentState = sessions.get(activeRun.sessionId);
+      if (!parentState) throw new Error("Parent Pi session is unavailable for subagent delegation");
+      const calls = Array.isArray(params.calls) ? params.calls : [];
+      if (!calls.length || calls.length > 3) throw new Error("subagent.calls must contain between one and three tasks");
+      const normalizedCalls = calls.map((call) => {
+        const task = String(call.prompt || "").trim();
+        if (!task) throw new Error("subagent.prompt must not be blank");
+        return { agent: nativeSubagentProfile(call.agent), prompt: task };
+      });
+      const childrenById = nativeScientificChildren.get(activeRun.sessionId) || new Map<string, NativeScientificChild>();
+      nativeScientificChildren.set(activeRun.sessionId, childrenById);
+      const callDigest = JSON.stringify(normalizedCalls);
+      const batchKey = `${activeRun.sessionId}:subagent:${String(params.idempotency_key || callDigest)}`;
+      const priorDigest = nativeSubagentBatchDigests.get(batchKey);
+      if (priorDigest && priorDigest !== callDigest) {
+        throw new Error("subagent.idempotency_key was already used for a different task batch");
+      }
+      const existing = (nativeScientificBatches.get(batchKey) || [])
+        .map((childId) => childrenById.get(childId))
+        .filter((child): child is NativeScientificChild => Boolean(child));
+      if (existing.length) {
+        const replay = {
+          backend: "pi-native",
+          replayed: true,
+          children: existing.map(nativeScientificChildSummary),
+          counts: nativeScientificCounts(existing),
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(replay) }], details: replay };
+      }
+      const children = normalizedCalls.map((call) => {
+        const child: NativeScientificChild = {
+          childId: `pi-child-${crypto.randomUUID()}`,
+          parentSessionId: activeRun.sessionId,
+          role: call.agent,
+          task: call.prompt,
+          status: "running",
+        };
+        childrenById.set(child.childId, child);
+        return child;
+      });
+      nativeSubagentBatchDigests.set(batchKey, callDigest);
+      nativeScientificBatches.set(batchKey, children.map((child) => child.childId));
+      await Promise.all(children.map(async (child) => {
+        try {
+          await runNativeScientificChild(activeRun, parentState, child, child.task || "", signal);
+        } catch (error) {
+          child.status = child.cancelRequested || signal?.aborted || activeRun.cancelled ? "cancelled" : "failed";
+          child.error = redactSensitiveText(error).slice(0, 500);
+          emit({
+            type: "subagent.failed",
+            request_id: activeRun.requestId,
+            session_id: child.childId,
+            parent_session_id: activeRun.sessionId,
+            profile: child.role,
+            role: child.role,
+            backend: "pi-native",
+            error: child.error,
+          });
+        }
+      }));
+      const result = {
+        backend: "pi-native",
+        replayed: false,
+        children: children.map(nativeScientificChildSummary),
+        counts: nativeScientificCounts(children),
+      };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+    },
+  });
+}
+
+function nativeSubagentListTool() {
+  return defineTool({
+    name: "list_subagents",
+    label: "List Pi child sessions",
+    description: "List native Pi child sessions owned by the current parent session.",
+    executionMode: "parallel",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const activeRun = activeRunStorage.getStore();
+      if (!activeRun) throw new Error("No active Pi run owns subagent listing");
+      claimToolCall("list_subagents", {});
+      const children = [...(nativeScientificChildren.get(activeRun.sessionId)?.values() || [])];
+      const result = { backend: "pi-native", children: children.map(nativeScientificChildSummary), counts: nativeScientificCounts(children) };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+    },
+  });
+}
+
+function nativeSubagentCollectTool() {
+  return defineTool({
+    name: "collect_subagents",
+    label: "Collect Pi child sessions",
+    description: "Collect bounded handoffs from native Pi child sessions, optionally waiting for completion.",
+    executionMode: "parallel",
+    parameters: Type.Object({
+      wait_seconds: Type.Optional(Type.Number({ minimum: 0, maximum: 30 })),
+      poll_interval_ms: Type.Optional(Type.Integer({ minimum: 10, maximum: 1000 })),
+    }),
+    execute: async (_toolCallId, params, signal) => {
+      const activeRun = activeRunStorage.getStore();
+      if (!activeRun) throw new Error("No active Pi run owns subagent collection");
+      claimToolCall("collect_subagents", params as JsonRecord);
+      const waitMs = Math.min(30_000, Math.max(0, Number(params.wait_seconds || 0) * 1000));
+      const pollMs = Math.min(1000, Math.max(10, Number(params.poll_interval_ms || 100)));
+      const deadline = Date.now() + waitMs;
+      let children = [...(nativeScientificChildren.get(activeRun.sessionId)?.values() || [])];
+      while (children.some((child) => child.status === "running") && Date.now() < deadline) {
+        if (signal?.aborted) throw new Error("Native subagent collection was cancelled");
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        children = [...(nativeScientificChildren.get(activeRun.sessionId)?.values() || [])];
+      }
+      const result = { backend: "pi-native", children: children.map(nativeScientificChildSummary), counts: nativeScientificCounts(children) };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+    },
+  });
+}
+
+function nativeSubagentCancelTool() {
+  return defineTool({
+    name: "cancel_subagents",
+    label: "Cancel Pi child sessions",
+    description: "Cancel selected native Pi child sessions owned by the current parent session.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      child_run_ids: Type.Optional(Type.Array(Type.String({ maxLength: 120 }), { minItems: 1, maxItems: 8 })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const activeRun = activeRunStorage.getStore();
+      if (!activeRun) throw new Error("No active Pi run owns subagent cancellation");
+      claimToolCall("cancel_subagents", params as JsonRecord);
+      const children = [...(nativeScientificChildren.get(activeRun.sessionId)?.values() || [])];
+      const requested = Array.isArray(params.child_run_ids) ? new Set(params.child_run_ids.map(String)) : undefined;
+      const selected = children.filter((child) => !requested || requested.has(child.childId));
+      let cancelled = 0;
+      for (const child of selected) {
+        if (child.status !== "running") continue;
+        child.cancelRequested = true;
+        if (child.session) await child.session.abort().catch(() => undefined);
+        if (child.status === "running") child.status = "cancelled";
         cancelled += 1;
       }
       const result = { backend: "pi-native", selected: selected.length, cancelled, children: selected.map(nativeScientificChildSummary) };
@@ -2935,6 +3153,12 @@ function tools(
         output_name: Type.Optional(Type.String()),
       }),
     ),
+    nativeSubagentTool(),
+    nativeSubagentListTool(),
+    nativeSubagentCollectTool(),
+    nativeSubagentCancelTool(),
+    // Legacy names remain available only when an explicitly persisted legacy
+    // contract asks for them; new contracts expose the generic subagent API.
     nativeScientificDelegateTool(),
     nativeScientificListTool(),
     nativeScientificCollectTool(),
@@ -4348,6 +4572,9 @@ async function closeSession(message: JsonRecord): Promise<void> {
       for (const key of nativeScientificBatches.keys()) {
         if (key.startsWith(`${sessionId}:`)) nativeScientificBatches.delete(key);
       }
+      for (const key of nativeSubagentBatchDigests.keys()) {
+        if (key.startsWith(`${sessionId}:`)) nativeSubagentBatchDigests.delete(key);
+      }
     }
     emit({ type: "session.closed", ...commandCorrelation(message), session_id: sessionId });
   } catch (error) {
@@ -4525,6 +4752,7 @@ async function shutdown(): Promise<void> {
   sessions.clear();
   nativeScientificChildren.clear();
   nativeScientificBatches.clear();
+  nativeSubagentBatchDigests.clear();
   emit({ type: "runtime.shutdown_ack" });
   process.exit(0);
 }

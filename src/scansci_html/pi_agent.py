@@ -173,6 +173,8 @@ _PARALLEL_SAFE_TOOL_NAMES = frozenset({
     "audit_references",
     "list_scientific_agents",
     "collect_scientific_agents",
+    "list_subagents",
+    "collect_subagents",
 })
 _TOOL_EXECUTOR_WORKERS = 4
 _TOOL_EXECUTOR_CAPACITY = 16
@@ -2938,6 +2940,7 @@ class PiAgentClient:
                         "request_id": event_request_id or request_id,
                         "session_id": str(event.get("session_id", "")),
                         "parent_session_id": str(event.get("parent_session_id", session_id)),
+                        "profile": str(event.get("profile", event.get("role", ""))),
                         "role": str(event.get("role", "")),
                         "backend": str(event.get("backend", "pi-native")),
                         "error": str(event.get("error", "")),
@@ -4525,6 +4528,8 @@ class PiAgentClient:
         }
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name in {"subagent", "list_subagents", "collect_subagents", "cancel_subagents"}:
+            raise PermissionError("Generic subagents require the native Pi runtime")
         if name in {
             "delegate_scientific_agents",
             "list_scientific_agents",

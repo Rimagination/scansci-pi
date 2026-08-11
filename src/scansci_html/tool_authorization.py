@@ -42,6 +42,12 @@ _RISK_RANK = {
     "high": 3,
     "approval_required": 3,
 }
+_LEGACY_COMPAT_TOOL_IDS = frozenset({
+    "delegate_scientific_agents",
+    "list_scientific_agents",
+    "collect_scientific_agents",
+    "cancel_scientific_agents",
+})
 
 
 def _explicit_decision(response: Mapping[str, Any] | None) -> str:
@@ -108,7 +114,10 @@ def authorize_tool_call(
     raw_descriptor = dict(descriptor or {})
     if not raw_descriptor or str(raw_descriptor.get("id", "")).strip() != normalized_name:
         raise ToolAuthorizationError(f"Host capability descriptor is unavailable for {normalized_name}")
-    if str(raw_descriptor.get("status", "ready")) != "ready":
+    descriptor_status = str(raw_descriptor.get("status", "ready"))
+    if descriptor_status != "ready" and not (
+        descriptor_status == "legacy" and normalized_name in _LEGACY_COMPAT_TOOL_IDS
+    ):
         raise ToolAuthorizationError(f"Host capability {normalized_name} is not ready")
     risk_level = str(raw_descriptor.get("risk_level", "")).strip()
     if risk_level not in _RISK_RANK:

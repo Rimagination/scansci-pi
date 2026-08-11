@@ -111,24 +111,49 @@ _BUILTIN_CAPABILITIES: tuple[CapabilityDescriptor, ...] = (
     CapabilityDescriptor(
         "delegate_scientific_agents", "control", "Delegate scientific agents",
         "Atomically reserve and start bounded, read-only scientific child runs owned by the active durable parent.",
-        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        status="legacy", risk_level="reversible", subagent_allowed=False, evidence_policy="off",
         output_kinds=("scientific_children",), idempotent=False,
     ),
     CapabilityDescriptor(
         "list_scientific_agents", "control", "List scientific agents",
         "List durable scientific child runs owned by the active durable parent.",
-        subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_children",),
+        status="legacy", subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_children",),
     ),
     CapabilityDescriptor(
         "collect_scientific_agents", "control", "Collect scientific agents",
         "Validate and collect partial structured handoffs from owned scientific child runs.",
-        subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_handoffs",),
+        status="legacy", subagent_allowed=False, evidence_policy="off", output_kinds=("scientific_handoffs",),
     ),
     CapabilityDescriptor(
         "cancel_scientific_agents", "control", "Cancel scientific agents",
         "Cancel only scientific child runs owned by the active durable parent.",
-        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        status="legacy", risk_level="reversible", subagent_allowed=False, evidence_policy="off",
         output_kinds=("scientific_children",), idempotent=False,
+    ),
+    # Generic Pi-native child-session controls. Legacy scientific ids above
+    # remain readable for durable-run migration, but are not in the default
+    # model contract.
+    CapabilityDescriptor(
+        "subagent", "control", "Pi child session",
+        "Start bounded native Pi child sessions with a task-defined prompt and a host-owned read-only tool subset.",
+        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        output_kinds=("subagent_children",), idempotent=False,
+    ),
+    CapabilityDescriptor(
+        "list_subagents", "control", "List Pi child sessions",
+        "List native Pi child sessions owned by the current parent session.",
+        subagent_allowed=False, evidence_policy="off", output_kinds=("subagent_children",),
+    ),
+    CapabilityDescriptor(
+        "collect_subagents", "control", "Collect Pi child sessions",
+        "Collect bounded handoffs from native Pi child sessions, optionally waiting for completion.",
+        subagent_allowed=False, evidence_policy="off", output_kinds=("subagent_handoffs",),
+    ),
+    CapabilityDescriptor(
+        "cancel_subagents", "control", "Cancel Pi child sessions",
+        "Cancel native Pi child sessions owned by the current parent session.",
+        risk_level="reversible", subagent_allowed=False, evidence_policy="off",
+        output_kinds=("subagent_children",), idempotent=False,
     ),
     CapabilityDescriptor(
         "self_assess", "control", "执行自评", "基于当前轮次的工具记录检查缺口和下一步。",
@@ -176,10 +201,10 @@ _CANONICAL_TOOL_IDS: tuple[str, ...] = (
     "compile_latex",
     "edit_section",
     "edit_slide",
-    "delegate_scientific_agents",
-    "list_scientific_agents",
-    "collect_scientific_agents",
-    "cancel_scientific_agents",
+    "subagent",
+    "list_subagents",
+    "collect_subagents",
+    "cancel_subagents",
     "self_assess",
 )
 _REVERSIBLE_TOOL_IDS = {
@@ -191,8 +216,8 @@ _REVERSIBLE_TOOL_IDS = {
     "compile_latex",
     "edit_section",
     "edit_slide",
-    "delegate_scientific_agents",
-    "cancel_scientific_agents",
+    "subagent",
+    "cancel_subagents",
 }
 _SUBAGENT_DENIED_TOOL_IDS = {
     "create_document",
@@ -202,6 +227,12 @@ _SUBAGENT_DENIED_TOOL_IDS = {
     "compile_latex",
     "edit_section",
     "edit_slide",
+    "subagent",
+    "list_subagents",
+    "collect_subagents",
+    "cancel_subagents",
+}
+_LEGACY_TOOL_IDS = {
     "delegate_scientific_agents",
     "list_scientific_agents",
     "collect_scientific_agents",
@@ -399,7 +430,10 @@ def compile_capability_lease(
 
     def eligible(capability_id: str) -> bool:
         descriptor = descriptors.get(capability_id, {})
-        return bool(descriptor) and descriptor.get("status") == "ready" and (
+        status = descriptor.get("status")
+        return bool(descriptor) and (status == "ready" or (
+            status == "legacy" and capability_id in _LEGACY_TOOL_IDS
+        )) and (
             not subagent or bool(descriptor.get("subagent_allowed", False))
         )
 
