@@ -535,9 +535,11 @@ def load_workspace_summary(
     notebook_id: str = "",
 ) -> dict[str, object]:
     workspace = Path(workspace_path)
+    workspace_directory = str(workspace.expanduser().resolve().parent)
     if not workspace.exists():
         return {
             "workspace_path": str(workspace),
+            "workspace_directory": workspace_directory,
             "notebooks": [],
             "counts": {"notebooks": 0, "sources": 0, "notes": 0, "layers": 0},
         }
@@ -579,6 +581,7 @@ def load_workspace_summary(
             }
     return {
         "workspace_path": str(workspace),
+        "workspace_directory": workspace_directory,
         "notebooks": notebooks,
         "counts": counts,
     }

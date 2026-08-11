@@ -242,7 +242,7 @@ def sync_official_registry(workspace: str | Path, *, timeout: float = 7.0) -> di
                 by_id[item["id"]] = item
     cached_items = sorted(by_id.values(), key=lambda item: (-int(item.get("rank", 0)), item["title"].casefold()))[:_MAX_CACHED_ITEMS]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "synced_at": datetime.now(UTC).isoformat(),
         "items": cached_items,
     }
@@ -446,7 +446,7 @@ def _read_cache(workspace: str | Path) -> dict[str, Any]:
 
 def _fetch_registry_query(query: str, timeout: float) -> list[dict[str, Any]]:
     url = f"{OFFICIAL_REGISTRY_URL}?{urlencode({'limit': 24, 'version': 'latest', 'search': query})}"
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "ScanSci/0.2 MCP Marketplace"})
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "ScanSci/0.4 MCP Marketplace"})
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed official HTTPS registry URL
         payload = json.loads(response.read().decode("utf-8"))
     servers = payload.get("servers") if isinstance(payload, dict) else []

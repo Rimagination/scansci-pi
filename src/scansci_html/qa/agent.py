@@ -263,6 +263,13 @@ def answer_question(
         else:
             verified_answer = verify_answer_claims(answer, evidence_table)
         verified_answer = apply_verification_policy(verified_answer)
+    verified_answer = _filter_answer_to_requested_source_language(verified_answer, evidence_table, question)
+    if verified_answer.get("source_language_filter"):
+        # Re-run the ordinary citation policy after removing claims that do not
+        # satisfy an explicit source-language request.  The UI must never show
+        # a filtered claim as verified merely because it was verified before the
+        # presentation constraint was applied.
+        verified_answer = apply_verification_policy(verify_answer_claims(verified_answer, evidence_table))
     if bool(adequacy.get("is_sufficient", False)) and _requires_chinese_claims(question, query_plan):
         if not _verified_answer_has_chinese_claims(verified_answer):
             # Citation integrity comes first: never discard supported material
@@ -395,6 +402,58 @@ def _requires_chinese_claims(question: str, query_plan: dict[str, Any]) -> bool:
     return str(query_plan.get("language", "")).strip().lower() == "zh" or bool(re.search(r"[\u4e00-\u9fff]", question))
 
 
+def _filter_answer_to_requested_source_language(
+    answer: dict[str, Any],
+    evidence_table: list[dict[str, Any]],
+    question: str,
+) -> dict[str, Any]:
+    """Enforce an explicit request for source excerpts in Chinese.
+
+    A Chinese question alone should still be allowed to use an English paper
+    and produce a Chinese paraphrase.  The stricter filter is only activated by
+    wording such as ``中文原文``/``中文摘要``/``只返回中文``.  This is applied
+    after model verification because provider-side JSON can still contain an
+    otherwise valid English quote claim.
+    """
+
+    normalized = " ".join(str(question or "").split()).casefold()
+    if not any(marker in normalized for marker in ("中文原文", "中文摘要", "中文证据", "只返回中文")):
+        return answer
+    rows_by_quote_id = {
+        str(row.get("quote_id", "")): row
+        for row in evidence_table
+        if str(row.get("quote_id", ""))
+    }
+    chinese_quote_ids = {
+        quote_id
+        for quote_id, row in rows_by_quote_id.items()
+        if len(re.findall(r"[\u4e00-\u9fff]", str(row.get("exact_quote", "")))) >= 2
+    }
+    if not chinese_quote_ids:
+        return answer
+    retained: list[dict[str, Any]] = []
+    for claim in list(answer.get("answer", []) or []):
+        item = dict(claim)
+        quote_ids = [
+            str(quote_id)
+            for quote_id in list(item.get("quote_ids", []) or [])
+            if str(quote_id) in chinese_quote_ids
+        ]
+        text = str(item.get("text", ""))
+        if quote_ids and len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2:
+            item["quote_ids"] = quote_ids
+            retained.append(item)
+    if len(retained) == len(list(answer.get("answer", []) or [])):
+        return answer
+    filtered = {**answer, "answer": retained, "source_language_filter": "zh_source_excerpt"}
+    limitations = list(filtered.get("limitations", []) or [])
+    notice = "已按请求仅保留有中文原文证据支持的主张。"
+    if notice not in limitations:
+        limitations.append(notice)
+    filtered["limitations"] = limitations
+    return filtered
+
+
 def _verified_answer_has_chinese_claims(answer: dict[str, Any]) -> bool:
     text = " ".join(str(claim.get("text", "")) for claim in list(answer.get("answer", []) or []))
     if not text.strip():
@@ -476,6 +535,19 @@ def _apply_topical_relevance_gate(
     if not bool(adequacy.get("is_sufficient", False)):
         return adequacy
     domain_terms = [term for term in lexical_tokens(question) if term not in STOPWORDS and len(term) >= 3]
+    # ``lexical_tokens`` deliberately emits CJK n-grams for retrieval.  Using
+    # those raw n-grams as a ratio denominator makes short Chinese questions
+    # look unrelated: query scaffolding such as ``当前选择的知识库`` contributes
+    # many 3-grams while a quote may contain only ``光伏电站`` and ``植物``.
+    # Strip common request scaffolding first and score the remaining CJK topic
+    # terms separately so a direct domain match is not rejected by boilerplate.
+    chinese_topic_terms = _chinese_topic_terms(question)
+    if chinese_topic_terms:
+        domain_terms = [
+            term
+            for term in domain_terms
+            if not all("\u4e00" <= char <= "\u9fff" for char in term)
+        ] + chinese_topic_terms
     # Chinese bi-grams from lexical_tokens are meaningless noise; a CJK
     # domain term needs at least three characters; Latin terms need four.
     domain_terms = [t for t in domain_terms if all('\u4e00' <= c <= '\u9fff' for c in t) or len(t) >= 4]
@@ -525,6 +597,21 @@ def _apply_topical_relevance_gate(
         }
     # A one-word match among many domain terms can pass the gate while
     # every substantive term is absent.  Require a meaningful fraction.
+    matched_chinese = [term for term in chinese_topic_terms if term in combined_text]
+    # One unambiguous 3-gram (or two independent 2-grams) is enough for a
+    # concise CJK question.  Latin queries retain the existing fraction gate.
+    if matched_chinese and (
+        any(len(term) >= 3 for term in matched_chinese)
+        or len(matched_chinese) >= 2
+    ):
+        return {
+            **adequacy,
+            "topical_relevance": {
+                "domain_terms": domain_terms[:12],
+                "matched_terms": matched[:8],
+                "checked_quotes": len(evidence_table),
+            },
+        }
     if len(matched) >= 3 or len(matched) / len(domain_terms) >= 0.2:
         return adequacy
     long_match = any(len(term) >= 5 and term in combined_text for term in domain_terms)
@@ -539,6 +626,66 @@ def _apply_topical_relevance_gate(
             "checked_quotes": len(evidence_table),
         },
     }
+
+
+_CJK_QUERY_SCAFFOLDING = (
+    "基于当前选择的知识库",
+    "基于当前选择的",
+    "当前选择的知识库",
+    "当前知识库",
+    "找出与",
+    "直接相关的",
+    "相关的三条证据",
+    "三条证据",
+    "只输出",
+    "没有证据就写未找到",
+    "如果当前库中找不到可靠证据",
+    "请明确写未找到证据",
+)
+
+_CJK_NON_TOPIC_TERMS = frozenset(
+    {
+        "基于",
+        "当前",
+        "选择",
+        "知识",
+        "知识库",
+        "找出",
+        "直接",
+        "相关",
+        "证据",
+        "文献",
+        "题名",
+        "年份",
+        "摘要",
+        "原文",
+        "页码",
+        "没有",
+        "找到",
+        "明确",
+        "输出",
+        "一个",
+        "三条",
+    }
+)
+
+
+def _chinese_topic_terms(question: str) -> list[str]:
+    """Return CJK n-grams after removing UI/request boilerplate."""
+
+    text = " ".join(str(question or "").casefold().split())
+    for phrase in _CJK_QUERY_SCAFFOLDING:
+        text = text.replace(phrase, " ")
+    terms: set[str] = set()
+    for sequence in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", text):
+        for width in (2, 3):
+            if len(sequence) < width:
+                continue
+            for index in range(len(sequence) - width + 1):
+                term = sequence[index : index + width]
+                if term not in _CJK_NON_TOPIC_TERMS:
+                    terms.add(term)
+    return sorted(terms, key=lambda item: (-len(item), item))
 
 
 def _apply_relation_grounding_gate(

@@ -155,10 +155,16 @@ def test_dark_model_selector_is_a_dark_control_with_light_text() -> None:
 
 
 def test_settings_pages_consume_semantic_surfaces_and_text() -> None:
-    assert_last_property(".settings-view", "background", "var(--page-background)")
+    assert_last_property(".settings-view", "background", "var(--canvas)")
+    assert_last_property(".settings-sidebar", "border-right", "0")
+    assert_last_property(
+        'html:not([data-theme="dark"]) .settings-view',
+        "background",
+        "var(--canvas)",
+    )
     assert_last_property(".settings-content", "background", "var(--page-background)")
-    assert_last_property(".settings-surface", "background", "var(--surface)")
-    assert_last_property(".settings-surface", "border-color", "var(--rule)")
+    assert_last_property(".settings-surface", "background", "transparent")
+    assert_last_property(".settings-surface", "border", "0")
     assert_last_property(".settings-page-heading h1", "color", "var(--ink)")
     assert_last_property(".settings-page-heading p", "color", "var(--muted)")
     assert_last_property(
@@ -166,6 +172,122 @@ def test_settings_pages_consume_semantic_surfaces_and_text() -> None:
     )
     assert_last_property(".settings-select-trigger", "color", "var(--ink)")
     assert_last_property(".settings-select-model-meta", "color", "var(--muted)")
+
+
+def test_settings_surface_is_flat_in_both_themes() -> None:
+    assert_last_property(".settings-surface", "width", "100%")
+    assert_last_property(".settings-surface", "min-height", "0")
+    assert_last_property(".settings-surface", "margin", "0")
+    assert_last_property(".settings-surface", "padding", "0")
+    assert_last_property(".settings-surface", "border-radius", "0")
+    assert_last_property(".settings-surface", "box-shadow", "none")
+    assert_last_property(
+        'html[data-theme="dark"] .settings-surface', "background", "transparent"
+    )
+
+
+def test_settings_content_keeps_the_top_left_corner_rounded_in_both_themes() -> None:
+    assert_last_property(".settings-content", "border-top-left-radius", "24px")
+    assert_last_property(
+        ".settings-view.is-active > .settings-content",
+        "border-top-left-radius",
+        "24px",
+    )
+    assert_last_property(
+        'html[data-theme="dark"] .settings-view', "background", "var(--canvas)"
+    )
+
+
+def test_active_settings_nav_shadow_is_soft_and_follows_the_rounded_pill() -> None:
+    assert_last_property(".settings-nav.is-active", "border-radius", "999px")
+    assert_last_property(
+        ".settings-nav.is-active",
+        "box-shadow",
+        "0 4px 14px color-mix(in srgb, var(--ink) 10%, transparent)",
+    )
+
+
+def test_ocr_select_menu_can_float_above_adjacent_service_cards() -> None:
+    assert_last_property(".settings-select-menu", "z-index", "130")
+    assert_last_property(
+        ".settings-content .document-service-card:has(.settings-select.is-open)",
+        "z-index",
+        "130",
+    )
+    assert_last_property(
+        ".settings-content .document-service-card:has(.settings-select.is-open)",
+        "isolation",
+        "auto",
+    )
+
+
+def test_ocr_language_selector_uses_the_api_field_scale_and_next_line() -> None:
+    selector = (
+        ".settings-surface:has(.default-capabilities-page) "
+        ".default-tools-section .document-language-row"
+    )
+    assert_last_property(selector, "display", "grid")
+    assert_last_property(selector, "grid-template-columns", "1fr")
+    assert_last_property(selector, "font-size", "calc(12px * var(--settings-font-scale))")
+    assert_last_property(
+        f"{selector} > .settings-select", "width", "100%"
+    )
+
+
+def test_local_model_sections_match_default_assistant_typography() -> None:
+    assert_last_property(".settings-content .local-models-page", "font-family", "var(--ui)")
+    for selector in (
+        ".settings-content .local-installed-panel h2",
+        ".settings-content .local-model-market-disclosure > summary",
+    ):
+        assert_last_property(
+            selector, "font-size", "calc(16px * var(--settings-font-scale))"
+        )
+        assert_last_property(selector, "line-height", "21px")
+    for selector in (
+        ".settings-content .local-installed-panel .quiet-model-row strong",
+        ".settings-content .local-model-market-disclosure .quiet-model-row strong",
+    ):
+        assert_last_property(
+            selector, "font-size", "calc(12px * var(--settings-font-scale))"
+        )
+        assert_last_property(selector, "line-height", "17px")
+
+
+def test_settings_visual_system_is_shared_and_interface_scale_reaches_the_app_shell() -> None:
+    assert_last_property(":root", "--ui-font-scale", "1")
+    assert_last_property('html[data-font-scale="small"]', "--ui-font-scale", ".92")
+    assert_last_property('html[data-font-scale="large"]', "--ui-font-scale", "1.08")
+    assert_last_property(".workbench", "zoom", "var(--ui-font-scale)")
+    assert_last_property(".settings-content", "font-family", "var(--settings-font-family)")
+    assert_last_property(".settings-content", "--settings-font-scale", "1")
+    assert_last_property(".settings-content", "color", "var(--ink)")
+    assert_last_property(".settings-content", "background", "var(--page-background)")
+    assert_last_property(".settings-content .settings-page-heading h1", "font-size", "calc(var(--settings-page-title) * var(--settings-font-scale))")
+
+
+def test_settings_pages_drop_decorative_horizontal_rules() -> None:
+    assert_last_property(".settings-sidebar-bottom", "border-top", "0")
+    for selector, property_name in (
+        (".settings-content .settings-minimal-section", "border-top"),
+        (".settings-content .settings-row", "border-bottom"),
+        (".settings-content .default-capability-panel > header", "border-bottom"),
+        (".settings-content .default-capability-row", "border-bottom"),
+        (".settings-content .local-installed-panel > header", "border-bottom"),
+        (".settings-content .local-model-disclosure", "border-bottom"),
+        (".settings-content .about-card-heading", "border-bottom"),
+        (".settings-content .about-row", "border-top"),
+        (".software-update-card > header", "border-bottom"),
+    ):
+        assert_last_property(selector, property_name, "0")
+
+
+def test_software_update_page_uses_the_settings_visual_system() -> None:
+    assert_last_property(".software-update-page", "font-family", "var(--ui)")
+    assert_last_property(".software-update-card", "border-color", "var(--rule)")
+    assert_last_property(".software-update-card", "background", "var(--surface)")
+    assert_last_property(".software-update-page h1", "color", "var(--ink)")
+    assert_last_property(".software-update-page p", "color", "var(--muted)")
 
 
 def test_provider_list_consumes_semantic_surfaces_and_text() -> None:

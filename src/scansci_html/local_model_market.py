@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Iterable
 from urllib import parse, request
 
@@ -331,6 +332,70 @@ def installed_models() -> list[dict[str, Any]]:
             repo_id = _canonical_model_id(folder, _read_model_json(folder / "config.json"))
             add_snapshot(repo_id, folder)
     return sorted(rows, key=lambda item: str(item["name"]).casefold())
+
+
+def delete_installed_model(repo_id: str) -> dict[str, Any]:
+    """Delete one discovered model and the files owned by its cache entry.
+
+    Hugging Face stores snapshots below ``models--ORG--NAME`` and keeps the
+    actual blobs beside them.  Removing only the snapshot would leave most of
+    a model on disk, so cache entries are removed at the repository directory
+    level.  Manually copied model folders are removed as-is.  In both cases we
+    resolve the discovered path and require it to remain below a configured
+    model root before touching the filesystem.
+    """
+
+    requested_id = str(repo_id or "").strip()
+    if not _MODEL_ID.fullmatch(requested_id):
+        raise ValueError("模型 ID 格式无效")
+
+    requested_key = requested_id.casefold()
+    row = next(
+        (
+            item
+            for item in installed_models()
+            if str(item.get("id", "")).strip().casefold() == requested_key
+        ),
+        None,
+    )
+    if row is None:
+        raise FileNotFoundError(f"未找到已安装模型：{requested_id}")
+
+    discovered_path = Path(str(row.get("path", ""))).expanduser()
+    if discovered_path.is_symlink() or not discovered_path.is_dir():
+        raise FileNotFoundError(f"模型目录不存在：{requested_id}")
+
+    # A snapshot is only one revision inside the cache.  Remove the complete
+    # ``models--ORG--NAME`` directory so blobs and refs do not become orphans.
+    if (
+        discovered_path.parent.name.casefold() == "snapshots"
+        and discovered_path.parent.parent.name.casefold().startswith("models--")
+    ):
+        target = discovered_path.parent.parent
+    else:
+        target = discovered_path
+
+    if target.is_symlink() or not target.is_dir():
+        raise FileNotFoundError(f"模型目录不存在：{requested_id}")
+    target = target.resolve()
+
+    roots: list[Path] = []
+    for root in discover_model_roots():
+        try:
+            resolved_root = root.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved_root not in roots:
+            roots.append(resolved_root)
+    if not any(target != root and root in target.parents for root in roots):
+        raise ValueError("模型目录不在受支持的本地模型目录中")
+
+    shutil.rmtree(target)
+    return {
+        "deleted": True,
+        "id": str(row.get("id") or requested_id),
+        "path": str(target),
+    }
 
 
 def _remote_catalog(query: str, limit: int) -> list[dict[str, Any]]:

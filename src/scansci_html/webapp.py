@@ -67,6 +67,7 @@ from .local_evidence_runtime import (
 from .local_model_market import (
     QWEN3_ASR_NATIVE_MODEL_ID,
     create_install_manager,
+    delete_installed_model,
     installed_models,
     market_catalog,
 )
@@ -1311,6 +1312,9 @@ class NotebookWebApp:
                 HTTPStatus.OK,
                 verify_doi_metadata(str(payload.get("doi", "")), expected_title=str(payload.get("title", ""))),
             )
+        if path == "/api/local-models/delete":
+            model_id = str(payload.get("id", "")).strip()
+            return self._json(HTTPStatus.OK, delete_installed_model(model_id))
         if path == "/api/local-models/download":
             repo_id = str(payload.get("id", ""))
             runtime = str(payload.get("runtime", "") or "").strip().lower()

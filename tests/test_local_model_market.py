@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scansci_html import local_model_market
 from scansci_html import app_settings
 from scansci_html import research_agent
@@ -50,6 +52,53 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "icon_url": "https://resources.modelscope.cn/avatar/4c40e6ce-1348-43b5-a3bc-6bafec6ac805.jpg",
         }
     ]
+
+
+def test_delete_installed_model_removes_huggingface_cache(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    cache = tmp_path / "HuggingFace" / "hub" / "models--Qwen--Qwen2.5-1.5B-Instruct"
+    snapshot = cache / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}), encoding="utf-8"
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    result = local_model_market.delete_installed_model("Qwen/Qwen2.5-1.5B-Instruct")
+
+    assert result == {
+        "deleted": True,
+        "id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "path": str(cache),
+    }
+    assert not cache.exists()
+    assert local_model_market.installed_models() == []
+
+
+def test_delete_installed_model_removes_manually_copied_folder(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    folder = tmp_path / "Qwen3-Embedding-0.6B"
+    folder.mkdir()
+    (folder / "config.json").write_text(
+        json.dumps({"_name_or_path": "Qwen/Qwen3-Embedding-0.6B", "model_type": "qwen3"}), encoding="utf-8"
+    )
+    (folder / "model.safetensors").write_bytes(b"weights")
+
+    result = local_model_market.delete_installed_model("Qwen/Qwen3-Embedding-0.6B")
+
+    assert result["deleted"] is True
+    assert result["id"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert result["path"] == str(folder)
+    assert not folder.exists()
+
+
+def test_delete_installed_model_rejects_unknown_or_unsafe_id(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+
+    with pytest.raises(ValueError):
+        local_model_market.delete_installed_model("../outside")
+    with pytest.raises(FileNotFoundError):
+        local_model_market.delete_installed_model("Qwen/missing")
 
 
 def test_installed_models_reuses_a_manually_copied_model_folder(tmp_path: Path, monkeypatch):

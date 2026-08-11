@@ -117,6 +117,35 @@ def test_contract_advisor_reports_evidence_gaps_without_side_effects() -> None:
     assert classify_failure("403 forbidden") == "permission_denied"
 
 
+def test_contract_advisor_counts_verified_artifact_as_background_tool_completion() -> None:
+    """Durable evidence stages are persisted as one host tool call, not each UI trace step."""
+
+    run = {
+        "run_id": "run-background-answer",
+        "status": "completed",
+        "stage_counts": {"total": 4, "completed": 4},
+        "task_contract": {
+            "required_tool_groups": [["build_verified_answer"]],
+            "task_profile": {"evidence_policy": "required"},
+        },
+        "tool_calls": [
+            {"tool_name": "scansci.evidence.ask", "status": "completed", "duration_ms": 12},
+        ],
+        "output_artifact": {
+            "artifact_type": "evidence_answer",
+            "evidence_links": [{"evidence_id": "doc.s1", "uri": "scansci://evidence/doc.s1"}],
+            "payload": {"citation_verification": {"passed": True}},
+        },
+        "events": [],
+        "error": {},
+    }
+
+    report = review_research_run(run)
+
+    assert report["verdict"] == "passed"
+    assert report["findings"] == []
+
+
 def test_harness_grading_checks_trace_and_evidence_requirements() -> None:
     run = {
         "run_id": "run-benchmark",

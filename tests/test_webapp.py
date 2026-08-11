@@ -371,6 +371,21 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "isError ? 10000 : 2800" in script
 
 
+def test_model_services_preview_keeps_provider_catalog_when_backend_is_unavailable(tmp_path: Path) -> None:
+    """The static preview must not collapse the model-service catalog to ScanSci only."""
+
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    fallback = script.split("const BOOTSTRAP_PROVIDER_DEFINITIONS =", 1)[1].split(
+        "function bootstrapSettingsFallback()", 1
+    )[0]
+
+    assert "function bootstrapProviderCatalogFallback()" in script
+    assert 'id: "openai"' in fallback
+    assert 'id: "anthropic"' in fallback
+    assert "providers: bootstrapProviderCatalogFallback()" in script
+
+
 def test_settings_compact_model_list_and_multiselect_ocr_languages_are_exposed(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     page = app.dispatch("GET", "/").body.decode("utf-8")
@@ -385,6 +400,295 @@ def test_settings_compact_model_list_and_multiselect_ocr_languages_are_exposed(t
     assert ".local-installed-model-list" in styles
     assert "max-height: 360px" in styles
     assert "overflow-y: auto" in styles
+
+
+def test_general_settings_tabs_are_configurable_and_hide_desktop_system_page(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert 'id="generalConversationForm"' in script
+    assert 'name="conversation-send-shortcut"' in script
+    assert 'data-general-toggle="completion_notifications"' in script
+    assert 'data-action="choose-general-directory"' in script
+    assert 'directoryControl("directory-default-workspace"' in script
+    assert 'directoryControl("directory-conversation-workspace"' in script
+    assert "function collectGeneralSettingsForm" in script
+    assert 'option("shift-enter"' in script
+    assert 'data-settings-tab="desktop"' not in script
+    assert "桌面与系统" not in script
+    assert ".settings-tab-strip" in styles
+    assert "grid-template-columns: repeat(3" in styles
+
+
+def test_default_capability_cards_keep_complete_rounded_borders(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert ".settings-content .settings-surface .default-capability-panel," in styles
+    assert "border: 1px solid var(--rule);" in styles
+    assert ".settings-content .settings-surface .default-capability-panel:first-child" in styles
+    assert "border-top-color: var(--rule);" in styles
+
+
+def test_settings_directory_defaults_use_the_application_workspace_directory(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert "function workspaceDirectoryFromFilePath" in script
+    assert "state.workspace?.workspace_directory" in script
+    assert "const applicationWorkspaceDirectory" in script
+    assert 'const displayValue = String(value || "").trim() || placeholder;' in script
+    assert "const readDirectory = (name, fallback)" in script
+
+
+def test_preview_assets_are_cache_busted(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+
+    assert 'href="/styles.css?v=26"' in page
+    assert 'src="/app.js?v=26"' in page
+
+
+def test_settings_layout_groups_navigation_and_separates_runtime_page(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert 'class="settings-nav-group"' in page
+    assert 'data-settings-panel="models"' in page
+    assert 'data-settings-panel="local-models"' in page
+    assert 'data-settings-panel="runtime"' in page
+    assert 'data-settings-tab="${id}"' in script
+    assert 'data-action="switch-general-tab"' in script
+    assert "function renderRuntimeSettings" in script
+    assert ".settings-nav-group-title" in styles
+    assert "background: var(--ink)" in styles
+
+
+def test_runtime_settings_default_surface_focuses_on_lifecycle_controls(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    start = script.index("function renderRuntimeSettings()")
+    end = script.index("function renderLocalModelsSettings()", start)
+    runtime_view = script[start:end]
+
+    assert 'data-action="install-local-runtime"' in runtime_view
+    assert 'data-action="choose-local-runtime-files"' in runtime_view
+    assert 'data-action="refresh-local-runtime"' in runtime_view
+    assert "模型权重仍由“本地模型”单独管理" in runtime_view
+    assert "用户可以在这里安装、更新或重新检测本地运行组件" in runtime_view
+    assert "runtimeComponentsSettingsMarkup()" not in runtime_view
+    assert "renderExternalRuntimeConnectionsMarkup()" in runtime_view
+    assert ".runtime-lifecycle-summary" in styles
+    assert ".runtime-connections-panel" in styles
+
+
+def test_runtime_advanced_components_only_show_when_actionable(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    start = script.index("function runtimeComponentsSettingsMarkup()")
+    end = script.index("async function refreshRuntimeComponents", start)
+    components_markup = script[start:end]
+
+    assert "runtimeComponentSnapshot" in components_markup
+    assert "component.state !== \"ready\"" in components_markup
+    assert "component.install_available" in components_markup
+    assert "component.manual_install_available" in components_markup
+    assert "没有需要处理的应用组件" in components_markup
+
+
+def test_runtime_surface_does_not_render_application_components(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    start = script.index("function renderRuntimeSettings()")
+    end = script.index("function renderLocalModelsSettings()", start)
+    runtime_view = script[start:end]
+
+    assert "runtimeComponentsSettingsMarkup()" not in runtime_view
+    assert "renderExternalRuntimeConnectionsMarkup()" in runtime_view
+
+
+def test_runtime_settings_flatten_local_and_external_runtime_surfaces(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    start = script.index("function renderRuntimeSettings()")
+    end = script.index("function renderLocalModelsSettings()", start)
+    runtime_view = script[start:end]
+
+    assert 'class="runtime-advanced-disclosure"' not in runtime_view
+    assert "runtimeAdvancedSettingsMarkup()" not in runtime_view
+    assert "renderExternalRuntimeConnectionsMarkup()" in runtime_view
+
+
+def test_settings_language_copy_covers_general_controls_and_runtime_titles(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    general_start = script.index("function renderGeneralSettings()")
+    general_end = script.index("function updateStatusCopy", general_start)
+    general_view = script[general_start:general_end]
+    runtime_start = script.index("function renderRuntimeSettings()")
+    runtime_end = script.index("function renderLocalModelsSettings()", runtime_start)
+    runtime_view = script[runtime_start:runtime_end]
+
+    assert 'copy("generalTitle")' in general_view
+    assert 'copy("generalTabConversation")' in general_view
+    assert 'copy("directoriesDescription")' in general_view
+    assert "applicationCopy" in script and "generalTitle: \"General\"" in script
+    assert "LOCAL TRANSFORMERS" not in runtime_view
+    assert "OPTIONAL CONNECTIONS" not in runtime_view
+    assert "APP COMPONENTS" not in runtime_view
+
+
+def test_settings_sidebar_labels_the_about_page_as_software_update(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'class="settings-nav settings-nav-about" data-settings-panel="about"' in page
+    assert 'data-i18n="softwareUpdate">软件更新' in page
+    assert 'softwareUpdate: "软件更新"' in script
+    assert 'softwareUpdate: "Software update"' in script
+    assert "function renderSoftwareUpdateSettings" in script
+    assert 'class="software-update-page settings-minimal-page"' in script
+    assert "关于 ScanSci" not in script
+
+
+def test_settings_navigation_uses_system_group_for_update_archive_storage(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'class="settings-nav-group-title">系统</h2>' in page
+    assert 'data-settings-panel="about"' in page
+    assert 'data-settings-panel="archive"' in page
+    assert 'data-settings-panel="storage"' in page
+    assert 'class="settings-nav-group-title">连接与扩展</h2>' not in page
+    assert 'data-settings-panel="skills"' not in page
+    assert 'data-settings-panel="mcp"' not in page
+    assert 'data-settings-panel="plugins"' not in page
+    assert 'archive: "archive"' in script
+    assert 'storage: "storage"' in script
+    assert page.index('data-settings-panel="archive"') < page.index('data-settings-panel="storage"') < page.index('data-settings-panel="about"')
+
+
+def test_archive_and_storage_settings_pages_share_the_settings_surface(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "function renderArchiveSettings" in script
+    assert "function renderStorageSettings" in script
+    assert 'request("/api/runs?view=archived&limit=200")' in script
+    assert 'request("/api/chat/history?view=archived&limit=200")' in script
+    assert 'class="archive-settings-page settings-minimal-page"' in script
+    assert 'class="storage-settings-page settings-minimal-page"' in script
+    assert ".archive-settings-card" in styles
+    assert ".storage-settings-card" in styles
+
+
+def test_local_models_page_only_contains_installed_and_market_sections(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    start = script.index("function renderLocalModelsSettings()")
+    end = script.index("function renderDocumentProcessingFormMarkup", start)
+    local_models_page = script[start:end]
+
+    assert 'class="local-installed-panel"' in local_models_page
+    assert 'class="local-model-disclosure local-model-market-disclosure" open' in local_models_page
+    assert 'data-action="delete-installed-local-model"' in local_models_page
+    assert 'data-model-id="${escapeHtml(item.id)}"' in local_models_page
+    assert 'request("/api/local-models/delete"' in script
+    assert 'confirmLabel: "删除模型"' in script
+    assert 'class="local-agent-routing-card"' not in local_models_page
+    assert 'class="local-model-fallback"' not in local_models_page
+
+
+def test_installed_model_delete_control_uses_semantic_theme_tokens(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert ".local-installed-model-list .local-installed-remove" in styles
+    assert "grid-template-columns: 30px minmax(0, 1fr) auto auto auto;" in styles
+    assert "color: var(--danger);" in styles
+    assert "background: var(--surface);" in styles
+
+
+def test_model_settings_use_flat_shared_hierarchy_for_light_and_dark_themes(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert ".settings-content .local-installed-panel," in styles
+    assert ".settings-content .local-model-market-disclosure" in styles
+    assert ".settings-content .cherry-model-section," in styles
+    assert ".settings-content .cherry-model-list," in styles
+    assert "html[data-theme] .settings-content .local-installed-panel," in styles
+    assert "html[data-theme] .settings-content .cherry-model-list," in styles
+    assert "background: transparent;" in styles
+    assert "border: 0;" in styles
+
+
+def test_model_settings_typography_uses_shared_settings_scale(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "font-size: calc(var(--settings-section-title) * var(--settings-font-scale));" in styles
+    assert "font-size: calc(var(--settings-body-size) * var(--settings-font-scale));" in styles
+    assert "font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));" in styles
+    assert "background: var(--page-background);" in styles
+    assert "color: var(--ink);" in styles
+
+
+def test_model_service_catalog_is_wider_and_has_no_outer_panel(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "html[data-theme] .settings-content .cherry-provider-catalog" in styles
+    assert "grid-template-columns: 244px minmax(0, 1fr);" in styles
+    assert "border: 0;" in styles
+    assert "background: transparent;" in styles
+
+
+def test_model_service_header_hides_duplicate_provider_toggle_and_keeps_actions(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    start = script.index("function renderModelsSettings()")
+    end = script.index("function renderLegacyLocalModelsSettings()", start)
+    model_services = script[start:end]
+    provider_row = script.split("const providerRow =", 1)[1].split("const providerItems", 1)[0]
+    header_start = model_services.index('class="cherry-provider-header-actions"')
+    header_end = model_services.index("</header>", header_start)
+    header = model_services[header_start:header_end]
+
+    assert 'data-action="restore-provider-default"' in model_services
+    assert 'data-action="refresh-model-health"' in model_services
+    assert 'class="cherry-save-button"' in model_services
+    assert 'name="provider-enabled"' in header
+    assert "cherry-provider-status" in provider_row
+    assert "html[data-theme] .settings-content .cherry-provider-header-actions > .cherry-toggle" in styles
+    assert "html[data-theme] .settings-content .cherry-provider-header-actions > .cherry-provider-header-divider" in styles
+    assert "display: none;" in styles[styles.index("html[data-theme] .settings-content .cherry-provider-header-actions") : styles.index("/* The provider directory", styles.index("html[data-theme] .settings-content .cherry-provider-header-actions"))]
+
+
+def test_settings_preview_skips_first_run_overlay_for_direct_browser_review(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert "const previewSettings = {" in script
+    assert 'defaults: "defaults"' in script
+    assert '"software-update": "about"' in script
+    assert (
+        "state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed)"
+        " && !previewSettings;"
+    ) in script
 
 
 def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path):
@@ -4031,6 +4335,27 @@ def test_model_download_control_api_delegates_to_persistent_manager(
     assert response.status == 202
     assert _payload(response) == expected
     assert calls == [(action, "retrieval-core")]
+
+
+def test_installed_model_delete_api_removes_selected_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    calls: list[str] = []
+
+    def delete(model_id: str) -> dict[str, object]:
+        calls.append(model_id)
+        return {"deleted": True, "id": model_id, "path": str(tmp_path / "models" / "cache")}
+
+    monkeypatch.setattr("scansci_html.webapp.delete_installed_model", delete)
+
+    response = app.dispatch(
+        "POST",
+        "/api/local-models/delete",
+        json.dumps({"id": "Qwen/Qwen2.5-1.5B-Instruct"}).encode("utf-8"),
+    )
+
+    assert response.status == 200
+    assert _payload(response)["deleted"] is True
+    assert calls == ["Qwen/Qwen2.5-1.5B-Instruct"]
 
 
 def test_model_download_is_refused_before_a_lightweight_build_has_a_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

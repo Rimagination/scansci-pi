@@ -86,6 +86,27 @@ def test_local_fallback_selects_one_directly_relevant_sentence_for_a_direct_ques
     assert "https://" not in answer["answer"][0]["text"]
 
 
+def test_local_fallback_prefers_requested_chinese_evidence_over_english_excerpts():
+    answer = synthesize_answer(
+        "光伏电站和植物多样性有哪些证据？",
+        [
+            {
+                "quote_id": "q0001",
+                "claim_target": "光伏电站会影响植物群落。",
+                "exact_quote": "光伏电站会影响板下植物群落组成和多样性。",
+            },
+            {
+                "quote_id": "q0002",
+                "claim_target": "Solar farms alter vegetation.",
+                "exact_quote": "Solar farms alter vegetation and soil conditions.",
+            },
+        ],
+    )
+
+    assert answer["answer"]
+    assert all("Solar" not in str(claim["text"]) for claim in answer["answer"])
+
+
 def test_synthesize_answer_groups_conflict_evidence_into_contrast_claim():
     evidence_table = [
         {

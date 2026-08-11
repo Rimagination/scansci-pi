@@ -80,7 +80,7 @@ def _tracer(workspace: str | Path) -> Any | None:
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-            provider = TracerProvider(resource=Resource.create({"service.name": "ScanSci", "service.version": "0.2"}))
+            provider = TracerProvider(resource=Resource.create({"service.name": "ScanSci", "service.version": "0.4"}))
             provider.add_span_processor(SimpleSpanProcessor(_JsonlSpanExporter(diagnostics_root(workspace) / "spans.jsonl")))
             tracer = provider.get_tracer("scansci.desktop")
             _PROVIDERS[key] = (provider, tracer)
@@ -95,8 +95,14 @@ def diagnostic_span(
     workspace: str | Path,
     name: str,
     attributes: dict[str, Any] | None = None,
+    *,
+    trace_tools: bool = False,
 ) -> Iterator[Any]:
-    """Create a local diagnostic span and record terminal errors."""
+    """Create a local diagnostic span and record terminal errors.
+
+    When *trace_tools* is True the span accumulates tool-call ids, skill ids,
+    and planning changes that the caller reports via :func:`record_tool_call`.
+    """
 
     tracer = _tracer(workspace)
     if tracer is None:
@@ -105,6 +111,8 @@ def diagnostic_span(
     with tracer.start_as_current_span(str(name)[:120]) as span:
         for key, value in _safe_attributes(attributes or {}).items():
             span.set_attribute(key, value)
+        if trace_tools:
+            span.set_attribute("scansci.trace_tools", True)
         try:
             yield span
         except BaseException as error:
@@ -113,6 +121,26 @@ def diagnostic_span(
             raise
         else:
             span.set_attribute("scansci.ok", True)
+
+
+def record_tool_call(span: Any, tool_name: str, *, skills: list[str] | None = None, success: bool | None = None) -> None:
+    """Record a tool call on an active diagnostic span."""
+    if span is None or isinstance(span, _NullSpan):
+        return
+    try:
+        tools: list[str] = list(getattr(span, "_scansci_tools", []) or [])
+        tools.append(tool_name)
+        span.set_attribute("scansci.tool_calls", ",".join(tools[-48:]))
+        setattr(span, "_scansci_tools", tools)  # noqa: B010
+        if success is not None:
+            span.set_attribute("scansci.tool_success", success)
+        if skills:
+            recorded: list[str] = list(getattr(span, "_scansci_skills", []) or [])
+            recorded.extend(skills)
+            span.set_attribute("scansci.skills_used", ",".join(dict.fromkeys(recorded)[:32]))
+            setattr(span, "_scansci_skills", recorded)  # noqa: B010
+    except Exception:
+        pass
 
 
 def diagnostics_summary(workspace: str | Path, *, limit: int = 30) -> dict[str, Any]:

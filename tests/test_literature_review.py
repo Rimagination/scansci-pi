@@ -17,6 +17,7 @@ from scansci_html.literature_review import (
     _deterministic_grounded_review_section,
     _diverse_section_citation_ids,
     _exclusive_section_citation_ids,
+    _fallback_review_plan,
     _has_unrequested_model_detour,
     _required_review_subjects,
     _review_subject_coverage_complete,
@@ -556,6 +557,18 @@ def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():
         "比较原始 Transformer、BERT 与 GPT-3。",
         plan["sections"][3],
     ) == ["原始 Transformer", "BERT", "GPT-3"]
+
+
+def test_fallback_review_plan_uses_domain_sections_for_photovoltaic_ecology():
+    plan = _fallback_review_plan(
+        "基于光伏生态文献，写一份光伏电站建设对生态系统影响及光伏农业协同治理的中文综述。"
+    )
+    titles = [str(section["title"]) for section in plan["sections"]]
+    assert any("生态影响机制" in title for title in titles)
+    assert any("协同治理" in title for title in titles)
+    assert any("研究现状" in title for title in titles)
+    assert not any("训练目标" in title or "适配与应用" in title for title in titles)
+    assert all("光伏" in str(section["queries"][0]) for section in plan["sections"])
 
 
 def test_explicit_three_paper_contract_does_not_accept_a_model_rewritten_outline():

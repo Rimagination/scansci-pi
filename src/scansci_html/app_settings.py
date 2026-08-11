@@ -319,6 +319,18 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "accent": "jade",
         "font_scale": "medium",
     },
+    "general": {
+        "conversation": {
+            "send_shortcut": "enter",
+            "completion_notifications": True,
+            "agent_completion_notifications": True,
+            "subagent_completion_notifications": False,
+        },
+        "directories": {
+            "default_workspace": "",
+            "conversation_workspace": "",
+        },
+    },
     "skills": default_skill_records(),
     "mcp_servers": [],
     "plugins": default_plugin_records(),
@@ -614,6 +626,7 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     document_processing = _normalize_document_processing(payload.get("document_processing", defaults["document_processing"]))
     onboarding = _normalize_onboarding(payload.get("onboarding", defaults["onboarding"]))
     appearance = _normalize_appearance(payload.get("appearance", defaults["appearance"]))
+    general = _normalize_general(payload.get("general", defaults["general"]))
     skills = _with_builtin_skills(_normalize_records(payload.get("skills", defaults["skills"]), kind="skill"))
     mcp_servers = _normalize_records(payload.get("mcp_servers", defaults["mcp_servers"]), kind="mcp")
     plugins = _with_builtin_plugins(_normalize_records(payload.get("plugins", defaults["plugins"]), kind="plugin"))
@@ -662,6 +675,7 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
         "document_processing": document_processing,
         "onboarding": onboarding,
         "appearance": appearance,
+        "general": general,
         "skills": skills,
         "mcp_servers": mcp_servers,
         "plugins": plugins,
@@ -913,6 +927,30 @@ def _normalize_appearance(value: object) -> dict[str, str]:
         "theme": theme if theme in {"system", "light", "dark"} else "system",
         "accent": accent if accent in {"jade", "ocean", "plum", "amber"} else "jade",
         "font_scale": font_scale if font_scale in {"small", "medium", "large"} else "medium",
+    }
+
+
+def _normalize_general(value: object) -> dict[str, Any]:
+    """Normalize behavior and directory preferences shown under General settings."""
+
+    defaults = deepcopy(_DEFAULT_SETTINGS["general"])
+    source = value if isinstance(value, dict) else {}
+    conversation_source = source.get("conversation") if isinstance(source.get("conversation"), dict) else {}
+    directories_source = source.get("directories") if isinstance(source.get("directories"), dict) else {}
+    send_shortcut = _text(conversation_source.get("send_shortcut"), fallback=defaults["conversation"]["send_shortcut"], limit=24).lower()
+    if send_shortcut not in {"enter", "shift-enter"}:
+        send_shortcut = defaults["conversation"]["send_shortcut"]
+    return {
+        "conversation": {
+            "send_shortcut": send_shortcut,
+            "completion_notifications": bool(conversation_source.get("completion_notifications", defaults["conversation"]["completion_notifications"])),
+            "agent_completion_notifications": bool(conversation_source.get("agent_completion_notifications", defaults["conversation"]["agent_completion_notifications"])),
+            "subagent_completion_notifications": bool(conversation_source.get("subagent_completion_notifications", defaults["conversation"]["subagent_completion_notifications"])),
+        },
+        "directories": {
+            "default_workspace": _text(directories_source.get("default_workspace"), limit=1000),
+            "conversation_workspace": _text(directories_source.get("conversation_workspace"), limit=1000),
+        },
     }
 
 

@@ -27,6 +27,7 @@ const state = {
   activeView: "home",
   activeMode: "tools",
   activeSettings: "general",
+  generalSettingsTab: "appearance",
   settingsReturnView: "home",
   activeExtensions: "skills",
   extensionDetail: null,
@@ -51,6 +52,12 @@ const state = {
   historySearchOpen: false,
   directMessages: [],
   directConversations: [],
+  archivedRuns: [],
+  archivedConversations: [],
+  archiveSettingsQuery: "",
+  archiveSettingsLoaded: false,
+  archiveSettingsLoading: false,
+  archiveSettingsError: "",
   directConversationId: window.localStorage.getItem("scansci.active.direct") || "",
   runs: [],
   activeTaskId: "",
@@ -208,7 +215,7 @@ const applicationCopy = Object.freeze({
     modelServices: "模型服务",
     localModels: "本地模型",
     documentProcessing: "文档处理",
-    about: "关于搜索科学",
+    softwareUpdate: "软件更新",
     settingsLocal: "配置仅保存在此电脑",
     settingsTitle: "设置",
     settingsDescription: "此设备上的工作区与应用设置。",
@@ -250,6 +257,34 @@ const applicationCopy = Object.freeze({
     modelKeyNote: "模型密钥不会写入工作区文件。",
     runtimeStatus: "运行状态",
     readyTools: "个工具可用。模型与本地模型的配置可分别在对应页面查看。",
+    generalTitle: "通用",
+    generalDescription: "管理界面偏好、对话输入和目录行为。",
+    generalAutoApply: "修改会自动生效",
+    generalTabsLabel: "通用设置分区",
+    generalTabAppearance: "界面与外观",
+    generalTabConversation: "对话与输入",
+    generalTabDirectories: "目录与文件",
+    conversationDescription: "控制消息阅读、发送方式和完成提醒。",
+    sendShortcut: "发送快捷键",
+    sendShortcutHint: "选择用 Enter 还是 Shift+Enter 发送消息；另一个键用于换行。",
+    sendEnter: "Enter 发送 · Shift+Enter 换行",
+    sendShiftEnter: "Shift+Enter 发送 · Enter 换行",
+    completionNotifications: "回复完成通知",
+    completionNotificationsHint: "AI 助手回复完成时，显示系统通知。",
+    agentCompletionNotifications: "主代理完成通知",
+    agentCompletionNotificationsHint: "主对话或分支对话完成时，显示系统通知。",
+    subagentCompletionNotifications: "子代理完成通知",
+    subagentCompletionNotificationsHint: "子代理会话完成时，显示系统通知。",
+    directoriesTitle: "目录与文件",
+    directoriesDescription: "选择工作区和对话文件的默认保存位置；留空则继续使用应用默认目录。",
+    defaultWorkspace: "默认工作目录",
+    defaultWorkspaceHint: "新建资料库和研究项目时优先使用此目录。",
+    conversationWorkspace: "对话工作目录",
+    conversationWorkspaceHint: "未绑定资料库的对话文件保存在此目录。",
+    chooseDirectory: "选择目录",
+    resetDefault: "恢复默认",
+    defaultWorkspacePlaceholder: "使用应用默认工作区",
+    conversationWorkspacePlaceholder: "使用应用默认对话目录",
   },
   en: {
     brand: "ScanSci | Research Science",
@@ -266,7 +301,7 @@ const applicationCopy = Object.freeze({
     modelServices: "Model services",
     localModels: "Local models",
     documentProcessing: "Documents",
-    about: "About ScanSci",
+    softwareUpdate: "Software update",
     settingsLocal: "Preferences stay on this computer",
     settingsTitle: "Settings",
     settingsDescription: "Workspace and application preferences for this device.",
@@ -308,6 +343,34 @@ const applicationCopy = Object.freeze({
     modelKeyNote: "Model credentials are never written to workspace files.",
     runtimeStatus: "Runtime status",
     readyTools: "tools available. Configure cloud and local models on their respective pages.",
+    generalTitle: "General",
+    generalDescription: "Manage interface preferences, conversation input, and directory behavior.",
+    generalAutoApply: "Changes apply automatically",
+    generalTabsLabel: "General settings sections",
+    generalTabAppearance: "Language & appearance",
+    generalTabConversation: "Conversation & input",
+    generalTabDirectories: "Directories & files",
+    conversationDescription: "Control message reading, sending, and completion notifications.",
+    sendShortcut: "Send shortcut",
+    sendShortcutHint: "Choose whether Enter or Shift+Enter sends a message; the other key inserts a new line.",
+    sendEnter: "Enter sends · Shift+Enter new line",
+    sendShiftEnter: "Shift+Enter sends · Enter new line",
+    completionNotifications: "Reply completion notifications",
+    completionNotificationsHint: "Show a system notification when the AI assistant finishes replying.",
+    agentCompletionNotifications: "Agent completion notifications",
+    agentCompletionNotificationsHint: "Show a system notification when the main or branch conversation finishes.",
+    subagentCompletionNotifications: "Subagent completion notifications",
+    subagentCompletionNotificationsHint: "Show a system notification when a subagent session finishes.",
+    directoriesTitle: "Directories & files",
+    directoriesDescription: "Choose where workspaces and conversation files are saved by default; leave blank to use application defaults.",
+    defaultWorkspace: "Default workspace directory",
+    defaultWorkspaceHint: "Prefer this directory when creating libraries and research projects.",
+    conversationWorkspace: "Conversation workspace",
+    conversationWorkspaceHint: "Conversation files without a linked library are saved here.",
+    chooseDirectory: "Choose directory",
+    resetDefault: "Restore default",
+    defaultWorkspacePlaceholder: "Use application default workspace",
+    conversationWorkspacePlaceholder: "Use application default conversation folder",
   },
 });
 
@@ -361,6 +424,37 @@ function collectAppearanceForm() {
   };
   applyAppearancePreferences();
   return state.settings.appearance;
+}
+
+function collectGeneralSettingsForm() {
+  if (!state.settings) return generalPreferences();
+  const current = generalPreferences();
+  const conversationForm = byId("generalConversationForm");
+  const directoriesForm = byId("generalDirectoriesForm");
+  const readDirectory = (name, fallback) => {
+    const value = String(directoriesForm?.elements[name]?.value ?? fallback).trim();
+    const applicationDirectory = String(state.workspace?.workspace_directory || "").trim()
+      || workspaceDirectoryFromFilePath(state.workspace?.workspace_path);
+    if (!value || value.startsWith("使用应用默认") || value.startsWith("Use application default") || value === applicationDirectory) return "";
+    return value;
+  };
+  state.settings.general = {
+    conversation: {
+      send_shortcut: conversationForm?.elements["conversation-send-shortcut"]?.value === "shift-enter" ? "shift-enter" : current.conversation.send_shortcut,
+      completion_notifications: Boolean(conversationForm?.querySelector('[data-general-toggle="completion_notifications"]')?.checked ?? current.conversation.completion_notifications),
+      agent_completion_notifications: Boolean(conversationForm?.querySelector('[data-general-toggle="agent_completion_notifications"]')?.checked ?? current.conversation.agent_completion_notifications),
+      subagent_completion_notifications: Boolean(conversationForm?.querySelector('[data-general-toggle="subagent_completion_notifications"]')?.checked ?? current.conversation.subagent_completion_notifications),
+    },
+    directories: {
+      default_workspace: readDirectory("directory-default-workspace", current.directories.default_workspace),
+      conversation_workspace: readDirectory("directory-conversation-workspace", current.directories.conversation_workspace),
+    },
+  };
+  return state.settings.general;
+}
+
+function composerUsesShiftEnterToSend() {
+  return generalPreferences().conversation.send_shortcut === "shift-enter";
 }
 
 window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener?.("change", () => {
@@ -1981,37 +2075,91 @@ async function restoreSessionStats(fallbackStats = null) {
 function bootstrapWorkspaceFallback() {
   return {
     workspace_path: "",
+    workspace_directory: "",
     notebooks: [],
     counts: { notebooks: 0, sources: 0, notes: 0, layers: 0 },
   };
 }
 
+// The browser preview is intentionally served without the Python API. Keep a
+// credential-free copy of the provider directory here so a failed /api/settings
+// request does not make the Model Services page look as if its providers were
+// deleted. The backend remains the source of truth once it is reachable.
+const BOOTSTRAP_PROVIDER_DEFINITIONS = [
+  { id: "scansci-managed", name: "ScanSci", category: "ScanSci", baseUrl: "https://scansci-glm-gateway.932196440.workers.dev/v1", modelId: "glm-4.7-flash", modelName: "GLM-4.7 Flash", authMode: "managed", modelListing: false },
+  { id: "openai", name: "OpenAI", category: "国际模型", baseUrl: "https://api.openai.com/v1", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "anthropic", name: "Anthropic", category: "国际模型", kind: "anthropic-compatible", baseUrl: "https://api.anthropic.com/v1", modelId: "claude-sonnet-4-6", modelName: "Claude Sonnet 4.6" },
+  { id: "gemini", name: "Google Gemini", category: "国际模型", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
+  { id: "vertex-ai", name: "Google Vertex AI", category: "国际模型", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
+  { id: "openrouter", name: "OpenRouter", category: "模型聚合", baseUrl: "https://openrouter.ai/api/v1", modelId: "openai/gpt-5.2", modelName: "OpenAI GPT-5.2" },
+  { id: "nvidia", name: "NVIDIA NIM", category: "国际模型", baseUrl: "https://integrate.api.nvidia.com/v1", modelId: "meta/llama-3.3-70b-instruct", modelName: "Llama 3.3 70B Instruct" },
+  { id: "deepseek", name: "DeepSeek", category: "国内直连", baseUrl: "https://api.deepseek.com", modelId: "deepseek-v4-flash", modelName: "DeepSeek V4 Flash" },
+  { id: "dashscope", name: "阿里云百炼", category: "国内直连", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", modelId: "qwen-plus", modelName: "Qwen Plus" },
+  { id: "zai", name: "Z.ai", category: "国内直连", baseUrl: "https://api.z.ai/api/paas/v4", modelId: "glm-4.7", modelName: "GLM-4.7" },
+  { id: "zhipu", name: "智谱开放平台", category: "国内直连", baseUrl: "https://open.bigmodel.cn/api/paas/v4", modelId: "glm-4.7-flash", modelName: "GLM-4.7 Flash" },
+  { id: "moonshot", name: "Kimi", category: "国内直连", baseUrl: "https://api.moonshot.ai/v1", modelId: "kimi-k2.5", modelName: "Kimi K2.5" },
+  { id: "minimax", name: "MiniMax", category: "国内直连", baseUrl: "https://api.minimaxi.com/v1", modelId: "MiniMax-M2.7", modelName: "MiniMax M2.7" },
+  { id: "xiaomi-mimo", name: "Xiaomi MiMo", category: "国内直连", modelId: "mimo-v2-flash", modelName: "MiMo V2 Flash" },
+  { id: "siliconflow", name: "硅基流动", category: "云端推理", baseUrl: "https://api.siliconflow.cn/v1", modelId: "deepseek-ai/DeepSeek-V3", modelName: "DeepSeek V3" },
+  { id: "modelscope", name: "ModelScope", category: "云端推理", baseUrl: "https://api-inference.modelscope.cn/v1", modelId: "Qwen/Qwen2.5-72B-Instruct", modelName: "Qwen 2.5 72B" },
+  { id: "ppio", name: "PPIO Cloud", category: "云端推理", modelId: "deepseek-ai/DeepSeek-V3", modelName: "DeepSeek V3" },
+  { id: "volcengine", name: "火山引擎", category: "云端推理", baseUrl: "https://ark.cn-beijing.volces.com/api/v3", modelId: "doubao-seed-1-6-thinking", modelName: "Doubao Seed Thinking" },
+  { id: "huawei-cloud", name: "华为云", category: "云端推理", modelId: "DeepSeek-R1", modelName: "DeepSeek R1" },
+  { id: "infinigence", name: "无问芯穹", category: "云端推理", modelId: "Qwen2.5-72B-Instruct", modelName: "Qwen 2.5 72B" },
+  { id: "qiniu-ai", name: "七牛云 AI 推理", category: "云端推理", modelId: "DeepSeek-V3", modelName: "DeepSeek V3" },
+  { id: "modal", name: "Modal", category: "云端推理", modelId: "zai-org/GLM-5.1-FP8", modelName: "GLM-5.1-FP8" },
+  { id: "new-api", name: "NewAPI", category: "模型聚合", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "one-api", name: "OneAPI", category: "模型聚合", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "aihubmix", name: "AiHubMix", category: "模型聚合", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "ocoolai", name: "ocoolAI", category: "模型聚合", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "alaya", name: "Alaya NeW", category: "模型聚合", modelId: "deepseek-chat", modelName: "DeepSeek Chat" },
+  { id: "dmxapi", name: "DMXAPI", category: "模型聚合", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
+  { id: "aionly", name: "唯一AI (AiOnly)", category: "模型聚合", modelId: "deepseek-chat", modelName: "DeepSeek Chat" },
+  { id: "burncloud", name: "BurnCloud", category: "模型聚合", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "cherryai", name: "CherryAI", category: "Cherry 生态", modelId: "cherry-model", modelName: "Cherry 模型", authMode: "account_or_key" },
+  { id: "cherryin", name: "CherryIN", category: "Cherry 生态", modelId: "gpt-5.2", modelName: "GPT-5.2" },
+  { id: "github-copilot", name: "GitHub Copilot", category: "Cherry 生态", modelId: "gpt-5.2", modelName: "GPT-5.2", authMode: "account_or_token" },
+  { id: "wuwen", name: "无问", category: "Cherry 生态", modelId: "deepseek-r1", modelName: "DeepSeek R1" },
+];
+
+function bootstrapProviderCatalogFallback() {
+  return BOOTSTRAP_PROVIDER_DEFINITIONS.map((definition) => {
+    const managed = definition.id === "scansci-managed";
+    const modelId = definition.modelId || "chat-model";
+    return {
+      id: definition.id,
+      name: definition.name,
+      logo: definition.id,
+      kind: definition.kind || "openai-compatible",
+      base_url: definition.baseUrl || "",
+      api_surface: "chat_completions",
+      responses_enabled: false,
+      enabled: managed,
+      category: definition.category || "自定义提供商",
+      summary: managed ? "ScanSci 托管模型，无需配置 API 密钥。" : "在此配置 API 地址与密钥。",
+      auth_mode: definition.authMode || (managed ? "managed" : "key"),
+      model_listing: definition.modelListing !== false,
+      api_key_configured: managed,
+      models: [{
+        id: modelId,
+        name: definition.modelName || "通用对话模型",
+        group: definition.name,
+        context_window: managed ? "200K" : "",
+        capabilities: ["reasoning", "tool", "coding"],
+      }],
+    };
+  });
+}
+
 function bootstrapSettingsFallback() {
-  // The desktop must still expose the built-in model when an unrelated local
-  // database request fails during first launch. The backend remains the source
-  // of truth and will replace this snapshot as soon as /api/settings responds.
+  // The desktop must still expose the built-in model and credential-free
+  // provider catalog when an unrelated local database request fails during
+  // first launch. The backend remains the source of truth and will replace
+  // this snapshot as soon as /api/settings responds.
   return {
     schema_version: 2,
     active_model: { provider_id: "scansci-managed", model_id: "glm-4.7-flash" },
-    providers: [{
-      id: "scansci-managed",
-      name: "ScanSci",
-      kind: "openai-compatible",
-      base_url: "https://scansci-glm-gateway.932196440.workers.dev/v1",
-      api_surface: "chat_completions",
-      responses_enabled: false,
-      enabled: true,
-      auth_mode: "managed",
-      model_listing: false,
-      api_key_configured: true,
-      models: [{
-        id: "glm-4.7-flash",
-        name: "GLM-4.7 Flash",
-        group: "GLM",
-        context_window: "200K",
-        capabilities: ["reasoning", "tool", "coding"],
-      }],
-    }],
+    providers: bootstrapProviderCatalogFallback(),
     local_models: [{
       id: "builtin-evidence",
       name: "离线基础检索",
@@ -2036,6 +2184,15 @@ function bootstrapSettingsFallback() {
     },
     onboarding: { welcome_dismissed: false, resource_setup_completed: false, data_setup_completed: false },
     appearance: { locale: "zh-CN", theme: "system", accent: "jade", font_scale: "medium" },
+    general: {
+      conversation: {
+        send_shortcut: "enter",
+        completion_notifications: true,
+        agent_completion_notifications: true,
+        subagent_completion_notifications: false,
+      },
+      directories: { default_workspace: "", conversation_workspace: "" },
+    },
     skills: [],
     mcp_servers: [],
     plugins: [],
@@ -2043,7 +2200,7 @@ function bootstrapSettingsFallback() {
 }
 
 function bootstrapPresetsFallback() {
-  return { providers: [], local_models: [] };
+  return { providers: bootstrapProviderCatalogFallback(), local_models: [] };
 }
 
 function mergeProviderCatalogIntoSettings(settings, presets) {
@@ -2112,7 +2269,21 @@ async function initialize() {
     state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);
     state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
-    state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed);
+    const preview = new URLSearchParams(window.location.search).get("preview");
+    const previewSettings = {
+      settings: "general",
+      "general-settings": "general",
+      defaults: "defaults",
+      "knowledge-settings": "knowledge-preview",
+      models: "models",
+      "local-models": "local-models",
+      runtime: "runtime",
+      about: "about",
+      "software-update": "about",
+      archive: "archive",
+      storage: "storage",
+    }[preview];
+    state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed) && !previewSettings;
     // The current first-run flow is the four-page local-capability guide.
     // Older builds left onboardingMode empty and therefore rendered the
     // retired three-page flow with links to the old resource settings page.
@@ -2189,8 +2360,8 @@ async function initialize() {
         await openDirectConversation(rememberedDirectId, { record: false });
       }
     }
-    if (new URLSearchParams(window.location.search).get("preview") === "knowledge-settings") {
-      state.activeSettings = "knowledge-preview";
+    if (previewSettings) {
+      state.activeSettings = previewSettings;
       setView("settings", { record: false });
     }
     if (bootstrapWarnings.length) {
@@ -2412,7 +2583,7 @@ function scheduleLocalModelInstallPoll(delay = 900) {
       state.downloadStatusError = "";
       state.localModelInstall = status || { jobs: [], active: null };
       const retrieval = (status.jobs || []).find((item) => item.job_id === "retrieval-core");
-      if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+      if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
       if (state.onboardingOpen) renderResourceOnboarding();
       renderDownloadActivity();
       if (retrieval && retrieval.state !== previousRetrieval?.state) {
@@ -2453,7 +2624,7 @@ async function controlDownloadTask(jobId, action, kind = "model") {
     mergeLocalModelInstall(job);
   }
   renderDownloadActivity();
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   if (componentId) scheduleRuntimeComponentInstallPoll(componentId, 250);
   else if (runtime) scheduleLocalRuntimeInstallPoll(250);
   else scheduleLocalModelInstallPoll(250);
@@ -2468,7 +2639,7 @@ function scheduleLocalRuntimeInstallPoll(delay = 700) {
       const job = await request("/api/local-runtime/install-status");
       state.downloadStatusError = "";
       state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
-      if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+      if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
       if (state.onboardingOpen) renderResourceOnboarding();
       renderDownloadActivity();
       if (["queued", "installing", "pausing", "cancelling"].includes(job.state)) {
@@ -2594,14 +2765,25 @@ function runtimeComponentCardMarkup(componentId, { compact = false } = {}) {
 }
 
 function runtimeComponentsSettingsMarkup() {
-  return `<section class="runtime-components-panel"><header><div><span>APP COMPONENTS</span><h2>应用运行组件</h2><p>主程序保持轻量；独立组件只安装一次，并会被之后的 ScanSci 版本继续复用。</p></div><button type="button" class="quiet-text-button" data-action="refresh-runtime-components">重新检测</button></header><div class="runtime-component-list">${runtimeComponentCardMarkup("node")}${runtimeComponentCardMarkup("tectonic")}</div></section>`;
+  const actionableComponents = ["node", "tectonic"]
+    .map((componentId) => runtimeComponentSnapshot(componentId))
+    .filter((component) => component.state !== "ready" && (
+      component.active
+      || component.failed
+      || component.paused
+      || component.install_available
+      || component.manual_install_available
+    ));
+  if (!actionableComponents.length) return `<p class="runtime-components-empty">没有需要处理的应用组件</p>`;
+  const cards = actionableComponents.map((component) => runtimeComponentCardMarkup(component.id)).join("");
+  return `<section class="runtime-components-panel"><header><div><span>APP COMPONENTS</span><h2>应用运行组件</h2><p>只在组件缺失或安装未完成时显示操作；已就绪的内部组件不会占用设置页。</p></div><button type="button" class="quiet-text-button" data-action="refresh-runtime-components">重新检测</button></header><div class="runtime-component-list">${cards}</div></section>`;
 }
 
 async function refreshRuntimeComponents({ render = true } = {}) {
   const payload = await request("/api/runtime-components");
   state.runtimeComponents = { ...state.runtimeComponents, ...(payload?.components || {}) };
   if (render) {
-    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
     if (state.onboardingOpen) renderResourceOnboarding();
     renderDownloadActivity();
   }
@@ -2617,7 +2799,7 @@ function scheduleRuntimeComponentInstallPoll(componentId, delay = 700) {
       const job = await request(`/api/runtime-components/install-status?component=${encodeURIComponent(identifier)}`);
       state.downloadStatusError = "";
       state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
-      if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+      if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
       if (state.onboardingOpen) renderResourceOnboarding();
       renderDownloadActivity();
       if (["queued", "downloading", "installing", "pausing", "cancelling"].includes(String(job.state || ""))) {
@@ -2657,7 +2839,7 @@ async function startRuntimeComponentInstall(componentId) {
     body: JSON.stringify({ component: identifier }),
   });
   state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   if (state.onboardingOpen) renderResourceOnboarding();
   renderDownloadActivity();
   scheduleRuntimeComponentInstallPoll(identifier);
@@ -2684,7 +2866,7 @@ async function chooseRuntimeComponentFiles(componentId) {
     body: JSON.stringify({ component: identifier, paths }),
   });
   state.runtimeComponents[identifier] = { ...(state.runtimeComponents?.[identifier] || {}), install_job: job };
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   if (state.onboardingOpen) renderResourceOnboarding();
   renderDownloadActivity();
   scheduleRuntimeComponentInstallPoll(identifier);
@@ -4755,6 +4937,8 @@ async function restoreTask(runId) {
   state.historyMenuRunId = "";
   const run = await request(`/api/runs/${encodeURIComponent(runId)}/restore`, { method: "POST", body: "{}" });
   upsertRun(run);
+  state.archivedRuns = state.archivedRuns.filter((item) => item.run_id !== runId);
+  if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
   toast("对话已恢复");
 }
 
@@ -4773,7 +4957,9 @@ async function deleteTask(runId) {
   state.historyMenuRunId = "";
   await request(`/api/runs/${encodeURIComponent(runId)}/delete`, { method: "POST", body: "{}" });
   state.runs = state.runs.filter((item) => item.run_id !== runId);
+  state.archivedRuns = state.archivedRuns.filter((item) => item.run_id !== runId);
   if (state.activeTaskId === runId) startTask();
+  else if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
   else renderTasks();
   toast("对话已删除");
 }
@@ -4810,7 +4996,9 @@ async function restoreDirectConversation(conversationId) {
   state.historyMenuRunId = "";
   await request(`/api/chat/history/${encodeURIComponent(id)}/restore`, { method: "POST", body: "{}" });
   state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
-  renderTasks();
+  state.archivedConversations = state.archivedConversations.filter((item) => item.conversation_id !== id);
+  if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
+  else renderTasks();
   toast("对话已恢复");
 }
 
@@ -4834,7 +5022,9 @@ async function deleteDirectConversation(conversationId) {
   state.historyMenuRunId = "";
   await request(`/api/chat/history/${encodeURIComponent(id)}/delete`, { method: "POST", body: "{}" });
   state.directConversations = state.directConversations.filter((item) => item.conversation_id !== id);
+  state.archivedConversations = state.archivedConversations.filter((item) => item.conversation_id !== id);
   if (state.directConversationId === id) startTask();
+  else if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
   else renderTasks();
   toast("对话已删除");
 }
@@ -4942,6 +5132,34 @@ function directTurnConfiguration({
     deliveryMode: "follow-up",
     createdAt: new Date().toISOString(),
   };
+}
+
+function generalPreferences() {
+  const source = state.settings?.general || {};
+  const conversation = source.conversation && typeof source.conversation === "object" ? source.conversation : {};
+  const directories = source.directories && typeof source.directories === "object" ? source.directories : {};
+  return {
+    conversation: {
+      send_shortcut: conversation.send_shortcut === "shift-enter" ? "shift-enter" : "enter",
+      completion_notifications: conversation.completion_notifications !== false,
+      agent_completion_notifications: conversation.agent_completion_notifications !== false,
+      subagent_completion_notifications: conversation.subagent_completion_notifications === true,
+    },
+    directories: {
+      default_workspace: String(directories.default_workspace || "").trim(),
+      conversation_workspace: String(directories.conversation_workspace || "").trim(),
+    },
+  };
+}
+
+function workspaceDirectoryFromFilePath(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.startsWith("使用应用默认")) return "";
+  const normalized = raw.replace(/[\\/]+$/, "");
+  const separator = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  if (separator < 0) return normalized;
+  if (separator === 2 && normalized[1] === ":") return normalized.slice(0, 3);
+  return normalized.slice(0, separator) || normalized;
 }
 
 function clearSubmittedDirectComposer(turn, input = null) {
@@ -10441,9 +10659,101 @@ async function installTesseractOcr() {
   throw new Error("Tesseract OCR 安装等待超时，请点击重新检测。");
 }
 
+async function loadArchivedSettingsRecords() {
+  if (state.archiveSettingsLoading) return;
+  state.archiveSettingsLoading = true;
+  state.archiveSettingsError = "";
+  if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
+  try {
+    const [runsPayload, directPayload] = await Promise.all([
+      request("/api/runs?view=archived&limit=200"),
+      request("/api/chat/history?view=archived&limit=200"),
+    ]);
+    state.archivedRuns = Array.isArray(runsPayload?.runs) ? runsPayload.runs : [];
+    state.archivedConversations = Array.isArray(directPayload?.conversations) ? directPayload.conversations : [];
+    state.archiveSettingsLoaded = true;
+  } catch (error) {
+    state.archiveSettingsError = error.message || "无法读取归档对话";
+  } finally {
+    state.archiveSettingsLoading = false;
+    if (state.activeView === "settings" && state.activeSettings === "archive") renderSettings();
+  }
+}
+
+function archiveSettingsRecords() {
+  const query = String(state.archiveSettingsQuery || "").trim().toLocaleLowerCase();
+  const runs = (state.archiveSettingsLoaded ? state.archivedRuns : state.runs.filter((item) => Boolean(item.archived)))
+    .map((item) => ({ ...item, settingsRecordKind: "run" }));
+  const conversations = (state.archivedConversations || [])
+    .map((item) => ({ ...item, settingsRecordKind: "direct" }));
+  return [...runs, ...conversations]
+    .filter((item) => {
+      if (!query) return true;
+      const title = item.settingsRecordKind === "direct" ? item.title : runDisplayTitle(item);
+      return [title, item.preview, item.status, item.updated_at, "归档对话"].join(" ").toLocaleLowerCase().includes(query);
+    })
+    .sort((left, right) => String(right.updated_at || "").localeCompare(String(left.updated_at || "")));
+}
+
+function renderArchiveSettings() {
+  if (!state.archiveSettingsLoaded && !state.archiveSettingsLoading) {
+    window.setTimeout(() => loadArchivedSettingsRecords(), 0);
+  }
+  const records = archiveSettingsRecords();
+  const total = state.archiveSettingsLoaded ? records.length : (state.runs.filter((item) => Boolean(item.archived)).length + state.archivedConversations.length);
+  const rows = records.length
+    ? `<div class="archive-settings-list">${records.slice(0, 100).map((record) => {
+      const isDirect = record.settingsRecordKind === "direct";
+      const title = isDirect ? (record.title || "直接对话") : runDisplayTitle(record);
+      const action = isDirect ? "open-direct-conversation" : "open-task";
+      const identifier = isDirect ? record.conversation_id : record.run_id;
+      const keyAttribute = isDirect ? "data-conversation-id" : "data-task-id";
+      const meta = isDirect ? "直接对话" : (runStatusLabel(record) || "研究对话");
+      return `<article class="archive-settings-row"><button type="button" class="archive-settings-open" data-action="${action}" ${keyAttribute}="${escapeHtml(identifier)}"><span class="archive-settings-icon">${uiIcon(isDirect ? "message-circle" : "archive")}</span><span class="archive-settings-copy"><strong>${escapeHtml(compact(title, 60))}</strong><small>${escapeHtml(meta)} · ${escapeHtml(record.updated_at || "")}</small></span></button><div class="archive-settings-actions"><button type="button" class="settings-inline-link" data-action="${isDirect ? "restore-direct-conversation" : "restore-task"}" ${keyAttribute}="${escapeHtml(identifier)}">${uiIcon("archive-restore")}恢复</button><button type="button" class="settings-inline-link is-danger" data-action="${isDirect ? "delete-direct-conversation" : "delete-task"}" ${keyAttribute}="${escapeHtml(identifier)}">${uiIcon("trash")}删除</button></div></article>`;
+    }).join("<div class=\"archive-settings-row-gap\" aria-hidden=\"true\"></div>")}</div>`
+    : `<div class="archive-settings-empty"><span>${uiIcon("archive")}</span><strong>${state.archiveSettingsLoading ? "正在读取归档对话" : "还没有已归档对话"}</strong><p>${state.archiveSettingsError ? escapeHtml(state.archiveSettingsError) : "从历史对话中归档的内容会显示在这里。"}</p></div>`;
+  return `<main class="archive-settings-page settings-minimal-page">
+    ${settingsHeading("已归档对话", "查看已经从历史对话移除的内容；你可以打开、恢复或永久删除。")}
+    <section class="archive-settings-card">
+      <header class="archive-settings-card-header"><div><h2>归档对话</h2><p>归档不会删除原始资料或导出的文件。</p></div><span class="archive-settings-count">${escapeHtml(String(total))} 个归档</span></header>
+      <label class="archive-settings-search">${uiIcon("search")}<input id="archiveSettingsSearch" type="search" value="${escapeHtml(state.archiveSettingsQuery)}" placeholder="搜索已归档对话" autocomplete="off" /></label>
+      ${rows}
+    </section>
+  </main>`;
+}
+
+function renderStorageSettings() {
+  const general = generalPreferences();
+  const workspacePathValue = String(state.workspace?.workspace_path || "").trim();
+  const workspacePath = workspacePathValue || "使用应用默认工作区";
+  const workspaceDirectory = String(state.workspace?.workspace_directory || "").trim()
+    || workspaceDirectoryFromFilePath(workspacePathValue);
+  const defaultWorkspace = String(general.directories?.default_workspace || "").trim()
+    || workspaceDirectory || "使用应用默认工作区";
+  const conversationWorkspace = String(general.directories?.conversation_workspace || "").trim()
+    || workspaceDirectory || "使用应用默认对话目录";
+  const installedCount = Number(state.localModelMarket?.installed?.length || 0);
+  const pathButton = (path) => path && !path.startsWith("使用应用默认") ? `<button type="button" class="settings-inline-link" data-action="reveal-local-path" data-local-path="${escapeHtml(path)}">打开位置</button>` : "";
+  const row = (icon, title, detail, path, extra = "") => `<article class="storage-settings-row"><span class="storage-settings-icon">${uiIcon(icon)}</span><div class="storage-settings-copy"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(detail)}</p></div><span class="storage-settings-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>${extra || pathButton(path)}</article>`;
+  return `<main class="storage-settings-page settings-minimal-page">
+    ${settingsHeading("存储", "查看 ScanSci 在此设备上的工作区、对话和本地模型数据位置。")}
+    <section class="storage-settings-card">
+      <header class="storage-settings-card-header"><div><h2>当前数据位置</h2><p>路径保持与现有工作区兼容；调整默认目录请前往常规设置。</p></div><span class="storage-settings-badge">${escapeHtml(`${installedCount} 个本地模型`)}</span></header>
+      <div class="storage-settings-list">
+        ${row("database", "工作区数据", "资料库索引、研究记录和证据数据。", workspacePath)}
+        ${row("folder", "默认工作目录", "新建资料库和研究项目使用的目录。", defaultWorkspace)}
+        ${row("message-circle", "对话工作目录", "未绑定资料库的对话文件保存位置。", conversationWorkspace)}
+      </div>
+      <footer class="storage-settings-footer"><span>${uiIcon("info")}数据不会因软件更新被自动删除。</span><button type="button" class="settings-primary-button" data-action="open-general-directories">管理目录</button></footer>
+    </section>
+    <section class="storage-settings-card storage-settings-note"><span class="storage-settings-icon">${uiIcon("shield-check")}</span><div><h2>安全与兼容</h2><p>本页只展示当前路径，不会在没有明确确认和完整校验前移动或覆盖你的数据。</p></div></section>
+  </main>`;
+}
+
 function renderSettings() {
   if (["routing", "document-processing"].includes(state.activeSettings)) state.activeSettings = "defaults";
   if (state.activeSettings === "resources") state.activeSettings = "local-models";
+  if (["skills", "mcp", "plugins"].includes(state.activeSettings)) state.activeSettings = "general";
   applyAppearancePreferences();
   document.querySelectorAll(".settings-nav").forEach((button) => button.classList.toggle("is-active", button.dataset.settingsPanel === state.activeSettings));
   const target = byId("settingsContent");
@@ -10458,11 +10768,11 @@ function renderSettings() {
   else if (state.activeSettings === "defaults") settingsMarkup = renderDefaultCapabilitiesSettings();
   else if (state.activeSettings === "models") settingsMarkup = renderModelsSettings();
   else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettings();
+  else if (state.activeSettings === "runtime") settingsMarkup = renderRuntimeSettings();
   else if (state.activeSettings === "document-processing") settingsMarkup = renderDocumentProcessingSettings();
-  else if (state.activeSettings === "skills") settingsMarkup = renderRecordsSettings("skills");
-  else if (state.activeSettings === "mcp") settingsMarkup = renderMcpMarketplaceSettings();
-  else if (state.activeSettings === "plugins") settingsMarkup = renderRecordsSettings("plugins");
-  else if (state.activeSettings === "about") settingsMarkup = renderAboutSettings();
+  else if (state.activeSettings === "about") settingsMarkup = renderSoftwareUpdateSettings();
+  else if (state.activeSettings === "archive") settingsMarkup = renderArchiveSettings();
+  else if (state.activeSettings === "storage") settingsMarkup = renderStorageSettings();
   else settingsMarkup = renderGeneralSettings();
   target.innerHTML = `<div class="settings-surface">${settingsMarkup}</div>`;
   hydrateIcons(target);
@@ -10844,6 +11154,15 @@ function settingsHeading(title, description) {
 function renderGeneralSettings() {
   const { provider, model } = activeModel();
   const appearance = appearancePreferences();
+  const general = generalPreferences();
+  const applicationWorkspaceDirectory = String(state.workspace?.workspace_directory || "").trim()
+    || workspaceDirectoryFromFilePath(state.workspace?.workspace_path);
+  const defaultWorkspacePlaceholder = applicationWorkspaceDirectory || copy("defaultWorkspacePlaceholder");
+  const conversationWorkspacePlaceholder = applicationWorkspaceDirectory || copy("conversationWorkspacePlaceholder");
+  const tab = ["appearance", "conversation", "directories"].includes(state.generalSettingsTab)
+    ? state.generalSettingsTab
+    : "appearance";
+  state.generalSettingsTab = tab;
   const option = (value, label, selected) => `<option value="${escapeHtml(value)}" ${selected === value ? "selected" : ""}>${escapeHtml(label)}</option>`;
   const accentHex = {
     jade: "#1F7D4E",
@@ -10853,9 +11172,12 @@ function renderGeneralSettings() {
   };
   const accentOption = (value) => `<option value="${escapeHtml(value)}" data-accent-color="${accentHex[value]}" ${appearance.accent === value ? "selected" : ""}>${accentHex[value]}</option>`;
   const modelLabel = provider ? `${provider.name} · ${model?.name || ""}` : (appearance.locale === "en" ? "Not selected" : "未选择");
-  return `<section class="settings-minimal-page general-settings-page">
-    <header class="settings-page-heading"><div><h1>${escapeHtml(copy("settingsTitle"))}</h1><p>${escapeHtml(copy("settingsDescription"))}</p></div></header>
-    <form id="generalPreferencesForm" class="settings-minimal-form">
+  const tabs = [
+    ["appearance", copy("generalTabAppearance"), "settings"],
+    ["conversation", copy("generalTabConversation"), "message-circle"],
+    ["directories", copy("generalTabDirectories"), "folder"],
+  ].map(([id, label, icon]) => `<button type="button" class="settings-tab ${tab === id ? "is-active" : ""}" data-action="switch-general-tab" data-settings-tab="${id}" role="tab" aria-selected="${tab === id ? "true" : "false"}">${uiIcon(icon)}<span>${label}</span></button>`).join("");
+  const appearanceContent = `<form id="generalPreferencesForm" class="settings-minimal-form">
       <section class="settings-minimal-section"><h2>${escapeHtml(copy("appearanceTitle"))}</h2>
         <label class="settings-row"><span><strong>${escapeHtml(copy("interfaceLanguage"))}</strong><small>${escapeHtml(copy("interfaceLanguageHint"))}</small></span><select name="appearance-locale">${option("zh-CN", "简体中文", appearance.locale)}${option("en", "English", appearance.locale)}</select></label>
         <label class="settings-row"><span><strong>${escapeHtml(copy("appearanceTheme"))}</strong><small>${escapeHtml(copy("appearanceThemeHint"))}</small></span><select name="appearance-theme">${option("system", copy("system"), appearance.theme)}${option("light", copy("light"), appearance.theme)}${option("dark", copy("dark"), appearance.theme)}</select></label>
@@ -10866,7 +11188,34 @@ function renderGeneralSettings() {
     </form>
     <section class="settings-minimal-section settings-info-section"><h2>${escapeHtml(copy("currentWorkspace"))}</h2>
       <div class="settings-row is-static"><span><strong>${escapeHtml(state.notebook?.title || copy("noWorkspace"))}</strong><small>${escapeHtml(copy("currentModel"))}</small></span><span class="settings-row-value">${escapeHtml(modelLabel)}</span></div>
-    </section>
+    </section>`;
+  const toggleControl = (name, checked, label) => `<label class="settings-switch-control"><input type="checkbox" data-general-toggle="${name}" aria-label="${escapeHtml(label)}" ${checked ? "checked" : ""} /><span aria-hidden="true"></span></label>`;
+  const conversationContent = `<form id="generalConversationForm" class="settings-minimal-form">
+      <section class="settings-minimal-section"><h2>${escapeHtml(copy("generalTabConversation"))}</h2><p class="settings-section-intro">${escapeHtml(copy("conversationDescription"))}</p>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("sendShortcut"))}</strong><small>${escapeHtml(copy("sendShortcutHint"))}</small></span><select name="conversation-send-shortcut">${option("enter", copy("sendEnter"), general.conversation.send_shortcut)}${option("shift-enter", copy("sendShiftEnter"), general.conversation.send_shortcut)}</select></label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("completionNotifications"))}</strong><small>${escapeHtml(copy("completionNotificationsHint"))}</small></span>${toggleControl("completion_notifications", general.conversation.completion_notifications, copy("completionNotifications"))}</label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("agentCompletionNotifications"))}</strong><small>${escapeHtml(copy("agentCompletionNotificationsHint"))}</small></span>${toggleControl("agent_completion_notifications", general.conversation.agent_completion_notifications, copy("agentCompletionNotifications"))}</label>
+        <label class="settings-row"><span><strong>${escapeHtml(copy("subagentCompletionNotifications"))}</strong><small>${escapeHtml(copy("subagentCompletionNotificationsHint"))}</small></span>${toggleControl("subagent_completion_notifications", general.conversation.subagent_completion_notifications, copy("subagentCompletionNotifications"))}</label>
+      </section>
+    </form>`;
+  const directoryControl = (name, value, placeholder) => {
+    const displayValue = String(value || "").trim() || placeholder;
+    return `<div class="settings-path-control"><input name="${name}" value="${escapeHtml(displayValue)}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" /><div class="settings-path-actions"><button type="button" class="settings-inline-link" data-action="choose-general-directory" data-directory-setting="${name === "directory-default-workspace" ? "default_workspace" : "conversation_workspace"}">${escapeHtml(copy("chooseDirectory"))}</button><button type="button" class="settings-inline-link" data-action="reset-general-directory" data-directory-setting="${name === "directory-default-workspace" ? "default_workspace" : "conversation_workspace"}">${escapeHtml(copy("resetDefault"))}</button></div></div>`;
+  };
+  const directoriesContent = `<form id="generalDirectoriesForm" class="settings-minimal-form">
+      <section class="settings-minimal-section"><h2>${escapeHtml(copy("directoriesTitle"))}</h2><p class="settings-section-intro">${escapeHtml(copy("directoriesDescription"))}</p>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("defaultWorkspace"))}</strong><small>${escapeHtml(copy("defaultWorkspaceHint"))}</small></span>${directoryControl("directory-default-workspace", general.directories.default_workspace, defaultWorkspacePlaceholder)}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("conversationWorkspace"))}</strong><small>${escapeHtml(copy("conversationWorkspaceHint"))}</small></span>${directoryControl("directory-conversation-workspace", general.directories.conversation_workspace, conversationWorkspacePlaceholder)}</label>
+      </section>
+    </form>`;
+  const configurableTabContent = {
+    conversation: conversationContent,
+    directories: directoriesContent,
+  }[tab] || appearanceContent;
+  return `<section class="settings-minimal-page general-settings-page">
+    <header class="settings-page-heading"><div><h1>${escapeHtml(copy("generalTitle"))}</h1><p>${escapeHtml(copy("generalDescription"))}</p></div><span class="save-indicator">${escapeHtml(copy("generalAutoApply"))}</span></header>
+    <nav class="settings-tab-strip" aria-label="${escapeHtml(copy("generalTabsLabel"))}" role="tablist">${tabs}</nav>
+    <div class="settings-tab-panel" role="tabpanel">${tab === "appearance" ? appearanceContent : configurableTabContent}</div>
   </section>`;
 }
 
@@ -10881,7 +11230,7 @@ function updateStatusCopy(update = state.update || {}) {
   return "尚未检查更新。";
 }
 
-function renderAboutSettings() {
+function renderSoftwareUpdateSettings() {
   const update = state.update || {};
   const isBusy = ["checking", "installing", "restarting"].includes(update.state);
   const hasUpdate = Boolean(update.available);
@@ -10894,22 +11243,25 @@ function renderAboutSettings() {
     ? (notes.length ? notes.join(" · ") : "新版本的更新说明已准备就绪。")
     : "发现新版本后，可在这里查看发布说明。";
   const checkedAt = formatUpdateTime(update.checked_at).replace(/^检查于/, "") || "尚未检查";
-  return `<main class="about-settings">
-    <section class="about-card about-product-card">
-      <header class="about-card-heading"><h1>关于 ScanSci</h1><span>DESKTOP</span></header>
-      <div class="about-product">
-        <img class="about-product-mark" src="/scansci-mark.png" alt="ScanSci" />
-        <div class="about-product-copy"><h2>ScanSci</h2><p>由 Pi Agent 驱动的可追溯 AI 研究工作台</p><span class="about-version">v${escapeHtml(version)}</span></div>
-        <button type="button" class="about-check-button" data-action="${checkAction}" ${isBusy ? "disabled" : ""}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.8 7.2A6.3 6.3 0 1 0 16 12"></path><path d="M16 3.8v3.8h-3.8"></path></svg>${checkLabel}</button>
-      </div>
-      <div class="about-update-rows">
-        <div class="about-row"><div><strong>自动检查更新</strong><p>启动 ScanSci 时在后台检查稳定版更新</p></div><label class="about-switch"><input type="checkbox" data-update-auto-check ${state.autoCheckUpdates ? "checked" : ""} /><span aria-hidden="true"></span></label></div>
-        <div class="about-row"><div><strong>版本状态</strong><p>${escapeHtml(updateStatusCopy(update))}</p></div><span class="about-row-value ${hasUpdate ? "is-update" : ""}">${hasUpdate ? `v${escapeHtml(latestVersion)}` : `v${escapeHtml(version)}`}</span></div>
+  return `<main class="software-update-page settings-minimal-page">
+    <header class="settings-page-heading">
+      <div><h1>软件更新</h1><p>管理 ScanSci 的版本、更新通道与自动检查。</p></div>
+      <span class="save-indicator">${escapeHtml(checkedAt)}</span>
+    </header>
+    <section class="software-update-card software-update-summary">
+      <header>
+        <div class="software-update-heading-copy"><span class="settings-overline">SCANSCI DESKTOP</span><h2>保持应用为最新版本</h2><p>${escapeHtml(updateStatusCopy(update))}</p></div>
+        <img class="software-update-mark" src="/scansci-mark.png" alt="ScanSci" />
+      </header>
+      <div class="software-update-status-row">
+        <div><strong>当前版本</strong><span class="software-update-version">v${escapeHtml(version)}</span></div>
+        <button type="button" class="settings-primary-button software-update-check" data-action="${checkAction}" ${isBusy ? "disabled" : ""}>${checkLabel}</button>
       </div>
     </section>
-    <section class="about-card about-details-card" aria-label="版本详情">
-      <div class="about-row"><div><strong>更新通道</strong><p>仅接收经过验证的稳定版本</p></div><span class="about-row-value">稳定版</span></div>
-      <div class="about-row"><div><strong>上次检查</strong><p>${escapeHtml(releaseSummary)}</p></div><span class="about-row-value">${escapeHtml(checkedAt)}</span></div>
+    <section class="software-update-card software-update-details" aria-label="更新设置">
+      <div class="software-update-row"><div><strong>自动检查更新</strong><p>启动 ScanSci 时在后台检查稳定版更新。</p></div><label class="software-update-switch"><input type="checkbox" data-update-auto-check ${state.autoCheckUpdates ? "checked" : ""} /><span aria-hidden="true"></span></label></div>
+      <div class="software-update-row"><div><strong>更新通道</strong><p>仅接收经过验证的稳定版本。</p></div><span class="software-update-value">稳定版</span></div>
+      <div class="software-update-row"><div><strong>最新版本</strong><p>${escapeHtml(releaseSummary)}</p></div><span class="software-update-value ${hasUpdate ? "is-update" : ""}">${hasUpdate ? `v${escapeHtml(latestVersion)}` : `v${escapeHtml(version)}`}</span></div>
     </section>
   </main>`;
 }
@@ -11175,6 +11527,66 @@ function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
   return `<section class="local-runtime-recovery"><header><div><span>下载通道</span><strong>${escapeHtml(checking ? "正在检查自动通道…" : summary)}</strong></div><button type="button" class="quiet-text-button" data-action="check-local-runtime-channels" ${checking ? "disabled" : ""}>${uiIcon("refresh")} ${checking ? "检查中…" : checked ? "重新检查" : "检查通道"}</button></header>${channelRows}<div class="local-runtime-manual-fallback"><div><strong>网络仍不可用？可以手动安装</strong><p>从官方发布页下载 ZIP；如果是分片包，请把 JSON 清单和全部分片一起选中，ScanSci 会校验后再安装。</p></div><div class="local-runtime-recovery-actions"><button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地文件</button><a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开官方发布页 ${uiIcon("arrow-up-right")}</a></div></div></section>`;
 }
 
+function renderExternalRuntimeConnectionsMarkup() {
+  const presets = (state.presets?.local_models || [])
+    .filter((item) => ["ollama", "lm-studio", "llama.cpp"].includes(String(item.runtime || "").toLowerCase()))
+    .map((item) => `<button type="button" class="quiet-add-chip" data-action="add-local-preset" data-preset-id="${escapeHtml(item.id)}">＋ ${escapeHtml(item.name)}</button>`)
+    .join("");
+  const manualRuntimeItems = (state.settings?.local_models || [])
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !["builtin", "local-huggingface"].includes(String(item.runtime || "").toLowerCase()));
+  const runtimeRows = manualRuntimeItems
+    .map(({ item, index }) => {
+      const runtimeName = { ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp" }[String(item.runtime || "").toLowerCase()] || item.runtime || "本地运行时";
+      return `<article class="local-runtime-row"><header class="local-runtime-row-header"><div class="local-runtime-row-copy"><span class="local-runtime-row-icon">${uiIcon("cpu")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(runtimeName)} · ${item.enabled ? "可用" : "已停用"}</small></div></div><button type="button" class="local-runtime-remove" data-action="remove-local-model" data-local-index="${index}">移除</button></header><details class="local-runtime-edit"><summary>编辑连接</summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>允许助手使用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button></div></div></details></article>`;
+    })
+    .join("") || '<div class="quiet-empty">没有手动连接也没关系，ScanSci 会优先检测本地能力。</div>';
+  return `<section class="runtime-connections-panel"><header><div><h2>外部运行时</h2><p>连接你已经运行的 Ollama、LM Studio 或 llama.cpp；它们不会改变 ScanSci 默认的本地 Transformers 路线。</p></div><span class="runtime-connection-count">${manualRuntimeItems.length ? `${manualRuntimeItems.length} 个连接` : "可选"}</span></header>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存连接</button></footer></form></section>`;
+}
+
+function renderRuntimeSettings() {
+  const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
+  const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
+  const runtimeJob = runtime.install_job || {};
+  const runtimeInstalling = ["queued", "installing", "downloading", "pausing", "cancelling"].includes(String(runtimeJob.state || ""));
+  const runtimeChecking = Boolean(runtime.checking);
+  const runtimeNeedsRetry = ["failed", "cancelled", "interrupted"].includes(String(runtimeJob.state || ""));
+  const runtimeProgress = Math.max(0, Math.min(100, Math.round(Number(runtimeJob.progress || 0) * 100)));
+  const runtimeStatus = runtimeReady
+    ? "已就绪"
+    : runtimeInstalling
+      ? `准备中 ${runtimeProgress}%`
+      : runtime.update_required
+        ? "需要更新"
+      : runtimeNeedsRetry
+          ? "安装未完成"
+          : "尚未安装";
+  const runtimeAction = runtimeReady
+    ? `<span class="runtime-primary-status is-ready">${uiIcon("check")} 运行时已就绪</span>`
+    : runtimeInstalling
+      ? `<span class="runtime-primary-status">${escapeHtml(runtimeJob.message || "正在准备本地运行时")} · ${runtimeProgress}%</span>`
+      : runtime.install_available
+        ? `<button type="button" class="quiet-primary-button" data-action="install-local-runtime">${uiIcon(runtimeNeedsRetry || runtime.update_required ? "refresh" : "download")} ${runtimeNeedsRetry ? "继续安装" : runtime.update_required ? "更新运行时" : "安装运行时"}</button>`
+        : `<button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">${uiIcon("download")} 选择本地组件包</button>`;
+  const runtimeRecovery = runtime.update_required ? localRuntimeChannelRecoveryMarkup(runtime)
+    : (!runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "");
+  const runtimeMode = runtime.mode === "component"
+    ? "独立组件"
+    : runtime.mode === "system"
+      ? "复用系统"
+      : runtime.mode === "embedded"
+        ? "随应用提供"
+        : runtime.mode === "source"
+          ? "开发环境"
+          : "未配置";
+  return `<section class="settings-minimal-page runtime-settings-page">
+    <header class="settings-page-heading"><div><h1>运行时</h1><p>用户可以在这里安装、更新或重新检测本地运行组件；模型权重仍由“本地模型”单独管理。</p></div><span class="save-indicator">按需安装</span></header>
+    <section class="settings-runtime-card runtime-lifecycle-card"><header><div><h2>本地 AI 运行时</h2><p>为本地 Transformers 模型提供加载、推理和健康检查能力。它是独立组件，不会让主程序包变大。</p></div><span class="runtime-status-pill is-${runtimeReady ? "ready" : runtimeInstalling ? "loading" : "pending"}">${escapeHtml(runtimeStatus)}</span></header><div class="runtime-lifecycle-summary"><div><span>版本</span><strong>${escapeHtml(runtime.version || "—")}</strong></div><div><span>安装方式</span><strong>${escapeHtml(runtimeMode)}</strong></div><div><span>模型权重</span><strong>按需下载</strong></div></div><p class="runtime-lifecycle-boundary">这里只管理运行组件本身，不选择模型，也不修改 Ollama、LM Studio 等外部连接。已下载模型不会重复下载；模型已存在；更新运行组件后可直接使用。</p><footer>${runtimeAction}<button type="button" class="quiet-text-button" data-action="refresh-local-runtime" ${runtimeInstalling || runtimeChecking ? "disabled" : ""}>${uiIcon("refresh")} ${runtimeChecking ? "检测中…" : "重新检测"}</button></footer></section>
+    ${runtimeRecovery}
+    ${renderExternalRuntimeConnectionsMarkup()}
+  </section>`;
+}
+
 function renderLocalModelsSettings() {
   const installedItems = state.localModelMarket?.installed || [];
   const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
@@ -11183,35 +11595,7 @@ function renderLocalModelsSettings() {
   const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
   const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
-  const runtimeJob = runtime.install_job || {};
-  const runtimeInstalling = ["queued", "installing"].includes(runtimeJob.state);
-  const runtimeNeedsRetry = ["failed", "cancelled", "interrupted"].includes(runtimeJob.state);
-  const runtimeProgress = Math.max(0, Math.min(100, Math.round(Number(runtimeJob.progress || 0) * 100)));
   const ollama = state.ollama || {};
-  const presets = (state.presets?.local_models || [])
-    .filter((item) => ["ollama", "lm-studio", "llama.cpp"].includes(String(item.runtime || "").toLowerCase()))
-    .map((item) => `<button type="button" class="quiet-add-chip" data-action="add-local-preset" data-preset-id="${escapeHtml(item.id)}">＋ ${escapeHtml(item.name)}</button>`)
-    .join("");
-  const runtimeAction = runtimeReady
-    ? `<span class="local-model-primary-ready">${uiIcon("check")} 本地能力已就绪</span>`
-    : runtimeInstalling
-      ? `<span class="local-model-primary-state">${escapeHtml(runtimeJob.message || "正在安装")} ${runtimeProgress}%<small>${escapeHtml(downloadJobTelemetry(runtimeJob))}</small></span>`
-      : runtimeNeedsRetry && runtime.install_available
-        ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("refresh")} 继续安装</button>`
-        : runtime.install_available
-          ? `<button type="button" class="local-model-primary-action" data-action="install-local-runtime">${uiIcon("download")} ${runtime.update_required ? "更新本地运行组件" : "安装本地能力"}</button>`
-          : `<button type="button" class="local-model-primary-action" data-action="choose-local-runtime-files">${uiIcon("download")} 选择本地组件包</button>`;
-  const runtimeDescription = runtimeReady
-    ? "本地模型会在需要时自动加载；不需要用户选择运行时。"
-    : runtime.update_required
-      ? `检测到本地运行组件 ${runtime.version || "旧版本"}，需要更新到 ${runtime.required_version || "当前版本"}；已下载模型不会重复下载。`
-    : runtimeInstalling
-      ? "ScanSci 正在准备本地能力，完成后会自动纳入 Agent 的选择范围。"
-      : runtimeNeedsRetry
-        ? runtimeJob.error || runtimeJob.message || "安装未完成；继续安装会复用已下载内容。"
-        : runtime.install_available
-          ? "可选安装。没有本地模型时，ScanSci 仍会使用基础能力。"
-          : "可在默认能力页中按需添加；也可以手动连接已有的 Ollama、LM Studio 或 llama.cpp。";
   const installed = installedItems.map((item) => {
     const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
     const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
@@ -11221,53 +11605,8 @@ function renderLocalModelsSettings() {
     const icon = item.icon_url
       ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />`
       : `<span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span>`;
-    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
+    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span><button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}">删除</button></article>`;
   }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
-  const manualRuntimeItems = (state.settings.local_models || [])
-    .map((item, index) => ({ item, index }))
-    .filter(({ item }) => !["builtin", "local-huggingface"].includes(String(item.runtime || "").toLowerCase()));
-  const manualRuntimeCount = manualRuntimeItems.length;
-  const runtimeRows = manualRuntimeItems
-    .map(({ item, index }) => {
-      const runtimeName = { ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp" }[String(item.runtime || "").toLowerCase()] || item.runtime || "本地运行时";
-      return `<article class="local-runtime-row"><header class="local-runtime-row-header"><div class="local-runtime-row-copy"><span class="local-runtime-row-icon">${uiIcon("cpu")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(runtimeName)} · ${item.enabled ? "Agent 可用" : "已停用"}</small></div></div><button type="button" class="local-runtime-remove" data-action="remove-local-model" data-local-index="${index}">移除</button></header><details class="local-runtime-edit"><summary>编辑连接</summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>允许 Agent 使用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button></div></div></details></article>`;
-    })
-    .join("") || '<div class="quiet-empty">没有手动连接也没关系，Agent 会优先检测 ScanSci 本地能力。</div>';
-  const installedByKind = (kind) => installedItems
-    .filter((item) => item.ready && item.runtime_compatible !== false && String(item.kind || "") === kind)
-    .sort((left, right) => {
-      const priority = (item) => {
-        const id = String(item.id || "").toLowerCase();
-        if (id.includes("qwen3")) return 0;
-        if (id.includes("bge")) return 1;
-        return 2;
-      };
-      return priority(left) - priority(right)
-        || Number(left.size_bytes || 0) - Number(right.size_bytes || 0)
-        || String(left.id || "").localeCompare(String(right.id || ""));
-    })[0];
-  const externalByKind = (kind) => (state.settings.local_models || []).find((item) => item.enabled && item.model_id && Array.isArray(item.capabilities) && item.capabilities.includes(kind));
-  const autoRoute = (kind) => {
-    const installedModel = installedByKind(kind);
-    if (installedModel && runtimeReady) return { name: installedModel.name || installedModel.id, note: "本机已安装；Agent 按需加载", tone: "ready" };
-    if (installedModel && runtime.update_required) return { name: installedModel.name || installedModel.id, note: "模型已存在；更新运行组件后可直接使用", tone: "warning" };
-    if (installedModel) return { name: installedModel.name || installedModel.id, note: "模型已存在；准备运行组件后可直接使用", tone: "warning" };
-    const externalModel = externalByKind(kind);
-    if (externalModel) return { name: externalModel.name || externalModel.id, note: "已连接；调用前自动检测", tone: "ready" };
-    if (kind === "vision" && ollama.reachable && ollama.model_ready) return { name: "Ollama · MiniCPM-V 4.6", note: "已检测到外部连接；需要图片时自动使用", tone: "ready" };
-    if (["embedding", "reranking"].includes(kind)) return { name: "基础检索回退", note: "未安装语义模型，检索仍保持可用", tone: "fallback" };
-    return { name: "未配置（按需回退）", note: "需要时自动提示，不影响文字对话", tone: "muted" };
-  };
-  const agentRoutes = [
-    ["embedding", "知识库检索", "找到相关文献"],
-    ["reranking", "证据排序", "把更相关的片段排在前面"],
-    ["vision", "图片理解", "读取图表、截图和扫描页"],
-    ["audio", "语音识别", "把录音转换成文字"],
-  ].map(([kind, title, description]) => {
-    const route = autoRoute(kind);
-    return `<article class="local-agent-route is-${route.tone}"><span class="local-agent-route-mark">${uiIcon(kind === "vision" ? "eye" : kind === "audio" ? "audio" : kind === "reranking" ? "filter" : "database")}</span><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p></div><div class="local-agent-route-target"><b>${escapeHtml(route.name)}</b><small>${escapeHtml(route.note)}</small></div></article>`;
-  }).join("");
-  const runtimeRecovery = runtime.update_required ? localRuntimeChannelRecoveryMarkup(runtime) : !runtimeReady && (runtimeInstalling || runtimeNeedsRetry || runtime.channels?.checked_at) ? localRuntimeChannelRecoveryMarkup(runtime) : "";
   const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
   const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
     const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
@@ -11297,14 +11636,9 @@ function renderLocalModelsSettings() {
       : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`;
     return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
-  return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>模型安装在这里；具体什么时候使用，由 ScanSci Agent 根据任务和本机状态自动判断。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
-    <section class="local-agent-routing-card"><header><div><span>AUTO ROUTING</span><h2>Agent 自动选择本地能力</h2><p>优先使用本机已安装且可运行的模型；没有合适模型时自动回退，不要求你理解运行时或模型 ID。</p></div><div class="local-agent-routing-status">${runtime.update_required ? "本地组件需更新" : runtimeReady || ollama.model_ready ? `${uiIcon("check")} 已检测到本地能力` : "按需检测"}</div></header><div class="local-agent-route-list">${agentRoutes}</div><footer><span>${escapeHtml(runtimeDescription)}</span>${runtimeReady ? `<button type="button" class="local-model-primary-action" data-action="open-settings" data-settings-panel="resources">${uiIcon("download")} 添加本地能力</button>` : runtimeAction}</footer></section>
-    ${runtimeRecovery}
-    ${runtimeComponentsSettingsMarkup()}
-    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里；不用在这里手动指定用途。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
-    <details class="local-model-disclosure local-model-market-disclosure"><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
-    <details class="local-model-disclosure local-manual-runtime-disclosure" ${state.localRuntimeManualOpen ? "open" : ""}><summary><span><b>手动连接（可选）</b><small>只有你自己运行外部服务，且 Agent 没有自动发现时才需要</small></span><em>${manualRuntimeCount ? `${manualRuntimeCount} 个连接` : "不需要配置"}</em></summary><div class="local-model-disclosure-body"><div class="local-manual-runtime-intro"><span>${uiIcon("info")}</span><p>添加后也不会固定某个模型；Agent 只会在连接可用、能力匹配时使用它。需要撤销时，直接点击对应连接右侧的“移除”。</p></div>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存手动连接</button></footer></form></div></details>
-    <p class="local-model-fallback">默认能力页面只负责设置偏好；本页只负责模型安装、检测和可选的手动连接。</p></section>`;
+  return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>只在这里查看已安装模型，或从模型市场按需下载。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
+    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
+    <details class="local-model-disclosure local-model-market-disclosure" open><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details></section>`;
 }
 
 function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", embedded = false) {
@@ -11836,7 +12170,23 @@ async function refreshLocalModelMarket() {
   state.settings = await request("/api/settings");
   await refreshModelHealth({ render: false });
   renderModelSelectors();
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
+}
+
+async function refreshLocalRuntimeStatus() {
+  state.localRuntime = { ...(state.localRuntime || {}), checking: true };
+  if (state.activeView === "settings" && state.activeSettings === "runtime") renderSettings();
+  try {
+    const runtime = await request(`/api/local-runtime?refresh=${Date.now()}`);
+    state.localRuntime = { ...(state.localRuntime || {}), ...(runtime || {}), checking: false };
+    if (state.activeView === "settings" && state.activeSettings === "runtime") renderSettings();
+    toast(state.localRuntime.update_required ? "本地运行组件需要更新" : state.localRuntime.installed ? "本地运行时已重新检测" : "尚未安装本地运行组件");
+    return state.localRuntime;
+  } catch (error) {
+    state.localRuntime = { ...(state.localRuntime || {}), checking: false };
+    if (state.activeView === "settings" && state.activeSettings === "runtime") renderSettings();
+    throw error;
+  }
 }
 
 async function refreshInstalledModelInventory({ render = true } = {}) {
@@ -11867,17 +12217,17 @@ async function updateMcpMarketplaceServer(identifier) {
 
 async function checkLocalRuntimeChannels() {
   state.localRuntime = { ...(state.localRuntime || {}), channelsChecking: true };
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   try {
     const report = await request("/api/local-runtime/channels");
     state.localRuntime = { ...(state.localRuntime || {}), channels: report, channelsChecking: false };
-    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
     const healthy = (report.channels || []).filter((item) => item.valid).length;
     toast(healthy ? `已找到 ${healthy} 个可用资源通道` : "自动资源通道暂不可用，可使用本地文件安装", !healthy);
     return report;
   } catch (error) {
     state.localRuntime = { ...(state.localRuntime || {}), channelsChecking: false };
-    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
     throw error;
   }
 }
@@ -11896,7 +12246,7 @@ async function chooseLocalRuntimeFiles() {
   });
   state.localRuntime = { ...(state.localRuntime || {}), install_job: job };
   scheduleLocalRuntimeInstallPoll();
-  if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   renderDownloadActivity();
   toast("已开始校验本地组件；校验通过后才会启用。");
 }
@@ -12089,6 +12439,45 @@ async function handleSettingsAction(action, element) {
   }
   if (action === "open-local-models") {
     state.activeSettings = "local-models";
+    renderSettings();
+    return;
+  }
+  if (action === "choose-general-directory") {
+    const setting = ["default_workspace", "conversation_workspace"].includes(element.dataset.directorySetting)
+      ? element.dataset.directorySetting
+      : "default_workspace";
+    const picker = window.pywebview?.api?.choose_library_folder;
+    if (typeof picker !== "function") {
+      toast("浏览器预览不能读取本机目录，请在 ScanSci 桌面应用中选择文件夹。", true);
+      return;
+    }
+    const selected = String(await picker() || "").trim();
+    if (!selected) return;
+    const general = generalPreferences();
+    general.directories[setting] = selected;
+    state.settings.general = general;
+    await persistSettings("目录设置已保存");
+    return;
+  }
+  if (action === "open-general-directories") {
+    state.activeSettings = "general";
+    state.generalSettingsTab = "directories";
+    renderSettings();
+    return;
+  }
+  if (action === "reset-general-directory") {
+    const setting = ["default_workspace", "conversation_workspace"].includes(element.dataset.directorySetting)
+      ? element.dataset.directorySetting
+      : "default_workspace";
+    const general = generalPreferences();
+    general.directories[setting] = "";
+    state.settings.general = general;
+    await persistSettings("已恢复默认目录");
+    return;
+  }
+  if (action === "switch-general-tab") {
+    const nextTab = String(element.dataset.settingsTab || "appearance");
+    state.generalSettingsTab = ["appearance", "conversation", "directories"].includes(nextTab) ? nextTab : "appearance";
     renderSettings();
     return;
   }
@@ -12328,6 +12717,36 @@ async function handleSettingsAction(action, element) {
     document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
     return;
   }
+  if (action === "delete-installed-local-model") {
+    const modelId = String(element.dataset.modelId || "").trim();
+    if (!modelId) return;
+    const model = (state.localModelMarket?.installed || []).find(
+      (item) => String(item?.id || "").trim().toLowerCase() === modelId.toLowerCase(),
+    );
+    const modelName = String(model?.name || modelId);
+    const confirmed = await requestConfirmation({
+      eyebrow: "删除本地模型",
+      title: "删除这个已安装模型？",
+      subject: modelName,
+      message: "模型文件会从本机移除；之后仍可在模型市场重新下载。",
+      confirmLabel: "删除模型",
+      cancelLabel: "保留",
+      danger: true,
+    });
+    if (!confirmed) return;
+    element.disabled = true;
+    try {
+      await request("/api/local-models/delete", {
+        method: "POST",
+        body: JSON.stringify({ id: modelId }),
+      });
+      await refreshLocalModelMarket();
+      toast(`${modelName} 已删除`);
+    } finally {
+      if (element.isConnected) element.disabled = false;
+    }
+    return;
+  }
   if (action === "test-local-model") {
     collectLocalModelsForm();
     await persistSettings("正在测试本地运行时…");
@@ -12363,6 +12782,10 @@ async function handleSettingsAction(action, element) {
     installTesseractOcr().catch((error) => toast(error.message, true));
     return;
   }
+  if (action === "refresh-local-runtime") {
+    refreshLocalRuntimeStatus().catch((error) => toast(error.message, true));
+    return;
+  }
   if (action === "check-local-runtime-channels") {
     checkLocalRuntimeChannels().catch((error) => toast(error.message, true));
     return;
@@ -12372,13 +12795,13 @@ async function handleSettingsAction(action, element) {
     return;
   }
   if (action === "open-local-runtime-setup") {
-    openSettings("local-models");
-    document.querySelector(".local-runtime-disclosure")?.setAttribute("open", "");
+    // Legacy deep links may still call openSettings("local-models"); the
+    // visible destination is now the dedicated runtime page.
+    openSettings("runtime");
     return;
   }
   if (action === "open-ollama-setup") {
-    openSettings("local-models");
-    document.querySelector(".local-model-disclosure:last-of-type")?.setAttribute("open", "");
+    openSettings("runtime");
     toast("请先安装并启动 Ollama，再回来下载 MiniCPM-V 4.6。", true);
     return;
   }
@@ -12411,7 +12834,7 @@ async function handleSettingsAction(action, element) {
       .then((job) => {
         mergeLocalModelInstall(job);
         scheduleLocalModelInstallPoll();
-    if (state.activeView === "settings" && ["local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
         renderDownloadActivity();
         toast(`${repoId} 已开始下载；右上角可持续查看进度。`);
       })
@@ -13183,6 +13606,11 @@ document.addEventListener("change", (event) => {
     renderSettings();
     return;
   }
+  if (event.target.closest("#generalConversationForm, #generalDirectoriesForm")) {
+    collectGeneralSettingsForm();
+    persistSettings("常规设置已保存").catch((error) => toast(error.message, true));
+    return;
+  }
   if (event.target.id === "reviewSaveFolderInput") {
     const files = [...(event.target.files || [])];
     const folderLabel = String(files[0]?.webkitRelativePath || "").split("/")[0].trim();
@@ -13384,7 +13812,8 @@ document.addEventListener("keydown", (event) => {
       return;
     }
   }
-  if (composer && event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+  const sendWithShift = composerUsesShiftEnterToSend();
+  if (composer && event.key === "Enter" && (sendWithShift ? event.shiftKey : !event.shiftKey) && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     composer.form?.requestSubmit();
     return;
@@ -13446,6 +13875,11 @@ document.addEventListener("input", (event) => {
     state.modelQuery = event.target.value;
     renderSettings();
     window.setTimeout(() => byId("modelListSearch")?.focus(), 0);
+  }
+  if (event.target.id === "archiveSettingsSearch") {
+    state.archiveSettingsQuery = event.target.value;
+    renderSettings();
+    window.setTimeout(() => byId("archiveSettingsSearch")?.focus(), 0);
   }
   if (event.target.id === "mcpMarketplaceSearch") {
     state.mcpMarketplaceQuery = event.target.value;
@@ -13586,6 +14020,10 @@ document.addEventListener("submit", (event) => {
     event.preventDefault();
     collectAppearanceForm();
     persistSettings(copy("appearanceSaved")).catch((error) => toast(error.message, true));
+  } else if (["generalConversationForm", "generalDirectoriesForm"].includes(event.target.id)) {
+    event.preventDefault();
+    collectGeneralSettingsForm();
+    persistSettings("常规设置已保存").catch((error) => toast(error.message, true));
   } else if (event.target.id === "defaultCapabilitiesForm") {
     event.preventDefault();
     collectDefaultCapabilitiesForm();

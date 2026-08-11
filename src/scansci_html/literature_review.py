@@ -360,6 +360,61 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
                 },
             ],
         }
+    # A gateway fallback must remain faithful to the user's subject.  The
+    # generic outline below is intentionally model-oriented, which is a poor
+    # fallback for domain reviews (and was especially confusing for Chinese
+    # photovoltaic/ecology requests).  Keep the section ids stable enough for
+    # downstream citation handling, while changing the actual research plan
+    # to the requested domain.
+    domain_text = question.casefold()
+    if any(term in domain_text for term in ("光伏", "太阳能电站", "光伏农业")) and any(
+        term in domain_text for term in ("生态", "生态系统", "植被", "农业", "环境")
+    ):
+        domain_sections = [
+            (
+                "foundations",
+                "研究现状与证据范围",
+                "界定光伏电站生态影响与光伏农业协同治理的研究对象、情境和证据范围",
+                "光伏 生态 研究现状 证据范围",
+            ),
+            (
+                "mechanisms",
+                "生态影响机制",
+                "比较土地占用、遮阴、微气候以及水热碳循环对植被和生态系统的作用机制",
+                "光伏 生态影响 机制 植被 微气候 水热碳循环",
+            ),
+            (
+                "effects",
+                "生态效应与情境比较",
+                "比较不同地区、土地类型和光伏布局下的植被、生物多样性与生态效应证据",
+                "光伏 植被 生物多样性 生态效应 比较 沙地 农田",
+            ),
+            (
+                "governance",
+                "光伏农业协同治理",
+                "梳理农光互补、生态修复、监测评估和土地治理策略及其适用条件",
+                "光伏农业 协同治理 生态修复 监测评估 农田",
+            ),
+            (
+                "limits",
+                "证据边界与开放问题",
+                "识别时空尺度、研究方法、长期监测和因果识别方面的局限与待验证问题",
+                "光伏 生态 证据边界 局限 长期监测 开放问题",
+            ),
+        ]
+        return {
+            "title": _concise_review_title(question),
+            "scope": f"围绕“{question}”综合当前资料库中的光伏生态证据。",
+            "sections": [
+                {
+                    "id": section_id,
+                    "title": title,
+                    "objective": objective,
+                    "queries": [f"{retrieval_topic} {query_terms}"[:500]],
+                }
+                for section_id, title, objective, query_terms in domain_sections
+            ],
+        }
     sections = [
         ("foundations", "概念与理论基础", "界定核心概念、共享机制与理论边界", "foundations architecture mechanism"),
         ("methods", "方法与训练目标", "比较主要方法、训练目标与实现差异", "methods training objectives pretraining"),

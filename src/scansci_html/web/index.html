@@ -8,7 +8,7 @@
     <title>搜索科学 Pi</title>
     <link rel="icon" type="image/png" href="/scansci-mark.png" />
     <link rel="stylesheet" href="/vendor/pdfjs/pdf_viewer.css" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=26" />
   </head>
   <body>
     <main class="workbench" id="workbench">
@@ -264,18 +264,36 @@
         <section class="app-view settings-view" data-view="settings" aria-label="Settings">
           <aside class="settings-sidebar">
             <header class="settings-sidebar-header">
-              <button type="button" class="settings-back-button" data-action="close-settings" aria-label="返回应用"><span data-ui-icon="arrow-left" aria-hidden="true"></span><span>返回应用</span></button>
+              <button type="button" class="settings-back-button" data-action="close-settings" aria-label="返回应用"><span data-ui-icon="arrow-left" aria-hidden="true"></span><span>设置</span></button>
             </header>
-            <nav aria-label="Settings navigation">
-              <button type="button" class="settings-nav is-active" data-settings-panel="general"><span data-ui-icon="settings"></span><span class="settings-nav-label" data-i18n="general">常规</span></button>
-              <button type="button" class="settings-nav" data-settings-panel="defaults"><span data-ui-icon="sliders"></span><span class="settings-nav-label" data-i18n="defaultCapabilities">默认能力</span></button>
-              <button type="button" class="settings-nav" data-settings-panel="models"><span data-ui-icon="server"></span><span class="settings-nav-label" data-i18n="modelServices">模型服务</span></button>
-              <button type="button" class="settings-nav" data-settings-panel="local-models"><span data-ui-icon="layout"></span><span class="settings-nav-label" data-i18n="localModels">本地模型</span></button>
+            <nav class="settings-nav-scroll" aria-label="Settings navigation">
+              <section class="settings-nav-group">
+                <h2 class="settings-nav-group-title">基础</h2>
+                <div class="settings-nav-group-items">
+                  <button type="button" class="settings-nav is-active" data-settings-panel="general"><span data-ui-icon="settings"></span><span class="settings-nav-label" data-i18n="general">常规</span></button>
+                  <button type="button" class="settings-nav" data-settings-panel="models"><span data-ui-icon="server"></span><span class="settings-nav-label" data-i18n="modelServices">模型服务</span></button>
+                </div>
+              </section>
+              <section class="settings-nav-group">
+                <h2 class="settings-nav-group-title">本地 AI</h2>
+                <div class="settings-nav-group-items">
+                  <button type="button" class="settings-nav" data-settings-panel="defaults"><span data-ui-icon="sliders"></span><span class="settings-nav-label" data-i18n="defaultCapabilities">默认能力</span></button>
+                  <button type="button" class="settings-nav" data-settings-panel="local-models"><span data-ui-icon="layout"></span><span class="settings-nav-label" data-i18n="localModels">本地模型</span></button>
+                  <button type="button" class="settings-nav" data-settings-panel="runtime"><span data-ui-icon="cpu"></span><span class="settings-nav-label">运行时</span></button>
+                </div>
+              </section>
+              <section class="settings-nav-group">
+                <h2 class="settings-nav-group-title">系统</h2>
+                <div class="settings-nav-group-items">
+                  <button type="button" class="settings-nav" data-settings-panel="archive"><span data-ui-icon="archive"></span><span class="settings-nav-label">归档</span></button>
+                  <button type="button" class="settings-nav" data-settings-panel="storage"><span data-ui-icon="database"></span><span class="settings-nav-label">存储</span></button>
+                  <button type="button" class="settings-nav settings-nav-about" data-settings-panel="about"><span data-ui-icon="download"></span><span class="settings-nav-label" data-i18n="softwareUpdate">软件更新</span></button>
+                </div>
+              </section>
             </nav>
             <div class="settings-sidebar-bottom">
-              <button type="button" class="settings-nav settings-nav-about" data-settings-panel="about"><span data-ui-icon="info"></span><span class="settings-nav-label" data-i18n="about">关于搜索科学</span></button>
+              <p class="settings-local" data-i18n="settingsLocal">配置仅保存在此电脑</p>
             </div>
-            <p class="settings-local" data-i18n="settingsLocal">配置仅保存在此电脑</p>
           </aside>
           <article class="settings-content" id="settingsContent" aria-live="polite"></article>
         </section>
@@ -391,7 +409,7 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="/vendor/pptxgen/pptxgen.bundle.js"></script>
     <script src="/pptx-export.js"></script>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=26"></script>
     <script type="module" src="/pdf-viewer.js"></script>
   </body>
 </html>

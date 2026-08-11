@@ -192,6 +192,62 @@ def test_appearance_preferences_are_persisted_and_normalized(tmp_path: Path):
     assert normalized["appearance"] == {"locale": "zh-CN", "theme": "system", "accent": "jade", "font_scale": "medium"}
 
 
+def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+
+    settings = save_settings(
+        workspace,
+        {
+            "general": {
+                "conversation": {
+                    "send_shortcut": "shift-enter",
+                    "completion_notifications": False,
+                    "agent_completion_notifications": False,
+                    "subagent_completion_notifications": True,
+                },
+                "directories": {
+                    "default_workspace": r"D:\Research\default",
+                    "conversation_workspace": r"D:\Research\conversations",
+                },
+            }
+        },
+    )
+
+    assert settings["general"] == {
+        "conversation": {
+            "send_shortcut": "shift-enter",
+            "completion_notifications": False,
+            "agent_completion_notifications": False,
+            "subagent_completion_notifications": True,
+        },
+        "directories": {
+            "default_workspace": r"D:\Research\default",
+            "conversation_workspace": r"D:\Research\conversations",
+        },
+    }
+    persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    assert persisted["general"] == settings["general"]
+
+    normalized = save_settings(
+        workspace,
+        {
+            "general": {
+                "conversation": {"send_shortcut": "ctrl-enter", "completion_notifications": "yes"},
+                "directories": {"default_workspace": 123},
+            }
+        },
+    )
+    assert normalized["general"] == {
+        "conversation": {
+            "send_shortcut": "enter",
+            "completion_notifications": True,
+            "agent_completion_notifications": True,
+            "subagent_completion_notifications": False,
+        },
+        "directories": {"default_workspace": "123", "conversation_workspace": ""},
+    }
+
+
 def test_provider_and_local_runtime_presets_are_credential_free():
     providers = provider_presets()
     runtimes = local_model_presets()

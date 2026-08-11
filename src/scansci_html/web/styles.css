@@ -6517,6 +6517,21 @@ html[data-theme="dark"] .local-model-card {
     width: 100%;
   }
 
+  .settings-path-control {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .settings-path-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .settings-path-actions .settings-inline-link {
+    width: auto;
+    justify-self: auto;
+  }
+
   .settings-row-value {
     text-align: left;
   }
@@ -7128,7 +7143,6 @@ html[data-accent] .cherry-provider-item.is-enabled .cherry-provider-status:hover
 }
 
 .settings-surface .settings-minimal-section:first-child,
-.settings-surface .default-capability-panel:first-child,
 .settings-surface .document-service-card:first-child,
 .settings-surface .about-card:first-child {
   border-top-color: transparent;
@@ -9057,6 +9071,790 @@ html[data-theme="dark"] .composer-model-network-icon {
   background: var(--page-background);
 }
 
+/* Final model-settings surface overrides. These come after the legacy Cherry
+   rules and the theme token map so the hierarchy remains flat in both modes. */
+.settings-content .local-installed-panel,
+.settings-content .local-model-disclosure,
+.settings-content .cherry-model-section,
+.settings-content .cherry-model-list,
+.settings-content .cherry-model-group {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.settings-content .local-installed-panel {
+  overflow: visible;
+  margin: 0 0 26px;
+  padding: 0;
+}
+
+.settings-content .local-installed-panel > header,
+.settings-content .local-model-market-disclosure > summary {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+}
+
+.settings-content .local-installed-panel > header > div > span {
+  display: none;
+}
+
+.settings-content .local-installed-panel h2,
+.settings-content .local-model-market-disclosure > summary > span {
+  margin: 0;
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  letter-spacing: -.015em;
+  line-height: 1.35;
+}
+
+.settings-content .local-installed-panel > header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.55;
+}
+
+.settings-content .local-installed-panel > header > b,
+.settings-content .local-model-market-disclosure > summary em {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.settings-content .local-model-market-disclosure > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings-content .local-model-market-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-content .local-model-market-disclosure > summary::after {
+  margin-left: 0;
+  color: var(--muted);
+  content: "\\2304";
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1;
+  transition: transform .16s ease;
+}
+
+.settings-content .local-model-market-disclosure[open] > summary::after {
+  transform: rotate(180deg);
+}
+
+.settings-content .local-model-disclosure-body {
+  padding: 0 0 20px;
+}
+
+.settings-content .local-installed-panel > .quiet-model-list,
+.settings-content .local-model-disclosure .quiet-model-list,
+.settings-content .quiet-model-list {
+  border: 0;
+  background: transparent;
+}
+
+.settings-content .local-installed-panel .quiet-model-row,
+.settings-content .local-model-market-disclosure .quiet-model-row {
+  min-height: 60px;
+  padding-right: 0;
+  padding-left: 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+.settings-content .local-installed-panel .quiet-model-row strong,
+.settings-content .local-model-market-disclosure .quiet-model-row strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.settings-content .local-installed-panel .quiet-model-row p,
+.settings-content .local-installed-panel .quiet-model-row small,
+.settings-content .local-model-market-disclosure .quiet-model-row p,
+.settings-content .local-model-market-disclosure .quiet-model-row small,
+.settings-content .local-installed-panel .quiet-row-note,
+.settings-content .local-installed-panel .quiet-row-size,
+.settings-content .local-model-market-disclosure .quiet-row-note,
+.settings-content .local-model-market-disclosure .quiet-row-size {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.45;
+}
+
+.settings-content .local-installed-panel .quiet-model-row:hover,
+.settings-content .local-model-market-disclosure .quiet-model-row:hover {
+  background: var(--control-background-hover);
+}
+
+.settings-content .cherry-model-services,
+.settings-content .cherry-provider-panel {
+  background: var(--page-background);
+}
+
+.settings-content .cherry-model-section {
+  margin-top: 22px;
+  padding-top: 18px;
+}
+
+.settings-content .cherry-model-section > header {
+  min-height: 32px;
+  margin-bottom: 10px;
+}
+
+.settings-content .cherry-model-section-title h2,
+.settings-content .cherry-model-group > header strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.settings-content .cherry-model-section-title b {
+  border: 0;
+  color: var(--muted);
+  background: var(--control-background);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.settings-content .cherry-model-group {
+  margin: 0;
+  padding: 10px 0 0;
+}
+
+.settings-content .cherry-model-group + .cherry-model-group {
+  margin-top: 12px;
+  padding-top: 14px;
+}
+
+.settings-content .cherry-model-group > header {
+  min-height: 26px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.settings-content .cherry-model-row {
+  min-height: 52px;
+  padding: 7px 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+.settings-content .cherry-model-row:hover {
+  background: var(--control-background-hover);
+}
+
+.settings-content .cherry-model-copy > button {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  line-height: 1.4;
+}
+
+.settings-content .cherry-model-copy small,
+.settings-content .model-capability-empty {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.4;
+}
+
+.settings-content .cherry-model-search input,
+.settings-content .cherry-fetch-button,
+.settings-content .cherry-plus-button,
+.settings-content .cherry-provider-button,
+.settings-content .cherry-field,
+.settings-content .cherry-field input,
+.settings-content .cherry-field select {
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+/* Model settings hierarchy -------------------------------------------------
+   Installed models, the market, and provider model rows are sections of the
+   page rather than nested cards. Keep their headings on the same left edge,
+   let the page surface show through in both themes, and use the shared
+   settings scale for every level of copy. */
+.settings-content .local-installed-panel,
+.settings-content .local-model-market-disclosure,
+.settings-content .cherry-model-list,
+.settings-content .cherry-model-group {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.settings-content .local-installed-panel {
+  overflow: visible;
+  margin: 0 0 26px;
+  padding: 0;
+}
+
+.settings-content .local-installed-panel > header,
+.settings-content .local-model-market-disclosure > summary {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+}
+
+.settings-content .local-installed-panel > header > div {
+  min-width: 0;
+}
+
+.settings-content .local-installed-panel > header > div > span {
+  display: none;
+}
+
+.settings-content .local-installed-panel h2,
+.settings-content .local-model-market-disclosure > summary > span {
+  margin: 0;
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  letter-spacing: -.015em;
+  line-height: 1.35;
+}
+
+.settings-content .local-installed-panel > header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.55;
+}
+
+.settings-content .local-installed-panel > header > b,
+.settings-content .local-model-market-disclosure > summary em {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.settings-content .local-model-market-disclosure > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings-content .local-model-market-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-content .local-model-market-disclosure > summary::after {
+  margin-left: 0;
+  color: var(--muted);
+  content: "⌄";
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1;
+  transition: transform .16s ease;
+}
+
+.settings-content .local-model-market-disclosure[open] > summary::after {
+  transform: rotate(180deg);
+}
+
+.settings-content .local-model-disclosure-body {
+  padding: 0 0 20px;
+}
+
+.settings-content .local-installed-panel > .quiet-model-list,
+.settings-content .local-model-disclosure .quiet-model-list,
+.settings-content .quiet-model-list {
+  border: 0;
+  background: transparent;
+}
+
+.settings-content .local-installed-panel .quiet-model-row,
+.settings-content .local-model-market-disclosure .quiet-model-row {
+  min-height: 60px;
+  padding-right: 0;
+  padding-left: 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+.settings-content .local-installed-panel .quiet-model-row strong,
+.settings-content .local-model-market-disclosure .quiet-model-row strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.settings-content .local-installed-panel .quiet-model-row p,
+.settings-content .local-installed-panel .quiet-model-row small,
+.settings-content .local-model-market-disclosure .quiet-model-row p,
+.settings-content .local-model-market-disclosure .quiet-model-row small,
+.settings-content .local-installed-panel .quiet-row-note,
+.settings-content .local-installed-panel .quiet-row-size,
+.settings-content .local-model-market-disclosure .quiet-row-note,
+.settings-content .local-model-market-disclosure .quiet-row-size {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.45;
+}
+
+.settings-content .local-installed-panel .quiet-model-row:hover,
+.settings-content .local-model-market-disclosure .quiet-model-row:hover {
+  background: var(--control-background-hover);
+}
+
+.settings-content .cherry-model-section,
+.settings-content .cherry-model-list,
+.settings-content .cherry-model-group + .cherry-model-group,
+.settings-content .cherry-model-row {
+  border: 0;
+}
+
+.settings-content .cherry-model-section {
+  margin-top: 22px;
+  padding-top: 18px;
+  background: transparent;
+}
+
+.settings-content .cherry-model-section > header {
+  min-height: 32px;
+  margin-bottom: 10px;
+}
+
+.settings-content .cherry-model-section-title h2,
+.settings-content .cherry-model-group > header strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.settings-content .cherry-model-section-title b {
+  border: 0;
+  color: var(--muted);
+  background: var(--control-background);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.settings-content .cherry-model-group {
+  margin: 0;
+  padding: 10px 0 0;
+}
+
+.settings-content .cherry-model-group + .cherry-model-group {
+  margin-top: 12px;
+  padding-top: 14px;
+}
+
+.settings-content .cherry-model-group > header {
+  min-height: 26px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.settings-content .cherry-model-row {
+  min-height: 52px;
+  padding: 7px 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+.settings-content .cherry-model-row:hover {
+  background: var(--control-background-hover);
+}
+
+.settings-content .cherry-model-copy > button {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  line-height: 1.4;
+}
+
+.settings-content .cherry-model-copy small,
+.settings-content .model-capability-empty {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.4;
+}
+
+.settings-content .cherry-model-search input,
+.settings-content .cherry-fetch-button,
+.settings-content .cherry-plus-button,
+.settings-content .cherry-provider-button,
+.settings-content .cherry-field,
+.settings-content .cherry-field input,
+.settings-content .cherry-field select {
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+/* System settings ---------------------------------------------------------
+   Archive and storage use the same quiet cards and type scale as the other
+   settings pages. Whitespace separates rows; there are no decorative rules
+   between individual records. */
+.settings-sidebar-bottom {
+  display: grid;
+  gap: 14px;
+  border-top: 0;
+}
+
+.settings-sidebar-bottom .settings-local {
+  margin: 0;
+}
+
+.archive-settings-card,
+.storage-settings-card {
+  margin: 0 0 16px;
+  padding: 22px;
+  border: 1px solid var(--rule);
+  border-radius: 18px;
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.archive-settings-card-header,
+.storage-settings-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.archive-settings-card-header h2,
+.storage-settings-card-header h2,
+.storage-settings-note h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  line-height: 1.35;
+}
+
+.archive-settings-card-header p,
+.storage-settings-card-header p,
+.storage-settings-note p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.6;
+}
+
+.archive-settings-count,
+.storage-settings-badge {
+  flex: 0 0 auto;
+  padding: 7px 11px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control-background);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.archive-settings-search {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 16px;
+  padding: 0 13px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.archive-settings-search:focus-within {
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.archive-settings-search .ui-icon {
+  --icon-size: 17px;
+  flex: 0 0 auto;
+}
+
+.archive-settings-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font: inherit;
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+.archive-settings-list {
+  display: grid;
+  gap: 8px;
+}
+
+.archive-settings-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+}
+
+.archive-settings-open {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 11px;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.archive-settings-open:hover .archive-settings-copy strong,
+.archive-settings-open:focus-visible .archive-settings-copy strong {
+  color: var(--accent-ink);
+}
+
+.archive-settings-icon,
+.storage-settings-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.archive-settings-icon .ui-icon,
+.storage-settings-icon .ui-icon {
+  --icon-size: 17px;
+}
+
+.archive-settings-copy,
+.storage-settings-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.archive-settings-copy strong,
+.storage-settings-copy strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-settings-copy small,
+.storage-settings-copy p {
+  overflow: hidden;
+  margin: 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archive-settings-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
+.archive-settings-actions .settings-inline-link {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border-radius: 9px;
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.archive-settings-actions .settings-inline-link .ui-icon {
+  --icon-size: 14px;
+}
+
+.archive-settings-actions .settings-inline-link.is-danger {
+  color: var(--muted);
+}
+
+.archive-settings-actions .settings-inline-link.is-danger:hover,
+.archive-settings-actions .settings-inline-link.is-danger:focus-visible {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+}
+
+.archive-settings-empty {
+  display: grid;
+  min-height: 210px;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 24px;
+  border-radius: 14px;
+  color: var(--muted);
+  background: var(--surface-elevated);
+  text-align: center;
+}
+
+.archive-settings-empty > span {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.archive-settings-empty > span .ui-icon {
+  --icon-size: 20px;
+}
+
+.archive-settings-empty strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+.archive-settings-empty p {
+  max-width: 440px;
+  margin: 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.6;
+}
+
+.storage-settings-list {
+  display: grid;
+  gap: 10px;
+}
+
+.storage-settings-row {
+  display: grid;
+  grid-template-columns: 32px minmax(150px, .72fr) minmax(180px, 1.2fr) auto;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+
+.storage-settings-path {
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 11px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control-background);
+  font-family: var(--mono);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-settings-row > .settings-inline-link {
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+.storage-settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 2px;
+}
+
+.storage-settings-footer > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.storage-settings-footer .ui-icon {
+  --icon-size: 15px;
+}
+
+.storage-settings-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--surface-elevated);
+}
+
+.storage-settings-note .storage-settings-icon {
+  margin-top: 1px;
+}
+
+@media (max-width: 760px) {
+  .archive-settings-card,
+  .storage-settings-card {
+    padding: 18px;
+  }
+
+  .archive-settings-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .archive-settings-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .storage-settings-row {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .storage-settings-row > .storage-settings-path,
+  .storage-settings-row > .settings-inline-link {
+    grid-column: 2;
+  }
+
+  .storage-settings-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 .cherry-provider-catalog {
   background: var(--surface-elevated);
 }
@@ -9799,4 +10597,1519 @@ html[data-theme="dark"] :is(
   .mcp-owned-record small
 ) {
   color: var(--muted);
+}
+
+/* -------------------------------------------------------------------------
+   Settings navigation and card shell
+
+   The settings surface follows the same visual grammar as the reference
+   layout: a grouped rail, a clear page heading, a segmented sub-navigation,
+   and one quiet card that owns the form rows. All surfaces deliberately use
+   the semantic theme variables so light and dark mode stay in parity.
+   ------------------------------------------------------------------------- */
+.settings-view {
+  grid-template-columns: 320px minmax(0, 1fr);
+  background: var(--page-background);
+}
+
+.settings-sidebar {
+  min-width: 0;
+  padding: 30px 20px 22px;
+  border-right: 0;
+  background: var(--surface-elevated);
+}
+
+.settings-sidebar-header {
+  margin: 0 0 28px;
+}
+
+.settings-back-button {
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 12px;
+  color: var(--ink);
+  background: transparent;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.settings-back-button > span:last-child {
+  margin-left: 4px;
+}
+
+.settings-back-button:hover,
+.settings-back-button:focus-visible {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.settings-nav-scroll {
+  display: flex !important;
+  min-height: 0;
+  flex-direction: column;
+  gap: 24px !important;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+
+.settings-nav-group {
+  display: grid;
+  gap: 7px;
+}
+
+.settings-nav-group-title {
+  margin: 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+
+.settings-nav-group-items {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-nav {
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 15px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: left;
+  transition: color .16s ease, background .16s ease, transform .16s ease;
+}
+
+.settings-nav > .ui-icon {
+  --icon-size: 19px;
+  color: currentColor;
+}
+
+.settings-nav:hover,
+.settings-nav:focus-visible {
+  color: var(--ink);
+  background: var(--control-background-hover);
+  outline: none;
+}
+
+.settings-nav.is-active {
+  color: var(--surface);
+  background: var(--ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--ink) 10%, transparent);
+}
+
+.settings-sidebar-bottom {
+  padding: 20px 8px 0;
+  border-top-color: var(--rule);
+}
+
+.settings-sidebar-bottom .settings-nav {
+  min-height: 40px;
+  padding: 0 8px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.settings-local {
+  margin: 18px 8px 0;
+  color: var(--muted);
+}
+
+.settings-content {
+  min-width: 0;
+  overflow: auto;
+  padding: 38px clamp(24px, 5vw, 84px) 70px;
+  border-top-left-radius: 24px;
+  background: var(--page-background);
+}
+
+.settings-surface {
+  width: min(1120px, 100%);
+  min-height: min(640px, 100%);
+  margin: 0 auto;
+  padding: 34px 36px 38px;
+  border: 1px solid var(--rule);
+  border-color: var(--rule);
+  border-radius: 24px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: 0 10px 32px color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+.settings-minimal-page {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+
+.settings-page-heading {
+  margin: 0 0 25px;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+.settings-page-heading h1 {
+  color: var(--ink);
+  font-size: clamp(28px, 3vw, 36px);
+  letter-spacing: -.035em;
+}
+
+.settings-page-heading p {
+  color: var(--muted);
+}
+
+.settings-page-heading .save-indicator {
+  color: var(--muted);
+  background: var(--control-background);
+}
+
+.settings-tab-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0 0 20px;
+  padding: 4px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--surface-elevated);
+}
+
+.settings-tab {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.settings-tab .ui-icon {
+  --icon-size: 17px;
+}
+
+.settings-tab:hover,
+.settings-tab:focus-visible {
+  color: var(--ink);
+  background: var(--control-background-hover);
+  outline: none;
+}
+
+.settings-tab.is-active {
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.settings-tab-panel {
+  min-width: 0;
+}
+
+.settings-minimal-section {
+  border-top-color: var(--rule);
+}
+
+.settings-row {
+  border-bottom-color: var(--rule);
+}
+
+.settings-row > select,
+.settings-row > .settings-select,
+.settings-row > .settings-row-control {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.settings-row > select:hover,
+.settings-row > select:focus-visible {
+  border-color: var(--rule-strong);
+  background: var(--control-background-hover);
+  outline: none;
+}
+
+.settings-section-intro {
+  max-width: 680px;
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.settings-inline-link {
+  justify-self: end;
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--control-background);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-inline-link:hover,
+.settings-inline-link:focus-visible {
+  background: var(--control-background-hover);
+  outline: none;
+}
+
+.settings-switch-control {
+  position: relative;
+  display: inline-flex;
+  width: 42px;
+  height: 24px;
+  justify-self: end;
+  align-items: center;
+  cursor: pointer;
+}
+
+.settings-switch-control input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.settings-switch-control span {
+  position: relative;
+  display: block;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--rule-strong);
+  transition: background .16s ease;
+}
+
+.settings-switch-control span::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--ink) 18%, transparent);
+  content: "";
+  transition: transform .16s ease;
+}
+
+.settings-switch-control input:checked + span {
+  background: var(--accent);
+}
+
+.settings-switch-control input:checked + span::after {
+  transform: translateX(18px);
+}
+
+.settings-switch-control input:focus-visible + span {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+}
+
+.settings-path-control {
+  display: grid;
+  width: min(430px, 100%);
+  justify-self: end;
+  gap: 8px;
+}
+
+.settings-path-control input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  color: var(--ink);
+  background: var(--control-background);
+  font: inherit;
+}
+
+.settings-path-control input:hover,
+.settings-path-control input:focus-visible {
+  border-color: var(--rule-strong);
+  background: var(--control-background-hover);
+  outline: none;
+}
+
+.settings-path-control input::placeholder {
+  color: var(--muted);
+}
+
+.settings-path-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-runtime-card,
+.runtime-connections-panel,
+.settings-runtime-note,
+.runtime-components-panel,
+.local-runtime-recovery {
+  margin-top: 16px;
+  padding: 22px;
+  border: 1px solid var(--rule);
+  border-radius: 18px;
+  color: var(--ink);
+  background: var(--surface-elevated);
+}
+
+.settings-runtime-card > header,
+.runtime-connections-panel > header,
+.runtime-components-panel > header,
+.local-runtime-recovery > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.settings-runtime-card > header > div,
+.runtime-connections-panel > header > div,
+.runtime-components-panel > header > div,
+.local-runtime-recovery > header > div {
+  min-width: 0;
+}
+
+.settings-runtime-card > header span:first-child,
+.runtime-components-panel > header span:first-child,
+.local-runtime-recovery > header span:first-child {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.settings-runtime-card h2,
+.runtime-connections-panel h2,
+.runtime-components-panel h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 18px;
+}
+
+.settings-runtime-card p,
+.runtime-connections-panel p,
+.runtime-components-panel p,
+.settings-runtime-note p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.runtime-status-pill,
+.runtime-connection-count {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 11px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control-background);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.runtime-status-pill.is-ready {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.settings-runtime-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.settings-runtime-facts > div {
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.settings-runtime-facts span,
+.settings-runtime-facts strong {
+  display: block;
+}
+
+.settings-runtime-facts span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-runtime-facts strong {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-lifecycle-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+  margin-top: 20px;
+}
+
+.runtime-lifecycle-summary > div {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.runtime-lifecycle-summary span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.runtime-lifecycle-summary strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-lifecycle-boundary {
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.settings-runtime-card > footer,
+.runtime-connections-panel form > footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+
+.runtime-primary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.runtime-primary-status.is-ready {
+  color: var(--accent-ink);
+}
+
+.runtime-primary-status .ui-icon,
+.settings-runtime-note .ui-icon {
+  --icon-size: 16px;
+}
+
+.runtime-components-panel,
+.runtime-connections-panel {
+  margin-top: 16px;
+}
+
+.runtime-component-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.runtime-component-card,
+.local-runtime-row {
+  border-color: var(--rule) !important;
+  color: var(--ink);
+  background: var(--surface) !important;
+}
+
+.runtime-component-card strong,
+.runtime-component-card small,
+.local-runtime-row strong,
+.local-runtime-row small {
+  color: var(--ink);
+}
+
+.runtime-component-card p,
+.runtime-component-card > .runtime-component-copy > span,
+.local-runtime-row small {
+  color: var(--muted);
+}
+
+.runtime-component-primary,
+.runtime-component-secondary,
+.quiet-primary-button {
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+  background: var(--accent);
+}
+
+.runtime-component-primary:hover,
+.runtime-component-secondary:hover,
+.quiet-primary-button:hover {
+  background: var(--accent-strong);
+}
+
+.runtime-component-secondary {
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.runtime-component-secondary:hover {
+  color: var(--accent-ink);
+  background: var(--accent-surface-strong);
+}
+
+.settings-runtime-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+
+.runtime-components-empty {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.settings-runtime-note > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.settings-runtime-note strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.local-runtime-recovery {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+.local-runtime-recovery strong {
+  color: var(--ink);
+}
+
+.local-runtime-recovery p,
+.local-runtime-channel-empty,
+.local-runtime-manual-fallback p {
+  color: var(--muted);
+}
+
+.settings-select-trigger {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+}
+
+.settings-select-trigger:hover,
+.settings-select-trigger[aria-expanded="true"] {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+.settings-select-model-meta {
+  color: var(--muted);
+}
+
+@media (max-width: 960px) {
+  .settings-view {
+    grid-template-columns: 274px minmax(0, 1fr);
+  }
+
+  .settings-surface {
+    padding: 28px 26px 32px;
+  }
+}
+
+@media (max-width: 720px) {
+  .settings-view {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-sidebar {
+    min-height: auto;
+    padding: 18px 16px 14px;
+  }
+
+  .settings-nav-scroll {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px !important;
+    overflow: visible;
+  }
+
+  .settings-nav-group-items {
+    gap: 3px;
+  }
+
+  .settings-sidebar-bottom,
+  .settings-local {
+    display: none;
+  }
+
+  .settings-content {
+    padding: 22px 14px 42px;
+  }
+
+  .settings-surface {
+    padding: 24px 18px 28px;
+    border-radius: 18px;
+  }
+
+  .settings-tab-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-radius: 16px;
+  }
+
+  .settings-tab {
+    justify-content: flex-start;
+    padding: 0 12px;
+  }
+
+  .settings-row {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .settings-row > select,
+  .settings-row > .settings-select,
+  .settings-row > .settings-row-control,
+  .settings-inline-link {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .settings-runtime-facts {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Keep the outer shell visible through the rounded content corner. */
+.settings-view {
+  background: var(--canvas);
+}
+
+html[data-theme="dark"] .settings-view {
+  background: var(--canvas);
+}
+
+html:not([data-theme="dark"]) .settings-view {
+  background: var(--canvas);
+}
+
+html:not([data-theme="dark"]) .settings-view.is-active > .settings-content,
+html[data-theme="dark"] .settings-view.is-active > .settings-content {
+  border-top-left-radius: 24px;
+}
+
+.settings-view.is-active > .settings-content {
+  border-top-left-radius: 24px;
+}
+
+/* The settings content is the surface; keep the wrapper layout-only. */
+.settings-surface {
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+html:not([data-theme="dark"]) .settings-surface,
+html[data-theme="dark"] .settings-surface {
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* OCR controls: an open custom select must clear the following service card. */
+.settings-select-menu {
+  z-index: 130;
+}
+
+.settings-content .document-service-card:has(.settings-select.is-open) {
+  position: relative;
+  z-index: 130;
+  isolation: auto;
+}
+
+/* Keep the language field on the same form scale as the MinerU API fields. */
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-language-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 7px;
+  min-height: 0;
+  font-size: calc(12px * var(--settings-font-scale));
+  font-weight: 600;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-language-row > .settings-select {
+  width: 100%;
+}
+
+.settings-surface:has(.default-capabilities-page) .default-tools-section .document-language-row > .settings-select .settings-select-trigger {
+  min-height: 39px;
+  padding: 8px 36px 8px 10px;
+  border-radius: 8px;
+  font-size: calc(12px * var(--settings-font-scale));
+}
+
+/* Installed models and the market use the same type scale as the default
+   assistant rows, so moving between these settings pages does not change
+   the reading rhythm. */
+.settings-content .local-models-page {
+  font-family: var(--ui);
+}
+
+.settings-content .local-installed-panel h2,
+.settings-content .local-model-market-disclosure > summary {
+  font-size: calc(16px * var(--settings-font-scale));
+  line-height: 21px;
+}
+
+.settings-content .local-installed-panel .quiet-model-row strong,
+.settings-content .local-model-market-disclosure .quiet-model-row strong {
+  font-size: calc(12px * var(--settings-font-scale));
+  line-height: 17px;
+}
+
+/* Settings visual system ----------------------------------------------------
+   All settings pages inherit the same type scale and semantic surfaces. The
+   appearance preference is applied at the application shell so the selected
+   interface size is visible in the workbench as well as in Settings. */
+:root {
+  --ui-font-scale: 1;
+  --settings-font-family: var(--ui);
+}
+
+html[data-font-scale="small"] {
+  --ui-font-scale: .92;
+}
+
+html[data-font-scale="medium"] {
+  --ui-font-scale: 1;
+}
+
+html[data-font-scale="large"] {
+  --ui-font-scale: 1.08;
+}
+
+.workbench {
+  width: calc(100% / var(--ui-font-scale));
+  height: calc(100dvh / var(--ui-font-scale));
+  zoom: var(--ui-font-scale);
+}
+
+.settings-content,
+.settings-content button,
+.settings-content input,
+.settings-content select,
+.settings-content textarea,
+.settings-content .cherry-model-services,
+.settings-content .mcp-view,
+.settings-content .extensions-view,
+.settings-content .quiet-settings-page,
+.settings-content .resource-install-page,
+.settings-content .resource-settings-page,
+.settings-content .local-models-page,
+.settings-content .software-update-page {
+  font-family: var(--settings-font-family);
+}
+
+.settings-content {
+  --settings-font-scale: 1;
+  color: var(--ink);
+  background: var(--page-background);
+}
+
+.settings-content:has(.cherry-model-services),
+.settings-content:has(.default-capabilities-page),
+.settings-content:has(.software-update-page) {
+  background: var(--page-background);
+}
+
+.settings-content .local-models-page {
+  font-family: var(--ui);
+}
+
+.settings-content .cherry-model-services {
+  background: var(--page-background);
+}
+
+.settings-content .settings-page-heading h1,
+.settings-content .quiet-page-heading h1,
+.settings-content .resource-install-heading h1,
+.settings-content .resource-settings-heading h1,
+.settings-content .settings-heading h1,
+.settings-content .mcp-market-hero h1,
+.settings-content .extensions-header h1,
+.software-update-page h1 {
+  color: var(--ink);
+  font-size: calc(var(--settings-page-title) * var(--settings-font-scale));
+  line-height: 1.16;
+}
+
+.settings-content .settings-page-heading p,
+.settings-content .quiet-page-heading p,
+.settings-content .resource-install-heading p,
+.settings-content .resource-settings-heading p,
+.settings-content .settings-heading p,
+.settings-content .settings-section-intro,
+.settings-content .software-update-page p,
+.software-update-page p {
+  color: var(--muted);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  line-height: 1.6;
+}
+
+.settings-content :is(.settings-minimal-section h2, .quiet-section h2,
+  .default-capability-panel h2, .document-service-card h2,
+  .settings-runtime-card h2, .runtime-connections-panel h2,
+  .runtime-components-panel h2, .software-update-card h2) {
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+}
+
+.settings-content :is(.settings-row strong, .default-capability-copy strong,
+  .document-service-heading h2, .runtime-primary-status,
+  .runtime-lifecycle-summary strong,
+  .software-update-row strong, .software-update-status-row strong) {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+.settings-content :is(.settings-row small, .default-capability-copy small,
+  .document-service-heading p, .document-service-note,
+  .settings-runtime-card p, .runtime-connections-panel p,
+  .runtime-components-panel p, .runtime-lifecycle-boundary,
+  .runtime-components-empty,
+  .software-update-row p,
+  .software-update-heading-copy p) {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+.settings-content :is(.settings-minimal-section, .default-capability-panel,
+  .document-service-card, .settings-runtime-card,
+  .runtime-connections-panel, .runtime-components-panel,
+  .local-runtime-recovery, .local-installed-panel,
+  .local-model-disclosure, .cherry-model-services,
+  .mcp-market-card, .extension-record, .software-update-card) {
+  border-color: var(--rule);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.settings-content .cherry-model-services {
+  background: var(--page-background);
+}
+
+.settings-content :is(.settings-row > select, .settings-row > .settings-select,
+  .settings-row > .settings-row-control, .settings-inline-link,
+  .settings-path-control input,
+  .settings-select-trigger, .runtime-status-pill,
+  .runtime-connection-count, .software-update-value) {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+  background: var(--control-background);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+.settings-content :is(.settings-row > select:hover,
+  .settings-row > select:focus-visible, .settings-inline-link:hover,
+  .settings-inline-link:focus-visible, .settings-select-trigger:hover,
+  .settings-select-trigger[aria-expanded="true"],
+  .settings-path-control input:hover,
+  .settings-path-control input:focus-visible) {
+  color: var(--ink);
+  background: var(--control-background-hover);
+}
+
+/* The settings hierarchy uses whitespace and rounded surfaces instead of
+   decorative rules between every row. Control borders remain intact. */
+.settings-sidebar-bottom {
+  border-top: 0;
+}
+
+.settings-content .settings-minimal-section,
+.settings-content .settings-minimal-section:first-child,
+.settings-content .settings-minimal-section + .settings-minimal-section {
+  border-top: 0;
+  border-bottom: 0;
+}
+
+.settings-content .settings-row {
+  border-top: 0;
+  border-bottom: 0;
+}
+
+.settings-content .settings-minimal-actions,
+.settings-content .settings-runtime-card > footer,
+.settings-content .runtime-connections-panel form > footer,
+.settings-content .default-tools-section,
+.settings-content .default-tools-section .default-tools-heading {
+  border-top: 0;
+}
+
+.settings-content .default-capability-panel > header,
+.settings-content .default-capability-row,
+.settings-content .local-installed-panel > header,
+.settings-content .local-model-disclosure,
+.settings-content .about-card-heading,
+.settings-content .about-row,
+.settings-content .software-update-card > header,
+.settings-content .software-update-row {
+  border-top: 0;
+  border-bottom: 0;
+}
+
+.settings-content .quiet-section,
+.settings-content .local-model-category,
+.settings-content .local-model-recommendation > footer,
+.settings-content .local-model-primary,
+.settings-content .local-runtime-channel-list,
+.settings-content .quiet-model-list,
+.settings-content .quiet-model-row,
+.settings-content .quiet-runtime-list,
+.settings-content .quiet-runtime-row,
+.settings-content .resource-settings-list,
+.settings-content .resource-settings-row,
+.settings-content .cherry-model-section,
+.settings-content .cherry-model-group,
+.settings-content .cherry-model-row,
+.settings-content .cherry-capability-editor,
+.settings-content .cherry-model-editor footer,
+.settings-content .cherry-provider-header,
+.settings-content .mcp-market-tabs,
+.settings-content .mcp-market-card footer,
+.settings-content .extensions-header,
+.settings-content .extension-detail-card dl,
+.settings-content .extension-detail-card dl div,
+.settings-content .knowledge-settings-choice-card > footer,
+.settings-content .knowledge-settings-advanced-section,
+.settings-content .knowledge-settings-model-list,
+.settings-content .knowledge-settings-model-row,
+.settings-content .knowledge-settings-actions {
+  border-top: 0;
+  border-bottom: 0;
+}
+
+/* Keep capability cards as complete rounded surfaces. The row separators are
+   intentionally removed above, but the card's own border must remain intact
+   on every side so its radius does not appear cut off. */
+.settings-content .settings-surface .default-capability-panel,
+.settings-content .settings-surface .default-capability-panel:first-child {
+  border: 1px solid var(--rule);
+  border-radius: 16px;
+  border-top-color: var(--rule);
+}
+
+.software-update-page {
+  width: 100%;
+  max-width: none;
+  color: var(--ink);
+  font-family: var(--ui);
+}
+
+.software-update-page h1 {
+  margin: 0;
+  color: var(--ink);
+}
+
+.software-update-page p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.software-update-card {
+  margin: 0 0 16px;
+  padding: 22px;
+  border: 1px solid var(--rule);
+  border-color: var(--rule);
+  border-radius: 16px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.software-update-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 0 18px;
+  border: 0;
+  border-bottom: 0;
+}
+
+.software-update-heading-copy {
+  min-width: 0;
+}
+
+.software-update-heading-copy .settings-overline {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.software-update-card h2 {
+  margin: 0 0 6px;
+  color: var(--ink);
+}
+
+.software-update-mark {
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+  border-radius: 14px;
+  object-fit: cover;
+}
+
+.software-update-status-row,
+.software-update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.software-update-status-row {
+  padding-top: 16px;
+}
+
+.software-update-status-row > div,
+.software-update-row > div {
+  min-width: 0;
+}
+
+.software-update-status-row strong,
+.software-update-version,
+.software-update-row strong,
+.software-update-value {
+  display: block;
+}
+
+.software-update-version {
+  margin-top: 4px;
+  color: var(--ink);
+  font-size: calc(16px * var(--settings-font-scale));
+  font-weight: 700;
+}
+
+.software-update-check,
+.settings-primary-button {
+  min-height: 36px;
+  flex: 0 0 auto;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--accent-contrast);
+  background: var(--accent);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  font-weight: 650;
+}
+
+.software-update-check:hover,
+.software-update-check:focus-visible,
+.settings-primary-button:hover,
+.settings-primary-button:focus-visible {
+  background: var(--accent-strong);
+  outline: none;
+}
+
+.software-update-check:disabled,
+.settings-primary-button:disabled {
+  opacity: .58;
+}
+
+.software-update-details {
+  display: grid;
+  gap: 20px;
+}
+
+.software-update-row p {
+  margin-top: 4px;
+}
+
+.software-update-value {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--control-background);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-weight: 650;
+}
+
+.software-update-value.is-update {
+  border-color: var(--accent-border);
+  color: var(--accent-ink);
+  background: var(--accent-surface);
+}
+
+.software-update-switch {
+  position: relative;
+  display: inline-flex;
+  width: 38px;
+  height: 22px;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.software-update-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.software-update-switch span {
+  position: relative;
+  display: block;
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--rule-strong);
+  transition: background .16s ease;
+}
+
+.software-update-switch span::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--ink) 18%, transparent);
+  content: "";
+  transition: transform .16s ease;
+}
+
+.software-update-switch input:checked + span {
+  background: var(--accent);
+}
+
+.software-update-switch input:checked + span::after {
+  transform: translateX(16px);
+}
+
+@media (max-width: 680px) {
+  .software-update-card {
+    padding: 18px;
+  }
+
+  .software-update-card > header,
+  .software-update-status-row,
+  .software-update-row {
+    align-items: flex-start;
+  }
+
+  .software-update-status-row,
+  .software-update-row {
+    flex-direction: column;
+  }
+
+  .software-update-check,
+  .software-update-value,
+  .software-update-switch {
+    align-self: flex-start;
+  }
+}
+
+@media (max-width: 720px) {
+  .workbench {
+    height: auto;
+    min-height: calc(100dvh / var(--ui-font-scale));
+  }
+}
+
+/* Preserve the page-level surface contract used by the provider editor. */
+.cherry-model-services {
+  background: var(--page-background);
+}
+
+/* Final model-settings cascade: data-theme raises specificity above the
+   older light/dark compatibility rules while still consuming semantic vars. */
+html[data-theme] .settings-content .local-installed-panel,
+html[data-theme] .settings-content .local-model-disclosure,
+html[data-theme] .settings-content .cherry-model-section,
+html[data-theme] .settings-content .cherry-model-list,
+html[data-theme] .settings-content .cherry-model-group,
+html[data-theme] .settings-content .quiet-model-list {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+html[data-theme] .settings-content .local-installed-panel {
+  overflow: visible;
+  margin: 0 0 26px;
+  padding: 0;
+}
+
+html[data-theme] .settings-content .local-installed-panel > header,
+html[data-theme] .settings-content .local-model-market-disclosure > summary {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+}
+
+html[data-theme] .settings-content .local-installed-panel > header > div > span {
+  display: none;
+}
+
+html[data-theme] .settings-content .local-installed-panel h2,
+html[data-theme] .settings-content .local-model-market-disclosure > summary > span {
+  margin: 0;
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  letter-spacing: -.015em;
+  line-height: 1.35;
+}
+
+html[data-theme] .settings-content .local-installed-panel > header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.55;
+}
+
+html[data-theme] .settings-content .local-installed-panel > header > b,
+html[data-theme] .settings-content .local-model-market-disclosure > summary em {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+html[data-theme] .settings-content .local-model-market-disclosure > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+html[data-theme] .settings-content .local-model-market-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+html[data-theme] .settings-content .local-model-market-disclosure > summary::after {
+  margin-left: 0;
+  color: var(--muted);
+  content: "⌄";
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1;
+  transition: transform .16s ease;
+}
+
+html[data-theme] .settings-content .local-model-market-disclosure[open] > summary::after {
+  transform: rotate(180deg);
+}
+
+html[data-theme] .settings-content .local-model-disclosure-body {
+  padding: 0 0 20px;
+}
+
+html[data-theme] .settings-content .local-installed-panel .quiet-model-row,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-model-row,
+html[data-theme] .settings-content .cherry-model-row {
+  min-height: 52px;
+  padding-right: 0;
+  padding-left: 0;
+  border: 0;
+  color: var(--ink);
+  background: transparent;
+}
+
+html[data-theme] .settings-content .local-installed-panel .quiet-model-row strong,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-model-row strong,
+html[data-theme] .settings-content .cherry-model-copy > button {
+  color: var(--ink);
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+html[data-theme] .settings-content .local-installed-panel .quiet-model-row p,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-model-row p,
+html[data-theme] .settings-content .local-installed-panel .quiet-row-note,
+html[data-theme] .settings-content .local-installed-panel .quiet-row-size,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-row-note,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-row-size,
+html[data-theme] .settings-content .cherry-model-copy small,
+html[data-theme] .settings-content .model-capability-empty {
+  color: var(--muted);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  line-height: 1.45;
+}
+
+html[data-theme] .settings-content .local-installed-panel .quiet-model-row:hover,
+html[data-theme] .settings-content .local-model-market-disclosure .quiet-model-row:hover,
+html[data-theme] .settings-content .cherry-model-row:hover {
+  background: var(--control-background-hover);
+}
+
+html[data-theme] .settings-content .cherry-model-services,
+html[data-theme] .settings-content .cherry-provider-panel {
+  background: var(--page-background);
+}
+
+html[data-theme] .settings-content .cherry-model-section {
+  margin-top: 22px;
+  padding-top: 18px;
+}
+
+html[data-theme] .settings-content .cherry-model-section-title h2,
+html[data-theme] .settings-content .cherry-model-group > header strong {
+  color: var(--ink);
+  font-size: calc(var(--settings-section-title) * var(--settings-font-scale));
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+html[data-theme] .settings-content .cherry-model-group > header {
+  min-height: 26px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+}
+
+html[data-theme] .settings-content .cherry-model-group + .cherry-model-group {
+  margin-top: 12px;
+  padding-top: 14px;
+}
+
+html[data-theme] .settings-content .cherry-model-search input,
+html[data-theme] .settings-content .cherry-fetch-button,
+html[data-theme] .settings-content .cherry-plus-button,
+html[data-theme] .settings-content .cherry-provider-button,
+html[data-theme] .settings-content .cherry-field,
+html[data-theme] .settings-content .cherry-field input,
+html[data-theme] .settings-content .cherry-field select {
+  font-size: calc(var(--settings-body-size) * var(--settings-font-scale));
+}
+
+/* The catalog owns provider enable/disable; hide the duplicate header control. */
+html[data-theme] .settings-content .cherry-provider-header-actions > .cherry-toggle,
+html[data-theme] .settings-content .cherry-provider-header-actions > .cherry-provider-header-divider {
+  display: none;
+}
+
+/* The provider directory is part of the page canvas, not another panel. Give
+   it a little more room for provider names while keeping its background flat. */
+html[data-theme] .settings-content .cherry-provider-catalog {
+  border: 0;
+  background: transparent;
+}
+
+@media (min-width: 701px) {
+  html[data-theme] .settings-content .cherry-model-services {
+    grid-template-columns: 244px minmax(0, 1fr);
+  }
+}
+
+/* Installed models expose a destructive action in the final column. Keep it
+   inside the shared settings scale and semantic light/dark color system. */
+html[data-theme] .settings-content .local-installed-model-list .quiet-model-row {
+  grid-template-columns: 30px minmax(0, 1fr) auto auto auto;
+}
+
+html[data-theme] .settings-content .local-installed-model-list .local-installed-remove {
+  min-height: 30px;
+  margin-left: 0;
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--rule));
+  color: var(--danger);
+  background: var(--surface);
+  font-size: calc(var(--settings-caption-size) * var(--settings-font-scale));
+  white-space: nowrap;
+}
+
+html[data-theme] .settings-content .local-installed-model-list .local-installed-remove:hover,
+html[data-theme] .settings-content .local-installed-model-list .local-installed-remove:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--rule));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, var(--surface));
+}
+
+html[data-theme] .settings-content .local-installed-model-list .local-installed-remove:disabled {
+  opacity: .55;
+}
+
+@media (max-width: 700px) {
+  html[data-theme] .settings-content .local-installed-model-list .quiet-model-row {
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+
+  html[data-theme] .settings-content .local-installed-model-list .quiet-row-note,
+  html[data-theme] .settings-content .local-installed-model-list .quiet-row-size {
+    display: none;
+  }
 }

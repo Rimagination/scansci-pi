@@ -41,6 +41,7 @@ interface RunStart extends JsonRecord {
   context_policy?: JsonRecord;
   mcp_servers?: JsonRecord[];
   disabled_tools?: string[];
+  images?: { url: string; detail?: string }[];
   background?: boolean;
 }
 
@@ -102,9 +103,26 @@ interface ActiveRun {
   modelTokenBudgetExceeded: boolean;
 }
 
-const PROVIDER_CONTEXT_WINDOW = 128_000;
-const PROVIDER_COMPACTION_RESERVE = 16_384;
-const PROVIDER_INPUT_LIMIT = PROVIDER_CONTEXT_WINDOW - PROVIDER_COMPACTION_RESERVE;
+	const PROVIDER_CONTEXT_WINDOW = 128_000;
+	const PROVIDER_COMPACTION_RESERVE = 16_384;
+
+	function modelContextWindow(modelId: string): number {
+	  const id = String(modelId || "").toLowerCase();
+	  if (id.includes("gemini")) return 1_048_576;
+	  if (id.includes("claude")) return 200_000;
+	  if (id.includes("gpt-4") || id.includes("gpt4") || id.includes("o1") || id.includes("o3") || id.includes("o4")) return 128_000;
+	  if (id.includes("deepseek")) return 128_000;
+	  if (id.includes("qwen")) return 128_000;
+	  if (id.includes("glm") || id.includes("chatglm")) return 128_000;
+	  if (id.includes("minicpm")) return 128_000;    // MiniCPM-V-4.6 has 262K; 128K is a safe floor
+	  if (id.includes("llama") || id.includes("phi") || id.includes("mistral") || id.includes("mixtral")) return 128_000;
+	  if (id.includes("gemma") || id.includes("smollm")) return 32_000;
+	  // Default to a generous floor.  Ollama / local models usually report
+	  // their real context via the model card, but we can't query it at
+	  // runtime.  128K is safe for most modern SLMs.
+	  return PROVIDER_CONTEXT_WINDOW;
+	}
+	const PROVIDER_INPUT_LIMIT = PROVIDER_CONTEXT_WINDOW - PROVIDER_COMPACTION_RESERVE;
 
 interface PendingTool {
   requestId: string;
@@ -118,6 +136,107 @@ interface PendingInteraction {
   kind: "ask_user" | "plan";
   resolve: (value: JsonRecord) => void;
   reject: (reason: Error) => void;
+}
+
+// ── Lifecycle Hooks ─────────────────────────────────────────────────
+// Pluggable governance hooks that run around tool calls and provider
+// requests.  Each hook receives the active run state, tool metadata,
+// and payload; it may throw to veto the call or return a modified
+// result.  Hooks are registered per-session and can be toggled by name.
+interface ToolHookContext {
+  toolName: string;
+  toolLabel: string;
+  arguments: JsonRecord;
+  activeRun: ActiveRun;
+  request: RunStart;
+}
+type ToolHook = (ctx: ToolHookContext) => Promise<void> | void;
+
+interface ToolResultContext extends ToolHookContext {
+  result: JsonRecord;
+  durationMs: number;
+  error?: Error;
+}
+type ToolResultHook = (ctx: ToolResultContext) => Promise<JsonRecord | void> | JsonRecord | void;
+
+interface ProviderRequestContext {
+  requestId: string;
+  providerKind: string;
+  baseUrl: string;
+  modelId: string;
+}
+type ProviderRequestHook = (ctx: ProviderRequestContext) => Promise<void> | void;
+
+interface LifecycleHooks {
+  before_tool_call: { name: string; fn: ToolHook }[];
+  after_tool_result: { name: string; fn: ToolResultHook }[];
+  before_provider_request: { name: string; fn: ProviderRequestHook }[];
+}
+
+function createHooks(): LifecycleHooks {
+  return {
+    before_tool_call: [],
+    after_tool_result: [],
+    before_provider_request: [],
+  };
+}
+
+function registerHook(hooks: LifecycleHooks, phase: keyof LifecycleHooks, name: string, fn: ToolHook | ToolResultHook | ProviderRequestHook): void {
+  (hooks[phase] as { name: string; fn: unknown }[]).push({ name, fn });
+}
+
+async function runHooks<T extends keyof LifecycleHooks>(
+  hooks: LifecycleHooks,
+  phase: T,
+  ctx: unknown,
+): Promise<void> {
+  for (const entry of hooks[phase]) {
+    try {
+      await (entry.fn as (...args: unknown[]) => unknown)(ctx);
+    } catch (error) {
+      emit({
+        type: "status.update",
+        status: "hook_rejected",
+        hook: entry.name,
+        error: errorText(error),
+      });
+      throw error;
+    }
+  }
+}
+
+// ── Default governance hooks ────────────────────────────────────────
+function defaultToolGuardHooks(): { name: string; fn: ToolHook }[] {
+  return [
+    {
+      name: "scansci-tool-budget-guard",
+      fn: (ctx: ToolHookContext) => {
+        if (ctx.activeRun.toolCallBudget >= 0 && ctx.activeRun.toolCalls >= ctx.activeRun.toolCallBudget) {
+          throw new Error(
+            `Tool-call budget exhausted (${ctx.activeRun.toolCalls}/${ctx.activeRun.toolCallBudget}).`,
+          );
+        }
+      },
+    },
+    {
+      name: "scansci-ask-user-guard",
+      fn: (ctx: ToolHookContext) => {
+        if (ctx.toolName !== "ask_user") return;
+        if (ctx.activeRun.askUserCount >= 1) {
+          throw new Error("Capability lease denied repeated AskUser in one turn.");
+        }
+        if (
+          ctx.activeRun.taskContract.riskLevel !== "high"
+          && ctx.activeRun.taskContract.allowedTools.size > 0
+          && ctx.activeRun.successfulToolCalls === 0
+        ) {
+          throw new Error(
+            "Capability lease denied AskUser before read-only discovery. Inspect available context first.",
+          );
+        }
+      },
+    },
+  ];
 }
 
 const pendingTools = new Map<string, PendingTool>();
@@ -277,7 +396,70 @@ function providerApi(
 
 function estimateTokenText(value: unknown): number {
   const text = String(value || "");
-  return text ? Math.ceil(text.length / 4) : 0;
+  if (!text) return 0;
+  // Fallback: chars / 4 for US-ASCII-heavy text.
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function estimateProviderInputTokens(value: unknown): number {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  if (!text) return 0;
+  // Tokeniser approximation without a native dep.
+  // Works by counting word-like runs and CJK characters, then applying a
+  // small per-token overhead.  Far more accurate than chars/4 for mixed
+  // Chinese/English/JSON input while still a safety ceiling, not UI billing.
+  let tokens = 0;
+  let pos = 0;
+  const len = text.length;
+  while (pos < len) {
+    const code = text.charCodeAt(pos);
+    // CJK Unified, Compatibility, and Supplement blocks
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) // CJK Unified
+      || (code >= 0x3400 && code <= 0x4dbf) // CJK Ext-A
+      || (code >= 0x20000 && code <= 0x2a6df) // CJK Ext-B
+      || (code >= 0xf900 && code <= 0xfaff) // CJK Compat
+      || (code >= 0x2f800 && code <= 0x2fa1f) // CJK Compat Sup
+    ) {
+      tokens += 1;
+      pos += 1;
+      continue;
+    }
+    if (code >= 0xac00 && code <= 0xd7af) { tokens += 1; pos += 1; continue; } // Hangul
+    // Whitespace sequence: skip (implicitly separates word runs)
+    if (code <= 0x20 || code === 0x7f || (code >= 0x2000 && code <= 0x200a) || code === 0x3000) {
+      pos += 1;
+      continue;
+    }
+    // ASCII letter / digit / common token chars: group into runs
+    if (
+      (code >= 0x30 && code <= 0x39) // digits
+      || (code >= 0x41 && code <= 0x5a) // A-Z
+      || (code >= 0x61 && code <= 0x7a) // a-z
+      || code === 0x2d // hyphen
+      || code === 0x5f // underscore
+    ) {
+      let run = 1;
+      while (pos + run < len) {
+        const nc = text.charCodeAt(pos + run);
+        if (
+          (nc >= 0x30 && nc <= 0x39)
+          || (nc >= 0x41 && nc <= 0x5a)
+          || (nc >= 0x61 && nc <= 0x7a)
+          || nc === 0x2d || nc === 0x5f
+        ) { run += 1; continue; }
+        break;
+      }
+      tokens += Math.ceil(run / 4);
+      pos += run;
+      continue;
+    }
+    // JSON syntax, punctuation, symbols: one token each
+    tokens += 1;
+    pos += 1;
+  }
+  // Safety floor for very short inputs
+  return Math.max(1, tokens);
 }
 
 const MAX_TOOL_RESULT_BYTES = 16_000;
@@ -287,20 +469,7 @@ const MAX_MCP_TOOLS_PER_SERVER = 32;
 const MAX_MCP_SCHEMA_BYTES = 12_000;
 const MAX_MCP_DESCRIPTION_CHARS = 800;
 const MCP_CONNECT_TIMEOUT_MS = 15_000;
-const MCP_CALL_TIMEOUT_MS = 120_000;
-
-function estimateProviderInputTokens(value: unknown): number {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  let ascii = 0;
-  let nonAscii = 0;
-  for (const char of text) {
-    if (char.charCodeAt(0) <= 0x7f) ascii += 1;
-    else nonAscii += 1;
-  }
-  // Conservative for Chinese and JSON/tool syntax. This is a safety fuse,
-  // not UI billing data.
-  return Math.ceil(ascii / 4) + nonAscii;
-}
+	const MCP_CALL_TIMEOUT_MS = 120_000;
 
 function jsonBytes(value: unknown): number {
   try {
@@ -883,7 +1052,37 @@ function bridgeTool(
     description,
     parameters,
     execute: async (_toolCallId, params) => {
-      const result = boundedToolPayload(name, await callPythonTool(name, params as JsonRecord));
+      const rawArgs = params as JsonRecord;
+      const isReadOnly = toolRisk(name) === "read_only";
+      // ── Read-only tool cache ──────────────────────────────────
+      if (isReadOnly) {
+        const cacheKey = `${name}:${stableHash(JSON.stringify(rawArgs))}`;
+        const activeRun = activeRunStorage.getStore();
+        if (activeRun) {
+          const cached = activeRun.idempotentResults.get(cacheKey);
+          if (cached) {
+            emit({
+              type: "status.update",
+              request_id: activeRun.requestId,
+              status: "tool_cache_hit",
+              name,
+            });
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify(cached) }],
+              details: cached,
+            };
+          }
+        }
+      }
+      const result = boundedToolPayload(name, await callPythonTool(name, rawArgs));
+      // Cache the result for read-only tools within this run
+      if (isReadOnly) {
+        const cacheKey = `${name}:${stableHash(JSON.stringify(rawArgs))}`;
+        const activeRun = activeRunStorage.getStore();
+        if (activeRun) {
+          activeRun.idempotentResults.set(cacheKey, result);
+        }
+      }
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
         details: result,
@@ -962,7 +1161,7 @@ function deferredMcpTools(
       });
       const transport = createMcpTransport(raw, request);
       if (!transport) throw new Error(`MCP server ${serverLabel} has no usable transport configuration`);
-      const next = new McpClient({ name: "scansci-pi", version: "0.2.0" }, { capabilities: {} });
+      const next = new McpClient({ name: "scansci-pi", version: "0.4.0" }, { capabilities: {} });
       try {
         await next.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
         const listed = await next.listTools({}, { timeout: MCP_CONNECT_TIMEOUT_MS });
@@ -1118,6 +1317,24 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
     if (exposed.length >= MAX_MCP_TOOLS) break;
     let serverId = safeToolSegment(raw.id || raw.name);
     if (raw.deferred === true) {
+      // ── v0.4 deferred axis ──────────────────────────────────────────
+      // Deferred MCP servers follow the v0.4 protocol contract:
+      //  - handshake: 0.4.0 (enforced by McpClient below)
+      //  - scope schema: v2 (cache payload uses schema_version 2)
+      //  - activation: lazy (connect on first search or call)
+      // Legacy eager servers (else branch) are NOT subject to these
+      // assertions; they retain backward compatibility with older MCP
+      // transport configurations and should not be broken by v0.4 gates.
+      // ─────────────────────────────────────────────────────────────────
+      if (raw.schema_version === 1) {
+        emit({
+          type: "status.update",
+          request_id: request.request_id,
+          status: "mcp_schema_migrated",
+          name: String(raw.name || raw.id || serverId),
+          details: { activation_mode: "deferred", schema_version: 1, notice: "v0.4 deferred axis requires scope schema v2; upgrading automatically." },
+        });
+      }
       if (exposed.length + 2 > MAX_MCP_TOOLS) {
         emit({
           type: "status.update",
@@ -1140,7 +1357,7 @@ async function externalMcpTools(request: RunStart): Promise<{ tools: ReturnType<
     }
     const transport = createMcpTransport(raw, request);
     if (!transport) continue;
-    const client = new McpClient({ name: "scansci-pi", version: "0.2.0" }, { capabilities: {} });
+    const client = new McpClient({ name: "scansci-pi", version: "0.4.0" }, { capabilities: {} });
     try {
       await client.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
       const listed = await client.listTools({}, { timeout: MCP_CONNECT_TIMEOUT_MS });
@@ -1315,6 +1532,44 @@ function tools(
       "Inspect ScanSci tools",
       "List the currently available ScanSci research capabilities.",
       Type.Object({}),
+    ),
+    bridgeTool(
+      "search_tools",
+      "Search available tools and skills",
+      "Search ScanSci's available tools, skills, and MCP connectors by keyword. Returns matching names, descriptions, and parameter schemas. Use this before calling an unfamiliar tool to verify it exists and understand its inputs.",
+      Type.Object({
+        query: Type.String({ description: "Keyword or capability description to search for" }),
+        kind: Type.Optional(Type.Union([
+          Type.Literal("tool"),
+          Type.Literal("skill"),
+          Type.Literal("mcp"),
+          Type.Literal("all"),
+        ])),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      }),
+    ),
+    bridgeTool(
+      "load_skill",
+      "Load a skill's full instructions",
+      "Load the complete SKILL.md instructions for a named ScanSci research skill. Use this when you need the full task specification of a skill that was mentioned in the catalog or found via search_tools, but whose details are not yet in context.",
+      Type.Object({
+        skill_id: Type.String({ description: "Skill identifier, e.g. 'literature-review' or 'nature-writing'" }),
+      }),
+    ),
+    bridgeTool(
+      "delegate_scientific_subagent",
+      "Delegate a scientific sub-agent",
+      "Spawn a focused scientific sub-agent with a specific role for parallel or specialised research work. Roles: literature_scout (paper discovery), fulltext_analyst (document extraction), evidence_auditor (gap/contradiction audit), synthesis_writer (evidence-backed synthesis). The sub-agent returns structured findings, evidence URIs, and uncertainties.",
+      Type.Object({
+        role: Type.Union([
+          Type.Literal("literature_scout"),
+          Type.Literal("fulltext_analyst"),
+          Type.Literal("evidence_auditor"),
+          Type.Literal("synthesis_writer"),
+        ]),
+        prompt: Type.String({ description: "The research question or task for the sub-agent" }),
+        context: Type.Optional(Type.String({ description: "Optional additional context (document identifiers, previous findings)" })),
+      }),
     ),
     bridgeTool(
       "read_task_documents",
@@ -1644,19 +1899,19 @@ function tools(
   const blocked = new Set(disabledTools.map(String));
   const enabledAvailable = available.filter((tool) => !blocked.has(tool.name));
   const namesByMode: Record<string, Set<string>> = {
-    knowledge: new Set(["inspect_workspace", "inspect_available_tools", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
-    research: new Set(["inspect_workspace", "inspect_available_tools", "search_web", "agent_reach", "browser_access", "discover_papers", "download_and_index", "summarize_documents", "check_task_completion", "verify_doi", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
+	    knowledge: new Set(["inspect_workspace", "inspect_available_tools", "search_tools", "load_skill", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
+	    research: new Set(["inspect_workspace", "inspect_available_tools", "search_tools", "load_skill", "delegate_scientific_subagent", "search_web", "agent_reach", "browser_access", "discover_papers", "download_and_index", "summarize_documents", "check_task_completion", "verify_doi", "search_local_evidence", "kb_search", "zotero_search", "zotero_status", "zotero_fulltext", "zotero_attachment", "zotero_export_bibtex", "zotero_citations", "obsidian_status", "obsidian_search", "obsidian_read", "obsidian_backlinks", "build_verified_answer", "self_assess"]),
     "workspace-status": new Set(["inspect_workspace"]),
     "zotero-status": new Set(["zotero_status"]),
     "zotero-search": new Set(["zotero_search"]),
-    "task-documents": new Set(["read_task_documents", "summarize_documents", "check_task_completion", "self_assess"]),
-    "web-auto": new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
-    web: new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "self_assess"]),
+	    "task-documents": new Set(["read_task_documents", "summarize_documents", "check_task_completion", "search_tools", "load_skill", "self_assess"]),
+	    "web-auto": new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "search_tools", "load_skill", "self_assess"]),
+	    web: new Set(["search_web", "agent_reach", "browser_access", "discover_papers", "verify_doi", "search_tools", "load_skill", "self_assess"]),
     // The verified-answer endpoint has one mandatory terminal action. Keeping
     // only this composite tool prevents small/text-only models from spending
     // their bounded generation window on an intermediate search and stopping.
     "verified-answer": new Set(["build_verified_answer"]),
-    slides: new Set(["inspect_workspace", "build_presentation_outline", "create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex", "edit_section", "edit_slide", "self_assess"]),
+	    slides: new Set(["inspect_workspace", "search_tools", "load_skill", "build_presentation_outline", "create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex", "edit_section", "edit_slide", "self_assess"]),
     benchmark: new Set(enabledAvailable.map((tool) => tool.name)),
   };
   const modeParts = new Set(String(taskMode || "general").split("+").filter(Boolean));
@@ -1800,7 +2055,7 @@ function systemPrompt(request: RunStart): string {
   const artifactRule = hasMode("slides")
     ? "This request also requires a real artifact. Call the matching create_* or compile_latex tool, use retrieved/document evidence as its content, and report only the verified file_path returned by the tool. An outline or filename invented in prose is not delivery."
     : "";
-  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Call ONE tool at a time. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
+  return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Call independent read-only tools in parallel when their inputs do not depend on each other. Chain calls serially when later steps require earlier results. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
 }
 
 function looksLikeDeferredAnswer(text: string): boolean {
@@ -1919,9 +2174,9 @@ async function createSession(
       id: request.model_id,
       name: request.model_id,
       reasoning: thinkingLevel(request.thinking_level) !== "off",
-      input: ["text"],
+	      input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: PROVIDER_CONTEXT_WINDOW,
+	      contextWindow: modelContextWindow(request.model_id),
       maxTokens: modelOutputBudget(String(request.task_mode || "general")),
       compat: modelCompat(request),
     }],
@@ -2219,7 +2474,20 @@ async function executeRun(request: RunStart, runState: ActiveRun): Promise<void>
         emit({ type: "status.update", request_id: request.request_id, status: "context_pruned", name: "stale_tool_results", details: cleanup });
       }
       try {
-        await state.session.prompt(request.prompt);
+        // Build the user prompt: if images are present, use structured
+        // multimodal content so vision-capable models receive both text
+        // and image blocks.  Providers that do not support image input
+        // should gracefully ignore or reject the blocks.
+        const userPrompt = Array.isArray(request.images) && request.images.length > 0
+          ? ([
+            { type: "text" as const, text: request.prompt },
+            ...request.images.map((img) => ({
+              type: "image_url" as const,
+              image_url: { url: img.url, detail: img.detail || "auto" },
+            })),
+          ])
+          : request.prompt;
+        await state.session.prompt(userPrompt);
       } catch (error) {
         if (runState.modelTokenBudgetExceeded) {
           throw new Error(

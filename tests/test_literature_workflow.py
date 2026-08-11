@@ -31,6 +31,26 @@ def test_cascade_reranker_trims_between_stages():
     assert ranked[0]["routes"] == ["cascade-stage-1", "cascade-stage-2"]
 
 
+def test_cascade_reranker_degrades_on_local_cuda_oom_without_failing_retrieval():
+    class FirstStage:
+        def rerank(self, query, candidates):
+            return list(candidates)
+
+    class ExhaustedAccelerator:
+        def rerank(self, query, candidates):
+            raise RuntimeError("CUDA error: out of memory")
+
+    ranked = CascadeReranker(
+        [(FirstStage(), 2), (ExhaustedAccelerator(), None)]
+    ).rerank(
+        "光伏生态影响",
+        [{"evidence_id": "a"}, {"evidence_id": "b"}],
+    )
+
+    assert [hit["evidence_id"] for hit in ranked] == ["a", "b"]
+    assert all("reranker-fallback" in hit["routes"] for hit in ranked)
+
+
 def test_onefind_bge_profile_uses_bge_m3_stack():
     profile = workflow_profile("onefind-bge")
 

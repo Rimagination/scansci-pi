@@ -53,8 +53,10 @@ _LOCAL_PRODUCT_STATUS = re.compile(
 )
 _PRESENTATION = re.compile(r"(?:ppt|幻灯片|演示文稿|汇报(?:材料|幻灯片)?|presentation\s*(?:deck)?|slides?)", re.IGNORECASE)
 _LOCAL_EVIDENCE = re.compile(
+    r"(?:\u77e5\u8bc6\u5e93|\u6587\u732e\u5e93|\u8d44\u6599\u5e93|\u672c\u5730\u6587\u732e|\u539f\u6587\u8bc1\u636e|\u9010\u53e5\u5f15\u7528|"
+    r"\u5f53\u524d\u9009\u62e9.{0,12}(?:\u6587\u732e|\u8d44\u6599|\u77e5\u8bc6\u5e93)|\u57fa\u4e8e\u5f53\u524d\u9009\u62e9.{0,12}(?:\u6587\u732e|\u8d44\u6599|\u77e5\u8bc6\u5e93)|"
     r"(?:知识库|资料库|本地资料|本地文献|我的文献|原文证据|逐句引用|"
-    r"local\s+(?:knowledge|library)|my\s+(?:library|papers?))",
+    r"local\s+(?:knowledge|library)|my\s+(?:library|papers?)))",
     re.IGNORECASE,
 )
 _LONG_FORM_WRITING = re.compile(
@@ -65,6 +67,19 @@ _LONG_FORM_WRITING = re.compile(
 _EVIDENCE_REVIEW = re.compile(
     r"(?:证据综述|基于(?:原文)?证据.{0,20}(?:综述|回顾)|"
     r"(?:逐句|逐条)引用.{0,24}(?:综述|回顾)|notebooklm(?:式|风格)?(?:综述|回顾)?)",
+    re.IGNORECASE,
+)
+_LOCAL_EVIDENCE_CJK = re.compile(
+    "(?:\u77e5\u8bc6\u5e93|\u6587\u732e\u5e93|\u8d44\u6599\u5e93|\u672c\u5730\u6587\u732e|\u539f\u6587\u8bc1\u636e|\u9010\u53e5\u5f15\u7528|"
+    "\u5f53\u524d\u9009\u62e9.{0,12}(?:\u6587\u732e|\u8d44\u6599|\u77e5\u8bc6\u5e93)|\u57fa\u4e8e\u5f53\u524d\u9009\u62e9.{0,12}(?:\u6587\u732e|\u8d44\u6599|\u77e5\u8bc6\u5e93))",
+    re.IGNORECASE,
+)
+_LONG_FORM_WRITING_CJK = re.compile(
+    "(?:\u5199\u4e00\u4efd|\u7ed3\u6784\u5316\u7efc\u8ff0|\u7efc\u8ff0\u521d\u7a3f).{0,20}(?:\u7efc\u8ff0|\u6587\u732e\u56de\u987e|\u8bba\u6587\u521d\u7a3f|\u7814\u7a76\u62a5\u544a)",
+    re.IGNORECASE,
+)
+_EVIDENCE_REVIEW_CJK = re.compile(
+    "(?:\u8bc1\u636e\u7efc\u8ff0|\u57fa\u4e8e(?:\u539f\u6587)?\u8bc1\u636e.{0,20}(?:\u7efc\u8ff0|\u56de\u987e))",
     re.IGNORECASE,
 )
 _SKILL_HELP = re.compile(
@@ -164,8 +179,19 @@ def route_freeform_task(
     # A user explicitly asking for their local evidence gets a durable,
     # citable evidence task.  Without an active usable library, keep the
     # request in general chat rather than presenting an artificial gate.
-    if has_knowledge and (_EVIDENCE_REVIEW.search(request) or _LOCAL_EVIDENCE.search(request)):
-        if _EVIDENCE_REVIEW.search(request) or _LONG_FORM_WRITING.search(request):
+    local_evidence_request = bool(
+        _EVIDENCE_REVIEW.search(request)
+        or _LOCAL_EVIDENCE.search(request)
+        or _EVIDENCE_REVIEW_CJK.search(request)
+        or _LOCAL_EVIDENCE_CJK.search(request)
+    )
+    if has_knowledge and local_evidence_request:
+        if (
+            _EVIDENCE_REVIEW.search(request)
+            or _LONG_FORM_WRITING.search(request)
+            or _EVIDENCE_REVIEW_CJK.search(request)
+            or _LONG_FORM_WRITING_CJK.search(request)
+        ):
             return FreeformTaskRoute(
                 route="durable_run",
                 workflow_type="literature_review",

@@ -453,7 +453,40 @@ class CascadeReranker:
     def rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         current = list(candidates)
         for stage_index, (reranker, keep_top) in enumerate(self.stages, start=1):
-            current = reranker.rerank(query, current)
+            try:
+                current = reranker.rerank(query, current)
+            except Exception as error:
+                # Retrieval is a serving path: an exhausted local accelerator
+                # must not turn a grounded answer/review into a failed run.
+                # Keep the already-ranked bounded candidate set and make the
+                # degradation explicit in routes.  Other programming/config
+                # errors still propagate so they cannot be hidden as a quality
+                # fallback.
+                message = str(error).casefold()
+                recoverable = any(
+                    marker in message
+                    for marker in (
+                        "cuda error",
+                        "out of memory",
+                        "cuda out of memory",
+                        "cudamemoryerror",
+                        "acceleratorerror",
+                    )
+                )
+                if not recoverable:
+                    raise
+                for hit in current:
+                    routes = [str(route) for route in hit.get("routes", []) or []]
+                    if "reranker-fallback" not in routes:
+                        routes.append("reranker-fallback")
+                    hit["routes"] = routes
+                try:
+                    torch = importlib.import_module("torch")
+                    cuda = getattr(torch, "cuda", None)
+                    if cuda is not None and bool(cuda.is_available()):
+                        cuda.empty_cache()
+                except Exception:
+                    pass
             for hit in current:
                 routes = [str(route) for route in hit.get("routes", []) or []]
                 route_name = f"cascade-stage-{stage_index}"

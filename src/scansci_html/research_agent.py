@@ -3104,6 +3104,7 @@ class ResearchAgentRuntime:
         *,
         messages: list[dict[str, Any]] | None = None,
         run: dict[str, Any] | None = None,
+        selected_knowledge: bool = False,
     ) -> str:
         final_user_text = cls._last_user_text(messages)
         # Knowledge-library mentions are labels, not actions.  A library named
@@ -3124,6 +3125,22 @@ class ResearchAgentRuntime:
                 re.IGNORECASE,
             )
         )
+        # The UI already carries the selected notebook in the request.  Do
+        # not force users to repeat the label "knowledge base" in their text:
+        # a request such as "基于当前选择的光伏生态文献找证据" must stay on
+        # the local evidence route.  Keep ordinary greetings/free-form chat
+        # direct by requiring a retrieval/analysis cue as well.
+        selected_knowledge_query = bool(
+            selected_knowledge
+            and re.search(
+                r"证据|文献|资料|研究|检索|搜索|找出|查找|依据|基于|影响|机制|多样性|水分|微气候|综述|分析|evidence|paper|document|literature|search|review",
+                final_user_text,
+                re.IGNORECASE,
+            )
+        )
+        if selected_knowledge_query:
+            explicit_knowledge_source = True
+            explicit_knowledge_intent = True
         acquisition_text = re.sub(
             r"(?:可下载的?|downloadable)\s*(?:pptx?|powerpoint|slides?|幻灯片|演示文稿)",
             "",
@@ -3988,6 +4005,11 @@ class ResearchAgentRuntime:
                 chat_request.chat_mode,
                 "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
                 messages=chat_request.messages,
+                selected_knowledge=bool(
+                    chat_request.notebook_id
+                    or chat_request.notebook_ids
+                    or chat_request.knowledge_scope
+                ),
             )
         )
         user_text = self._last_user_text(chat_request.messages)
@@ -4261,6 +4283,11 @@ class ResearchAgentRuntime:
             chat_request.chat_mode,
             messages=chat_request.messages,
             run=run,
+            selected_knowledge=bool(
+                chat_request.notebook_id
+                or chat_request.notebook_ids
+                or chat_request.knowledge_scope
+            ),
         )
         user_text = self._last_user_text(chat_request.messages)
         task_contract = self._compile_contract(
@@ -4762,6 +4789,11 @@ class ResearchAgentRuntime:
                     chat_request.chat_mode,
                     "on" if _selected_skill_requires_web(chat_request.selected_skills) else web_search_mode,
                     messages=chat_request.messages,
+                    selected_knowledge=bool(
+                        chat_request.notebook_id
+                        or chat_request.notebook_ids
+                        or chat_request.knowledge_scope
+                    ),
                 )
             )
             user_text = self._last_user_text(chat_request.messages)
@@ -5702,7 +5734,10 @@ class ResearchAgentRuntime:
         return marker_pattern.sub(replace_marker, normalized)
 
     @staticmethod
-    def _verified_evidence_fallback(citations: list[dict[str, Any]]) -> str:
+    def _verified_evidence_fallback(
+        citations: list[dict[str, Any]],
+        question: str = "",
+    ) -> str:
         """Retain every checked source when the prose-writing pass is unavailable.
 
         A failed writing provider must not quietly turn a 12-source retrieval
@@ -5712,8 +5747,31 @@ class ResearchAgentRuntime:
         exact source span.
         """
 
+        selected_citations = list(citations)
+        # When a Chinese request falls back to source excerpts (for example
+        # when the configured writing provider returns HTTP 402), prefer
+        # Chinese excerpts if the verified package contains them.  Returning
+        # unrelated English snippets is technically source-grounded but makes
+        # the UI look like the answer was not completed.  If no Chinese source
+        # exists we keep the full package and let the scope note be honest.
+        question_text = str(question or "")
+        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", question_text):
+            chinese_citations = [
+                citation
+                for citation in selected_citations
+                if re.search(
+                    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]",
+                    " ".join(
+                        str(citation.get(field, ""))
+                        for field in ("paper", "section", "claim_target", "exact_quote")
+                    ),
+                )
+            ]
+            if chinese_citations:
+                selected_citations = chinese_citations
+
         entries: list[str] = []
-        for citation in citations:
+        for citation in selected_citations:
             citation_id = str(citation.get("citation_id", "")).strip()
             quote = " ".join(str(citation.get("exact_quote", "")).split())
             if not citation_id or not quote:
@@ -5905,7 +5963,7 @@ class ResearchAgentRuntime:
 
         if not text:
             text = (
-                self._verified_evidence_fallback(citations)
+                self._verified_evidence_fallback(citations, question)
                 or fallback_text
                 or "当前资料不足以生成带原文脚标的文章草稿。请缩小主题或补充可检索资料。"
             )
@@ -7381,7 +7439,14 @@ class ResearchAgentRuntime:
             elif workflow_type == "literature_review" and str(stage.get("key", "")) == "research":
                 notebook = self._notebook(str(run["notebook_id"]))
                 evidence_db = self._evidence_db_for_notebook(notebook)
-                local_evidence = self._local_evidence_stack(evidence_db)
+                # Literature review runs in the desktop/web process.  Do not
+                # import a heavyweight CUDA embedding/reranker stack here:
+                # native accelerator OOMs can terminate the host before Python
+                # gets a chance to downgrade.  The task-scoped full-text
+                # stack is deliberately hashing+lexical, bounded, and still
+                # retrieves from the selected notebook's real evidence spans.
+                # Generation remains on the configured writing model.
+                local_evidence = self._task_fulltext_evidence_stack()
                 output = retrieve_review_evidence(
                     evidence_db,
                     str(payload["question"]),

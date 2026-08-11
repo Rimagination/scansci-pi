@@ -73,6 +73,14 @@ def test_workspace_registers_notebook_sources_notes_and_layers(tmp_path: Path):
     assert notebook_summary["layers"][0]["sources"][0]["evidence_count"] == 1
 
 
+def test_workspace_summary_exposes_application_default_directory(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+
+    summary = load_workspace_summary(workspace)
+
+    assert summary["workspace_directory"] == str(workspace.parent.resolve())
+
+
 def test_workspace_syncs_citation_records_from_annotation_layers(tmp_path: Path):
     evidence_db = _build_store(tmp_path)
     layer_db = tmp_path / "annotation_layers.sqlite"

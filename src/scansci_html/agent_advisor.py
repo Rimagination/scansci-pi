@@ -72,6 +72,15 @@ def review_research_run(run: dict[str, Any]) -> dict[str, Any]:
         for item in list(run.get("tool_calls", []) or [])
         if isinstance(item, dict) and str(item.get("status", "")) == "completed"
     }
+    # Background UI runs persist the evidence pipeline as one durable host
+    # call (for example ``scansci.evidence.ask``/``scansci.review.write``),
+    # while the interactive path exposes the internal trace tools
+    # ``search_local_evidence`` and ``build_verified_answer``.  Once the
+    # artifact itself contains verified, navigable evidence links, treat those
+    # internal stages as completed too.  Without this projection every
+    # successful background evidence task is incorrectly labelled
+    # ``needs_review`` even though its artifact passed citation verification.
+    completed_tools.update(_artifact_completed_tools(artifact))
     findings: list[dict[str, str]] = []
     if str(run.get("status", "")) != "completed":
         findings.append({"code": "run_not_completed", "severity": "high", "message": "任务未处于已完成状态。"})
@@ -115,6 +124,26 @@ def review_research_run(run: dict[str, Any]) -> dict[str, Any]:
         "metrics": run_metrics(run),
         "recommended_next_action": _next_action(findings),
     }
+
+
+def _artifact_completed_tools(artifact: dict[str, Any]) -> set[str]:
+    """Project durable evidence artifacts onto their contract tool stages."""
+
+    artifact_type = str(artifact.get("artifact_type", "")).strip().casefold()
+    if artifact_type not in {"evidence_answer", "literature_review", "review"}:
+        return set()
+    evidence_links = [
+        item for item in list(artifact.get("evidence_links", []) or []) if isinstance(item, dict)
+    ]
+    if not evidence_links:
+        return set()
+    payload = dict(artifact.get("payload", {}) or {})
+    verification = dict(payload.get("citation_verification", {}) or {})
+    # A non-empty link list is already the persisted source-navigation gate;
+    # honour an explicit failed verification and leave the contract unmet.
+    if verification and verification.get("passed") is False:
+        return set()
+    return {"search_local_evidence", "build_verified_answer"}
 
 
 def _stage_ratio(run: dict[str, Any]) -> float:

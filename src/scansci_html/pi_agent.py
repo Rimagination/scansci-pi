@@ -8,6 +8,7 @@ receives shell or arbitrary filesystem tools.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -929,6 +930,7 @@ class PiAgentClient:
         self._tool_history: list[dict[str, Any]] = []
         self._run_lock = threading.Lock()
         self._cancel_requested = threading.Event()
+        self._tool_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scansci-tool-")
         self._active_request_id = ""
         self._active_session_id = ""
         self._provider_key_fingerprint = ""
@@ -1123,14 +1125,43 @@ class PiAgentClient:
         messages, context_report = prune_stale_tool_results(messages)
         system_parts: list[str] = []
         conversation: list[str] = []
+        collected_images: list[dict[str, str]] = []
         for item in messages:
             role = str(item.get("role", "user")).strip().lower()
             content = item.get("content", "")
             if not isinstance(content, str):
                 if role in {"tool", "toolresult", "tool_result"}:
                     content = json.dumps(content, ensure_ascii=False, default=str)
+                elif isinstance(content, (list, tuple)):
+                    # Multimodal content blocks: extract text and image URLs
+                    text_parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = str(block.get("type", "")).lower()
+                        if block_type == "text" and isinstance(block.get("text"), str):
+                            text_parts.append(str(block["text"]))
+                        elif block_type == "image_url":
+                            image_url = block.get("image_url", {})
+                            if isinstance(image_url, dict):
+                                url = str(image_url.get("url", ""))
+                                if url:
+                                    collected_images.append({
+                                        "url": url,
+                                        "detail": str(image_url.get("detail", "auto")),
+                                    })
+                        elif block_type == "image" and isinstance(block.get("source"), dict):
+                            src = block["source"]
+                            b64 = str(src.get("data", "") or src.get("base64", "") or "")
+                            media_type = str(src.get("media_type", "image/png"))
+                            if b64:
+                                collected_images.append({
+                                    "url": f"data:{media_type};base64,{b64}",
+                                    "detail": "auto",
+                                })
+                    content = " ".join(text_parts) if text_parts else "(image-only message)"
                 else:
-                    raise ValueError("Pi text bridge does not accept image message blocks")
+                    content = str(content)
             if role == "system":
                 system_parts.append(content)
             else:
@@ -1212,6 +1243,7 @@ class PiAgentClient:
             "mcp_servers": self._enabled_mcp_servers(),
             "disabled_tools": self._disabled_artifact_tools(),
             "task_contract": effective_contract,
+            "images": collected_images if collected_images else None,
             "prefix_shape": prefix_shape,
             "context_policy": context_report.to_dict(),
         }
@@ -1378,75 +1410,114 @@ class PiAgentClient:
                 if event_request_id and event_request_id != request_id:
                     continue
                 if event_type == "tool.call":
-                    call_id = str(event.get("call_id", ""))
-                    name = str(event.get("name", ""))
-                    arguments = dict(event.get("arguments", {}) or {})
-                    try:
-                        if self._cancel_requested.is_set():
-                            raise InterruptedError("Pi tool execution was cancelled before it started")
-                        result = self._execute_tool(name, arguments)
-                        if self._cancel_requested.is_set():
-                            raise InterruptedError("Pi tool execution was cancelled")
-                        # L1: auto-retry empty searches with a broadened query.
-                        # If the first pass returns zero hits, the query is
-                        # likely too narrow; a widened retry costs one extra
-                        # API round-trip but often prevents the model from
-                        # giving up or hallucinating.
-                        retried = _retry_empty_search(name, arguments, result, executor=self._execute_tool)
-                        if retried is not None:
-                            result = retried
-                        safe_result = _redact_tool_value(_json_safe(result))
-                        model_result, result_meta = _bounded_tool_result_for_model(name, safe_result)
-                        if result_meta["persist_full"]:
-                            result_reference, persisted_bytes = self._persist_tool_result(
-                                name,
-                                safe_result if isinstance(safe_result, dict) else {"result": safe_result},
-                            )
-                            model_result["_full_result_reference"] = result_reference
-                            model_result["_persisted_bytes"] = persisted_bytes
-                        # Record for self_assess introspection.
-                        self._tool_history.append({
-                            "name": name,
-                            "status": "ok",
-                            "result_summary": _summarize_tool_result(name, model_result),
-                        })
-                        response = {
+                    # ── Parallel tool dispatch ──────────────────────────
+                    # Collect consecutive tool.call events (the Pi SDK emits
+                    # them in a burst when the model requests parallel calls)
+                    # and dispatch independent ones concurrently.
+                    def _parse_tool(evt: dict[str, Any]) -> dict[str, Any]:
+                        return {
+                            "call_id": str(evt.get("call_id", "")),
+                            "name": str(evt.get("name", "")),
+                            "arguments": dict(evt.get("arguments", {}) or {}),
+                        }
+                    def _execute_one(item: dict[str, Any]) -> dict[str, Any]:
+                        name = item["name"]
+                        arguments = item["arguments"]
+                        try:
+                            if self._cancel_requested.is_set():
+                                raise InterruptedError("Pi tool execution was cancelled")
+                            result = self._execute_tool(name, arguments)
+                            if self._cancel_requested.is_set():
+                                raise InterruptedError("Pi tool execution was cancelled")
+                            retried = _retry_empty_search(name, arguments, result, executor=self._execute_tool)
+                            if retried is not None:
+                                result = retried
+                            safe_result = _redact_tool_value(_json_safe(result))
+                            model_result, result_meta = _bounded_tool_result_for_model(name, safe_result)
+                            if result_meta["persist_full"]:
+                                result_reference, persisted_bytes = self._persist_tool_result(
+                                    name,
+                                    safe_result if isinstance(safe_result, dict) else {"result": safe_result},
+                                )
+                                model_result["_full_result_reference"] = result_reference
+                                model_result["_persisted_bytes"] = persisted_bytes
+                            return {
+                                "call_id": item["call_id"],
+                                "name": name,
+                                "ok": True,
+                                "result": model_result,
+                                "event": {
+                                    "type": "tool.completed",
+                                    "name": name,
+                                    "result": model_result,
+                                    "result_bytes": result_meta["original_bytes"],
+                                    "model_result_bytes": result_meta["model_bytes"],
+                                    "result_truncated": result_meta["truncated"],
+                                },
+                                "summary": _summarize_tool_result(name, model_result),
+                            }
+                        except Exception as error:
+                            public_error = str(_redact_tool_value(str(error)))[:500]
+                            return {
+                                "call_id": item["call_id"],
+                                "name": name,
+                                "ok": False,
+                                "error": f"{type(error).__name__}: {public_error}",
+                                "event": {"type": "tool.failed", "name": name, "error": public_error},
+                                "summary": public_error[:200],
+                            }
+                    batch = [_parse_tool(event)]
+                    # Drain any immediately available follow-up tool.call events
+                    buffered: dict[str, Any] | None = None
+                    while True:
+                        try:
+                            lookahead_line = self._output.get(timeout=0.05)
+                        except Empty:
+                            break
+                        if lookahead_line is None:
+                            break
+                        try:
+                            la_event = json.loads(lookahead_line)
+                        except json.JSONDecodeError:
+                            self._errors.append(lookahead_line.rstrip())
+                            continue
+                        if str(la_event.get("type", "")) != "tool.call":
+                            buffered = la_event
+                            break
+                        if str(la_event.get("request_id", "")) != request_id:
+                            continue
+                        batch.append(_parse_tool(la_event))
+                    # Execute: single tool runs inline, multiples run concurrently
+                    batch_outcomes: list[dict[str, Any]] = []
+                    if len(batch) == 1:
+                        batch_outcomes = [_execute_one(batch[0])]
+                    else:
+                        futures = {
+                            self._tool_executor.submit(_execute_one, item): item
+                            for item in batch
+                        }
+                        for future in as_completed(futures):
+                            batch_outcomes.append(future.result())
+                    for outcome in batch_outcomes:
+                        self._write({
                             "type": "tool.result",
-                            "call_id": call_id,
-                            "ok": True,
-                            "result": model_result,
-                        }
-                        yield {
-                            "type": "tool.completed",
-                            "name": name,
-                            "result": model_result,
-                            "result_bytes": result_meta["original_bytes"],
-                            "model_result_bytes": result_meta["model_bytes"],
-                            "result_truncated": result_meta["truncated"],
-                        }
-                        if name == "build_verified_answer" and task_mode == "verified-answer":
-                            terminal_tool_completed = name
-                    except Exception as error:  # noqa: BLE001 - error is returned to the model as tool output
-                        public_error = str(_redact_tool_value(str(error)))[:500]
-                        self._tool_history.append({
-                            "name": name,
-                            "status": "failed",
-                            "error": public_error[:200],
+                            "call_id": outcome["call_id"],
+                            "ok": outcome["ok"],
+                            "result": outcome.get("result"),
+                            "error": outcome.get("error"),
                         })
-                        response = {
-                            "type": "tool.result",
-                            "call_id": call_id,
-                            "ok": False,
-                            "error": f"{type(error).__name__}: {public_error}",
-                        }
-                        yield {"type": "tool.failed", "name": name, "error": public_error}
-                    self._write(response)
+                        yield outcome["event"]
+                        self._tool_history.append({
+                            "name": outcome["name"],
+                            "status": "ok" if outcome["ok"] else "failed",
+                            "result_summary": outcome.get("summary", ""),
+                        })
+                        if outcome["name"] == "build_verified_answer" and task_mode == "verified-answer":
+                            terminal_tool_completed = outcome["name"]
+                    if buffered is not None:
+                        event = buffered
+                        continue
                     if terminal_tool_completed:
-                        # This composite tool is the evidence endpoint's final
-                        # product, not intermediate context for another model
-                        # generation. Abort only the SDK's automatic follow-up
-                        # turn after the successful tool result has been
-                        # persisted; report the run as successfully completed.
                         self._write({"type": "run.cancel", "request_id": request_id})
                     continue
                 if event_type == "session.ready":
@@ -2845,6 +2916,140 @@ class PiAgentClient:
                 [path for path in self.evidence_dbs if path.is_file()]
             )
             return snapshot
+        if name == "search_tools":
+            query = str(arguments.get("query", "")).strip().lower()
+            kind = str(arguments.get("kind", "all")).lower()
+            limit = _bounded_limit(arguments.get("limit"), default=10)
+            snapshot = capability_snapshot(workspace=self.workspace, evidence_db=self.evidence_db)
+            results: list[dict[str, Any]] = []
+            # Collect searchable entries: built-in capabilities + pi high-level tools
+            for cap in list(snapshot.get("capabilities", []) or []):
+                if not isinstance(cap, dict):
+                    continue
+                cap_id = str(cap.get("id", "")).lower()
+                cap_desc = str(cap.get("description", "")).lower()
+                cap_label = str(cap.get("label", "")).lower()
+                if kind not in ("tool", "all"):
+                    continue
+                if query and query not in cap_id and query not in cap_desc and query not in cap_label:
+                    continue
+                results.append({"id": cap.get("id", ""), "kind": "tool", "label": cap.get("label", ""), "description": cap.get("description", ""), "status": cap.get("status", "ready")})
+            for hi in list(snapshot.get("pi_high_level_tools", []) or []):
+                if not isinstance(hi, dict):
+                    continue
+                hi_id = str(hi.get("id", "")).lower()
+                hi_desc = str(hi.get("description", "")).lower()
+                if kind not in ("tool", "all"):
+                    continue
+                if query and query not in hi_id and query not in hi_desc:
+                    continue
+                if any(r.get("id") == hi.get("id") for r in results):
+                    continue
+                results.append({"id": hi.get("id", ""), "kind": "tool", "label": hi.get("id", ""), "description": hi.get("description", ""), "status": hi.get("status", "ready")})
+            # Available skills
+            if kind in ("skill", "all"):
+                from .skill_runtime import RESEARCH_SKILL_IDS
+                for sid in sorted(RESEARCH_SKILL_IDS):
+                    if query and query not in sid.lower():
+                        continue
+                    results.append({"id": sid, "kind": "skill", "label": sid, "description": f"Research skill: {sid}", "status": "available"})
+            # Available MCP servers
+            if kind in ("mcp", "all"):
+                for srv in list(snapshot.get("mcp_servers", []) or []):
+                    if not isinstance(srv, dict):
+                        continue
+                    srv_id = str(srv.get("id", "")).lower()
+                    srv_desc = str(srv.get("description", "")).lower()
+                    if query and query not in srv_id and query not in srv_desc:
+                        continue
+                    results.append({"id": srv.get("id", ""), "kind": "mcp", "label": srv.get("name", srv.get("id", "")), "description": srv.get("description", ""), "status": "enabled" if srv.get("enabled") else "disabled"})
+            results = results[:limit]
+            return {"query": query, "kind": kind, "count": len(results), "results": results}
+        if name == "load_skill":
+            skill_id = str(arguments.get("skill_id", "")).strip()
+            if not skill_id:
+                raise ValueError("load_skill requires a non-empty skill_id")
+            from .skill_manager import installed_skills
+            records = [item for item in installed_skills(self.workspace) if item.get("available") and item.get("enabled", True)]
+            by_id = {str(item.get("id", "")).lower(): item for item in records if item.get("id")}
+            match = by_id.get(skill_id.lower())
+            if match is None:
+                return {"skill_id": skill_id, "loaded": False, "error": f"Skill not found or not enabled: {skill_id}", "available_ids": sorted(by_id.keys())}
+            skill_file = Path(str(match.get("skill_file", "")))
+            if not skill_file.is_file():
+                return {"skill_id": skill_id, "loaded": False, "error": f"Skill file missing: {skill_file}"}
+            try:
+                instructions = skill_file.read_text(encoding="utf-8-sig", errors="replace")
+                # Truncate to a generous limit for tool-result context
+                max_chars = 16_000
+                if len(instructions) > max_chars:
+                    instructions = instructions[:max_chars] + f"\n\n[... truncated at {max_chars} chars; use a more specific skill or query for full details]"
+            except OSError as exc:
+                return {"skill_id": skill_id, "loaded": False, "error": str(exc)}
+            return {
+                "skill_id": skill_id,
+                "loaded": True,
+                "name": str(match.get("name", skill_id)),
+                "source": str(match.get("source", "")),
+                "instructions": instructions,
+                "instruction_chars": len(instructions),
+            }
+        if name == "delegate_scientific_subagent":
+            role = str(arguments.get("role", "")).strip()
+            prompt = str(arguments.get("prompt", "")).strip()
+            context = str(arguments.get("context", "")).strip()
+            if not role or not prompt:
+                raise ValueError("delegate_scientific_subagent requires role and prompt")
+            from .research_subagents import SCIENTIFIC_ROLES, structured_output_schema, validate_subagent_result
+            import asyncio
+            role_def = SCIENTIFIC_ROLES.get(role)
+            if role_def is None:
+                available = sorted(SCIENTIFIC_ROLES.keys())
+                return {"role": role, "success": False, "error": f"Unknown role: {role}", "available_roles": available}
+            # Build a constrained system prompt for the sub-agent
+            sub_system = (
+                f"You are the {role_def.label} ({role_def.role_id}) — a focused ScanSci scientific sub-agent.\n\n"
+                f"Objective: {role_def.objective}\n"
+                f"Output contract: {role_def.output_contract}\n"
+                f"You have a bounded tool budget and must return structured JSON conforming to the output schema.\n\n"
+                f"Parent task context: {context}" if context else f"Parent task context: (none)"
+            )
+            # Use the main Pi client with restricted tools and budget
+            sub_contract_raw = {
+                "goal": prompt,
+                "output_format": "structured_json",
+                "constraints": [f"Only use tools from: {', '.join(role_def.allowed_capabilities)}"],
+                "allowed_tools": list(role_def.allowed_capabilities),
+                "required_evidence": [],
+                "pause_policy": "never",
+                "autonomy": "full",
+                "risk_level": "low",
+                "success_criteria": [role_def.output_contract],
+                "initial_tool_budget": 6,
+                "max_tool_budget": 12,
+                "model_token_budget": 24_000,
+                "max_model_token_budget": 48_000,
+            }
+            # For now, return structured handoff instructing the parent model how to proceed.
+            # Full sub-agent process spawning requires the durable run infrastructure which
+            # is not directly callable from the Pi bridge. This tool provides the role
+            # contract and delegates execution to the parent model within its Pi session.
+            schema = structured_output_schema(role_def)
+            return {
+                "role": role,
+                "label": role_def.label,
+                "task_mode": role_def.task_mode,
+                "allowed_capabilities": list(role_def.allowed_capabilities),
+                "output_contract": role_def.output_contract,
+                "output_schema": schema,
+                "subagent_contract": sub_contract_raw,
+                "instruction": (
+                    f"Execute this sub-agent task within your current session using only the allowed capabilities: "
+                    f"{', '.join(role_def.allowed_capabilities)}. "
+                    f"Return results in the specified output schema format. "
+                    f"Task: {prompt}"
+                ),
+            }
         if name == "read_task_documents":
             return self._read_task_documents(arguments)
         if name == "download_and_index":
