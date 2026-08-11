@@ -22,6 +22,7 @@ import requests
 import shutil
 import subprocess
 import sys
+from tempfile import NamedTemporaryFile
 import threading
 import time
 from typing import Any, Callable
@@ -3555,12 +3556,26 @@ class PiAgentClient:
 
     def _save_session_registry(self, registry: dict[str, str]) -> None:
         path = self._registry_path()
-        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         with _SESSION_REGISTRY_LOCK:
             latest = self._load_session_registry_unlocked()
             latest.update(registry)
-            temporary.write_text(json.dumps(latest, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, path)
+            temporary: Path | None = None
+            try:
+                with NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    prefix=".",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temporary = Path(handle.name)
+                    handle.write(json.dumps(latest, ensure_ascii=False, indent=2))
+                assert temporary is not None
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def _load_session_registry_unlocked(self) -> dict[str, str]:
         try:

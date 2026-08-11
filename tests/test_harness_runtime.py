@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 from pathlib import Path
+import threading
 
 import pytest
 
+import scansci_html.run_manifest as run_manifest_module
 from scansci_html.harness_adapters import (
     OptionalHarnessUnavailable,
     build_openai_agents_agent,
@@ -17,10 +20,19 @@ from scansci_html.pi_agent import PiAgentClient
 
 
 VERIFY_SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_pi_capabilities.py"
+FRONTEND_VERIFY_SCRIPT = Path(__file__).parents[1] / "scripts" / "verify_scansci_frontend.py"
 
 
 def _load_verifier():
     spec = importlib.util.spec_from_file_location("scansci_verify_pi_capabilities", VERIFY_SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_frontend_verifier():
+    spec = importlib.util.spec_from_file_location("scansci_verify_frontend", FRONTEND_VERIFY_SCRIPT)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -60,6 +72,7 @@ def _write_complete_pi_junit(path: Path) -> Path:
 
 
 def test_run_manifest_is_durable_and_redacted(tmp_path):
+    full_tool_lease = [f"tool_{index:02d}" for index in range(60)]
     manifest = RunManifest.start(
         tmp_path / "workspace.sqlite",
         harness="pi",
@@ -69,6 +82,21 @@ def test_run_manifest_is_durable_and_redacted(tmp_path):
         session_id="session-1",
         prompt="do not persist this prompt",
         tool_set=["search_local_evidence"],
+        task_contract={
+            "schema_version": "scansci.task-contract.v2",
+            "version": 2,
+            "goal": "PRIVATE_GOAL_SENTINEL api_key=goal-secret",
+            "Question": "CASE_PRIVATE_SENTINEL",
+            "metadata": {
+                "prompt": "NESTED_PRIVATE_SENTINEL",
+                "question": "NESTED_QUESTION_SENTINEL",
+            },
+            "allowed_tools": full_tool_lease,
+            "capability_lease": {
+                "requested_tools": full_tool_lease,
+                "allowed_tools": full_tool_lease,
+            },
+        },
         timeout_seconds=12,
     )
     manifest.record("model.request.started", api_key="secret-value", input_chars=120)
@@ -80,8 +108,87 @@ def test_run_manifest_is_durable_and_redacted(tmp_path):
     assert payload["api_surface"] == "chat_completions"
     assert payload["prompt_version"]
     assert "secret-value" not in raw
+    assert "PRIVATE_GOAL_SENTINEL" not in raw
+    assert "CASE_PRIVATE_SENTINEL" not in raw
+    assert "NESTED_PRIVATE_SENTINEL" not in raw
+    assert "NESTED_QUESTION_SENTINEL" not in raw
+    assert "goal-secret" not in raw
     assert "api_key" not in raw
+    assert payload["task_contract"]["projection_schema"] == "scansci.task-contract-audit.v1"
+    assert payload["task_contract"]["goal_reference"]["chars"] > 0
+    assert len(payload["task_contract"]["goal_reference"]["sha256"]) == 64
+    assert payload["task_contract"]["allowed_tools"] == full_tool_lease
+    assert payload["task_contract"]["capability_lease"]["requested_tools"] == full_tool_lease
+    assert payload["task_contract"]["capability_lease"]["allowed_tools"] == full_tool_lease
     assert payload["metrics"]["total_tokens"] == 3
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path-length regression")
+def test_run_manifest_atomic_write_survives_a_near_limit_windows_path(tmp_path: Path) -> None:
+    workspace_root = tmp_path
+    placeholder = "run-" + ("0" * 32) + ".json"
+    final_length = len(str(workspace_root / ".scansci-diagnostics" / "runs" / placeholder))
+    padding = 250 - final_length - 1
+    assert 0 < padding < 240
+    workspace_root /= "x" * padding
+    assert len(str(workspace_root / ".scansci-diagnostics" / "runs" / placeholder)) == 250
+
+    manifest = RunManifest.start(
+        workspace_root / "workspace.sqlite",
+        harness="pi",
+        provider="gateway",
+        model="model",
+        api_surface="chat_completions",
+    )
+    manifest.finish(status="completed", tool_calls=1)
+
+    assert manifest.path.exists()
+    assert load_manifest(manifest.path)["status"] == "completed"
+    assert not list(manifest.path.parent.glob("*.tmp"))
+
+
+def test_run_manifest_atomic_staging_does_not_overwrite_a_peer_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = RunManifest(
+        workspace=tmp_path / "workspace.sqlite",
+        harness="pi",
+        provider="gateway",
+        model="model",
+        api_surface="chat_completions",
+        run_id="run-collision",
+    )
+    manifest.path.parent.mkdir(parents=True, exist_ok=True)
+    peer = manifest.path.parent / ".deadbeef.tmp"
+    peer.write_text("peer-owned", encoding="utf-8")
+    monkeypatch.setattr(
+        run_manifest_module,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": "deadbeef" + ("0" * 24)})(),
+    )
+
+    manifest.persist()
+
+    assert peer.read_text(encoding="utf-8") == "peer-owned"
+    assert load_manifest(manifest.path)["run_id"] == "run-collision"
+
+
+def test_run_manifest_atomic_staging_is_cleaned_when_serialization_fails(tmp_path: Path) -> None:
+    manifest = RunManifest(
+        workspace=tmp_path / "workspace.sqlite",
+        harness="pi",
+        provider="gateway",
+        model="model",
+        api_surface="chat_completions",
+        run_id="run-serialization-error",
+    )
+    manifest.metrics["not-json"] = object()
+
+    with pytest.raises(TypeError):
+        manifest.persist()
+
+    assert not list(manifest.path.parent.glob("*.tmp"))
 
 
 def test_optional_harness_probe_is_lazy_and_serializable():
@@ -125,14 +232,28 @@ def test_pi_capability_verifier_runs_a_real_sidecar_tool_loop(tmp_path: Path) ->
 
 def test_pi_capability_verifier_builds_a_complete_deterministic_report(tmp_path: Path) -> None:
     verifier = _load_verifier()
-    output = tmp_path / "pi-capabilities-deterministic.json"
+    report_root = tmp_path
+    if os.name == "nt":
+        placeholder = (
+            report_root
+            / "matrix-cycles"
+            / "multimodal"
+            / ".scansci-diagnostics"
+            / "runs"
+            / ("run-" + ("0" * 32) + ".json")
+        )
+        padding = 262 - len(str(placeholder)) - 1
+        assert 0 < padding < 240
+        report_root /= "x" * padding
+    report_root.mkdir(parents=True, exist_ok=True)
+    output = report_root / "pi-capabilities-deterministic.json"
 
     report = verifier.run_verification(
         mode="deterministic",
         output=output,
-        workspace=tmp_path / "workspace.sqlite",
+        workspace=report_root / "workspace.sqlite",
         timeout_seconds=30,
-        test_evidence=_write_complete_pi_junit(tmp_path / "pi-targeted-junit.xml"),
+        test_evidence=_write_complete_pi_junit(report_root / "pi-targeted-junit.xml"),
     )
 
     assert report["status"] == "passed"
@@ -140,6 +261,39 @@ def test_pi_capability_verifier_builds_a_complete_deterministic_report(tmp_path:
     assert report["fallback_count"] == 0
     assert all(axis["status"] == "passed" for axis in report["axes"])
     assert output.is_file()
+
+
+def test_frontend_release_verifier_rejects_serialized_parallel_streams() -> None:
+    pytest.importorskip("playwright.sync_api")
+    verifier = _load_frontend_verifier()
+    real_stream = verifier._fake_chat_stream
+    serialization_lock = threading.Lock()
+
+    def serialized_stream(runtime, payload):
+        with serialization_lock:
+            yield from real_stream(runtime, payload)
+
+    verifier._fake_chat_stream = serialized_stream
+
+    with pytest.raises(AssertionError, match="overlap"):
+        verifier.verify()
+
+
+def test_frontend_release_verifier_rejects_non_fifo_follow_up_events() -> None:
+    verifier = _load_frontend_verifier()
+
+    with pytest.raises(AssertionError, match="FIFO"):
+        verifier._assert_follow_up_sequence(
+            [
+                ("start", "parent"),
+                ("start", "child-2"),
+                ("finish", "parent"),
+                ("finish", "child-2"),
+                ("start", "child-1"),
+                ("finish", "child-1"),
+            ],
+            ["parent", "child-1", "child-2"],
+        )
 
 
 def test_pi_capability_verifier_rejects_a_stale_runtime_protocol(

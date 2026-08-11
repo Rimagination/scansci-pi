@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import deque
 import json
+import os
 import subprocess
 from pathlib import Path
 from queue import Empty, Queue
@@ -28,6 +29,61 @@ from scansci_html.workspace import initialize_notebook
 
 
 _TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path-length regression")
+def test_session_registry_atomic_write_survives_a_near_limit_windows_path(tmp_path: Path) -> None:
+    workspace_root = tmp_path
+    placeholder = workspace_root / ".scansci-pi-agent" / "sessions.json"
+    padding = 250 - len(str(placeholder)) - 1
+    assert 0 < padding < 240
+    workspace_root /= "x" * padding
+    workspace = workspace_root / "workspace.sqlite"
+    assert len(str(workspace.parent / ".scansci-pi-agent" / "sessions.json")) == 250
+    client = PiAgentClient(workspace=workspace, evidence_db=workspace_root / "evidence.sqlite")
+
+    client._save_session_registry({"session-long-path": "session.jsonl"})
+
+    registry_path = workspace_root / ".scansci-pi-agent" / "sessions.json"
+    assert json.loads(registry_path.read_text(encoding="utf-8")) == {
+        "session-long-path": "session.jsonl",
+    }
+    assert not list(registry_path.parent.glob("*.tmp"))
+
+
+def test_session_registry_atomic_staging_does_not_overwrite_a_peer_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    registry_path = tmp_path / ".scansci-pi-agent" / "sessions.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    peer = registry_path.parent / ".deadbeef.tmp"
+    peer.write_text("peer-owned", encoding="utf-8")
+    monkeypatch.setattr(
+        pi_agent,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": "deadbeef" + ("0" * 24)})(),
+    )
+
+    client._save_session_registry({"session-collision": "session.jsonl"})
+
+    assert peer.read_text(encoding="utf-8") == "peer-owned"
+    assert json.loads(registry_path.read_text(encoding="utf-8")) == {
+        "session-collision": "session.jsonl",
+    }
+
+
+def test_session_registry_atomic_staging_is_cleaned_when_serialization_fails(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    with pytest.raises(TypeError):
+        client._save_session_registry({"session-invalid": object()})  # type: ignore[dict-item]
+
+    registry_dir = tmp_path / ".scansci-pi-agent"
+    assert not list(registry_dir.glob("*.tmp"))
 
 
 def test_disabling_zotero_plugin_removes_native_zotero_tools_from_pi(tmp_path: Path) -> None:

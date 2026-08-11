@@ -247,12 +247,16 @@ def run_deterministic_matrix_cycles(
     root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
 
-    dynamic_workspace = root / "dynamic" / "workspace.sqlite"
+    # These workspaces live below already descriptive release-gate paths.
+    # Keep their on-disk names short enough that manifest filenames remain
+    # usable on Windows installations without long-path support.
+    dynamic_root = root / "d"
+    dynamic_workspace = dynamic_root / "workspace.sqlite"
     dynamic_runs = diagnostics_root(dynamic_workspace) / "runs"
     dynamic_before = set(dynamic_runs.glob("*.json")) if dynamic_runs.is_dir() else set()
     dynamic = PiAgentClient.diagnostic_tool_loop(
         workspace=dynamic_workspace,
-        evidence_db=root / "dynamic" / "evidence.sqlite",
+        evidence_db=dynamic_root / "evidence.sqlite",
         timeout_seconds=timeout_seconds,
         task_count=10,
         dynamic_activation=True,
@@ -260,12 +264,13 @@ def run_deterministic_matrix_cycles(
     _, dynamic_records = _manifest_delta(dynamic_workspace, dynamic_before)
     records.extend(dynamic_records)
 
-    image_workspace = root / "multimodal" / "workspace.sqlite"
+    image_root = root / "i"
+    image_workspace = image_root / "workspace.sqlite"
     image_runs = diagnostics_root(image_workspace) / "runs"
     image_before = set(image_runs.glob("*.json")) if image_runs.is_dir() else set()
     multimodal = PiAgentClient.diagnostic_tool_loop(
         workspace=image_workspace,
-        evidence_db=root / "multimodal" / "evidence.sqlite",
+        evidence_db=image_root / "evidence.sqlite",
         timeout_seconds=timeout_seconds,
         task_count=10,
         include_image=True,
