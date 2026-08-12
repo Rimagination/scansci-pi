@@ -209,6 +209,16 @@ def test_plan_query_extracts_required_facets_for_multi_part_research_question():
     ]
 
 
+def test_plan_query_extracts_facets_from_chinese_consensus_and_conflict_question():
+    plan = plan_query("光伏电站对植被覆盖、土壤水分和微气候有哪些一致结论与争议？")
+
+    assert plan["required_facets"] == [
+        {"id": "植被覆盖", "label": "植被覆盖", "terms": ["植被覆盖"]},
+        {"id": "土壤水分", "label": "土壤水分", "terms": ["土壤水分"]},
+        {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+    ]
+
+
 def test_plan_query_extracts_clean_english_facets_after_effects_clause():
     plan = plan_query(
         "How do different photovoltaic construction years affect microclimate, vegetation communities, and soil carbon storage?"

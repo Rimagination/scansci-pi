@@ -213,6 +213,8 @@ def main() -> int:
         reader_answer = dict(answer.get("reader_answer", {}) or {})
         runtime_meta = dict(answer.get("pi_agent", {}) or {})
         compatibility_failure = dict(runtime_meta.get("compatibility_failure", {}) or {})
+        citation_verification = dict(answer.get("citation_verification", {}) or {})
+        citation_repair = dict(answer.get("citation_repair", {}) or {})
         citations = list(reader_answer.get("citations", []) or [])
         tool_calls = [str(item.get("name", "")) for item in list(runtime_meta.get("tool_calls", []) or [])]
         agent_report = {
@@ -237,7 +239,14 @@ def main() -> int:
                 compatibility_failure.get("retryable")
             ),
             "tool_calls": tool_calls,
-            "verification_passed": bool(dict(answer.get("citation_verification", {}) or {}).get("passed")),
+            "verification_passed": bool(citation_verification.get("passed")),
+            # Preserve the non-secret audit details so a failed gate points to
+            # the exact claim/facet instead of forcing another full import and
+            # model run just to discover why citation verification failed.
+            "citation_verification": citation_verification,
+            "citation_repair": citation_repair,
+            "answerability": str(answer.get("answerability", "") or ""),
+            "answer_completeness": dict(answer.get("answer_completeness", {}) or {}),
         }
 
     summary = dict(imported.get("ingestion", {}).get("summary", {}) or {})

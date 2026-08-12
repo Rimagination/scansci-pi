@@ -206,7 +206,10 @@ def _section_hints(question: str, *, question_type: str, answer_type: str) -> li
 
 
 _FACET_CUES = re.compile(
-    r"(?:影响|作用于|作用|涉及|关注|评估|比较|对比|分析|讨论|考察|解释|关联|关于|针对|\b(?:between|among|for|affect|affects|impact|impacts|influence|influences)\b)",
+    # ``对`` is a preposition in questions such as “电站对植被覆盖、土壤
+    # 水分有什么影响”。  Treat it as a cue, but do not consume the first
+    # half of ``对比``; the latter is itself a comparison cue.
+    r"(?:影响|作用于|作用|涉及|关注|评估|比较|对比|对(?!比)|分析|讨论|考察|解释|关联|关于|针对|\b(?:between|among|for|affect|affects|impact|impacts|influence|influences)\b)",
     re.IGNORECASE,
 )
 _FACET_SPLIT = re.compile(r"(?:、|，|,|;|；|\band\b|\bor\b|和|与|及|以及)", re.IGNORECASE)
@@ -236,6 +239,20 @@ _FACET_GENERIC = frozenset(
         "建设年份",
         "不同建设年份",
         "光伏项目",
+        # These are answer scaffolding rather than research dimensions.  If
+        # they survive list splitting, treating them as required facets makes
+        # strict citation completeness fail even when every concrete topic is
+        # covered (for example, “微气候有哪些一致结论与争议”).
+        "结论",
+        "一致结论",
+        "主要结论",
+        "共同结论",
+        "发现",
+        "争议",
+        "共识",
+        "分歧",
+        "差异",
+        "异同",
     }
 )
 
@@ -272,7 +289,18 @@ def _required_facets(question: str, *, question_type: str) -> list[dict[str, obj
     for piece in pieces:
         # Remove trailing question scaffolding and split a compound phrase
         # that did not contain punctuation (e.g. “植被群落和土壤碳储量”).
-        piece = re.sub(r"(?:是什么|如何|为何|为什么|有哪些|分别是|是什么样的)$", "", piece).strip()
+        piece = re.sub(
+            r"(?:是什么|如何|为何|为什么|有哪些|有什么|分别是|分别有哪些)"
+            r"(?:一致|共同|主要|总体)?"
+            r"(?:结论|发现|争议|共识|分歧|差异|异同)?$",
+            "",
+            piece,
+        ).strip()
+        piece = re.sub(
+            r"(?:一致|共同|主要|总体)?(?:结论|发现|争议|共识|分歧|差异|异同)$",
+            "",
+            piece,
+        ).strip()
         if not piece:
             continue
         cjk_parts = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", piece)
