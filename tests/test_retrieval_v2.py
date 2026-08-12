@@ -4,7 +4,11 @@ import sqlite3
 import pytest
 
 import scansci_html.retrieval as retrieval
-from scansci_html.evidence_store import build_library_overview, index_evidence_library
+from scansci_html.evidence_store import (
+    build_library_overview,
+    index_evidence_library,
+    index_markdown_library,
+)
 from scansci_html.retrieval import search_evidence_store
 from scansci_html.vector_index import (
     load_embedding_cache_rows,
@@ -601,6 +605,74 @@ def test_vector_generation_reuses_unchanged_rows_and_switches_after_validation(t
     assert states == ["retired", "active"]
 
 
+def test_incremental_library_change_reuses_vectors_from_stale_generation(tmp_path: Path):
+    """Changing one source document must not re-embed the whole library.
+
+    The incremental evidence index marks the old serving generation stale
+    before the next prewarm.  That generation is still a valid source of
+    digest-matched vectors, even though it must not be served while the new
+    generation is incomplete.
+    """
+
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    first = library / "first.md"
+    second = library / "second.md"
+    first.write_text(
+        "# First\n\n## Results\n\nA stable evidence sentence remains reusable.",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "# Second\n\n## Results\n\nAn editable evidence sentence starts in its first version.",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=10, incremental=True)
+
+    class Provider:
+        dimensions = 2
+        cache_key = "sentence-transformers:stale-generation-test"
+
+        def __init__(self):
+            self.document_texts: list[str] = []
+
+        def embed_query(self, _query):
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            self.document_texts.extend(str(text) for text in texts)
+            return [[1.0, 0.0] for _text in texts]
+
+    first_provider = Provider()
+    first_rows = load_embedding_cache_rows(db_path)
+    first_cache = prewarm_embedding_cache(db_path, first_rows, provider=first_provider)
+    assert first_cache["ready"] is True
+    assert len(first_provider.document_texts) == 2
+
+    second.write_text(
+        "# Second\n\n## Results\n\nAn editable evidence sentence now has a second version.",
+        encoding="utf-8",
+    )
+    refreshed = index_markdown_library(library, db_path=db_path, min_sentence_length=10, incremental=True)
+    assert refreshed["reused_documents"] == 1
+    assert refreshed["changed_documents"] == 1
+
+    second_provider = Provider()
+    second_cache = prewarm_embedding_cache(
+        db_path,
+        load_embedding_cache_rows(db_path),
+        provider=second_provider,
+    )
+
+    assert second_cache["ready"] is True
+    assert second_cache["embedded"] == 1
+    assert second_cache["reused"] == 1
+    assert second_provider.document_texts == [
+        "An editable evidence sentence now has a second version."
+    ]
+
+
 def test_vector_generation_rejects_invalid_document_vectors_without_replacing_active(tmp_path: Path):
     pytest.importorskip("sqlite_vec")
     library = tmp_path / "library"
@@ -635,6 +707,36 @@ def test_vector_generation_rejects_invalid_document_vectors_without_replacing_ac
     assert status["ready"] is False
     assert status["state"] == "failed"
     assert status["active_generation_id"] == ""
+
+
+def test_prewarm_discovers_remote_embedding_dimensions_before_building_generation(tmp_path: Path):
+    pytest.importorskip("sqlite_vec")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        "<article class='paper' data-doi='10.1234/remote-dimensions'><h1>Remote dimensions</h1>"
+        "<p>A remote embedding endpoint may report its native vector size on the first request.</p></article>",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+    rows = load_embedding_cache_rows(db_path)
+
+    class Provider:
+        cache_key = "siliconflow:https://api.siliconflow.cn/v1:BAAI/bge-m3"
+        dimensions = 0
+
+        def embed_query(self, _query):
+            self.dimensions = 2
+            return [1.0, 0.0]
+
+        def embed_texts(self, texts):
+            return [[1.0, 0.0] for _text in texts]
+
+    result = prewarm_embedding_cache(db_path, rows, provider=Provider())
+
+    assert result["ready"] is True
+    assert result["total"] == len(rows)
 
 
 def test_search_evidence_store_adds_adjacent_answer_sentence_before_reranking(tmp_path: Path):

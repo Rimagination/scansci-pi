@@ -16,6 +16,7 @@ def plan_query(question: str, *, max_routes: int = 8, enable_hyde: bool = False)
     if section_kinds:
         filters["section_kinds"] = section_kinds
     section_hints = _section_hints(question, question_type=question_type, answer_type=answer_type)
+    required_facets = _required_facets(question, question_type=question_type)
     legacy_variants = _query_variants(question, question_type=question_type, core_terms=core_terms)
     routes = _rewrite_routes(
         question,
@@ -34,6 +35,7 @@ def plan_query(question: str, *, max_routes: int = 8, enable_hyde: bool = False)
         "expected_answer_count": _expected_answer_count(question),
         "language": _language(question),
         "core_terms": core_terms,
+        "required_facets": required_facets,
         "filters": filters,
         "section_hints": section_hints,
         "rewrite_strategy": "deterministic_query_rewrite_plan_v1",
@@ -149,18 +151,41 @@ def _year_min(question: str) -> int | None:
 
 
 def _section_kinds(question: str, *, question_type: str) -> list[str]:
-    value = question.lower()
-    if question_type != "comparison" and re.search(
+    # A source policy such as “only cite the methods section when the paper
+    # explicitly discusses methods” is an output constraint, not a request to
+    # search methods. Strip that clause before detecting actual method intent;
+    # otherwise the policy itself turns every evidence answer into a
+    # methods-only retrieval.
+    method_query = _without_method_policy(question)
+    value = method_query.lower()
+    if re.search(
         r"\b(methods?|methodological|protocol|procedure|procedures|experimental setup|sample preparation|"
         r"measurement|measured|calibrated|randomized|randomised)\b",
         value,
     ):
         return ["methods"]
-    if any(term in question for term in ("方法", "实验设计", "流程", "测量", "随机")) and question_type != "comparison":
+    if any(term in method_query for term in ("方法", "实验设计", "流程", "测量", "随机")):
         return ["methods"]
     if re.search(r"\babstract\b", value) or "摘要" in question:
         return ["abstract"]
     return []
+
+
+def _without_method_policy(question: str) -> str:
+    """Remove source-selection instructions before classifying method intent."""
+
+    return re.sub(
+        r"(?:\bonly\s+(?:when|if|cite|include|use)|\bunless\b|"
+        r"\u53ea\u6709|\u4ec5\u5f53|\u4ec5\u5728|\u9664\u975e)"
+        r"[^.!?\u3002\uff01\uff1f\r\n]{0,180}?"
+        r"(?:methods?|methodological|\u65b9\u6cd5|\u65b9\u6cd5\u5b66)"
+        r"[^.!?\u3002\uff01\uff1f\r\n]{0,100}"
+        r"(?:cite|include|use|\u5f15\u7528|\u4f7f\u7528|\u52a0\u5165|\u7eb3\u5165|\u624d|\u65f6)"
+        r"[^.!?\u3002\uff01\uff1f\r\n]*",
+        " ",
+        str(question or ""),
+        flags=re.IGNORECASE,
+    )
 
 
 def _section_hints(question: str, *, question_type: str, answer_type: str) -> list[str]:
@@ -173,9 +198,119 @@ def _section_hints(question: str, *, question_type: str, answer_type: str) -> li
         hints.extend(["abstract", "introduction"])
     if question_type in {"comparison", "conflict"}:
         hints.extend(["results", "discussion"])
+    if question_type == "synthesis":
+        hints.extend(["abstract", "results", "discussion", "conclusion"])
     if question_type == "mechanism":
         hints.extend(["results", "discussion"])
     return _unique_nonempty(hints)
+
+
+_FACET_CUES = re.compile(
+    r"(?:影响|作用于|作用|涉及|关注|评估|比较|对比|分析|讨论|考察|解释|关联|关于|针对|\b(?:between|among|for|affect|affects|impact|impacts|influence|influences)\b)",
+    re.IGNORECASE,
+)
+_FACET_SPLIT = re.compile(r"(?:、|，|,|;|；|\band\b|\bor\b|和|与|及|以及)", re.IGNORECASE)
+_ENGLISH_FACET_CUE = re.compile(
+    r"\b(?:affect|affects|affected|impact|impacts|impacted|influence|influences|influenced|change|changes|changed|vary|varies|varied)\b",
+    re.IGNORECASE,
+)
+_FACET_GENERIC = frozenset(
+    {
+        "影响",
+        "作用",
+        "研究",
+        "结果",
+        "方法",
+        "过程",
+        "分析",
+        "比较",
+        "讨论",
+        "问题",
+        "因素",
+        "方面",
+        "表现",
+        "变化",
+        "性能",
+        "机制",
+        "项目",
+        "建设年份",
+        "不同建设年份",
+        "光伏项目",
+    }
+)
+
+
+def _required_facets(question: str, *, question_type: str) -> list[dict[str, object]]:
+    """Extract explicit dimensions in a multi-part research question.
+
+    This is intentionally conservative.  Facets are only emitted when the
+    question contains at least two concrete list-like dimensions, so ordinary
+    factoid questions keep the legacy plan shape and do not acquire a false
+    completeness requirement.
+    """
+
+    value = " ".join(str(question or "").split()).strip(" ?？。.!！")
+    if not value:
+        return []
+    if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", value) and not _FACET_SPLIT.search(value):
+        return []
+    value = re.sub(
+        r"^(?:what\s+(?:are|is)|which|how\s+(?:does|do)|the\s+effects?\s+(?:of|on)|effects?\s+(?:of|on)|impact\s+(?:of|on)|influence\s+(?:of|on))\s+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"^(?:effects?|impact|influence)\s+(?:of|on)\s+", "", value, flags=re.IGNORECASE)
+    cue_matches = list(_FACET_CUES.finditer(value))
+    if cue_matches:
+        value = value[cue_matches[-1].end() :]
+    # A leading preposition can remain after the cue (for example, “对微气候”).
+    value = re.sub(r"^\s*(?:对|于|在|与|和|及|以及|the|the effects? of|on|in)\s*", "", value, flags=re.I)
+    pieces = [piece.strip(" \t,，、;；:：") for piece in _FACET_SPLIT.split(value) if piece.strip()]
+
+    candidates: list[str] = []
+    for piece in pieces:
+        # Remove trailing question scaffolding and split a compound phrase
+        # that did not contain punctuation (e.g. “植被群落和土壤碳储量”).
+        piece = re.sub(r"(?:是什么|如何|为何|为什么|有哪些|分别是|是什么样的)$", "", piece).strip()
+        if not piece:
+            continue
+        cjk_parts = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", piece)
+        if cjk_parts:
+            candidates.extend(cjk_parts)
+            continue
+        english_cue = _ENGLISH_FACET_CUE.search(piece)
+        if english_cue:
+            piece = piece[english_cue.end() :].strip()
+        piece = re.sub(r"^(?:the|a|an|its|their|on|in|for)\s+", "", piece, flags=re.IGNORECASE)
+        if not piece:
+            continue
+        words = re.findall(r"[A-Za-z][A-Za-z0-9+./-]*(?:\s+[A-Za-z][A-Za-z0-9+./-]*){0,3}", piece)
+        candidates.extend(words)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = " ".join(candidate.split()).strip(" \t,，、;；:：")
+        if not candidate or candidate.casefold() in seen:
+            continue
+        if candidate in _FACET_GENERIC or len(candidate) < 2:
+            continue
+        # A CJK run may still include a leading subject when no cue was
+        # present. Keep only its final concrete noun phrase in that case.
+        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", candidate):
+            candidate = re.sub(r"^(?:不同|各种|相关|当前|光伏项目|该项目|这些项目)", "", candidate).strip()
+        if not candidate or candidate in _FACET_GENERIC or len(candidate) < 2:
+            continue
+        seen.add(candidate.casefold())
+        normalized.append(candidate)
+
+    if len(normalized) < 2:
+        return []
+    return [
+        {"id": facet, "label": facet, "terms": [facet]}
+        for facet in normalized[:8]
+    ]
 
 
 def _followup_queries(core_terms: list[str], *, answer_type: str = "evidence") -> list[str]:

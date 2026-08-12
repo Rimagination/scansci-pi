@@ -468,7 +468,10 @@ const MAX_MCP_TOOLS = 64;
 const MAX_MCP_TOOLS_PER_SERVER = 32;
 const MAX_MCP_SCHEMA_BYTES = 12_000;
 const MAX_MCP_DESCRIPTION_CHARS = 800;
-const MCP_CONNECT_TIMEOUT_MS = 15_000;
+// MCP servers can be cold-started on Windows (especially when their runtime
+// is a Python/Node environment). Give the connection test enough time to
+// complete on a busy machine instead of reporting a false unavailable state.
+const MCP_CONNECT_TIMEOUT_MS = 30_000;
 	const MCP_CALL_TIMEOUT_MS = 120_000;
 
 function jsonBytes(value: unknown): number {

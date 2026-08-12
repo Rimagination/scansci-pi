@@ -19,6 +19,7 @@ from scansci_html.literature_review import (
     _exclusive_section_citation_ids,
     _fallback_review_plan,
     _has_unrequested_model_detour,
+    _normalize_review_document,
     _required_review_subjects,
     _review_subject_coverage_complete,
     _review_query_variant_budget,
@@ -140,7 +141,13 @@ def test_review_retrieval_scopes_every_query_and_preserves_writing_brief(monkeyp
     )
 
     assert calls
-    assert all(call["filters"] == {"doc_ids": ["paper-a", "paper-b"]} for call in calls)
+    assert all(
+        call["filters"] == {
+            "section_kinds": ["abstract", "results", "discussion", "conclusion"],
+            "doc_ids": ["paper-a", "paper-b"],
+        }
+        for call in calls
+    )
     assert result["source_scope"] == {
         "mode": "selected",
         "doc_ids": ["paper-a", "paper-b"],
@@ -154,6 +161,121 @@ def test_review_retrieval_scopes_every_query_and_preserves_writing_brief(monkeyp
     }
 
 
+def test_review_plan_rejects_a_valid_but_off_topic_model_outline():
+    class OffTopicClient:
+        def complete_json(self, messages, *, schema_name):
+            assert schema_name == "literature_review_plan"
+            return {
+                "title": "医疗影像分析中的机器学习技术概述",
+                "scope": "围绕医学影像模型展开综述",
+                "sections": [
+                    {
+                        "id": "imaging",
+                        "title": "卷积神经网络在医疗影像中的应用",
+                        "objective": "比较医学影像分类与分割方法",
+                        "queries": ["medical imaging convolutional neural network"],
+                    }
+                    ,
+                    {
+                        "id": "evaluation",
+                        "title": "医学影像模型评估",
+                        "objective": "比较分类性能与泛化能力",
+                        "queries": ["medical imaging model evaluation"],
+                    },
+                    {
+                        "id": "limits",
+                        "title": "医疗影像研究挑战",
+                        "objective": "总结数据偏差与可解释性问题",
+                        "queries": ["medical imaging bias explainability"],
+                    },
+                ],
+            }
+
+        def complete_text(self, messages, *, max_tokens=700):
+            raise AssertionError("plan drift test should not synthesize prose")
+
+    question = (
+        "请基于光伏中文文献测试中来自光伏生态文献的中文文献，"
+        "写一份关于光伏电站生态影响的结构化综述。"
+    )
+    plan = plan_literature_review(question, chat_client=OffTopicClient())
+
+    assert plan["planning"]["mode"] == "deterministic-evidence-plan"
+    assert "off-topic" in plan["planning"]["reason"]
+    assert any("光伏" in section["title"] for section in plan["sections"])
+
+
+def test_review_document_prioritizes_findings_and_rejects_off_topic_open_questions():
+    question = "请综述光伏工程对生态系统、植被和土壤的影响。"
+    plan = {
+        "title": "光伏生态证据综述",
+        "sections": [
+            {
+                "id": "findings",
+                "title": "生态效应与主要结论",
+                "objective": "总结植被、土壤和微气候的主要发现",
+            },
+            {
+                "id": "methods",
+                "title": "研究方法差异",
+                "objective": "比较野外观测、实验和模型方法",
+            },
+        ],
+    }
+    raw = {
+        "abstract": {
+            "sentences": [
+                {"text": "光伏建设可改善土壤和植被条件。", "citation_ids": ["1"]},
+                {"text": "研究采用野外观测和室内实验。", "citation_ids": ["2"]},
+            ]
+        },
+        "sections": [
+            {
+                "paragraphs": [
+                    {
+                        "sentences": [
+                            {"text": "光伏区域的植被恢复程度有所提高。", "citation_ids": ["1"]},
+                            {"text": "研究通过野外观测和室内实验进行分析。", "citation_ids": ["2"]},
+                            {"text": "研究通过比较有无光伏设施的区域发现土壤得到改善。", "citation_ids": ["1"]},
+                        ]
+                    }
+                ]
+            },
+            {
+                "paragraphs": [
+                    {
+                        "sentences": [
+                            {"text": "研究采用样方调查和三维建模比较不同布置。", "citation_ids": ["2"]},
+                        ]
+                    }
+                ]
+            },
+        ],
+        "comparison_table": {
+            "columns": ["主题", "目标", "发现", "边界"],
+            "rows": [{"cells": ["生态", "总结", "改善", "当前资料库"], "citation_ids": ["1"]}],
+        },
+        "controversies": [],
+        "open_questions": [
+            {
+                "text": "这些结论能否在不同任务、数据和模型规模下稳定复现？",
+                "basis": "当前章节显示训练目标与评估设置存在差异。",
+                "citation_ids": ["1"],
+            }
+        ],
+        "limitations": ["仅覆盖当前资料库。"],
+    }
+
+    document = _normalize_review_document(question, plan, raw, known_ids={"1", "2"})
+
+    assert "野外观测" not in document["abstract"]["text"]
+    assert "野外观测" not in document["sections"][0]["paragraphs"][0]["text"]
+    assert "通过比较" not in document["sections"][0]["paragraphs"][0]["text"]
+    assert "样方调查" in document["sections"][1]["paragraphs"][0]["text"]
+    assert all("任务、数据和模型规模" not in item["text"] for item in document["open_questions"])
+    assert any("光伏" in item["text"] for item in document["open_questions"])
+
+
 def test_review_title_is_content_focused_instead_of_replaying_the_instruction():
     question = (
         "请基于当前三篇论文撰写中文综述：比较原始 Transformer、BERT 与 GPT-3。"
@@ -164,6 +286,11 @@ def test_review_title_is_content_focused_instead_of_replaying_the_instruction():
         "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
     )
     assert _concise_review_title("免疫治疗有哪些证据？", "免疫治疗证据综述") == "免疫治疗证据综述"
+    assert _concise_review_title(
+        "仅基于当前知识库写一份中文综述，主题为“光伏设施对植物群落与生态系统的影响机制及生态修复路径”。"
+        "要求：以论文综述形式组织，不要堆砌证据碎片；优先使用摘要、结果、讨论和结论。",
+        "以论文综述形式组织，不要堆砌证据碎片；优先使用摘要、结果、讨论和结论；每",
+    ) == "光伏设施对植物群落与生态系统的影响机制及生态修复路径：证据综述"
     assert ResearchAgentRuntime._run_title("literature_review", {"question": question}) == (
         "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
     )
@@ -361,6 +488,36 @@ def test_plain_text_recovery_is_used_before_literal_quote_fallback():
     assert result["writing_runtime"]["fallback_section_count"] == 0
 
 
+def test_synthesis_refuses_to_publish_evidence_fragments_when_writer_is_unavailable():
+    class UnavailableWriter:
+        def complete_json(self, _messages, *, schema_name):
+            raise RuntimeError("HTTP 402")
+
+        def complete_text(self, _messages, *, max_tokens=700):
+            raise RuntimeError("HTTP 402")
+
+    plan = {
+        "title": "Evidence-bounded review",
+        "scope": "Only indexed evidence.",
+        "sections": [
+            {"id": "s1", "title": "Mechanism", "objective": "Describe the mechanism", "citation_ids": ["1"]},
+            {"id": "s2", "title": "Outcomes", "objective": "Compare the outcomes", "citation_ids": ["2"]},
+        ],
+    }
+    evidence = [
+        {"citation_id": "1", "doc_id": "d1", "exact_quote": "研究测定了光伏板下的冠层温度。"},
+        {"citation_id": "2", "doc_id": "d2", "exact_quote": "研究报告显示处理样地的植被盖度更高。"},
+    ]
+
+    with pytest.raises(ValueError, match="写作模型不可用"):
+        _synthesize_review_in_parts(
+            "光伏系统如何影响植被生态？",
+            plan,
+            evidence,
+            chat_client=UnavailableWriter(),
+        )
+
+
 def test_plain_text_recovery_accepts_inline_sentence_citations_without_json_attribution():
     class InlineCitationClient:
         def complete_json(self, _messages, *, schema_name):
@@ -522,6 +679,38 @@ def test_default_local_evidence_role_cannot_pretend_to_be_review_writer(tmp_path
         runtime._writing_chat_client()
 
 
+def test_local_huggingface_model_can_be_used_as_review_writer(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace.sqlite"
+    model_id = "Qwen/Qwen3.5-2B"
+    monkeypatch.setattr(
+        "scansci_html.research_agent.load_settings",
+        lambda _workspace: {
+            "model_roles": {"writing": f"provider:local-huggingface:{model_id}"},
+            "providers": [
+                {
+                    "id": "local-huggingface",
+                    "kind": "local",
+                    "enabled": True,
+                    "models": [{"id": model_id, "capabilities": ["reasoning"]}],
+                }
+            ],
+        },
+    )
+
+    def start_runtime(selected: str) -> str:
+        assert selected == model_id
+        return "http://127.0.0.1:17863/v1"
+
+    monkeypatch.setattr("scansci_html.research_agent.ensure_local_transformers_runtime", start_runtime)
+
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    client = runtime._writing_chat_client()
+
+    assert client.base_url == "http://127.0.0.1:17863/v1"
+    assert client.api_key == "scansci-local-runtime"
+    assert client.model == model_id
+
+
 def test_managed_writing_client_disables_hidden_reasoning_for_bounded_workflows(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
@@ -531,6 +720,21 @@ def test_managed_writing_client_disables_hidden_reasoning_for_bounded_workflows(
     assert client.thinking_mode == "disabled"
     assert client.session is managed_gateway_session()
     assert runtime._writing_chat_client() is client
+
+
+def test_siliconflow_writing_client_disables_hidden_reasoning_for_review(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    provider["enabled"] = True
+    settings["model_roles"]["writing"] = "provider:siliconflow:deepseek-ai/DeepSeek-V4-Flash"
+    save_settings(workspace, settings)
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    client = runtime._writing_chat_client()
+
+    assert client.thinking_mode == "disabled"
 
 
 def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():

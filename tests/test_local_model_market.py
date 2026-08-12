@@ -27,6 +27,15 @@ def test_hub_cache_root_uses_configured_huggingface_cache(monkeypatch, tmp_path:
     assert local_model_market.hub_cache_root() == tmp_path / "huggingface" / "hub"
 
 
+def test_discover_model_roots_includes_configured_huggingface_hub_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cache = tmp_path / "selected-hub"
+    cache.mkdir()
+    monkeypatch.delenv("SCANSCI_MODEL_ROOT", raising=False)
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+
+    assert cache.resolve() in local_model_market.discover_model_roots()
+
+
 def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
     snapshot = tmp_path / "HuggingFace" / "hub" / "models--Qwen--Qwen2.5-1.5B-Instruct" / "snapshots" / "abc"
@@ -138,6 +147,28 @@ def test_installed_models_does_not_rediscover_huggingface_snapshot_hash(tmp_path
     rows = local_model_market.installed_models()
 
     assert [row["id"] for row in rows] == ["Qwen/Qwen2.5-1.5B-Instruct"]
+
+
+def test_install_manager_treats_downloaded_qwen35_files_as_ready_for_runtime_probe(monkeypatch):
+    model_id = "Qwen/Qwen3.5-2B"
+    monkeypatch.setattr(
+        local_model_market,
+        "installed_models",
+        lambda: [
+            {
+                "id": model_id,
+                "ready": False,
+                "model_files_present": True,
+                "runtime_probe_state": "pending",
+                "format": "transformers",
+                "kind": "vision",
+            }
+        ],
+    )
+
+    manager = local_model_market.create_install_manager()
+
+    assert manager.ready_checker(model_id) is True
 
 
 def test_market_catalog_marks_cached_model_without_network(tmp_path: Path, monkeypatch):

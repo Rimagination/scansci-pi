@@ -208,6 +208,44 @@ def sync_sources_from_evidence_store(
     }
 
 
+def update_evidence_db_paths(
+    workspace_path: str | Path,
+    mappings: dict[str, str],
+) -> int:
+    """Update durable workspace references after an evidence-store move.
+
+    Sources and annotation layers both retain evidence database paths.  Keep
+    the update transactional so a failed migration cannot leave a workspace
+    pointing at only half of the copied stores.
+    """
+
+    if not mappings:
+        return 0
+    workspace = Path(workspace_path)
+    normalized = {
+        str(Path(source).expanduser().resolve()): str(Path(target).expanduser().resolve())
+        for source, target in mappings.items()
+        if str(source).strip() and str(target).strip()
+    }
+    if not normalized:
+        return 0
+    updated = 0
+    with closing(sqlite3.connect(workspace)) as connection:
+        _initialize_schema(connection)
+        for source, target in normalized.items():
+            cursor = connection.execute(
+                "update sources set evidence_db_path = ?, updated_at = ? where evidence_db_path = ?",
+                (target, _utc_now(), source),
+            )
+            updated += int(cursor.rowcount or 0)
+            connection.execute(
+                "update layers set evidence_db_path = ?, updated_at = ? where evidence_db_path = ?",
+                (target, _utc_now(), source),
+            )
+        connection.commit()
+    return updated
+
+
 def set_notebook_root_path(
     workspace_path: str | Path,
     *,

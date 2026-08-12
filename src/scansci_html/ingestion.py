@@ -23,6 +23,8 @@ from docx import Document
 from pypdf import PdfReader
 from pptx import Presentation
 
+from .paper_metadata import extract_pdf_metadata
+
 
 INGESTION_SCHEMA_VERSION = 1
 MAX_INGESTION_FILES = 8
@@ -109,6 +111,7 @@ def extract_local_document(
     *,
     output_dir: str | Path,
     parser: str = "auto",
+    workspace: str | Path | None = None,
 ) -> dict[str, Any]:
     """Extract a referenced local file without copying the original document."""
 
@@ -131,7 +134,12 @@ def extract_local_document(
         "size": source_path.stat().st_size,
         "status": "persisted",
     }
-    return _extract_source(source, parser=normalized_parser, output_dir=target)
+    return _extract_source(
+        source,
+        parser=normalized_parser,
+        output_dir=target,
+        workspace=workspace,
+    )
 
 
 def persist_ingestion_sources(
@@ -244,6 +252,12 @@ def public_ingestion_job(job: dict[str, Any]) -> dict[str, Any]:
                 "character_count": int(item.get("character_count", 0) or 0),
                 "warnings": list(item.get("warnings", []) or []),
                 "preview": str(item.get("preview", "")),
+                "metadata": {
+                    key: str(value)
+                    for key, value in dict(item.get("metadata", {}) or {}).items()
+                    if key in {"title", "author", "doi", "date", "year", "metadata_source", "metadata_confidence"}
+                    and str(value or "").strip()
+                },
                 "file_url": f"/api/ingestions/{job_id}/sources/{source_id}/file",
                 "text_url": f"/api/ingestions/{job_id}/sources/{source_id}/text",
             }
@@ -311,6 +325,7 @@ def _extract_source(
     warnings: list[str] = []
     text = ""
     selected_parser = ""
+    metadata = extract_pdf_metadata(path) if suffix == ".pdf" else {}
 
     # MinerU is a configurable cloud PDF parser.  When the user has enabled it
     # and supplied an API key, it takes priority over the local parsers.
@@ -328,7 +343,7 @@ def _extract_source(
         except Exception as error:
             warnings.append(f"MinerU 解析失败，已回退到本地解析：{error}")
 
-    if parser == "enhanced":
+    if parser == "enhanced" and not text:
         text = _docling_text(path)
         if text:
             selected_parser = "docling"
@@ -381,6 +396,7 @@ def _extract_source(
         "pages_path": str(pages_path),
         "preview": _clean_text(text)[:360],
         "warnings": warnings,
+        **({"metadata": metadata} if metadata else {}),
     }
 
 

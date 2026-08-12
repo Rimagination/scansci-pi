@@ -63,7 +63,7 @@ from .research_ideation import (
     generate_research_candidate,
     plan_research_idea,
 )
-from .embeddings import HashingEmbeddingProvider
+from .embeddings import HashingEmbeddingProvider, build_embedding_provider
 from .rerankers import LexicalReranker, build_reranker
 from .llm import CascadingChatJsonClient, analyze_vision_images, build_chat_json_client, complete_chat_text, managed_gateway_session, stream_chat_text
 from .model_transport import select_api_surface
@@ -83,7 +83,12 @@ from .research_subagents import (
     structured_output_schema,
     validate_subagent_result,
 )
-from .vector_index import load_embedding_cache_rows, prewarm_embedding_cache, vector_cache_status
+from .vector_index import (
+    DEFAULT_NEURAL_CACHE_BATCH_SIZE,
+    load_embedding_cache_rows,
+    prewarm_embedding_cache,
+    vector_cache_status,
+)
 from .run_events import (
     CUSTOM,
     RUN_ERROR,
@@ -1490,7 +1495,23 @@ def _apply_direct_chat_profile(
         return chat_request
     if chat_request.selected_skills or chat_request.notebook_id or chat_request.notebook_ids:
         return chat_request
-    if any(not isinstance(item.get("content"), str) for item in chat_request.messages):
+    # Multimodal direct turns necessarily carry a list of content blocks on
+    # the final user message.  The old guard treated that list as a reason to
+    # keep the long scientific-agent system prompt, which made vision models
+    # reject perfectly valid image questions as "not a scientific task".
+    # Keep the guard for other structured messages (tool payloads or an
+    # unexpected assistant block), but allow the standard user image blocks.
+    for index, item in enumerate(chat_request.messages):
+        content = item.get("content")
+        if isinstance(content, str):
+            continue
+        if (
+            index == len(chat_request.messages) - 1
+            and str(item.get("role", "")).strip().lower() == "user"
+            and isinstance(content, list)
+            and all(isinstance(part, dict) for part in content)
+        ):
+            continue
         return chat_request
     system_indexes = [
         index
@@ -1511,6 +1532,13 @@ def _apply_direct_chat_profile(
         "describe long-run procedure coverage rather than a probability assigned to the fixed "
         "parameter. Do not add tutorials or alternatives the user did not ask for."
     )
+    if chat_request.image_attachments:
+        compact_system += (
+            " For image questions, identify the image type first, then describe the visible "
+            "interface or objects and transcribe the most important readable text. Do not answer "
+            "with only one isolated phrase unless the user asks for a single label, and never "
+            "guess details that are not visible."
+        )
     messages = [dict(item) for item in chat_request.messages]
     messages[0] = {"role": "system", "content": compact_system}
     return replace(chat_request, messages=messages)
@@ -1558,6 +1586,11 @@ class ResearchAgentRuntime:
         self._zotero_tag_sync_cache: set[str] = set()
         self._background_warm_lock = threading.Lock()
         self._background_warming: set[str] = set()
+        # Neural embedding/reranker weights can take minutes to initialise on
+        # a first run. Keep that work outside the request thread and expose a
+        # small status snapshot so the desktop can show progress truthfully.
+        self._local_evidence_prepare_lock = threading.Lock()
+        self._local_evidence_preparations: dict[str, dict[str, Any]] = {}
 
     def _maybe_warm_cache_in_background(
         self,
@@ -1595,8 +1628,7 @@ class ResearchAgentRuntime:
                     evidence_db,
                     rows,
                     provider=provider,
-                    # The batch size is already raised to 2048; GPU encoding
-                    # is auto-detected by the embedding provider.
+                    cache_batch_size=DEFAULT_NEURAL_CACHE_BATCH_SIZE,
                 )
             except Exception:
                 pass
@@ -1605,6 +1637,365 @@ class ResearchAgentRuntime:
                     self._background_warming.discard(key)
 
         threading.Thread(target=_warm, daemon=True, name=f"scansci-warm-{evidence_db.name}").start()
+
+    @staticmethod
+    def _local_evidence_preparation_key(evidence_db: Path, quality_profile: str) -> str:
+        profile = "precision" if str(quality_profile).lower() == "precision" else "balanced"
+        return f"{evidence_db.resolve()}|{profile}"
+
+    @staticmethod
+    def _local_evidence_model_snapshot(stack: Any) -> dict[str, Any]:
+        metadata = dict(getattr(stack, "metadata", {}) or {})
+        keys = (
+            "embedding",
+            "reranker",
+            "requested_embedding_model",
+            "requested_reranker_model",
+            "effective_quality_profile",
+            "embedding_device",
+            "reranker_device",
+            "local_neural_embedding",
+            "local_neural_reranker",
+            "remote_embedding_active",
+            "remote_reranker_active",
+            "qwen_embedding_active",
+            "qwen_reranker_active",
+            "fallback",
+        )
+        return {key: metadata[key] for key in keys if key in metadata}
+
+    def _local_evidence_status_snapshot(
+        self,
+        evidence_db: Path,
+        *,
+        quality_profile: str,
+        notebook_id: str = "",
+    ) -> dict[str, Any]:
+        key = self._local_evidence_preparation_key(evidence_db, quality_profile)
+        with self._local_evidence_prepare_lock:
+            current = dict(self._local_evidence_preparations.get(key, {}) or {})
+        if not current:
+            # A query may have loaded the stack before the UI asked for its
+            # status. Reflect that immediately instead of showing "idle".
+            with self._model_lock:
+                existing = next(
+                    (
+                        stack
+                        for stack in self._local_evidence_models.values()
+                        if any(
+                            bool(dict(getattr(stack, "metadata", {}) or {}).get(key))
+                            for key in (
+                                "local_neural_embedding",
+                                "remote_embedding_active",
+                                "remote_reranker_active",
+                            )
+                        )
+                    ),
+                    None,
+                )
+            if existing is not None:
+                current = {
+                    "state": "ready",
+                    "phase": "ready",
+                    "progress": 1.0,
+                    "message": (
+                        "远程嵌入与重排已就绪，无需预热本地 GPU"
+                        if dict(getattr(existing, "metadata", {}) or {}).get("remote_embedding_active")
+                        and dict(getattr(existing, "metadata", {}) or {}).get("remote_reranker_active")
+                        else "本地 AI 模型已就绪"
+                    ),
+                    "error": "",
+                    "model": self._local_evidence_model_snapshot(existing),
+                    "started_at": "",
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            else:
+                current = {
+                    "state": "idle",
+                    "phase": "idle",
+                    "progress": 0.0,
+                    "message": "尚未准备本地 AI 模型",
+                    "error": "",
+                    "model": {},
+                    "started_at": "",
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+        current["notebook_id"] = str(notebook_id or "")
+        current["quality_profile"] = "precision" if str(quality_profile).lower() == "precision" else "balanced"
+        current["cache_warming"] = False
+        current["cache_ready"] = False
+        if evidence_db.is_file():
+            try:
+                identity = default_vector_cache_identity()
+                cache = vector_cache_status(
+                    evidence_db,
+                    provider=str(identity["provider"]),
+                    dimensions=int(identity["dimensions"]),
+                )
+                current["cache_ready"] = bool(cache.get("ready"))
+            except Exception:
+                # Status reporting must never turn an otherwise usable library
+                # into an error just because an old cache is malformed.
+                current["cache_ready"] = False
+            with self._background_warm_lock:
+                current["cache_warming"] = str(evidence_db.resolve()) in self._background_warming
+        return current
+
+    def local_evidence_status(
+        self,
+        evidence_db: Path | None = None,
+        *,
+        notebook_id: str = "",
+        quality_profile: str = "precision",
+    ) -> dict[str, Any]:
+        """Return non-blocking local embedding/reranker preparation status."""
+
+        if notebook_id and evidence_db is None:
+            notebook = self._notebook(str(notebook_id))
+            evidence_db = self._evidence_db_for_notebook(notebook)
+        target = Path(evidence_db or self.evidence_db).resolve()
+        return self._local_evidence_status_snapshot(
+            target,
+            quality_profile=quality_profile,
+            notebook_id=notebook_id,
+        )
+
+    def _remote_evidence_models_configured(self) -> bool:
+        """Return whether both evidence roles are configured for SiliconFlow.
+
+        This is deliberately a credential-presence check only.  It does not
+        call either remote endpoint, so selecting API-backed embedding and
+        reranking never triggers a local model warm-up or a network probe.
+        """
+
+        try:
+            settings = load_settings(self.workspace)
+            providers = list(settings.get("providers", []) or [])
+            provider = next(
+                (item for item in providers if str(item.get("id", "")) == "siliconflow"),
+                None,
+            )
+            if provider is None or not provider.get("enabled", True):
+                return False
+            models = {
+                str(item.get("id", "")): {
+                    str(capability).casefold()
+                    for capability in list(item.get("capabilities", []) or [])
+                }
+                for item in list(provider.get("models", []) or [])
+                if isinstance(item, dict)
+            }
+            roles = dict(settings.get("model_roles", {}) or {})
+            for role, capability in (("embedding", "embedding"), ("reranking", "reranking")):
+                reference = str(roles.get(role, "") or "").strip()
+                provider_id, separator, model_id = (
+                    reference.removeprefix("provider:").partition(":")
+                    if reference.startswith("provider:")
+                    else ("", "", "")
+                )
+                if (
+                    not separator
+                    or provider_id != "siliconflow"
+                    or capability not in models.get(model_id.strip(), set())
+                    or not get_provider_api_key(self.workspace, provider_id)
+                ):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def prepare_local_evidence(
+        self,
+        evidence_db: Path | None = None,
+        *,
+        notebook_id: str = "",
+        quality_profile: str = "precision",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Schedule local model preparation without blocking the caller.
+
+        The fast hashing/lexical stack remains available while weights load.
+        A later request automatically uses the neural stack once the worker
+        has completed, so the desktop never needs to spin or retry blindly.
+        """
+
+        if notebook_id and evidence_db is None:
+            notebook = self._notebook(str(notebook_id))
+            evidence_db = self._evidence_db_for_notebook(notebook)
+        target = Path(evidence_db or self.evidence_db).resolve()
+        profile = "precision" if str(quality_profile).lower() == "precision" else "balanced"
+        key = self._local_evidence_preparation_key(target, profile)
+        if not target.is_file():
+            with self._local_evidence_prepare_lock:
+                self._local_evidence_preparations[key] = {
+                    "state": "idle",
+                    "phase": "idle",
+                    "progress": 0.0,
+                    "message": "暂无可检索资料，暂不加载本地 AI 模型",
+                    "error": "",
+                    "model": {},
+                    "started_at": "",
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            return self._local_evidence_status_snapshot(
+                target,
+                quality_profile=profile,
+                notebook_id=notebook_id,
+            )
+        with self._local_evidence_prepare_lock:
+            current = dict(self._local_evidence_preparations.get(key, {}) or {})
+        if current.get("state") == "preparing":
+            return self._local_evidence_status_snapshot(
+                target,
+                quality_profile=profile,
+                notebook_id=notebook_id,
+            )
+        if current.get("state") in {"ready", "fallback"} and not force:
+            return self._local_evidence_status_snapshot(
+                target,
+                quality_profile=profile,
+                notebook_id=notebook_id,
+            )
+        if self._remote_evidence_models_configured():
+            try:
+                stack = self._local_evidence_stack(
+                    target,
+                    quality_profile=profile,
+                    _allow_neural_build=True,
+                )
+                metadata = dict(getattr(stack, "metadata", {}) or {})
+                remote_ready = bool(
+                    metadata.get("remote_embedding_active")
+                    and metadata.get("remote_reranker_active")
+                )
+                if remote_ready:
+                    now = datetime.now().isoformat(timespec="seconds")
+                    with self._local_evidence_prepare_lock:
+                        self._local_evidence_preparations[key] = {
+                            "state": "ready",
+                            "phase": "remote",
+                            "progress": 1.0,
+                            "message": "远程嵌入与重排已就绪，无需预热本地 GPU",
+                            "error": "",
+                            "model": self._local_evidence_model_snapshot(stack),
+                            "started_at": now,
+                            "updated_at": now,
+                        }
+                    return self._local_evidence_status_snapshot(
+                        target,
+                        quality_profile=profile,
+                        notebook_id=notebook_id,
+                    )
+            except Exception:
+                # Fall through to the existing background local preparation
+                # path so a failed remote adapter cannot block retrieval.
+                pass
+        with self._local_evidence_prepare_lock:
+            now = datetime.now().isoformat(timespec="seconds")
+            self._local_evidence_preparations[key] = {
+                "state": "preparing",
+                "phase": "loading_models",
+                "progress": 0.05,
+                "message": "正在加载本地 AI 模型；首次加载可能需要几分钟",
+                "error": "",
+                "model": {},
+                "started_at": now,
+                "updated_at": now,
+            }
+
+        def _prepare() -> None:
+            try:
+                stack = self._local_evidence_stack(
+                    target,
+                    quality_profile=profile,
+                    _allow_neural_build=True,
+                )
+                metadata = dict(getattr(stack, "metadata", {}) or {})
+                neural = bool(
+                    metadata.get("local_neural_embedding")
+                    or metadata.get("remote_embedding_active")
+                    or metadata.get("remote_reranker_active")
+                )
+                intentionally_fast = str(metadata.get("effective_quality_profile", "")) == "fast"
+                fallback = (bool(metadata.get("fallback")) or not neural) and not intentionally_fast
+                reasons = [
+                    str(item).strip()
+                    for item in list(metadata.get("fallback_reasons", []) or [])
+                    if str(item).strip()
+                ]
+                if fallback and not reasons:
+                    reasons.append("local_neural_stack_unavailable")
+                state = "fallback" if fallback else "ready"
+                message = (
+                    "资料量较少，已使用快速检索"
+                    if intentionally_fast
+                    else "远程嵌入与重排已就绪，无需预热本地 GPU"
+                    if metadata.get("remote_embedding_active") and metadata.get("remote_reranker_active")
+                    else "本地 AI 模型已就绪，正在后台优化索引"
+                    if state == "ready"
+                    else "本地 AI 模型暂不可用，已保留基础检索；可稍后重试"
+                )
+                with self._local_evidence_prepare_lock:
+                    self._local_evidence_preparations[key] = {
+                        "state": state,
+                        "phase": "ready" if state == "ready" else "fallback",
+                        "progress": 1.0,
+                        "message": message,
+                        "error": "; ".join(reasons)[:800] if fallback else "",
+                        "model": self._local_evidence_model_snapshot(stack),
+                        "started_at": self._local_evidence_preparations.get(key, {}).get("started_at", ""),
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+            except Exception as error:  # optional local-model boundary
+                with self._local_evidence_prepare_lock:
+                    self._local_evidence_preparations[key] = {
+                        "state": "error",
+                        "phase": "error",
+                        "progress": 0.0,
+                        "message": "本地 AI 模型准备失败，已保留基础检索；可重试",
+                        "error": f"{type(error).__name__}: {str(error)[:700]}",
+                        "model": {},
+                        "started_at": self._local_evidence_preparations.get(key, {}).get("started_at", ""),
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+
+        threading.Thread(
+            target=_prepare,
+            daemon=True,
+            name=f"scansci-local-ai-{target.stem or 'evidence'}",
+        ).start()
+        return self._local_evidence_status_snapshot(
+            target,
+            quality_profile=profile,
+            notebook_id=notebook_id,
+        )
+
+    def _fast_preparing_evidence_stack(self, selector_key: str, requested_profile: str) -> LocalEvidenceStack:
+        # Do not take ``_model_lock`` here: the background neural build holds
+        # it while PyTorch initialises. A fresh lightweight stack is cheap and
+        # keeps the foreground query genuinely non-blocking.
+        del selector_key
+        return LocalEvidenceStack(
+            embedding_provider=HashingEmbeddingProvider(),
+            reranker=LexicalReranker(),
+            metadata={
+                "embedding": "local-hash-v1",
+                "reranker": "local-lexical-v1",
+                "local_neural_embedding": False,
+                "local_neural_reranker": False,
+                "qwen_embedding_active": False,
+                "qwen_reranker_active": False,
+                "embedding_device": "cpu",
+                "reranker_device": "cpu",
+                "fallback": True,
+                "fallback_reasons": ["local_neural_models_preparing"],
+                "selection_reason": "neural-model-preparing",
+                "requested_quality_profile": requested_profile,
+                "effective_quality_profile": "fast-preparing",
+                "precision_reranker_active": False,
+                "preparing": True,
+            },
+        )
 
     def _wrap_model_client(self, client: Any) -> Any:
         context = getattr(self._model_event_context, "value", None)
@@ -3439,11 +3830,231 @@ class ResearchAgentRuntime:
             session=managed_gateway_session(),
         )
 
+    @staticmethod
+    def _is_vision_service_fallback_error(error: BaseException) -> bool:
+        """Return whether an image provider can be safely replaced before output."""
+
+        details = getattr(error, "failure", None)
+        parts = [str(error)]
+        if isinstance(details, dict):
+            parts.extend(str(details.get(key, "")) for key in ("code", "message", "detail", "status"))
+        normalized = " ".join(parts).lower()
+        # Vision providers frequently expose different model allow-lists behind
+        # the same OpenAI-compatible endpoint.  A rejected request is therefore
+        # recoverable by trying the next configured vision model, while the
+        # original error remains in the fallback event for diagnostics.
+        return bool(
+            re.search(
+                r"(?:\b(?:400|401|403|404|408|429|500|502|503|504)\b|"
+                r"模型(?:服务|流式)|视觉模型|vision|image|local model|未能就绪|无法加载)",
+                normalized,
+            )
+        )
+
+    def _render_vision_messages(
+        self,
+        messages: list[dict[str, Any]],
+        image_attachments: list[dict[str, Any]],
+        provider_kind: str,
+    ) -> list[dict[str, Any]]:
+        """Re-encode persisted image blocks for a different provider contract."""
+
+        rendered = [dict(item) for item in messages]
+        user_index = next(
+            (
+                index
+                for index in range(len(rendered) - 1, -1, -1)
+                if str(rendered[index].get("role", "")).lower() == "user"
+            ),
+            -1,
+        )
+        if user_index < 0:
+            return rendered
+        original = rendered[user_index].get("content")
+        if isinstance(original, list):
+            text = "\n".join(
+                str(part.get("text", ""))
+                for part in original
+                if isinstance(part, dict) and str(part.get("type", "")) == "text"
+            ).strip()
+        else:
+            text = str(original or "").strip()
+        blocks = vision_image_blocks(self.workspace, image_attachments)
+        if provider_kind in {"anthropic-compatible", "anthropic"}:
+            content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+            content.extend(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": block["mime_type"], "data": block["data"]},
+                }
+                for block in blocks
+            )
+        else:
+            content = [{"type": "text", "text": text}]
+            content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{block['mime_type']};base64,{block['data']}"},
+                }
+                for block in blocks
+            )
+        rendered[user_index]["content"] = content
+        return rendered
+
+    def _vision_fallback_chat_request(
+        self,
+        chat_request: _DirectChatRequest,
+        *,
+        vision_fallback_attempts: int = 0,
+    ) -> _DirectChatRequest | None:
+        """Select another visual provider, then fall back to OCR plus text."""
+
+        route_info = dict(chat_request.vision_route or {})
+        if not route_info or route_info.get("mode") == "ocr-fallback" or not chat_request.image_attachments:
+            return None
+        settings = load_settings(self.workspace)
+        requested_provider_id = str(route_info.get("requested_provider_id", "") or "")
+        requested_model_id = str(route_info.get("requested_model_id", "") or "")
+        excluded: set[tuple[str, str]] = set()
+        for item in list(route_info.get("excluded_routes", []) or []):
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                excluded.add((str(item[0]), str(item[1])))
+        excluded.add((chat_request.provider_id, chat_request.model_id))
+        selected = None
+        # Try a small number of alternate visual endpoints, then use OCR plus
+        # the normal text model.  A catalog can contain many models that are
+        # present but not enabled for the user's account; probing all of them
+        # would make a simple image question look frozen instead of recoverable.
+        if vision_fallback_attempts < 2:
+            selected = select_vision_route(
+                self.workspace,
+                settings,
+                active_provider_id=requested_provider_id,
+                active_model_id=requested_model_id,
+                excluded_routes=excluded,
+            )
+        if selected is not None:
+            provider = dict(selected["provider"])
+            provider_id = str(selected["provider_id"])
+            provider_kind = str(selected["provider_kind"])
+            model_id = str(selected["model_id"])
+            managed = str(provider.get("auth_mode", "")) == "managed"
+            api_key = str(selected.get("api_key", ""))
+            route = {
+                **route_info,
+                "mode": str(selected.get("mode", "local")),
+                "provider_id": provider_id,
+                "provider_name": str(selected.get("provider_name", provider_id)),
+                "model_id": model_id,
+                "excluded_routes": [list(item) for item in sorted(excluded)],
+                "fallback_from": f"{chat_request.provider_id}:{chat_request.model_id}",
+            }
+            responses_enabled = bool(provider.get("responses_enabled", False))
+            api_surface = select_api_surface(
+                str(provider.get("api_surface", "chat_completions") or "chat_completions"),
+                provider_kind=provider_kind,
+                provider_id=provider_id,
+                model=model_id,
+                responses_enabled=responses_enabled,
+            )
+            return replace(
+                chat_request,
+                messages=self._render_vision_messages(chat_request.messages, chat_request.image_attachments, provider_kind),
+                provider_id=provider_id,
+                provider_name=str(provider.get("name", provider_id)),
+                provider_kind=provider_kind,
+                base_url=str(provider.get("base_url", "")),
+                api_key=api_key,
+                model_id=model_id,
+                api_surface=api_surface,
+                responses_enabled=responses_enabled,
+                thinking_mode=None,
+                session=managed_gateway_session() if managed else None,
+                vision_route=route,
+            )
+        text_route = select_text_route(
+            self.workspace,
+            settings,
+            active_provider_id=requested_provider_id,
+            active_model_id=requested_model_id,
+        )
+        if text_route is None:
+            return None
+        provider = dict(text_route["provider"])
+        provider_id = str(text_route["provider_id"])
+        provider_kind = str(text_route["provider_kind"])
+        model_id = str(text_route["model_id"])
+        blocks = vision_image_blocks(self.workspace, chat_request.image_attachments)
+        ocr = ocr_image_blocks(blocks, workspace=self.workspace, settings=settings)
+        ocr_text = str(ocr.get("text", "")).strip()
+        user_index = next(
+            (
+                index
+                for index in range(len(chat_request.messages) - 1, -1, -1)
+                if str(chat_request.messages[index].get("role", "")).lower() == "user"
+            ),
+            -1,
+        )
+        if user_index < 0:
+            return None
+        messages = [dict(item) for item in chat_request.messages]
+        original = messages[user_index].get("content")
+        text = "\n".join(
+            str(part.get("text", ""))
+            for part in original
+            if isinstance(part, dict) and str(part.get("type", "")) == "text"
+        ).strip() if isinstance(original, list) else str(original or "").strip()
+        image_context = (
+            f"[本地 OCR 图片文字]\n{ocr_text[:12_000]}"
+            if ocr_text
+            else "[图片处理提示]\n当前视觉模型不可用，且本机 OCR 未提取到文字。请明确说明无法可靠读取图片，不要猜测。"
+        )
+        messages[user_index]["content"] = f"{text}\n\n{image_context}".strip()
+        managed = str(provider.get("auth_mode", "")) == "managed"
+        api_key = "scansci-managed-gateway" if managed else get_provider_api_key(self.workspace, provider_id)
+        if not api_key:
+            return None
+        responses_enabled = bool(provider.get("responses_enabled", False))
+        api_surface = select_api_surface(
+            str(provider.get("api_surface", "chat_completions") or "chat_completions"),
+            provider_kind=provider_kind,
+            provider_id=provider_id,
+            model=model_id,
+            responses_enabled=responses_enabled,
+        )
+        return replace(
+            chat_request,
+            messages=messages,
+            provider_id=provider_id,
+            provider_name=str(provider.get("name", provider_id)),
+            provider_kind=provider_kind,
+            base_url=str(provider.get("base_url", "")),
+            api_key=api_key,
+            model_id=model_id,
+            api_surface=api_surface,
+            responses_enabled=responses_enabled,
+            thinking_mode=None,
+            session=managed_gateway_session() if managed else None,
+            vision_route={
+                **route_info,
+                "mode": "ocr-fallback",
+                "provider_id": provider_id,
+                "provider_name": str(provider.get("name", provider_id)),
+                "model_id": model_id,
+                "ocr_backend": str(ocr.get("backend", "unavailable")),
+                "ocr_available": bool(ocr.get("available")),
+                "ocr_message": str(ocr.get("message", ""))[:500],
+                "excluded_routes": [list(item) for item in sorted(excluded)],
+                "fallback_from": f"{chat_request.provider_id}:{chat_request.model_id}",
+            },
+        )
+
     def _direct_events_with_managed_fallback(
         self,
         chat_request: _DirectChatRequest,
         *,
         fallback_attempted: bool = False,
+        vision_fallback_attempts: int = 0,
     ):
         """Stream direct chat and retry once on a different managed model.
 
@@ -3476,6 +4087,34 @@ class ResearchAgentRuntime:
                     visible_output_started = True
                 yield event
         except Exception as error:
+            if (
+                not visible_output_started
+                and vision_fallback_attempts < 2
+                and self._is_vision_service_fallback_error(error)
+            ):
+                vision_fallback = self._vision_fallback_chat_request(
+                    chat_request,
+                    vision_fallback_attempts=vision_fallback_attempts,
+                )
+                if vision_fallback is not None:
+                    yield {
+                        "type": "vision.fallback",
+                        "from_model": chat_request.model_id,
+                        "to_model": vision_fallback.model_id,
+                        "from_provider": chat_request.provider_id,
+                        "to_provider": vision_fallback.provider_id,
+                        "from_provider_name": chat_request.provider_name,
+                        "to_provider_name": vision_fallback.provider_name,
+                        "to_mode": str((vision_fallback.vision_route or {}).get("mode", "local")),
+                        "reason": "vision_provider_unavailable",
+                        "error": f"{type(error).__name__}: {error}"[:500],
+                    }
+                    yield from self._direct_events_with_managed_fallback(
+                        vision_fallback,
+                        fallback_attempted=fallback_attempted,
+                        vision_fallback_attempts=vision_fallback_attempts + 1,
+                    )
+                    return
             fallback = self._managed_fallback_chat_request(chat_request)
             if (
                 visible_output_started
@@ -3497,6 +4136,72 @@ class ResearchAgentRuntime:
                 fallback,
                 fallback_attempted=True,
             )
+
+    def _complete_direct_with_managed_fallback(
+        self,
+        chat_request: _DirectChatRequest,
+        *,
+        user_text: str,
+    ) -> tuple[str, dict[str, int], dict[str, Any]]:
+        """Collect a direct completion while retaining the streaming fallback path.
+
+        The synchronous ``/api/chat`` endpoint used to call ``complete_chat_text``
+        directly.  That bypassed the visual failover implemented for the streaming
+        endpoint, so a rejected vision model surfaced as an HTTP 502 even though a
+        configured OCR/vision alternative could answer the same request.  Keeping
+        both endpoints on one event path makes provider failures recoverable and
+        keeps the fallback trace available to callers that do not stream.
+        """
+
+        fragments: list[str] = []
+        usage: dict[str, int] = {}
+        events: dict[str, Any] = {
+            "vision_fallback": None,
+            "model_fallback": None,
+            "compatibility_fallback": False,
+            "compatibility_error": "",
+            "truncated": False,
+        }
+        for event in self._direct_events_with_managed_fallback(chat_request):
+            event_type = str(event.get("type", ""))
+            if event_type == "delta":
+                content = str(event.get("content", ""))
+                if content:
+                    fragments.append(content)
+            elif event_type == "done":
+                raw_usage = event.get("usage")
+                if isinstance(raw_usage, dict):
+                    usage = {
+                        str(key): value
+                        for key, value in raw_usage.items()
+                        if isinstance(value, int) and not isinstance(value, bool)
+                    }
+                events["truncated"] = bool(event.get("truncated"))
+            elif event_type == "vision.fallback":
+                events["vision_fallback"] = {
+                    "from_provider": str(event.get("from_provider", "")),
+                    "from_model": str(event.get("from_model", "")),
+                    "to_provider": str(event.get("to_provider", "")),
+                    "to_model": str(event.get("to_model", "")),
+                    "from_provider_name": str(event.get("from_provider_name", "")),
+                    "to_provider_name": str(event.get("to_provider_name", "")),
+                    "to_mode": str(event.get("to_mode", "")),
+                    "reason": str(event.get("reason", "")),
+                    "error": str(event.get("error", ""))[:500],
+                }
+            elif event_type == "model.fallback":
+                events["model_fallback"] = {
+                    "from_model": str(event.get("from_model", "")),
+                    "to_model": str(event.get("to_model", "")),
+                    "reason": str(event.get("reason", "")),
+                }
+            elif event_type == "compatibility.fallback":
+                events["compatibility_fallback"] = True
+                events["compatibility_error"] = str(event.get("error", ""))[:500]
+        text = "".join(fragments).strip()
+        if not text:
+            raise RuntimeError("模型返回了空回答")
+        return text, usage, events
 
     def _pi_events_with_compatibility_fallback(
         self,
@@ -4074,25 +4779,29 @@ class ResearchAgentRuntime:
                     raise RuntimeError(
                         "ScanSci 未能完成本轮必需的工具调用；为避免编造能力或结果，本轮不会退化为裸模型回答"
                     ) from error
+                if chat_request.vision_route:
+                    text, usage, direct_events = self._complete_direct_with_managed_fallback(
+                        chat_request,
+                        user_text=user_text,
+                    )
+                else:
                     completion = complete_chat_text(
                         chat_request.provider_kind,
                         base_url=chat_request.base_url,
                         api_key=chat_request.api_key,
                         model=chat_request.model_id,
-                    messages=chat_request.messages,
-                    thinking_mode=_direct_thinking_mode(chat_request),
-                    session=chat_request.session,
-                    include_usage=True,
-                    timeout=45.0,
+                        messages=chat_request.messages,
+                        thinking_mode=_direct_thinking_mode(chat_request),
+                        session=chat_request.session,
+                        include_usage=True,
+                        timeout=45.0,
                         max_requests=1,
                         max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
                         temperature=0.2,
                         **_model_transport_kwargs(chat_request),
                     )
-                if isinstance(completion, tuple):
-                    text, usage = completion
-                else:
-                    text, usage = completion, {}
+                    text, usage = completion if isinstance(completion, tuple) else (completion, {})
+                    direct_events = {}
                 agent_runtime = {
                     "harness": "direct-provider",
                     "compatibility_fallback": True,
@@ -4103,27 +4812,67 @@ class ResearchAgentRuntime:
                     "task_contract": task_contract,
                     "web_search": web_search_mode,
                 }
+                if direct_events.get("vision_fallback"):
+                    agent_runtime["vision_fallback"] = direct_events["vision_fallback"]
+                if direct_events.get("model_fallback"):
+                    agent_runtime["model_fallback"] = direct_events["model_fallback"]
+                if direct_events.get("compatibility_error"):
+                    agent_runtime["compatibility_error"] = str(direct_events["compatibility_error"])
         else:
-            completion = complete_chat_text(
-                chat_request.provider_kind,
-                base_url=chat_request.base_url,
-                api_key=chat_request.api_key,
-                model=chat_request.model_id,
-                messages=chat_request.messages,
-                thinking_mode=_direct_thinking_mode(chat_request),
-                session=chat_request.session,
-                include_usage=True,
-                timeout=45.0,
-                max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                temperature=0.2,
-                **_model_transport_kwargs(chat_request),
-            )
-            if isinstance(completion, tuple):
-                text, usage = completion
+            if chat_request.vision_route:
+                text, usage, direct_events = self._complete_direct_with_managed_fallback(
+                    chat_request,
+                    user_text=user_text,
+                )
+                if direct_events.get("vision_fallback"):
+                    agent_runtime["vision_fallback"] = direct_events["vision_fallback"]
+                    agent_runtime["effective_model_id"] = str(
+                        dict(direct_events["vision_fallback"]).get("to_model", "")
+                    )
+                if direct_events.get("model_fallback"):
+                    agent_runtime["model_fallback"] = direct_events["model_fallback"]
+                if direct_events.get("compatibility_fallback"):
+                    agent_runtime["compatibility_fallback"] = True
+                    agent_runtime["compatibility_error"] = str(direct_events.get("compatibility_error", ""))
             else:
-                text, usage = completion, {}
+                completion = complete_chat_text(
+                    chat_request.provider_kind,
+                    base_url=chat_request.base_url,
+                    api_key=chat_request.api_key,
+                    model=chat_request.model_id,
+                    messages=chat_request.messages,
+                    thinking_mode=_direct_thinking_mode(chat_request),
+                    session=chat_request.session,
+                    include_usage=True,
+                    timeout=45.0,
+                    max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
+                    temperature=0.2,
+                    **_model_transport_kwargs(chat_request),
+                )
+                text, usage = completion if isinstance(completion, tuple) else (completion, {})
         if chat_request.vision_route:
-            agent_runtime["vision_route"] = dict(chat_request.vision_route)
+            effective_route = dict(chat_request.vision_route)
+            vision_fallback = agent_runtime.get("vision_fallback")
+            if isinstance(vision_fallback, dict):
+                effective_route.update(
+                    {
+                        "fallback_provider_id": str(vision_fallback.get("to_provider", "")),
+                        "fallback_model_id": str(vision_fallback.get("to_model", "")),
+                        "effective_model_id": str(
+                            vision_fallback.get("to_model", "") or chat_request.model_id
+                        ),
+                    }
+                )
+                effective_model_id = str(vision_fallback.get("to_model", "") or chat_request.model_id)
+                if effective_model_id:
+                    effective_route["model_id"] = effective_model_id
+                if vision_fallback.get("to_provider"):
+                    effective_route["provider_id"] = str(vision_fallback["to_provider"])
+                if vision_fallback.get("to_provider_name"):
+                    effective_route["provider_name"] = str(vision_fallback["to_provider_name"])
+                if vision_fallback.get("to_mode"):
+                    effective_route["mode"] = str(vision_fallback["to_mode"])
+            agent_runtime["vision_route"] = effective_route
         text = _normalize_direct_chat_output(text, chat_request.selected_skills)
         text = _repair_scientific_rewrite(user_text, text)
         text, temporal_guarded = _guard_temporal_delivery(user_text, text)
@@ -5060,6 +5809,31 @@ class ResearchAgentRuntime:
                     yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "cancelled":
                     raise _RunCancelled("Pi Agent run was cancelled")
+                elif model_event.get("type") == "vision.fallback":
+                    vision_fallback = {
+                        "from_provider": str(model_event.get("from_provider", "")),
+                        "from_model": str(model_event.get("from_model", "")),
+                        "to_provider": str(model_event.get("to_provider", "")),
+                        "to_model": str(model_event.get("to_model", "")),
+                        "from_provider_name": str(model_event.get("from_provider_name", "")),
+                        "to_provider_name": str(model_event.get("to_provider_name", "")),
+                        "to_mode": str(model_event.get("to_mode", "")),
+                        "reason": str(model_event.get("reason", "")),
+                        "error": str(model_event.get("error", ""))[:500],
+                    }
+                    agent_runtime["vision_fallback"] = vision_fallback
+                    agent_runtime["effective_model_id"] = vision_fallback["to_model"] or chat_request.model_id
+                    trace.append(
+                        {
+                            "title": "切换备用视觉模型",
+                            "detail": (
+                                f"{vision_fallback['from_model']} 暂时不可用，"
+                                f"已自动切换到 {vision_fallback['to_model']}。"
+                            ),
+                            "status": "fallback",
+                        }
+                    )
+                    yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "model.fallback":
                     from_model = str(model_event.get("from_model", ""))
                     to_model = str(model_event.get("to_model", ""))
@@ -5273,7 +6047,28 @@ class ResearchAgentRuntime:
             if delivery_ledger.required_groups:
                 agent_runtime["capability_ledger"] = delivery_ledger.to_dict()
             if chat_request.vision_route:
-                agent_runtime["vision_route"] = dict(chat_request.vision_route)
+                effective_route = dict(chat_request.vision_route)
+                vision_fallback = agent_runtime.get("vision_fallback")
+                if isinstance(vision_fallback, dict):
+                    effective_route.update(
+                        {
+                            "fallback_provider_id": str(vision_fallback.get("to_provider", "")),
+                            "fallback_model_id": str(vision_fallback.get("to_model", "")),
+                            "effective_model_id": str(
+                                vision_fallback.get("to_model", "") or chat_request.model_id
+                            ),
+                        }
+                    )
+                    effective_model_id = str(vision_fallback.get("to_model", "") or chat_request.model_id)
+                    if effective_model_id:
+                        effective_route["model_id"] = effective_model_id
+                    if vision_fallback.get("to_provider"):
+                        effective_route["provider_id"] = str(vision_fallback["to_provider"])
+                    if vision_fallback.get("to_provider_name"):
+                        effective_route["provider_name"] = str(vision_fallback["to_provider_name"])
+                    if vision_fallback.get("to_mode"):
+                        effective_route["mode"] = str(vision_fallback["to_mode"])
+                agent_runtime["vision_route"] = effective_route
             if temporal_guarded:
                 trace.append({
                     "title": "校验时效性",
@@ -7065,11 +7860,57 @@ class ResearchAgentRuntime:
         image_attachments: list[dict[str, Any]] = []
         if provider_id == "local-huggingface":
             # Registering the selected snapshot starts only a loopback server;
-            # weights are loaded lazily by the first completion request so the
-            # normal desktop startup remains quick.
+            # the component now runs a bounded generation probe before returning
+            # so model-loading failures can be handled before a user request.
             provider_kind = "openai-compatible"
             provider = dict(provider)
-            provider["base_url"] = ensure_local_transformers_runtime(model_id)
+            try:
+                provider["base_url"] = ensure_local_transformers_runtime(model_id)
+            except (RuntimeError, ValueError) as error:
+                # A local model can be present on disk but unusable because of
+                # VRAM/page-file pressure.  Interactive image questions should
+                # still work through OCR + the selected text model; do not make
+                # the user discover this as a generic HTTP 502.
+                text_route = select_text_route(
+                    self.workspace,
+                    settings,
+                    active_provider_id=requested_provider_id,
+                    active_model_id=requested_model_id,
+                )
+                if text_route is None:
+                    raise RuntimeError(
+                        f"本地视觉模型 {model_id} 无法启动：{error}。"
+                        "请在设置 → 本地模型检查显存或选择可用的视觉模型。"
+                    ) from error
+                provider = dict(text_route["provider"])
+                provider_id = str(text_route["provider_id"])
+                provider_kind = str(text_route["provider_kind"])
+                model_id = str(text_route["model_id"])
+                vision_route.update(
+                    {
+                        "mode": "ocr-fallback",
+                        "fallback_reason": "local_vision_unavailable",
+                        "fallback_message": " ".join(str(error).split())[:500],
+                        "text_provider_id": provider_id,
+                        "text_model_id": model_id,
+                    }
+                )
+                managed = str(provider.get("auth_mode", "")) == "managed"
+                api_key = (
+                    "scansci-managed-gateway"
+                    if managed
+                    else get_provider_api_key(self.workspace, provider_id)
+                )
+                if not api_key:
+                    raise ValueError("本地视觉模型不可用，且文字模型尚未配置 API Key") from error
+                responses_enabled = bool(provider.get("responses_enabled", False))
+                api_surface = select_api_surface(
+                    requested_api_surface,
+                    provider_kind=provider_kind,
+                    provider_id=provider_id,
+                    model=model_id,
+                    responses_enabled=responses_enabled,
+                )
         if raw_images:
             image_attachments = persist_image_attachments(self.workspace, raw_images)
             blocks = vision_image_blocks(self.workspace, image_attachments)
@@ -7101,6 +7942,7 @@ class ResearchAgentRuntime:
                     }
                     for block in blocks
                 )
+                messages[-1]["content"] = content
             else:
                 content = [{"type": "text", "text": text}]
                 content.extend(
@@ -7110,7 +7952,7 @@ class ResearchAgentRuntime:
                     }
                     for block in blocks
                 )
-            messages[-1]["content"] = content
+                messages[-1]["content"] = content
         thinking_mode = (
             managed_glm_thinking_mode(
                 thinking_level=payload.get("thinking_level"),
@@ -7388,7 +8230,10 @@ class ResearchAgentRuntime:
                 # semantic index and prevent the real model from rebuilding it
                 # later.  Test doubles and third-party providers that do not
                 # declare this flag remain compatible.
-                if local_evidence.metadata.get("qwen_embedding_active") is False:
+                if (
+                    local_evidence.metadata.get("qwen_embedding_active") is False
+                    and not local_evidence.metadata.get("remote_embedding_active")
+                ):
                     reasons = "；".join(
                         str(item)
                         for item in list(local_evidence.metadata.get("fallback_reasons", []) or [])
@@ -7421,7 +8266,7 @@ class ResearchAgentRuntime:
                     evidence_db,
                     rows,
                     provider=local_evidence.embedding_provider,
-                    cache_batch_size=2048,
+                    cache_batch_size=DEFAULT_NEURAL_CACHE_BATCH_SIZE,
                     progress_callback=report_progress,
                     cancel_requested=lambda: self.store.stop_requested(str(run["run_id"])),
                 )
@@ -7439,14 +8284,17 @@ class ResearchAgentRuntime:
             elif workflow_type == "literature_review" and str(stage.get("key", "")) == "research":
                 notebook = self._notebook(str(run["notebook_id"]))
                 evidence_db = self._evidence_db_for_notebook(notebook)
-                # Literature review runs in the desktop/web process.  Do not
-                # import a heavyweight CUDA embedding/reranker stack here:
-                # native accelerator OOMs can terminate the host before Python
-                # gets a chance to downgrade.  The task-scoped full-text
-                # stack is deliberately hashing+lexical, bounded, and still
-                # retrieves from the selected notebook's real evidence spans.
-                # Generation remains on the configured writing model.
-                local_evidence = self._task_fulltext_evidence_stack()
+                # A literature review over a selected notebook is a local
+                # knowledge workflow, not task-acquired full text.  Reuse the
+                # notebook's configured local evidence stack so its cached
+                # embedding model and neural reranker actually participate in
+                # section retrieval.  The stack still records an explicit
+                # hashing/lexical fallback when the optional local models are
+                # unavailable; generation remains on the writing model.
+                local_evidence = self._local_evidence_stack(
+                    evidence_db,
+                    quality_profile=self._retrieval_quality(payload, default="precision"),
+                )
                 output = retrieve_review_evidence(
                     evidence_db,
                     str(payload["question"]),
@@ -8493,9 +9341,17 @@ class ResearchAgentRuntime:
                 "details": verification,
             }
         reader = dict(result.get("reader_answer", {}) or {})
-        insufficient = bool(
-            dict(result.get("answer", {}) or {}).get("insufficient_evidence")
-            or dict(result.get("adequacy", {}) or {}).get("is_sufficient") is False
+        answer_payload = dict(result.get("answer", {}) or {})
+        adequacy_payload = dict(result.get("adequacy", {}) or {})
+        answerability = str(
+            adequacy_payload.get("answerability") or answer_payload.get("answerability") or ""
+        ).strip()
+        # ``needs_review`` is a deliberate intermediate state: evidence can
+        # be rendered with a warning when citation verification passes.  Only
+        # an explicit insufficient answer or a non-reviewable failed adequacy
+        # remains a hard stop for the workflow.
+        insufficient = bool(answer_payload.get("insufficient_evidence")) or (
+            adequacy_payload.get("is_sufficient") is False and answerability != "needs_review"
         )
         task_fulltext_ready = True
         verification_details: dict[str, Any] = verification
@@ -8510,7 +9366,7 @@ class ResearchAgentRuntime:
                 and task_evidence_claim_ready(quality)
             )
             verification_details = {**verification, "task_fulltext_ready": task_fulltext_ready}
-        return {
+        verification_result = {
             "passed": bool(verification.get("passed", False)) and not insufficient and task_fulltext_ready,
             "no_unsupported_claims": bool(verification.get("passed", False)),
             "insufficient_evidence": insufficient,
@@ -8518,6 +9374,10 @@ class ResearchAgentRuntime:
             "evidence_status": str(result.get("evidence_status", "")),
             "details": verification_details,
         }
+        if answerability:
+            verification_result["answerability"] = answerability
+            verification_result["needs_review"] = answerability == "needs_review"
+        return verification_result
 
     def _deliver(self, run: dict[str, Any]) -> dict[str, Any]:
         spec = _WORKFLOWS[str(run["workflow_type"])]
@@ -8999,6 +9859,28 @@ class ResearchAgentRuntime:
             )
             if provider is None or not provider.get("enabled", True):
                 raise ValueError("指定的写作模型提供商不存在或已停用")
+            if str(provider.get("kind", "")) == "local" and provider_id == "local-huggingface":
+                configured_model = next(
+                    (
+                        item
+                        for item in list(provider.get("models", []) or [])
+                        if str(item.get("id", "")) == model_id
+                    ),
+                    None,
+                )
+                if configured_model is None:
+                    raise ValueError("本地模型尚未通过运行时探测，请稍后刷新设置页后再选择")
+                base_url = ensure_local_transformers_runtime(model_id)
+                return self._wrap_model_client(
+                    build_chat_json_client(
+                        "openai-compatible",
+                        base_url=base_url,
+                        api_key="scansci-local-runtime",
+                        model=model_id,
+                        timeout=300.0,
+                        provider_id=provider_id,
+                    )
+                )
             if str(provider.get("kind", "")) == "local":
                 raise ValueError(
                     "真正的文献综述需要生成模型。请在“设置 → 模型服务”添加云端模型服务或本地 Ollama/LM Studio，"
@@ -9011,6 +9893,14 @@ class ResearchAgentRuntime:
             cache_key = (provider_id, model_id, str(provider.get("base_url", "")))
             if managed and cache_key in self._managed_writing_clients:
                 return self._wrap_model_client(self._managed_writing_clients[cache_key])
+            # SiliconFlow's reasoning models (including DeepSeek-V4-Flash)
+            # return a large hidden ``reasoning_content`` block when thinking
+            # is omitted.  Review synthesis uses bounded JSON/prose requests;
+            # leaving that mode implicit can exhaust the completion budget
+            # before the visible paragraph is emitted and makes the provider
+            # look unavailable.  Disable hidden reasoning for this bounded
+            # writer while keeping the provider/model selection unchanged.
+            provider_thinking_mode = "disabled" if provider_id == "siliconflow" else None
             primary_client = build_chat_json_client(
                 str(provider.get("kind", "")),
                 base_url=str(provider.get("base_url", "")),
@@ -9018,7 +9908,7 @@ class ResearchAgentRuntime:
                 model=model_id,
                 timeout=35.0 if managed else 60.0,
                 session=managed_gateway_session() if managed else None,
-                thinking_mode="disabled" if managed else None,
+                thinking_mode="disabled" if managed else provider_thinking_mode,
                 api_surface=str(provider.get("api_surface", "chat_completions")),
                 provider_id=provider_id,
                 responses_enabled=bool(provider.get("responses_enabled", False)),
@@ -9043,7 +9933,7 @@ class ResearchAgentRuntime:
                 model=fallback_model,
                 timeout=50.0,
                 session=managed_gateway_session(),
-                thinking_mode="disabled",
+                thinking_mode="disabled" if managed else provider_thinking_mode,
             )
             client = CascadingChatJsonClient([primary_client, fallback_client])
             self._managed_writing_clients[cache_key] = client
@@ -9085,6 +9975,7 @@ class ResearchAgentRuntime:
         *,
         quality_profile: str = "balanced",
         embedding_only: bool = False,
+        _allow_neural_build: bool = False,
     ) -> LocalEvidenceStack:
         target = evidence_db or self.evidence_db
         # Every non-empty desktop library uses the configured neural embedding
@@ -9202,6 +10093,54 @@ class ResearchAgentRuntime:
                     return model_id.strip()
             return ""
 
+        def configured_remote_embedding() -> tuple[str, Any | None]:
+            """Build the supported SiliconFlow embedding selected by the user.
+
+            The provider uses SiliconFlow's OpenAI-compatible ``/embeddings``
+            endpoint.  Constructing this adapter is local-only; no request is
+            made until a query or vector-cache build actually needs a vector.
+            """
+
+            reference = str(roles.get("embedding", "") or "").strip()
+            if not reference.startswith("provider:"):
+                return "", None
+            provider_id, separator, model_id = reference.removeprefix("provider:").partition(":")
+            if not separator or provider_id != "siliconflow" or not model_id.strip():
+                return "", None
+            provider = next(
+                (item for item in settings.get("providers", []) if str(item.get("id", "")) == provider_id),
+                None,
+            )
+            if provider is None or not provider.get("enabled", True):
+                return "", None
+            model = next(
+                (
+                    item
+                    for item in provider.get("models", [])
+                    if str(item.get("id", "")) == model_id.strip()
+                ),
+                None,
+            )
+            capabilities = {
+                str(capability).casefold()
+                for capability in list((model or {}).get("capabilities", []) or [])
+            }
+            if model is None or "embedding" not in capabilities:
+                return "", None
+            api_key = get_provider_api_key(self.workspace, provider_id)
+            if not api_key:
+                return "", None
+            try:
+                embedding = build_embedding_provider(
+                    "siliconflow",
+                    base_url=str(provider.get("base_url", "")).strip(),
+                    api_key=api_key,
+                    model=model_id.strip(),
+                )
+            except Exception:
+                return "", None
+            return model_id.strip(), embedding
+
         def configured_remote_reranker() -> tuple[str, Any | None]:
             """Build the supported cloud reranker selected in Default abilities.
 
@@ -9253,7 +10192,16 @@ class ResearchAgentRuntime:
 
         selected_embedding_model = configured_local_model("embedding")
         selected_reranker_model = configured_local_model("reranking")
+        remote_embedding_model, remote_embedding = configured_remote_embedding()
         remote_reranker_model, remote_reranker = configured_remote_reranker()
+        embedding_reference = str(roles.get("embedding", "") or "").strip()
+        if remote_embedding is not None:
+            selected_embedding_model = remote_embedding_model
+        elif embedding_reference.startswith("provider:"):
+            # If a remote key is missing or the provider is unavailable, use
+            # the best verified local model instead of silently loading an
+            # arbitrary model from the environment.
+            selected_embedding_model = auto_local_model("embedding")
         reranking_reference = str(roles.get("reranking", "") or "").strip()
         if remote_reranker is not None:
             selected_reranker_model = remote_reranker_model
@@ -9261,11 +10209,24 @@ class ResearchAgentRuntime:
             # If a remote key is missing or the provider is unavailable, use
             # the best verified local model instead of disabling reranking.
             selected_reranker_model = auto_local_model("reranking")
+        remote_embedding_selected = remote_embedding is not None
         remote_reranker_selected = remote_reranker is not None and not embedding_only
+        if remote_embedding_selected and target.is_file():
+            try:
+                neural_cache_ready = bool(
+                    vector_cache_status(
+                        target,
+                        provider=str(getattr(remote_embedding, "cache_key", "")),
+                        dimensions=int(getattr(remote_embedding, "dimensions", 0) or 0),
+                    ).get("ready")
+                )
+            except Exception:
+                neural_cache_ready = False
         use_fast_path = not target.is_file() or (
             not embedding_only
             and target.stat().st_size < _NEURAL_LIBRARY_MIN_BYTES
             and not neural_cache_ready
+            and not remote_embedding_selected
             and not remote_reranker_selected
         )
         stack_base = (
@@ -9280,8 +10241,36 @@ class ResearchAgentRuntime:
             or selected_reranker_model
             or "auto"
         )
-        selector_key = f"{selected_embedding_model or 'auto'}|{reranker_selector}"
+        embedding_selector = str(
+            getattr(remote_embedding, "cache_key", "")
+            or selected_embedding_model
+            or "auto"
+        )
+        selector_key = f"{embedding_selector}|{reranker_selector}"
         stack_kind = f"{stack_base}:{selector_key}"
+        preparation_key = self._local_evidence_preparation_key(target, requested_profile)
+        with self._local_evidence_prepare_lock:
+            preparation_state = str(
+                dict(self._local_evidence_preparations.get(preparation_key, {}) or {}).get("state", "")
+            )
+            if preparation_state != "preparing":
+                target_prefix = f"{target.resolve()}|"
+                preparation_state = "preparing" if any(
+                    key.startswith(target_prefix)
+                    and str(dict(status or {}).get("state", "")) == "preparing"
+                    for key, status in self._local_evidence_preparations.items()
+                ) else preparation_state
+        # A user query should remain responsive while the background worker
+        # initialises PyTorch/Transformers. Index-building calls also receive
+        # the explicit fast marker; their caller rejects it instead of writing
+        # a fake dense cache, so they fail promptly and can be retried when
+        # preparation completes.
+        if (
+            stack_base != "fast"
+            and preparation_state == "preparing"
+            and not _allow_neural_build
+        ):
+            return self._fast_preparing_evidence_stack(selector_key, requested_profile)
         with self._model_lock:
             if stack_kind not in self._local_evidence_models:
                 if stack_base == "fast":
@@ -9329,9 +10318,13 @@ class ResearchAgentRuntime:
                         quality_profile=requested_profile,
                         load_reranker=not embedding_only,
                         embedding_provider_override=(
-                            existing_neural.embedding_provider
-                            if existing_neural is not None
-                            else None
+                            remote_embedding
+                            if remote_embedding is not None
+                            else (
+                                existing_neural.embedding_provider
+                                if existing_neural is not None
+                                else None
+                            )
                         ),
                         reranker_override=(
                             remote_reranker

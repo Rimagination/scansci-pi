@@ -57,10 +57,21 @@ def test_large_gpu_uses_native_precision() -> None:
     assert plan.compute_dtype == "float16"
 
 
-def test_small_model_uses_native_bf16_on_eight_gib_gpu() -> None:
+def test_vision_model_with_four_gib_weights_uses_four_bit_on_eight_gib_gpu() -> None:
     plan = choose_local_model_plan(
         fake_torch(available=True, vram_gib=8),
         model_weight_gib=4.2,
+    )
+
+    assert plan.device == "cuda:0"
+    assert plan.quantization == "4bit"
+    assert plan.compute_dtype == "bfloat16"
+
+
+def test_small_model_still_uses_native_bf16_on_eight_gib_gpu() -> None:
+    plan = choose_local_model_plan(
+        fake_torch(available=True, vram_gib=8),
+        model_weight_gib=3.2,
     )
 
     assert plan.device == "cuda:0"

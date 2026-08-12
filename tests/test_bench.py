@@ -90,6 +90,27 @@ def test_run_benchmark_scores_retrieval_citation_and_abstention(tmp_path: Path):
     }
 
 
+def test_enhanced_benchmark_reports_mature_rag_quality_metrics(tmp_path: Path):
+    db_path, gold_path = _make_benchmark_fixture(tmp_path)
+
+    result = run_benchmark(db_path, gold_path, k=5, benchmark_mode="enhanced")
+
+    assert result["metric_groups"]["mature_quality"] == [
+        "answer_completeness_rate",
+        "facet_coverage",
+        "context_precision",
+        "reference_contamination_rate",
+        "abstention_precision",
+        "abstention_recall",
+    ]
+    assert result["answer_completeness_rate"] == 1.0
+    assert result["facet_coverage"] == 1.0
+    assert result["context_precision"] == 1.0
+    assert result["reference_contamination_rate"] == 0.0
+    assert result["abstention_precision"] == 1.0
+    assert result["abstention_recall"] == 1.0
+
+
 def test_build_benchmark_leaderboard_ranks_details_by_evidence_recall(tmp_path: Path):
     qasper_path = tmp_path / "qasper-details.json"
     scifact_path = tmp_path / "scifact-details.json"

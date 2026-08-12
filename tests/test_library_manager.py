@@ -195,6 +195,37 @@ def test_import_library_folder_reports_pipeline_milestones_and_persists_quality(
     }
 
 
+def test_import_library_files_passes_workspace_to_document_parser(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace, evidence = _workspace(tmp_path)
+    source = tmp_path / "paper.txt"
+    source.write_text("placeholder", encoding="utf-8")
+    seen: list[Path | None] = []
+
+    def fake_extract(path, *, output_dir, parser="auto", workspace=None):
+        seen.append(Path(workspace) if workspace is not None else None)
+        text_path = Path(output_dir) / "source.md"
+        text_path.write_text("# Catalog title\n\nA traceable text extraction is indexed as evidence.", encoding="utf-8")
+        return {
+            "source_id": "source-test",
+            "text_path": str(text_path),
+            "parser": "fake",
+            "page_count": 1,
+            "character_count": 70,
+        }
+
+    monkeypatch.setattr("scansci_html.library_manager.extract_local_document", fake_extract)
+    result = import_library_files(
+        workspace,
+        evidence,
+        notebook_id="research",
+        file_paths=[source],
+        replace_existing=True,
+    )
+
+    assert seen == [workspace.resolve()]
+    assert result["notebook"]["sources"][0]["title"] == "Catalog title"
+
+
 def test_each_notebook_keeps_an_isolated_evidence_index(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     evidence = tmp_path / "evidence.sqlite"

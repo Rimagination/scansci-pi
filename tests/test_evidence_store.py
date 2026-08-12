@@ -10,6 +10,7 @@ from scansci_html.evidence_store import (
     export_spans_jsonl,
     index_evidence_library,
     index_markdown_library,
+    repair_document_titles,
 )
 
 
@@ -281,6 +282,143 @@ This reference sentence should not enter the evidence store.
     )
     assert table_hits == [("10.5555_markdown-source.s0006",)]
     assert reference_hits == []
+
+
+def test_index_markdown_library_prefers_metadata_title_over_pdf_page_heading(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    (library / "solar-paper.md").write_text(
+        """---
+title: 光伏设施对荒漠草地生态环境的影响
+source_file: solar-paper.pdf
+source_url: D:/papers/solar-paper.pdf
+source_storage: external-reference
+---
+
+# 第 1 页分类号：S3
+
+摘要
+
+光伏设施改变了荒漠草地的近地微气候和土壤水分条件，并影响植被恢复过程。
+
+# 第 2 页
+
+## 结果
+
+研究结果显示，板下和板间的植被覆盖度存在显著差异。
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+
+    summary = index_markdown_library(library, db_path=db_path, min_sentence_length=10)
+
+    assert summary["documents"] == 1
+    with sqlite3.connect(db_path) as connection:
+        document_title = connection.execute("select title from source_documents").fetchone()[0]
+        span_titles = connection.execute("select distinct title from evidence_spans").fetchall()
+        fts_title = connection.execute("select title from evidence_spans_fts limit 1").fetchone()[0]
+
+    assert document_title == "光伏设施对荒漠草地生态环境的影响"
+    assert span_titles == [("光伏设施对荒漠草地生态环境的影响",)]
+    assert fts_title == "光伏设施对荒漠草地生态环境的影响"
+
+
+def test_repair_document_titles_updates_catalogue_without_rebuilding_vectors(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    source = library / "solar-paper.md"
+    source.write_text(
+        """---
+title: 光伏设施对荒漠草地生态环境的影响
+source_file: solar-paper.pdf
+---
+
+# 第 1 页分类号：S3
+
+研究结果显示，板下和板间的植被覆盖度存在显著差异。
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=10)
+    build_library_overview(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        doc_id = connection.execute("select doc_id from source_documents").fetchone()[0]
+        connection.execute("update source_documents set title = '第 1 页分类号：S3' where doc_id = ?", (doc_id,))
+        connection.execute("update evidence_spans set title = '第 1 页分类号：S3' where doc_id = ?", (doc_id,))
+        connection.execute("delete from evidence_spans_fts where doc_id = ?", (doc_id,))
+        connection.execute(
+            "insert into evidence_spans_fts select evidence_id, doc_id, title, section, text from evidence_spans where doc_id = ?",
+            (doc_id,),
+        )
+        connection.execute("update document_cards set title = '第 1 页分类号：S3' where doc_id = ?", (doc_id,))
+        connection.execute(
+            "update knowledge_graph_nodes set label = '第 1 页分类号：S3' where node_id = ?",
+            (f"document:{doc_id}",),
+        )
+        connection.execute(
+            "update document_index_revisions set source_fingerprint = 'legacy-title-fingerprint' where doc_id = ?",
+            (doc_id,),
+        )
+        connection.commit()
+        before_fingerprint = connection.execute(
+            "select source_fingerprint from document_index_revisions where doc_id = ?", (doc_id,)
+        ).fetchone()[0]
+
+    assert repair_document_titles(db_path) == {"documents": 1, "updated": 1}
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("select title from source_documents").fetchone()[0] == "光伏设施对荒漠草地生态环境的影响"
+        assert connection.execute("select distinct title from evidence_spans").fetchall() == [("光伏设施对荒漠草地生态环境的影响",)]
+        assert connection.execute("select title from evidence_spans_fts limit 1").fetchone()[0] == "光伏设施对荒漠草地生态环境的影响"
+        assert connection.execute("select title from document_cards").fetchone()[0] == "光伏设施对荒漠草地生态环境的影响"
+        assert connection.execute("select label from knowledge_graph_nodes where node_id = ?", (f"document:{doc_id}",)).fetchone()[0] == "光伏设施对荒漠草地生态环境的影响"
+        after_fingerprint = connection.execute(
+            "select source_fingerprint from document_index_revisions where doc_id = ?", (doc_id,)
+        ).fetchone()[0]
+
+    assert before_fingerprint == "legacy-title-fingerprint"
+    assert after_fingerprint != before_fingerprint
+
+
+def test_incremental_index_repairs_title_only_change_without_reparsing_document(tmp_path: Path):
+    library = tmp_path / "markdown"
+    library.mkdir()
+    source = library / "solar-paper.md"
+    source.write_text(
+        """---
+title: 光伏设施对荒漠草地生态环境的影响
+source_file: solar-paper.pdf
+---
+
+# 第 1 页分类号：S3
+
+研究结果显示，板下和板间的植被覆盖度存在显著差异。
+""",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_markdown_library(library, db_path=db_path, min_sentence_length=10)
+
+    with sqlite3.connect(db_path) as connection:
+        doc_id = connection.execute("select doc_id from source_documents").fetchone()[0]
+        connection.execute("update source_documents set title = '第 1 页分类号：S3' where doc_id = ?", (doc_id,))
+        connection.execute("delete from document_index_revisions where doc_id = ?", (doc_id,))
+        connection.commit()
+
+    refreshed = index_markdown_library(
+        library,
+        db_path=db_path,
+        min_sentence_length=10,
+        incremental=True,
+    )
+
+    assert refreshed["reused_documents"] == 1
+    assert refreshed["changed_documents"] == 0
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("select title from source_documents").fetchone()[0] == "光伏设施对荒漠草地生态环境的影响"
 
 
 def test_library_overview_uses_one_document_card_per_file_and_keeps_evidence_anchors(tmp_path: Path):

@@ -129,7 +129,13 @@ def index_evidence_library(
             if document.doc_id != stable_doc_id:
                 document = _rebind_document_spans([document], stable_doc_id)[0]
             fingerprint = _document_source_fingerprint(document, spans)
-            if incremental and _document_fingerprint_matches(connection, document.doc_id, fingerprint):
+            if incremental and _document_fingerprint_matches(
+                connection,
+                document.doc_id,
+                fingerprint,
+                first_span=document,
+                spans=spans,
+            ):
                 _refresh_document_paths(
                     connection,
                     document,
@@ -231,7 +237,8 @@ def index_markdown_library(
                     min_sentence_length=1,
                 )
             if not spans and include_title_only_notes:
-                fallback_title = _markdown_title(_split_markdown_front_matter(markdown_text)[1]) or markdown_file.stem
+                metadata, body = _split_markdown_front_matter(markdown_text)
+                fallback_title = _markdown_document_title(metadata, body, markdown_file)
                 spans = extract_markdown_evidence_spans(
                     f"---\ntitle: {fallback_title}\n---\n\n{fallback_title}",
                     markdown_path=markdown_file,
@@ -256,7 +263,13 @@ def index_markdown_library(
             documents += 1
             span_count += len(spans)
             fingerprint = _document_source_fingerprint(document_span, spans)
-            if incremental and _document_fingerprint_matches(connection, document_span.doc_id, fingerprint):
+            if incremental and _document_fingerprint_matches(
+                connection,
+                document_span.doc_id,
+                fingerprint,
+                first_span=document_span,
+                spans=spans,
+            ):
                 _refresh_document_paths(
                     connection,
                     document_span,
@@ -347,6 +360,61 @@ def ensure_library_overview(db_path: str | Path) -> dict[str, int]:
     except sqlite3.Error:
         return _empty_library_overview()
     return build_library_overview(db)
+
+
+def repair_document_titles(db_path: str | Path) -> dict[str, int]:
+    """Repair display titles from source metadata without rebuilding evidence.
+
+    This is intentionally a catalogue-only operation: evidence rows, section
+    anchors, and vector tables remain untouched. The per-document fingerprint
+    is refreshed because the display title is part of that catalogue identity;
+    changing it does not invalidate the evidence vectors.
+    """
+
+    db = Path(db_path)
+    if not db.is_file():
+        return {"documents": 0, "updated": 0}
+    documents = 0
+    updated = 0
+    with sqlite3.connect(db) as connection:
+        _initialize_schema(connection)
+        rows = list(connection.execute("select doc_id, title, html_path from source_documents"))
+        documents = len(rows)
+        for doc_id, current_title, html_path in rows:
+            source_path = Path(str(html_path or ""))
+            if source_path.suffix.lower() not in {".md", ".markdown"} or not source_path.is_file():
+                continue
+            try:
+                metadata, body = _split_markdown_front_matter(
+                    source_path.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, UnicodeError):
+                continue
+            title = _markdown_document_title(metadata, body, source_path)
+            title_changed = bool(title and title != str(current_title or "").strip())
+            if title_changed:
+                _refresh_document_title(connection, str(doc_id), title)
+                updated += 1
+            # Keep the revision aligned even when a previous repair already
+            # updated the visible title.  Otherwise the next incremental
+            # import would see the stale, page-heading fingerprint and
+            # needlessly reparse the document (and potentially rebuild
+            # dependent vectors).
+            document = connection.execute(
+                """
+                select doc_id, title, doi, source_url, publication_year, html_path
+                from source_documents where doc_id = ?
+                """,
+                (str(doc_id),),
+            ).fetchone()
+            if document is not None:
+                _record_document_fingerprint(
+                    connection,
+                    str(doc_id),
+                    _database_document_fingerprint(connection, document),
+                )
+        connection.commit()
+    return {"documents": documents, "updated": updated}
 
 
 def build_library_overview(
@@ -838,7 +906,7 @@ def extract_markdown_evidence_spans(
     min_sentence_length: int = 40,
 ) -> list[EvidenceSpan]:
     metadata, body = _split_markdown_front_matter(str(markdown_text or ""))
-    title = _markdown_title(body) or str(metadata.get("title") or "").strip() or Path(markdown_path).stem
+    title = _markdown_document_title(metadata, body, markdown_path)
     doi = str(metadata.get("doi") or "").strip() or None
     source_url = str(metadata.get("source_url") or metadata.get("url") or "").strip()
     normalized_path = Path(markdown_path).as_posix()
@@ -1432,6 +1500,41 @@ def _refresh_document_paths(
     )
 
 
+def _refresh_document_title(connection: sqlite3.Connection, doc_id: str, title: str) -> None:
+    """Update catalogue and FTS display titles without touching evidence vectors."""
+
+    normalized_title = str(title or "").strip()
+    if not normalized_title:
+        return
+    normalized_doc_id = str(doc_id or "").strip()
+    connection.execute(
+        "update source_documents set title = ? where doc_id = ?",
+        (normalized_title, normalized_doc_id),
+    )
+    connection.execute(
+        "update evidence_spans set title = ? where doc_id = ?",
+        (normalized_title, normalized_doc_id),
+    )
+    connection.execute("delete from evidence_spans_fts where doc_id = ?", (normalized_doc_id,))
+    connection.execute(
+        """
+        insert into evidence_spans_fts (evidence_id, doc_id, title, section, text)
+        select evidence_id, doc_id, title, section, text
+        from evidence_spans
+        where doc_id = ?
+        """,
+        (normalized_doc_id,),
+    )
+    connection.execute(
+        "update document_cards set title = ? where doc_id = ?",
+        (normalized_title, normalized_doc_id),
+    )
+    connection.execute(
+        "update knowledge_graph_nodes set label = ? where node_id = ? and node_type = 'document'",
+        (normalized_title, f"document:{normalized_doc_id}"),
+    )
+
+
 def _source_version_for_span(first_span: EvidenceSpan, content_hash: str = "") -> str:
     source_url = str(first_span.source_url or "").strip()
     if _is_remote_source(source_url):
@@ -1447,8 +1550,15 @@ def _stored_content_hash(connection: sqlite3.Connection, doc_id: str) -> str:
     return str(row[0] or "") if row else ""
 
 
-def _database_document_fingerprint(connection: sqlite3.Connection, document: sqlite3.Row | tuple[object, ...]) -> str:
+def _database_document_fingerprint(
+    connection: sqlite3.Connection,
+    document: sqlite3.Row | tuple[object, ...],
+    *,
+    title_override: str | None = None,
+) -> str:
     doc_id, title, doi, source_url, publication_year, _html_path = document
+    if title_override is not None:
+        title = title_override
     digest = blake2b(digest_size=20)
     digest.update(
         "\x1f".join(
@@ -1472,7 +1582,12 @@ def _database_document_fingerprint(connection: sqlite3.Connection, document: sql
     return digest.hexdigest()
 
 
-def _document_source_fingerprint(first_span: EvidenceSpan, spans: list[EvidenceSpan]) -> str:
+def _document_source_fingerprint(
+    first_span: EvidenceSpan,
+    spans: list[EvidenceSpan],
+    *,
+    title_override: str | None = None,
+) -> str:
     """Fingerprint original parsed structure, not a generated summary.
 
     The value lets a repeated import keep every unchanged source document and
@@ -1486,7 +1601,7 @@ def _document_source_fingerprint(first_span: EvidenceSpan, spans: list[EvidenceS
         "\x1f".join(
             (
                 str(first_span.doc_id),
-                str(first_span.title),
+                str(first_span.title if title_override is None else title_override),
                 str(first_span.doi or ""),
                 _fingerprint_source_marker(
                     str(first_span.source_url or ""),
@@ -1539,7 +1654,14 @@ def _stored_document_fingerprint(connection: sqlite3.Connection, doc_id: str) ->
     return _database_document_fingerprint(connection, document)
 
 
-def _document_fingerprint_matches(connection: sqlite3.Connection, doc_id: str, fingerprint: str) -> bool:
+def _document_fingerprint_matches(
+    connection: sqlite3.Connection,
+    doc_id: str,
+    fingerprint: str,
+    *,
+    first_span: EvidenceSpan | None = None,
+    spans: list[EvidenceSpan] | None = None,
+) -> bool:
     if doc_id not in _existing_document_ids(connection):
         return False
     existing = _stored_document_fingerprint(connection, doc_id)
@@ -1548,6 +1670,21 @@ def _document_fingerprint_matches(connection: sqlite3.Connection, doc_id: str, f
     if existing == fingerprint:
         _record_document_fingerprint(connection, doc_id, fingerprint)
         return True
+    if first_span is not None and spans is not None:
+        stored_title_row = connection.execute(
+            "select title from source_documents where doc_id = ?",
+            (str(doc_id),),
+        ).fetchone()
+        stored_title = str(stored_title_row[0] or "") if stored_title_row else ""
+        title_only_fingerprint = _document_source_fingerprint(
+            first_span,
+            spans,
+            title_override=stored_title,
+        )
+        if stored_title and existing == title_only_fingerprint:
+            _refresh_document_title(connection, str(doc_id), str(first_span.title))
+            _record_document_fingerprint(connection, doc_id, fingerprint)
+            return True
     return False
 
 
@@ -1741,6 +1878,50 @@ def _markdown_title(markdown_text: str) -> str:
     return ""
 
 
+def _markdown_document_title(
+    metadata: dict[str, str],
+    body: str,
+    markdown_path: str | Path,
+) -> str:
+    """Choose a stable document title without promoting a PDF page marker.
+
+    Imported PDFs store the source filename in front matter, while the body
+    starts with page-aware headings such as ``第 1 页分类号`` or ``Page 1``.
+    The front-matter title is the document identity in that case; the body
+    heading is only a fallback for ordinary Markdown notes.
+    """
+
+    metadata_title = _clean_document_title(metadata.get("title"))
+    if _looks_mojibake(metadata_title):
+        source_file = _clean_document_title(metadata.get("source_file"))
+        if source_file:
+            metadata_title = Path(source_file).stem
+    if metadata_title:
+        return metadata_title
+
+    body_title = _clean_document_title(_markdown_title(body))
+    if body_title and not _is_page_heading(body_title):
+        return body_title
+
+    source_file = _clean_document_title(metadata.get("source_file"))
+    if source_file:
+        return Path(source_file).stem
+    return _clean_document_title(Path(markdown_path).stem) or "Untitled article"
+
+
+def _clean_document_title(value: object) -> str:
+    text = _strip_markdown_inline(str(value or ""))
+    return re.sub(r"\s+", " ", text).strip(" \t\r\n-—–")
+
+
+def _looks_mojibake(value: str) -> bool:
+    text = str(value or "")
+    if "�" in text:
+        return True
+    markers = ("锛", "鐨", "涓", "绔", "鏂", "瀹", "纭", "閿", "Ã", "Â")
+    return sum(text.count(marker) for marker in markers) >= 2
+
+
 def _metadata_year(metadata: dict[str, str]) -> int | None:
     for key in ("publication_year", "published_year", "year", "date", "publication_date"):
         year = _year_from_text(str(metadata.get(key, "")))
@@ -1865,7 +2046,14 @@ def _implicit_markdown_heading(line: str) -> str:
 
 
 def _is_page_heading(value: str) -> bool:
-    return bool(re.fullmatch(r"(?:第\s*)?\d+\s*页|page\s*\d+", str(value or "").strip(), flags=re.IGNORECASE))
+    normalized = re.sub(r"\s+", " ", str(value or "").strip())
+    return bool(
+        re.match(
+            r"^(?:\u7b2c\s*)?\d+\s*(?:\u9875|page)(?:\b|\s|$)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _without_pdf_running_header(lines: list[str]) -> list[str]:

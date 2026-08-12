@@ -4,7 +4,8 @@ The evidence store is queried repeatedly while a review is planned section by
 section.  Persisting only the tiny hashing fallback meant a real local neural
 model had to re-embed the complete library for every query.  Providers that
 declare a stable ``cache_key`` can now share the same content-addressed cache.
-Remote providers intentionally remain uncached here.
+Remote providers are cached only when they expose a stable cache key and
+vector dimension; the API credential is never part of either value.
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ from typing import Any, Callable
 
 VECTOR_CACHE_SCHEMA = 1
 VECTOR_GENERATION_SCHEMA = 1
+# Keep local transformer batches bounded.  The default embedding provider
+# already encodes in small batches (normally 32–64); sending thousands of
+# evidence spans through one cache batch makes cancellation unresponsive and
+# can exhaust memory on CPU-only desktops.
+DEFAULT_NEURAL_CACHE_BATCH_SIZE = 64
 
 
 class VectorCacheBusy(RuntimeError):
@@ -255,6 +261,42 @@ def _active_generation(
         + """
           where logical_provider = ? and dimensions = ? and state = 'active'
           order by updated_at desc limit 1
+        """,
+        (provider, int(dimensions)),
+    ).fetchone()
+    return _generation_record(row)
+
+
+def _latest_reusable_generation(
+    connection: sqlite3.Connection,
+    *,
+    provider: str,
+    dimensions: int,
+) -> dict[str, Any] | None:
+    """Find the newest complete generation that can seed an incremental build.
+
+    ``stale`` is intentionally included here.  Evidence ingestion marks the
+    serving generation stale as soon as one source document changes so that a
+    query cannot mix old vectors with new text.  That safety state must not
+    make the unchanged vectors disposable: they remain valid migration input
+    for the next generation and avoid re-embedding the entire library.
+    """
+
+    if not _table_exists(connection, "scansci_vector_index_generations"):
+        return None
+    row = connection.execute(
+        _generation_select_sql()
+        + """
+          where logical_provider = ? and dimensions = ?
+            and state in ('active', 'stale', 'retired')
+          order by case state
+              when 'active' then 0
+              when 'stale' then 1
+              else 2
+            end,
+            updated_at desc,
+            created_at desc
+          limit 1
         """,
         (provider, int(dimensions)),
     ).fetchone()
@@ -965,7 +1007,7 @@ def _prepare_generation(
     row_digests: dict[str, str],
     corpus_sha256: str,
 ) -> dict[str, Any]:
-    """Create or resume a building generation and reuse unchanged active vectors."""
+    """Create or resume a generation while reusing unchanged vectors."""
 
     import sqlite_vec
 
@@ -988,7 +1030,7 @@ def _prepare_generation(
             if current is not None:
                 return current
 
-            active = _active_generation(
+            reusable = _latest_reusable_generation(
                 connection,
                 provider=logical_provider,
                 dimensions=dimensions,
@@ -1004,7 +1046,7 @@ def _prepare_generation(
             )
             storage_provider = (
                 logical_provider
-                if generation_count == 0 and active is None
+                if generation_count == 0 and reusable is None
                 else f"{logical_provider}#generation:{corpus_sha256[:20]}"
             )
             generation_id = "g_" + sha256(
@@ -1032,7 +1074,7 @@ def _prepare_generation(
             )
 
             reused = 0
-            if active is None:
+            if reusable is None:
                 # ``migrate_embedding_caches`` deliberately writes matching
                 # legacy vectors under the logical provider.  Treat those
                 # validated cache rows as reused when the first generation is
@@ -1043,8 +1085,8 @@ def _prepare_generation(
                     dimensions=dimensions,
                     row_digests=row_digests,
                 )
-            if active is not None and str(active["storage_provider"]) != storage_provider:
-                source_provider = str(active["storage_provider"])
+            if reusable is not None and str(reusable["storage_provider"]) != storage_provider:
+                source_provider = str(reusable["storage_provider"])
                 source_table = _vector_table(dimensions, provider_key=source_provider)
                 target_table = _vector_table(dimensions, provider_key=storage_provider)
                 if _table_exists(connection, source_table):
@@ -1207,7 +1249,7 @@ def prewarm_embedding_cache(
     rows: dict[str, dict[str, Any]],
     *,
     provider: Any,
-    cache_batch_size: int = 2048,
+    cache_batch_size: int = DEFAULT_NEURAL_CACHE_BATCH_SIZE,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -1225,7 +1267,24 @@ def prewarm_embedding_cache(
         }
     logical_provider = str(getattr(provider, "cache_key", "") or "").strip()
     dimensions = int(getattr(provider, "dimensions", 0) or 0)
-    if not logical_provider or dimensions <= 0:
+    if not logical_provider:
+        raise RuntimeError("本地嵌入模型未提供稳定的缓存标识或向量维度")
+    # Some remote-compatible embedding APIs do not expose their native output
+    # size until the first request. Discover it before creating the generation
+    # record, while keeping the fast path for providers with a known size.
+    query_vector: list[float] | None = None
+    if dimensions <= 0:
+        query_embedder = getattr(provider, "embed_query", None)
+        if callable(query_embedder):
+            query_vector = [float(value) for value in query_embedder("scientific evidence retrieval")]
+        else:
+            query_vector = [
+                float(value)
+                for value in provider.embed_texts(["scientific evidence retrieval"])[0]
+            ]
+        reported_dimensions = int(getattr(provider, "dimensions", 0) or 0)
+        dimensions = reported_dimensions or len(query_vector)
+    if dimensions <= 0 or (query_vector is not None and len(query_vector) != dimensions):
         raise RuntimeError("本地嵌入模型未提供稳定的缓存标识或向量维度")
     row_digests = _row_digests(rows)
     corpus_sha256 = _corpus_fingerprint(
@@ -1262,11 +1321,12 @@ def prewarm_embedding_cache(
             "reused": max(int(generation.get("reused", 0)), completed),
         }
 
-    query_embedder = getattr(provider, "embed_query", None)
-    if callable(query_embedder):
-        query_vector = [float(value) for value in query_embedder("scientific evidence retrieval")]
-    else:
-        query_vector = [float(value) for value in provider.embed_texts(["scientific evidence retrieval"])[0]]
+    if query_vector is None:
+        query_embedder = getattr(provider, "embed_query", None)
+        if callable(query_embedder):
+            query_vector = [float(value) for value in query_embedder("scientific evidence retrieval")]
+        else:
+            query_vector = [float(value) for value in provider.embed_texts(["scientific evidence retrieval"])[0]]
 
     generation_id = str(generation["generation_id"])
 

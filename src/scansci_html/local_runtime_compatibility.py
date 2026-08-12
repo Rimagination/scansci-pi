@@ -33,8 +33,12 @@ def default_compatibility_path() -> Path:
     if override:
         root = Path(override).expanduser().resolve()
     else:
-        local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        root = Path(local_app_data) / "ScanSci" / "runtimes" / "local-transformers" / "state"
+        runtime_root = os.getenv("SCANSCI_LOCAL_RUNTIME_ROOT", "").strip()
+        if runtime_root:
+            root = Path(runtime_root).expanduser().resolve() / "state"
+        else:
+            local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            root = Path(local_app_data) / "ScanSci" / "runtimes" / "local-transformers" / "state"
     return root / "model-compatibility.json"
 
 
@@ -85,7 +89,11 @@ class ModelCompatibilityStore:
 
     def apply(self, record: Mapping[str, Any], *, component_version: str) -> dict[str, Any]:
         result = dict(record)
-        if not _is_qwen35(record):
+        entry = self._entries().get(str(record.get("id", "")))
+        # Qwen3.5 requires a probe before its first use.  Other local models
+        # remain immediately selectable unless this component has previously
+        # recorded a probe result for the same snapshot and version.
+        if not _is_qwen35(record) and not isinstance(entry, dict):
             return result
         files_present = bool(record.get("model_files_present", record.get("ready")))
         result["model_files_present"] = files_present
@@ -109,12 +117,13 @@ class ModelCompatibilityStore:
                 }
             )
             return result
-        entry = self._entries().get(str(record.get("id", "")))
         matches = bool(
             isinstance(entry, dict)
             and entry.get("fingerprint") == fingerprint
             and entry.get("component_version") == str(component_version)
         )
+        if not _is_qwen35(record) and not matches:
+            return result
         if not matches:
             message = (
                 "尚未由当前本地运行组件在隔离进程中完成真实加载和最小生成；"

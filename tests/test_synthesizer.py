@@ -107,6 +107,40 @@ def test_local_fallback_prefers_requested_chinese_evidence_over_english_excerpts
     assert all("Solar" not in str(claim["text"]) for claim in answer["answer"])
 
 
+def test_local_synthesis_keeps_distinct_claims_for_required_facets():
+    answer = synthesize_answer(
+        "不同建设年份的光伏项目如何影响微气候、植被群落和土壤碳储量？",
+        [
+            {
+                "quote_id": "q0001",
+                "claim_target": "微气候变化",
+                "exact_quote": "不同建设年份的光伏项目改变了地表微气候。",
+                "confidence": 0.9,
+            },
+            {
+                "quote_id": "q0002",
+                "claim_target": "植被群落变化",
+                "exact_quote": "植被群落的物种组成和盖度发生了变化。",
+                "confidence": 0.85,
+            },
+        ],
+        query_plan={
+            "answer_type": "evidence",
+            "required_facets": [
+                {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+                {"id": "植被群落", "label": "植被群落", "terms": ["植被群落"]},
+            ],
+        },
+    )
+
+    assert len(answer["answer"]) == 2
+    assert {"q0001", "q0002"} == {
+        quote_id
+        for claim in answer["answer"]
+        for quote_id in claim["quote_ids"]
+    }
+
+
 def test_synthesize_answer_groups_conflict_evidence_into_contrast_claim():
     evidence_table = [
         {

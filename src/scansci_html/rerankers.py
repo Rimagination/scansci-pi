@@ -237,6 +237,7 @@ class SiliconFlowReranker:
         timeout: float = 30.0,
         session: Any | None = None,
         fallback: Reranker | None = None,
+        instruction: str = "",
     ) -> None:
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.api_key = str(api_key or "").strip()
@@ -250,6 +251,9 @@ class SiliconFlowReranker:
             raise ValueError("SiliconFlow reranker requires a model name")
         self.session = session or requests.Session()
         self.fallback = fallback or LexicalReranker()
+        self.instruction = str(instruction or "").strip()
+        if not self.instruction and self.model_name.casefold().startswith("qwen/qwen3-reranker"):
+            self.instruction = DEFAULT_QWEN3_RERANK_INSTRUCTION
         # Do not include the API key in any identity used by caches or logs.
         self.cache_key = f"siliconflow:{self.base_url}:{self.model_name}"
         self.device = "remote"
@@ -260,19 +264,22 @@ class SiliconFlowReranker:
             return []
         documents = [_candidate_text(candidate) for candidate in candidates]
         try:
+            payload = {
+                "model": self.model_name,
+                "query": str(query or ""),
+                "documents": documents,
+                "top_n": len(documents),
+                "return_documents": False,
+            }
+            if self.instruction:
+                payload["instruction"] = self.instruction
             response = self.session.post(
                 f"{self.base_url}/rerank",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": self.model_name,
-                    "query": str(query or ""),
-                    "documents": documents,
-                    "top_n": len(documents),
-                    "return_documents": False,
-                },
+                json=payload,
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -535,6 +542,7 @@ def build_reranker(
             model_name=model_name or DEFAULT_SILICONFLOW_RERANKER_MODEL,
             timeout=timeout,
             session=session,
+            instruction=instruction,
         )
     if name in {"qwen3", "qwen3-reranker", "qwen-reranker"}:
         return Qwen3Reranker(

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from scansci_html.embeddings import (
     OpenAICompatibleEmbeddingProvider,
     SentenceTransformersEmbeddingProvider,
+    SiliconFlowEmbeddingProvider,
     build_embedding_provider,
 )
 from scansci_html.rerankers import (
@@ -108,6 +109,66 @@ def test_openai_compatible_embedding_provider_rejects_oversized_input_before_net
 def test_build_embedding_provider_requires_config_for_openai_compatible():
     with pytest.raises(ValueError, match="base_url"):
         build_embedding_provider("openai-compatible", api_key="secret", model="embed-model")
+
+
+def test_siliconflow_embedding_provider_uses_remote_dimensions_and_cache_identity():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [1.0, 0.0]}]}
+
+    class FakeSession:
+        def post(self, url, *, headers, json, timeout):
+            calls.append((url, headers, json, timeout))
+            return FakeResponse()
+
+    provider = SiliconFlowEmbeddingProvider(
+        api_key="secret",
+        model="Qwen/Qwen3-Embedding-8B",
+        session=FakeSession(),
+        dimensions=2,
+    )
+
+    assert provider.embed_texts(["science"]) == [[1.0, 0.0]]
+    assert provider.device == "remote"
+    assert provider.dimensions == 2
+    assert provider.cache_key == "siliconflow:https://api.siliconflow.cn/v1:Qwen/Qwen3-Embedding-8B:2"
+    assert calls[0][0] == "https://api.siliconflow.cn/v1/embeddings"
+    assert calls[0][2] == {
+        "model": "Qwen/Qwen3-Embedding-8B",
+        "input": ["science"],
+        "dimensions": 2,
+    }
+
+
+def test_siliconflow_embedding_provider_keeps_native_dimensions_for_bge():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [1.0, 0.0]}]}
+
+    class FakeSession:
+        def post(self, url, *, headers, json, timeout):
+            calls.append(json)
+            return FakeResponse()
+
+    provider = SiliconFlowEmbeddingProvider(
+        api_key="secret",
+        model="BAAI/bge-m3",
+        session=FakeSession(),
+    )
+
+    assert provider.embed_texts(["science"]) == [[1.0, 0.0]]
+    assert provider.dimensions == 2
+    assert calls == [{"model": "BAAI/bge-m3", "input": ["science"]}]
 
 
 def test_sentence_transformers_embedding_provider_uses_model_encode():
@@ -453,6 +514,34 @@ def test_siliconflow_reranker_falls_back_without_failing_the_workflow():
     assert ranked[0]["evidence_id"] == "doc1"
     assert "siliconflow-fallback" in ranked[0]["routes"]
     assert reranker.last_error.startswith("RuntimeError:")
+
+
+def test_siliconflow_qwen3_reranker_sends_instruction_when_configured():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"index": 0, "relevance_score": 0.9}]}
+
+    class FakeSession:
+        def post(self, url, *, headers, json, timeout):
+            calls.append((url, headers, json, timeout))
+            return FakeResponse()
+
+    reranker = build_reranker(
+        "siliconflow",
+        api_key="secret",
+        model_name="Qwen/Qwen3-Reranker-8B",
+        instruction="请按科学证据相关性排序。",
+        session=FakeSession(),
+    )
+    reranker.rerank("光伏生态", [{"evidence_id": "doc1", "text": "生态影响"}])
+
+    assert calls[0][2]["model"] == "Qwen/Qwen3-Reranker-8B"
+    assert calls[0][2]["instruction"] == "请按科学证据相关性排序。"
 
 
 def test_qwen3_reranker_uses_yes_no_logits_instead_of_flat_cross_encoder_scores():

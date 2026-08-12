@@ -432,7 +432,12 @@ class OpenAICompatibleChatJsonClient:
                 # A review section is still bounded by its schema and length
                 # validator, so the larger ceiling prevents empty responses
                 # without permitting unbounded prose.
-                else 8192 if schema_name == "literature_review_section"
+                # Review sections are capped at 600–1200 Chinese characters;
+                # an 8K completion budget makes compatible gateways reject or
+                # throttle the request before returning any JSON. Keep enough
+                # room for a structured paragraph while avoiding needless
+                # provider quota consumption.
+                else 3072 if schema_name == "literature_review_section"
                 else 1024 if schema_name == "literature_review_overview"
                 else 3072 if schema_name == "evidence_grounded_literature_review" else 4096
             ),

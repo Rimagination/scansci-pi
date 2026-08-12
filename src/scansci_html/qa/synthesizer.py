@@ -36,7 +36,15 @@ def synthesize_answer(
     claims: list[dict[str, object]] = []
     seen_claims: dict[str, list[str]] = {}
     ranked_rows = _rank_local_evidence(question, evidence_table, query_plan=query_plan)
-    if len(evidence_table) > 1:
+    required_facets = [
+        facet
+        for facet in list((query_plan or {}).get("required_facets", []) or [])
+        if isinstance(facet, dict)
+    ]
+    if required_facets:
+        ranked_rows = _select_facet_rows(ranked_rows, required_facets)
+        ranked_rows = ranked_rows[: min(4, max(1, len(required_facets)))]
+    elif len(evidence_table) > 1:
         ranked_rows = ranked_rows[: 1 if _is_direct_question(question) else 3]
     for row in ranked_rows:
         claim_text = (
@@ -70,6 +78,44 @@ def synthesize_answer(
     }
 
 
+def _select_facet_rows(
+    ranked_rows: list[dict[str, Any]],
+    required_facets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Select at least one high-ranked row for each requested dimension."""
+
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for facet in required_facets:
+        terms = [
+            " ".join(str(term).split()).strip().casefold()
+            for term in list(facet.get("terms", []) or [])
+            if " ".join(str(term).split()).strip()
+        ]
+        if not terms:
+            terms = [" ".join(str(facet.get("label", facet.get("id", ""))).split()).strip().casefold()]
+        for row in ranked_rows:
+            row_id = str(row.get("quote_id", row.get("evidence_id", "")))
+            if row_id in selected_ids:
+                continue
+            text = " ".join(
+                str(row.get(field, ""))
+                for field in ("exact_quote", "claim_target")
+                if str(row.get(field, "")).strip()
+            ).casefold()
+            if any(term and term in text for term in terms):
+                selected.append(row)
+                selected_ids.add(row_id)
+                break
+    for row in ranked_rows:
+        row_id = str(row.get("quote_id", row.get("evidence_id", "")))
+        if row_id in selected_ids:
+            continue
+        selected.append(row)
+        selected_ids.add(row_id)
+    return selected
+
+
 def _rank_local_evidence(
     question: str,
     evidence_table: list[dict[str, Any]],
@@ -86,9 +132,20 @@ def _rank_local_evidence(
         matched = sum(1.0 for term in terms if term in quote)
         if named_list:
             matched = min(2.0, matched) + _named_list_answer_bonus(quote)
+        facet_bonus = 0.0
+        for facet in list((query_plan or {}).get("required_facets", []) or []):
+            if not isinstance(facet, dict):
+                continue
+            facet_terms = [
+                " ".join(str(term).split()).strip().casefold()
+                for term in list(facet.get("terms", []) or [])
+                if " ".join(str(term).split()).strip()
+            ]
+            if any(term and term in quote for term in facet_terms):
+                facet_bonus += 2.0
         confidence = float(row.get("confidence", 0.0) or 0.0)
         length_penalty = max(0.0, (len(quote) - 420) / 700)
-        return (matched + confidence - length_penalty, -index)
+        return (matched + facet_bonus + confidence - length_penalty, -index)
 
     return [row for _, row in sorted(indexed, key=score, reverse=True)]
 
@@ -225,6 +282,7 @@ def synthesize_answer_with_llm(
             target_language=target_language,
             is_synthesis=is_synthesis,
             retrying_language=attempt > 0,
+            query_plan=query_plan,
         )
         payload = AnswerPayloadSchema.model_validate(chat_client.complete_json(messages, schema_name="answer_claims") or {})
         claims = _validated_llm_claims(payload.answer, known_quote_ids)
@@ -258,6 +316,7 @@ def _llm_synthesis_messages(
     target_language: str,
     is_synthesis: bool,
     retrying_language: bool,
+    query_plan: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     language_rule = (
         "你正在为中文科研用户撰写答案。所有结论必须使用自然、简洁的简体中文；需要转述英文证据，不能粘贴英文原句。"
@@ -275,6 +334,19 @@ def _llm_synthesis_messages(
         if is_synthesis
         else ""
     )
+    required_facets = [
+        str(facet.get("label", facet.get("id", ""))).strip()
+        for facet in list((query_plan or {}).get("required_facets", []) or [])
+        if isinstance(facet, dict) and str(facet.get("label", facet.get("id", ""))).strip()
+    ]
+    facet_rule = (
+        "Explicitly cover each requested dimension when the evidence table contains support; "
+        "if a dimension is not supported, do not invent it and state it as missing: "
+        + ", ".join(required_facets)
+        + ". "
+        if required_facets
+        else ""
+    )
     retry_rule = (
         "上一稿主体是英文原文摘录，未达到中文回答要求。现在必须把结论改写为简体中文，不要输出英文引文句或参考文献条目。"
         if target_language == "zh"
@@ -289,6 +361,7 @@ def _llm_synthesis_messages(
             "content": (
                 language_rule
                 + synthesis_rule
+                + facet_rule
                 + retry_rule
                 + "Use only relevant rows from the evidence table. Return 1 to at most 4 concise, non-overlapping claims "
                 "ordered by importance; never repeat a claim. Every claim must be directly entailed by its exact supporting "

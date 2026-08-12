@@ -6,7 +6,9 @@ from scansci_html.qa import agent
 from scansci_html.qa.agent import (
     _followup_preserves_query_identity,
     _model_retrieval_queries,
+    _prioritize_evidence_sections,
     answer_question,
+    assess_facet_coverage,
     assess_evidence_adequacy,
     build_reader_answer,
     evidence_adequacy_thresholds,
@@ -22,7 +24,7 @@ def test_plan_query_identifies_comparison_and_core_terms():
     assert plan["query"] == "Compare method A and method B for cortical activity after 2020"
     assert plan["question_type"] == "comparison"
     assert plan["core_terms"] == ["compare", "method", "cortical", "activity", "after", "2020"]
-    assert plan["filters"] == {"year_min": 2020}
+    assert plan["filters"] == {"year_min": 2020, "section_kinds": ["methods"]}
     assert plan["query_variants"] == [
         "method cortical activity",
         "findings results method cortical activity",
@@ -197,6 +199,192 @@ def test_plan_query_identifies_conflict_and_synthesis_questions():
     assert synthesis_plan["question_type"] == "synthesis"
 
 
+def test_plan_query_extracts_required_facets_for_multi_part_research_question():
+    plan = plan_query("不同建设年份的光伏项目如何影响微气候、植被群落和土壤碳储量？")
+
+    assert plan["required_facets"] == [
+        {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+        {"id": "植被群落", "label": "植被群落", "terms": ["植被群落"]},
+        {"id": "土壤碳储量", "label": "土壤碳储量", "terms": ["土壤碳储量"]},
+    ]
+
+
+def test_plan_query_extracts_clean_english_facets_after_effects_clause():
+    plan = plan_query(
+        "How do different photovoltaic construction years affect microclimate, vegetation communities, and soil carbon storage?"
+    )
+
+    assert plan["required_facets"] == [
+        {"id": "microclimate", "label": "microclimate", "terms": ["microclimate"]},
+        {"id": "vegetation communities", "label": "vegetation communities", "terms": ["vegetation communities"]},
+        {"id": "soil carbon storage", "label": "soil carbon storage", "terms": ["soil carbon storage"]},
+    ]
+
+
+def test_topical_gate_rejects_generic_overlap_for_unrelated_chinese_topic():
+    adequacy = {"is_sufficient": True, "quote_count": 1, "document_count": 1, "followup_reason": ""}
+    evidence_table = [
+        {
+            "quote_id": "q0001",
+            "exact_quote": "研究结果表明发电效率受到影响。",
+        }
+    ]
+
+    gated = agent._apply_topical_relevance_gate(
+        "潮汐发电对珊瑚礁生态和珊瑚白化的影响是什么？",
+        evidence_table,
+        adequacy,
+    )
+
+    assert gated["is_sufficient"] is False
+    assert gated["topical_relevance"]["matched_terms"] == []
+
+
+def test_topical_gate_rejects_generic_overlap_for_unrelated_english_topic():
+    adequacy = {"is_sufficient": True, "quote_count": 1, "document_count": 1, "followup_reason": ""}
+    evidence_table = [
+        {
+            "quote_id": "q0001",
+            "exact_quote": "The study reports an effect on power generation.",
+        }
+    ]
+
+    gated = agent._apply_topical_relevance_gate(
+        "What evidence links tidal power to coral reef bleaching?",
+        evidence_table,
+        adequacy,
+    )
+
+    assert gated["is_sufficient"] is False
+    assert gated["answerability"] == "not_enough_information"
+    assert gated["topical_relevance"]["matched_terms"] == []
+
+
+def test_answer_question_keeps_borderline_evidence_visible_for_review(monkeypatch):
+    def fake_search_evidence_store(
+        db_path,
+        query,
+        *,
+        limit,
+        per_document_limit,
+        filters,
+        embedding_provider,
+        reranker,
+        context_mode,
+    ):
+        return [
+            {
+                "evidence_id": "doc1.s0001",
+                "doc_id": "doc1",
+                "title": "Tidal ecology paper",
+                "doi": "10.1234/tidal",
+                "html_path": "paper.evidence.html",
+                "html_anchor": "results-p1-s0001",
+                "section": "Results",
+                "section_kind": "results",
+                "text": "Tidal currents increased coastal water movement and influenced ecosystems during the study period.",
+                "score": 1.0,
+                "siliconflow_score": 0.72,
+                "matched_terms": ["tidal"],
+            }
+        ]
+
+    monkeypatch.setattr(agent, "search_evidence_store", fake_search_evidence_store)
+
+    result = answer_question(
+        "unused.sqlite",
+        "What evidence links tidal power to coral reef bleaching?",
+        limit=5,
+        max_followup_queries=0,
+    )
+
+    assert result["adequacy"]["answerability"] == "needs_review"
+    assert result["adequacy"]["retryable"] is True
+    assert result["answer"]["review_required"] is True
+    assert result["answer"]["answer"]
+
+
+def test_single_source_synthesis_is_reviewable_but_conflict_stays_hard():
+    synthesis_adequacy = agent._soften_adequacy_for_review(
+        {"question_type": "synthesis"},
+        {
+            "is_sufficient": False,
+            "quote_count": 1,
+            "document_count": 1,
+            "min_quotes": 2,
+            "min_documents": 2,
+            "followup_reason": "not enough source-document diversity",
+        },
+    )
+    conflict_adequacy = agent._soften_adequacy_for_review(
+        {"question_type": "conflict"},
+        {
+            "is_sufficient": False,
+            "quote_count": 1,
+            "document_count": 1,
+            "min_quotes": 2,
+            "min_documents": 2,
+            "followup_reason": "not enough source-document diversity",
+        },
+    )
+
+    assert synthesis_adequacy["answerability"] == "needs_review"
+    assert synthesis_adequacy["retryable"] is True
+    assert conflict_adequacy.get("answerability") != "needs_review"
+
+
+def test_assess_facet_coverage_reports_missing_research_dimension():
+    query_plan = {
+        "required_facets": [
+            {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+            {"id": "植被群落", "label": "植被群落", "terms": ["植被群落"]},
+            {"id": "土壤碳储量", "label": "土壤碳储量", "terms": ["土壤碳储量"]},
+        ]
+    }
+    evidence_table = [
+        {"quote_id": "q0001", "exact_quote": "光伏阵列改变了地表微气候。"},
+        {"quote_id": "q0002", "exact_quote": "植被群落的物种组成发生变化。"},
+    ]
+
+    coverage = assess_facet_coverage(query_plan, evidence_table)
+
+    assert coverage["status"] == "partial"
+    assert coverage["covered_facets"] == ["微气候", "植被群落"]
+    assert coverage["missing_facets"] == ["土壤碳储量"]
+
+
+def test_facet_coverage_strict_mode_keeps_citation_gate_exact():
+    evidence = [{"quote_id": "q0001", "exact_quote": "The study measured soil organic carbon stocks."}]
+
+    relaxed = assess_facet_coverage(
+        {"required_facets": [{"id": "soil carbon storage", "terms": ["soil carbon storage"]}]},
+        evidence,
+    )
+    strict = assess_facet_coverage(
+        {"required_facets": [{"id": "soil carbon storage", "terms": ["soil carbon storage"]}]},
+        evidence,
+        strict=True,
+    )
+
+    assert relaxed["status"] == "complete"
+    assert strict["status"] == "none"
+
+
+def test_section_aware_ranking_prefers_findings_sections_over_other_rows():
+    hits = [
+        {"evidence_id": "other.s1", "section_kind": "other", "score": 9.0},
+        {"evidence_id": "results.s1", "section_kind": "results", "score": 4.0},
+        {"evidence_id": "discussion.s1", "section_kind": "discussion", "score": 3.0},
+    ]
+
+    ranked = _prioritize_evidence_sections(
+        hits,
+        {"question_type": "synthesis", "section_hints": ["results", "discussion"]},
+    )
+
+    assert [hit["evidence_id"] for hit in ranked] == ["results.s1", "discussion.s1", "other.s1"]
+
+
 def test_evidence_adequacy_thresholds_auto_promotes_multi_source_questions():
     assert evidence_adequacy_thresholds("comparison", profile="auto", min_quotes=1, min_documents=1) == {
         "profile": "auto",
@@ -301,6 +489,7 @@ def test_answer_question_runs_local_evidence_first_pipeline(tmp_path: Path):
 
     assert result["query_plan"]["question_type"] == "evidence"
     assert result["adequacy"]["is_sufficient"] is True
+    assert result["adequacy"]["answerability"] == "answerable"
     assert result["adequacy"]["profile"] == "manual"
     assert result["adequacy"]["min_quotes"] == 1
     assert result["adequacy"]["min_documents"] == 1
@@ -431,6 +620,41 @@ def test_verify_citations_fails_uncited_or_unsupported_claims():
     assert result["passed"] is False
     assert result["uncited_claim_ids"] == ["c0002"]
     assert result["unsupported_cited_claim_ids"] == ["c0003"]
+
+
+def test_verify_citations_reports_incomplete_facet_coverage():
+    answer = {
+        "answer": [
+            {
+                "claim_id": "c0001",
+                "text": "光伏阵列改变了地表微气候。",
+                "quote_ids": ["q0001"],
+                "support_status": "supported",
+            }
+        ]
+    }
+    evidence_table = [
+        {
+            "quote_id": "q0001",
+            "exact_quote": "光伏阵列改变了地表微气候。",
+            "evidence_id": "doc.s0001",
+            "html_path": "doc.html",
+            "html_anchor": "results-p1-s1",
+        }
+    ]
+
+    result = verify_citations(
+        answer,
+        evidence_table,
+        required_facets=[
+            {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+            {"id": "植被群落", "label": "植被群落", "terms": ["植被群落"]},
+        ],
+    )
+
+    assert result["passed"] is False
+    assert result["citation_completeness"] is False
+    assert result["missing_facets"] == ["植被群落"]
 
 
 def test_answer_question_repairs_an_llm_answer_that_fails_strict_citation_verification(monkeypatch):

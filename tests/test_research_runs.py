@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,183 @@ from scansci_html.pi_agent import PiAgentRunError
 from scansci_html.research_agent import ResearchAgentRuntime, _is_restart_request
 from scansci_html.research_runs import ResearchRunStore, StageSpec
 from scansci_html.workspace import initialize_notebook, sync_sources_from_evidence_store
+
+
+def test_local_evidence_preparation_runs_in_background_and_reports_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 1_100_000)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    stack = SimpleNamespace(
+        embedding_provider=object(),
+        reranker=object(),
+        metadata={
+            "embedding": "sentence-transformers:Qwen/Qwen3-Embedding-0.6B",
+            "reranker": "qwen3:Qwen/Qwen3-Reranker-0.6B",
+            "local_neural_embedding": True,
+            "local_neural_reranker": True,
+            "fallback": False,
+            "embedding_device": "cuda:0",
+            "reranker_device": "cuda:0",
+        },
+    )
+
+    def fake_stack(**_kwargs):
+        started.set()
+        assert release.wait(5), "background model preparation did not stay cancellable"
+        return stack
+
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda *_args, **_kwargs: {"ready": False, "total": 1, "completed": 0},
+    )
+
+    status = runtime.prepare_local_evidence(evidence_db, quality_profile="precision")
+
+    assert status["state"] == "preparing"
+    assert status["phase"] == "loading_models"
+    assert started.wait(3), "model loading should start without blocking the caller"
+
+    release.set()
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        status = runtime.local_evidence_status(evidence_db, quality_profile="precision")
+        if status["state"] in {"ready", "fallback", "error"}:
+            break
+        time.sleep(0.02)
+    assert status["state"] == "ready"
+    assert status["model"]["embedding_device"] == "cuda:0"
+
+
+def test_local_evidence_stack_uses_fast_path_while_models_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 1_100_000)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_stack(**_kwargs):
+        started.set()
+        assert release.wait(2)
+        return SimpleNamespace(
+            embedding_provider=object(),
+            reranker=object(),
+            metadata={"local_neural_embedding": True, "local_neural_reranker": True, "fallback": False},
+        )
+
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda *_args, **_kwargs: {"ready": False, "total": 1, "completed": 0},
+    )
+
+    runtime.prepare_local_evidence(evidence_db, quality_profile="precision")
+    assert started.wait(1)
+    fast = runtime._local_evidence_stack(evidence_db, quality_profile="precision")
+
+    assert fast.metadata["preparing"] is True
+    assert fast.metadata["effective_quality_profile"] == "fast-preparing"
+    release.set()
+
+
+def test_local_evidence_status_resolves_the_selected_notebook_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    selected_db = tmp_path / "selected.sqlite"
+    selected_db.write_bytes(b"selected")
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "root.sqlite",
+    )
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "selected"})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: selected_db)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda evidence_db, **_kwargs: {"ready": Path(evidence_db).name == "selected.sqlite"},
+    )
+
+    status = runtime.local_evidence_status(notebook_id="selected")
+
+    assert status["cache_ready"] is True
+
+
+def test_local_evidence_preparation_blocks_neither_quality_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 1_100_000)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_stack(**_kwargs):
+        started.set()
+        assert release.wait(2)
+        return SimpleNamespace(
+            embedding_provider=object(),
+            reranker=object(),
+            metadata={"local_neural_embedding": True, "local_neural_reranker": True, "fallback": False},
+        )
+
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
+    monkeypatch.setattr(
+        research_agent,
+        "vector_cache_status",
+        lambda *_args, **_kwargs: {"ready": False, "total": 1, "completed": 0},
+    )
+    runtime.prepare_local_evidence(evidence_db, quality_profile="precision")
+    assert started.wait(1)
+    result: list[object] = []
+    returned = threading.Event()
+
+    def query_balanced():
+        result.append(runtime._local_evidence_stack(evidence_db, quality_profile="balanced"))
+        returned.set()
+
+    threading.Thread(target=query_balanced, daemon=True).start()
+    assert returned.wait(1), "a balanced query must not wait on a precision preload"
+    assert getattr(result[0], "metadata", {}).get("preparing") is True
+    release.set()
+
+
+def test_repeated_local_evidence_prepare_returns_existing_status_without_deadlock(tmp_path: Path):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x")
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    key = runtime._local_evidence_preparation_key(evidence_db, "precision")
+    with runtime._local_evidence_prepare_lock:
+        runtime._local_evidence_preparations[key] = {
+            "state": "preparing",
+            "phase": "loading_models",
+            "progress": 0.2,
+            "message": "正在加载本地 AI 模型",
+            "error": "",
+            "model": {},
+        }
+
+    result: list[dict[str, object]] = []
+    returned = threading.Event()
+
+    def repeat_prepare():
+        result.append(runtime.prepare_local_evidence(evidence_db, quality_profile="precision"))
+        returned.set()
+
+    threading.Thread(target=repeat_prepare, daemon=True).start()
+    assert returned.wait(1), "repeated status polling must not deadlock"
+    assert result[0]["state"] == "preparing"
 
 
 def _stages() -> list[StageSpec]:
@@ -857,6 +1036,148 @@ def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path,
     assert stack.reranker.stages[1][0] is remote
 
 
+def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 2_000_000)
+    embedding = SimpleNamespace(
+        cache_key="siliconflow:https://api.siliconflow.cn/v1:Qwen/Qwen3-Embedding-8B:4096",
+        dimensions=4096,
+        device="remote",
+    )
+    reranker = SimpleNamespace(
+        cache_key="siliconflow:https://api.siliconflow.cn/v1:Qwen/Qwen3-Reranker-8B",
+        device="remote",
+    )
+    build_calls = []
+
+    monkeypatch.setattr(
+        research_agent,
+        "load_settings",
+        lambda _workspace: {
+            "model_roles": {
+                "embedding": "provider:siliconflow:Qwen/Qwen3-Embedding-8B",
+                "reranking": "provider:siliconflow:Qwen/Qwen3-Reranker-8B",
+            },
+            "local_models": [],
+            "providers": [
+                {
+                    "id": "siliconflow",
+                    "kind": "openai-compatible",
+                    "enabled": True,
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "models": [
+                        {"id": "Qwen/Qwen3-Embedding-8B", "capabilities": ["embedding"]},
+                        {"id": "Qwen/Qwen3-Reranker-8B", "capabilities": ["reranking"]},
+                    ],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda _workspace, _provider: "secret")
+    monkeypatch.setattr(
+        research_agent,
+        "build_embedding_provider",
+        lambda provider, **kwargs: build_calls.append(("embedding", provider, kwargs)) or embedding,
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "build_reranker",
+        lambda provider, **kwargs: build_calls.append(("reranker", provider, kwargs)) or reranker,
+    )
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    stack = runtime._local_evidence_stack(evidence_db)
+
+    assert build_calls == [
+        (
+            "embedding",
+            "siliconflow",
+            {
+                "base_url": "https://api.siliconflow.cn/v1",
+                "api_key": "secret",
+                "model": "Qwen/Qwen3-Embedding-8B",
+            },
+        ),
+        (
+            "reranker",
+            "siliconflow",
+            {
+                "base_url": "https://api.siliconflow.cn/v1",
+                "api_key": "secret",
+                "model_name": "Qwen/Qwen3-Reranker-8B",
+            },
+        ),
+    ]
+    assert stack.embedding_provider is embedding
+    assert stack.reranker.stages[1][0] is reranker
+    assert stack.metadata["remote_embedding_active"] is True
+    assert stack.metadata["remote_reranker_active"] is True
+    assert stack.metadata["embedding_device"] == "remote"
+    assert stack.metadata["reranker_device"] == "remote"
+
+
+def test_prepare_remote_evidence_marks_ready_without_local_model_loading(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 1_100_000)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=evidence_db,
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "load_settings",
+        lambda _workspace: {
+            "model_roles": {
+                "embedding": "provider:siliconflow:Qwen/Qwen3-Embedding-8B",
+                "reranking": "provider:siliconflow:Qwen/Qwen3-Reranker-8B",
+            },
+            "providers": [
+                {
+                    "id": "siliconflow",
+                    "enabled": True,
+                    "models": [
+                        {"id": "Qwen/Qwen3-Embedding-8B", "capabilities": ["embedding"]},
+                        {"id": "Qwen/Qwen3-Reranker-8B", "capabilities": ["reranking"]},
+                    ],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda _workspace, _provider: "secret")
+    stack = SimpleNamespace(
+        embedding_provider=SimpleNamespace(cache_key="siliconflow:embedding", device="remote"),
+        reranker=SimpleNamespace(),
+        metadata={
+            "embedding": "siliconflow:embedding",
+            "reranker": "siliconflow:reranker",
+            "remote_embedding_active": True,
+            "remote_reranker_active": True,
+            "local_neural_embedding": False,
+            "local_neural_reranker": False,
+            "fallback": False,
+            "effective_quality_profile": "precision",
+            "embedding_device": "remote",
+            "reranker_device": "remote",
+        },
+    )
+    loading = []
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda *_args, **_kwargs: loading.append(True) or stack,
+    )
+
+    status = runtime.prepare_local_evidence(evidence_db, quality_profile="precision")
+
+    assert status["state"] == "ready"
+    assert status["phase"] == "remote"
+    assert "远程" in status["message"]
+    assert loading == [True]
+
+
 def test_paper_download_batch_workflow_runs_per_item_and_reports_progress(tmp_path: Path, monkeypatch):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
@@ -1010,6 +1331,31 @@ def test_deep_research_plan_has_stage_summary_and_insufficient_evidence_is_not_v
     }
 
 
+def test_deep_research_reviewable_answer_is_not_marked_as_hard_insufficient(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+
+    verification = runtime._verify(
+        {
+            "stages": [
+                {
+                    "kind": "tool",
+                    "status": "completed",
+                    "output": {
+                        "answer": {"insufficient_evidence": False, "answerability": "needs_review"},
+                        "adequacy": {"is_sufficient": False, "answerability": "needs_review"},
+                        "citation_verification": {"passed": True},
+                        "reader_answer": {"citation_count": 1},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert verification["passed"] is True
+    assert verification["insufficient_evidence"] is False
+    assert verification["answerability"] == "needs_review"
+
+
 def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_path: Path, monkeypatch):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
@@ -1128,6 +1474,80 @@ def test_deep_research_prefers_task_acquired_fulltext_evidence(tmp_path: Path, m
     assert captured["writing_brief"]["tone"] == "academic"
     assert "Compare audit frameworks." in captured["writing_brief"]["focus"]
     assert "Prioritize claims supported by the acquired full text" in captured["writing_brief"]["focus"]
+
+
+def test_literature_review_retrieval_uses_local_embedding_and_reranker(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A review over a selected notebook must use its configured neural stack."""
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    run = runtime.store.create_run(
+        notebook_id="pv-ecology",
+        workflow_type="literature_review",
+        title="Photovoltaic ecology review",
+        input_payload={
+            "question": "How do photovoltaic systems affect biodiversity?",
+            "retrieval_quality": "precision",
+            "source_doc_ids": ["doc-1"],
+            "writing_brief": {"tone": "academic"},
+        },
+        stages=[StageSpec("research", "Retrieve evidence", "tool", "scansci.review.retrieve")],
+        background=False,
+    )
+    runtime.store.begin_run(run["run_id"])
+    runtime.store.start_stage(run["run_id"], "research")
+
+    observed: dict[str, object] = {}
+    neural_stack = SimpleNamespace(
+        embedding_provider="embedding-neural",
+        reranker="reranker-neural",
+        metadata={
+            "embedding": "sentence-transformers:Qwen/Qwen3-Embedding-0.6B",
+            "reranker": "qwen3:Qwen/Qwen3-Reranker-0.6B",
+            "local_neural_embedding": True,
+            "local_neural_reranker": True,
+        },
+    )
+
+    def fake_local_stack(_db, **kwargs):
+        observed["local_stack_kwargs"] = kwargs
+        return neural_stack
+
+    monkeypatch.setattr(runtime, "_local_evidence_stack", fake_local_stack)
+    monkeypatch.setattr(
+        runtime,
+        "_task_fulltext_evidence_stack",
+        lambda: (_ for _ in ()).throw(AssertionError("review retrieval must not use task fallback")),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_notebook",
+        lambda _notebook_id: {"notebook_id": "pv-ecology", "sources": []},
+    )
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_writing_chat_client", lambda: "writing-client")
+
+    def fake_retrieve(_db, _question, **kwargs):
+        observed.update(kwargs)
+        return {"phase": "retrieval", "evidence": [], "retrieval_summary": {}}
+
+    monkeypatch.setattr(research_agent, "retrieve_review_evidence", fake_retrieve)
+
+    current = runtime.store.get_run(run["run_id"])
+    stage = next(item for item in current["stages"] if item["key"] == "research")
+    result = runtime._run_tool(current, stage)
+
+    assert result["phase"] == "retrieval"
+    assert observed["local_stack_kwargs"] == {"quality_profile": "precision"}
+    assert observed["embedding_provider"] == "embedding-neural"
+    assert observed["reranker"] == "reranker-neural"
+    assert observed["retrieval_runtime"]["local_neural_embedding"] is True
+    assert observed["retrieval_runtime"]["local_neural_reranker"] is True
 
 
 def test_task_fulltext_quality_warning_does_not_discard_traceable_claim_evidence() -> None:
@@ -1590,10 +2010,12 @@ def test_evidence_index_workflow_cooperatively_cancels_and_resumes(tmp_path: Pat
     )
 
     calls = 0
+    batch_sizes: list[int] = []
 
     def fake_prewarm(_db, _rows, *, progress_callback, cancel_requested, **_kwargs):
         nonlocal calls
         calls += 1
+        batch_sizes.append(int(_kwargs.get("cache_batch_size", 0)))
         if calls == 1:
             progress_callback(40, 100)
             active = runtime.store.list_runs(notebook_id="review")[0]
@@ -1625,6 +2047,7 @@ def test_evidence_index_workflow_cooperatively_cancels_and_resumes(tmp_path: Pat
     assert completed["status"] == "completed"
     assert completed["progress"] == 1
     assert sorted(call["status"] for call in completed["tool_calls"]) == ["cancelled", "completed"]
+    assert batch_sizes == [research_agent.DEFAULT_NEURAL_CACHE_BATCH_SIZE] * 2
 
 
 def test_evidence_index_never_persists_hash_fallback_as_qwen_vectors(tmp_path: Path, monkeypatch):
@@ -1663,6 +2086,42 @@ def test_evidence_index_never_persists_hash_fallback_as_qwen_vectors(tmp_path: P
 
     assert failed["status"] == "failed"
     assert "不会写入伪语义索引" in failed["error"]["message"]
+
+
+def test_evidence_index_accepts_siliconflow_embedding_without_local_qwen(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"0" * 1_000_001)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    runtime._pause_for_plan_review = False
+    monkeypatch.setattr(runtime, "_notebook", lambda notebook_id: {"notebook_id": notebook_id, "sources": []})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(research_agent, "load_embedding_cache_rows", lambda _db: {"a": {"text": "A"}})
+    provider = SimpleNamespace(cache_key="siliconflow:embedding", dimensions=4096, device="remote")
+    monkeypatch.setattr(
+        runtime,
+        "_local_evidence_stack",
+        lambda _db, **_kwargs: SimpleNamespace(
+            embedding_provider=provider,
+            metadata={
+                "qwen_embedding_active": False,
+                "remote_embedding_active": True,
+                "fallback": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "prewarm_embedding_cache",
+        lambda *_args, **_kwargs: {"ready": True, "completed": 1, "total": 1},
+    )
+
+    run = runtime.start_evidence_index("review")
+    assert run is not None
+    runtime._execute_run(run["run_id"])
+    completed = runtime.store.get_run(run["run_id"])
+
+    assert completed["status"] == "completed"
 
 
 def test_evidence_index_reports_vectors_migrated_from_a_previous_store(tmp_path: Path, monkeypatch):

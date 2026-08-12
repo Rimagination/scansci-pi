@@ -40,6 +40,7 @@ ScanSci 的论文长期母本是 `clean HTML`，不是 PDF、Markdown 或出版�
 | `paper.evidence.html` | 按需生成 | 干净的证据锚点视图，用于把 `evidence_id/html_anchor` 跳回原文句子；默认不显示全局高亮或角标 |
 | `annotation_layers.sqlite` | 长期保存 | 软标注图层库；不同问题、综述角度和人工审阅结果作为 layer 叠加到同一证据锚点上 |
 | `workspace.sqlite` | 长期保存 | Notebook/Source/Note/Layer/CitationRecord/CitationAudit 的对象索引和关系图 |
+| `*.libraries/<notebook>.sqlite` | 可迁移、可重建 | 每个知识库的证据与向量索引；默认位于应用证据库旁，也可在设置 → 常规 → 目录与文件中指定向量索引目录 |
 | `annotation-viewer.html` | 可重建 | 通用软标注阅读器；读取 layer 快照，在同一篇原文视图上切换高亮和 source card |
 | `source.xml.gz` | 可选保存 | 出版社 XML 原始输入追溯和重新转换材料，不作为下游统一接口 |
 | raw snapshot | 调试时保存 | 获取失败、结构异常、权限判断等问题的现场证据 |
@@ -115,6 +116,8 @@ ScanSci 的论文长期母本是 `clean HTML`，不是 PDF、Markdown 或出版�
 
 - 证据层不负责“找哪篇论文最相关”，只负责把每篇论文变成可检索证据。
 - 证据层可以提供索引字段，但不应绑定某个 reranker、LLM 或综述模板。
+- 向量索引目录是可选的存储覆盖；变更目录时必须使用 SQLite 一致性备份、更新 workspace 路径，并保留旧目录作为回退副本。
+- 资料增量索引或向量目录迁移不得因路径变化或旧 generation 被标记为 stale 就丢弃缓存；必须按证据文本摘要复用未变向量，只为新增/变更证据重新嵌入。
 - 上层输出的每个关键结论都应该能回指到这里的 evidence id 或 quote id。
 
 ## 核心层：RAG

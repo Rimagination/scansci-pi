@@ -77,6 +77,10 @@ def discover_model_roots() -> list[Path]:
         return [model_root()] if model_root().exists() else []
     candidates: list[Path] = [model_root(), *_env_paths("SCANSCI_MODEL_ROOTS")]
     candidates.extend(_env_paths("HF_HOME"))
+    # ``HF_HUB_CACHE`` is the path used by the settings page for new model
+    # downloads.  Include it in discovery as well so a moved cache remains
+    # visible alongside the legacy per-user ScanSci directory.
+    candidates.extend(_env_paths("HF_HUB_CACHE"))
     candidates.extend(_env_paths("HUGGINGFACE_HUB_CACHE"))
     home = Path.home()
     candidates.extend((home / "Models", home / ".cache" / "huggingface", home / ".cache" / "huggingface" / "hub"))
@@ -493,11 +497,20 @@ def create_install_manager() -> ModelInstallManager:
     """Create the non-blocking installer used by the desktop API."""
 
     def ready(model_id: str) -> bool:
-        return any(
-            str(item.get("id", "")).casefold() == str(model_id).casefold()
-            and bool(item.get("ready"))
-            for item in installed_models()
-        )
+        for item in installed_models():
+            if str(item.get("id", "")).casefold() != str(model_id).casefold():
+                continue
+            if bool(item.get("ready")):
+                return True
+            # Qwen3.5 snapshots deliberately remain unavailable until the
+            # isolated runtime has loaded them and produced a probe response.
+            # The download job still needs to reach ``ready`` so its callback
+            # can start that probe; this flag means the files are complete,
+            # not that the model is already usable.
+            return bool(item.get("model_files_present")) and str(
+                item.get("runtime_probe_state", "")
+            ) in {"pending", "failed"}
+        return False
 
     return ModelInstallManager(
         cache_root=hub_cache_root(),

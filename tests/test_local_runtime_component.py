@@ -18,6 +18,15 @@ from scansci_html.local_runtime_server import LocalRuntimeServer
 from scansci_html.webapp import NotebookWebApp
 
 
+def test_local_runtime_component_uses_configured_root(monkeypatch, tmp_path):
+    configured = tmp_path / "selected-runtime"
+    monkeypatch.setenv("SCANSCI_LOCAL_RUNTIME_ROOT", str(configured))
+
+    component = LocalRuntimeComponent(manifest_url="")
+
+    assert component.root == configured.resolve()
+
+
 def test_installed_component_is_preferred_even_when_source_has_torch(tmp_path: Path, monkeypatch) -> None:
     class InstalledComponent:
         def executable(self):

@@ -1,7 +1,9 @@
+import os
 import pytest
 import json
 from pathlib import Path
 
+from scansci_html import app_settings
 from scansci_html.app_settings import (
     configure_managed_glm_4_7_flash,
     load_settings,
@@ -208,6 +210,9 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
                 "directories": {
                     "default_workspace": r"D:\Research\default",
                     "conversation_workspace": r"D:\Research\conversations",
+                    "model_cache": r"D:\ScanSci\models",
+                    "local_runtime": r"D:\ScanSci\runtime",
+                    "vector_index": r"D:\ScanSci\vectors",
                 },
             }
         },
@@ -223,6 +228,9 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
         "directories": {
             "default_workspace": r"D:\Research\default",
             "conversation_workspace": r"D:\Research\conversations",
+            "model_cache": r"D:\ScanSci\models",
+            "local_runtime": r"D:\ScanSci\runtime",
+            "vector_index": r"D:\ScanSci\vectors",
         },
     }
     persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
@@ -244,8 +252,38 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
             "agent_completion_notifications": True,
             "subagent_completion_notifications": False,
         },
-        "directories": {"default_workspace": "123", "conversation_workspace": ""},
+        "directories": {
+            "default_workspace": "123",
+            "conversation_workspace": "",
+            "model_cache": "",
+            "local_runtime": "",
+            "vector_index": "",
+        },
     }
+
+
+def test_storage_directories_override_process_defaults_and_restore_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    model_cache = tmp_path / "models"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("HF_HUB_CACHE", "C:/original-hub")
+    monkeypatch.setenv("SCANSCI_LOCAL_RUNTIME_ROOT", "C:/original-runtime")
+
+    app_settings.apply_storage_directories(
+        {
+            "general": {
+                "directories": {
+                    "model_cache": str(model_cache),
+                    "local_runtime": str(runtime_root),
+                }
+            }
+        }
+    )
+    assert Path(os.environ["HF_HUB_CACHE"]) == model_cache.resolve()
+    assert Path(os.environ["SCANSCI_LOCAL_RUNTIME_ROOT"]) == runtime_root.resolve()
+
+    app_settings.apply_storage_directories({"general": {"directories": {}}})
+    assert os.environ["HF_HUB_CACHE"] == "C:/original-hub"
+    assert os.environ["SCANSCI_LOCAL_RUNTIME_ROOT"] == "C:/original-runtime"
 
 
 def test_provider_and_local_runtime_presets_are_credential_free():
@@ -280,6 +318,48 @@ def test_provider_catalog_includes_cherry_documented_and_desktop_services():
     assert providers["openai"]["logo"] == "openai"
     assert {"reasoning", "vision", "tool", "coding"} <= set(providers["openai"]["models"][0]["capabilities"])
     assert providers["siliconflow"]["models"][-1]["capabilities"] == ["reranking"]
+
+
+def test_siliconflow_catalog_preloads_qwen3_embedding_and_reranker_8b():
+    providers = {item["id"]: item for item in provider_presets()}
+    models = {item["id"]: item for item in providers["siliconflow"]["models"]}
+
+    assert models["Qwen/Qwen3-Embedding-8B"]["capabilities"] == ["embedding"]
+    assert models["Qwen/Qwen3-Reranker-8B"]["capabilities"] == ["reranking"]
+
+
+def test_existing_siliconflow_provider_receives_new_catalog_models(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings_path(workspace).write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "id": "siliconflow",
+                        "name": "硅基流动",
+                        "kind": "openai-compatible",
+                        "base_url": "https://api.siliconflow.cn/v1",
+                        "enabled": False,
+                        "models": [
+                            {
+                                "id": "deepseek-ai/DeepSeek-V3",
+                                "name": "DeepSeek V3",
+                                "capabilities": ["reasoning"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    model_ids = {item["id"] for item in provider["models"]}
+
+    assert "Qwen/Qwen3-Embedding-8B" in model_ids
+    assert "Qwen/Qwen3-Reranker-8B" in model_ids
 
 
 def test_zhipu_catalog_includes_glm_4_7_flash():

@@ -22,6 +22,19 @@ _MAX_REMOTE_EMBED_TOTAL_CHARS = 2_000_000
 _MAX_REMOTE_EMBED_TEXT_CHARS = 100_000
 _MAX_REMOTE_EMBED_BATCH_ITEMS = 128
 _MAX_REMOTE_EMBED_BATCH_CHARS = 500_000
+DEFAULT_SILICONFLOW_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
+DEFAULT_SILICONFLOW_EMBEDDING_DIMENSIONS = 4096
+
+
+def _default_siliconflow_embedding_dimensions(model: str) -> int:
+    """Return a safe default only for models with a documented projection."""
+
+    if str(model or "").strip().casefold() == DEFAULT_SILICONFLOW_EMBEDDING_MODEL.casefold():
+        return DEFAULT_SILICONFLOW_EMBEDDING_DIMENSIONS
+    # Existing SiliconFlow entries such as BAAI/bge-m3 should use the model's
+    # native output size.  Sending an undocumented ``dimensions`` field can
+    # make an otherwise compatible endpoint reject the request.
+    return 0
 
 
 class EmbeddingProvider(Protocol):
@@ -61,6 +74,8 @@ class OpenAICompatibleEmbeddingProvider:
         model: str,
         timeout: float = 30.0,
         session: Any | None = None,
+        dimensions: int = 0,
+        cache_namespace: str = "openai-compatible",
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required for openai-compatible embeddings")
@@ -73,6 +88,13 @@ class OpenAICompatibleEmbeddingProvider:
         self.model = model
         self.timeout = float(timeout)
         self.session = session or requests.Session()
+        self.dimensions = max(0, int(dimensions or 0))
+        self.device = "remote"
+        # The key deliberately excludes the credential.  A dimension suffix
+        # prevents a lower-dimensional SiliconFlow projection from reusing a
+        # cache generated with the default 4096-dimensional output.
+        suffix = f":{self.dimensions}" if self.dimensions > 0 else ""
+        self.cache_key = f"{cache_namespace}:{self.base_url}:{self.model}{suffix}"
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         normalized = [str(text) for text in texts]
@@ -107,16 +129,27 @@ class OpenAICompatibleEmbeddingProvider:
         dimensions = {len(vector) for vector in vectors}
         if 0 in dimensions or len(dimensions) != 1:
             raise RuntimeError("Embedding provider returned empty or inconsistent vectors")
+        resolved_dimensions = next(iter(dimensions))
+        if self.dimensions and resolved_dimensions != self.dimensions:
+            raise RuntimeError(
+                f"Embedding provider returned {resolved_dimensions} dimensions; "
+                f"expected {self.dimensions}"
+            )
+        if not self.dimensions:
+            self.dimensions = resolved_dimensions
         return vectors
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        payload = {"model": self.model, "input": texts}
+        if self.dimensions > 0:
+            payload["dimensions"] = self.dimensions
         response = self.session.post(
             f"{self.base_url}/embeddings",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={"model": self.model, "input": texts},
+            json=payload,
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -130,6 +163,38 @@ class OpenAICompatibleEmbeddingProvider:
 
     def embed_query(self, query: str) -> list[float]:
         return self.embed_texts([query])[0]
+
+
+class SiliconFlowEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
+    """Remote SiliconFlow embedding adapter for Qwen3 Embedding models.
+
+    SiliconFlow documents the Qwen3-Embedding-8B endpoint as OpenAI
+    compatible and supports an explicit 4096-dimensional projection.  Giving
+    the provider a known dimension lets the vector cache be prepared without
+    a local model probe or a GPU warm-up request.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_SILICONFLOW_EMBEDDING_MODEL,
+        base_url: str = "https://api.siliconflow.cn/v1",
+        dimensions: int = 0,
+        timeout: float = 30.0,
+        session: Any | None = None,
+    ) -> None:
+        requested_dimensions = int(dimensions or 0)
+        resolved_dimensions = requested_dimensions or _default_siliconflow_embedding_dimensions(model)
+        super().__init__(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+            session=session,
+            dimensions=resolved_dimensions,
+            cache_namespace="siliconflow",
+        )
 
 
 class SentenceTransformersEmbeddingProvider:
@@ -224,6 +289,25 @@ def build_embedding_provider(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             model=resolved_model,
+            dimensions=0,
+        )
+    if name in {"siliconflow", "silicon-flow"}:
+        resolved_base_url = base_url or "https://api.siliconflow.cn/v1"
+        resolved_api_key = api_key or os.getenv("SCANSCI_EMBEDDING_API_KEY", "")
+        resolved_model = model or os.getenv("SCANSCI_EMBEDDING_MODEL", "") or DEFAULT_SILICONFLOW_EMBEDDING_MODEL
+        requested_dimensions = int(dimensions or 0)
+        # ``128`` is the historical build_embedding_provider default for the
+        # local hashing backend, not an explicit SiliconFlow projection.
+        resolved_dimensions = (
+            _default_siliconflow_embedding_dimensions(resolved_model)
+            if requested_dimensions in {0, 128}
+            else requested_dimensions
+        )
+        return SiliconFlowEmbeddingProvider(
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            model=resolved_model,
+            dimensions=resolved_dimensions,
         )
     if name in {"sentence-transformers", "sentence_transformers", "sbert"}:
         resolved_model = (

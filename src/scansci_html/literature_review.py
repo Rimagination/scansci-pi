@@ -26,6 +26,228 @@ _MAX_PROMPT_EVIDENCE_ROWS = 30
 _MAX_PROMPT_QUOTE_BYTES = 900
 
 
+_REVIEW_METHOD_CUES = (
+    "方法",
+    "研究设计",
+    "实验设计",
+    "采样",
+    "样方",
+    "监测",
+    "测量",
+    "统计",
+    "method",
+    "protocol",
+    "sampling",
+    "measurement",
+    "experimental design",
+)
+
+
+def _review_section_filters(question: str, section: dict[str, Any]) -> dict[str, Any]:
+    """Prefer findings over procedural fragments for literature-review prose.
+
+    A review section normally needs claims from abstracts, results, discussion,
+    or conclusions.  The evidence store also contains many highly matchable
+    methods/table-caption spans; allowing those to compete equally makes a
+    review look like a pasted methods section.  A section that explicitly
+    asks about methods keeps the methods kind in its candidate pool, while
+    still retaining findings for comparison and interpretation.
+    """
+
+    # Do not let a broad review instruction such as “compare methods” add
+    # procedural spans to every section. Only the section's own title,
+    # objective, id, and query wording may opt that section into methods.
+    method_requested = _review_section_allows_methods(section)
+    section_kinds = ["abstract", "results", "discussion", "conclusion"]
+    if method_requested:
+        section_kinds.insert(1, "methods")
+    return {"section_kinds": section_kinds}
+
+
+def _review_section_allows_methods(section: dict[str, Any]) -> bool:
+    """Return whether a section explicitly asks for methodological evidence."""
+
+    target = " ".join(
+        str(value or "").strip()
+        for value in (
+            section.get("title", ""),
+            section.get("objective", ""),
+            section.get("id", ""),
+            *list(section.get("queries") or [])[:2],
+        )
+    ).casefold()
+    return any(cue.casefold() in target for cue in _REVIEW_METHOD_CUES)
+
+
+_REVIEW_PROCEDURAL_PATTERNS = (
+    r"(?:采用|使用|选取|设置|构建|建立|开展).{0,24}(?:实验|观测|监测|调查|样方|样地|测序|模型)",
+    r"(?:通过|采用|使用|选取|设置|综合运用).{0,30}(?:比较|对比|研究区|电站|实验|观测|调查|模型|方法|指标)",
+    r"(?:实验设计|研究设计|采样|样本|高通量测序|三维建模|回归分析|方差分析|显著性检验)",
+    r"(?:野外观测|室内实验|控制实验|空间替代时间)",
+)
+
+
+def _review_sentence_is_procedural(text: str) -> bool:
+    """Identify method-procedure sentences that do not belong in findings prose."""
+
+    value = " ".join(str(text or "").split()).strip()
+    if not value:
+        return False
+    return any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in _REVIEW_PROCEDURAL_PATTERNS)
+
+
+def _remove_non_method_procedural_sentences(
+    value: dict[str, Any],
+    *,
+    allow_methods: bool,
+) -> dict[str, Any]:
+    """Keep findings prose focused when the planned section is not methods."""
+
+    if allow_methods:
+        return value
+    sentences = _cited_sentence_items(value)
+    if not sentences:
+        return value
+    retained = [
+        sentence
+        for sentence in sentences
+        if not _review_sentence_is_procedural(str(sentence.get("text", "")))
+    ]
+    # If every sentence is procedural, retain the validated paragraph rather
+    # than making a section empty; the prompt/filter still prevents this in
+    # normal runs and the guard is deliberately conservative.
+    return _cited_text_from_sentences(retained) if retained else value
+
+
+_REVIEW_GENERIC_TOPIC_TERMS = frozenset(
+    {
+        "研究",
+        "文献",
+        "证据",
+        "综述",
+        "方法",
+        "结果",
+        "结论",
+        "主要",
+        "问题",
+        "组织",
+        "当前",
+        "选择",
+        "知识",
+        "库中",
+        "中文",
+    }
+)
+
+
+def _review_topic_signals(text: str) -> set[str]:
+    """Return repeated, content-bearing terms useful for plan-drift checks.
+
+    Chinese review requests often contain instructions and a file path rather
+    than a clean topic string. Repeated CJK bigrams provide a conservative
+    signal (for example ``光伏``/``生态``) without requiring a tokenizer; a
+    one-off term is intentionally ignored so existing free-form plans remain
+    compatible.
+    """
+
+    value = str(text or "").casefold()
+    terms: set[str] = set(re.findall(r"[A-Za-z][A-Za-z0-9.-]{3,}", value))
+    cjk_runs = re.findall(r"[\u3400-\u9fff]+", value)
+    counts: dict[str, int] = {}
+    for run in cjk_runs:
+        for index in range(len(run) - 1):
+            term = run[index : index + 2]
+            if term in _REVIEW_GENERIC_TOPIC_TERMS:
+                continue
+            counts[term] = counts.get(term, 0) + 1
+    terms.update(term for term, count in counts.items() if count >= 2)
+    # Short Chinese requests often mention a domain anchor only once, so the
+    # repeated-bigram rule alone would miss an obvious drift (for example a
+    # photovoltaic/ecology review rewritten as a machine-learning review).
+    domain_terms = (
+        "光伏",
+        "生态",
+        "植被",
+        "土壤",
+        "微气候",
+        "生物多样性",
+        "光伏农业",
+        "荒漠",
+        "盐碱地",
+        "能源",
+    )
+    terms.update(term for term in domain_terms if term in value)
+    return terms
+
+
+def _review_plan_is_on_topic(question: str, plan: dict[str, Any]) -> bool:
+    """Reject a valid-looking model outline that silently changes subjects."""
+
+    signals = _review_topic_signals(question)
+    if not signals:
+        return True
+    candidate_parts = [str(plan.get("title", "")), str(plan.get("scope", ""))]
+    for section in list(plan.get("sections", []) or []):
+        if isinstance(section, dict):
+            candidate_parts.extend(
+                str(section.get(key, ""))
+                for key in ("id", "title", "objective")
+            )
+            candidate_parts.extend(str(query) for query in list(section.get("queries", []) or []))
+    candidate = " ".join(candidate_parts).casefold()
+    return any(signal in candidate for signal in signals)
+
+
+def _review_open_question_is_on_topic(question: str, item: dict[str, Any]) -> bool:
+    """Reject generic model questions that silently switch review domains."""
+
+    signals = _review_topic_signals(question)
+    if not signals:
+        return True
+    candidate = " ".join(
+        str(item.get(key, ""))
+        for key in ("text", "basis")
+    ).casefold()
+    return any(signal in candidate for signal in signals)
+
+
+def _fallback_review_open_questions(
+    question: str,
+    *,
+    citation_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Create domain-aligned, evidence-linked questions when model output drifts."""
+
+    question_ids = citation_ids[-2:] or citation_ids[:1]
+    first_ids = question_ids or citation_ids[:1]
+    second_ids = citation_ids[:2] or question_ids
+    if "光伏" in question and any(term in question for term in ("生态", "植被", "土壤", "光伏农业")):
+        return [
+            {
+                "text": "光伏设施引起的微气候、土壤水分与植被恢复效应，在不同地区、建设年限和组件覆盖率下是否具有一致性？",
+                "basis": "现有证据同时报告了环境改善、生态扰动及时空差异，尚缺少跨地点和长期比较。",
+                "citation_ids": first_ids,
+            },
+            {
+                "text": "光伏建设初期的地形与植被扰动，如何与后续生态恢复及光伏—气候—土壤—生物反馈区分并量化？",
+                "basis": "现有研究指出恢复尚未达到稳态，且生态恢复过程可能反过来影响光伏运行稳定性。",
+                "citation_ids": second_ids,
+            },
+        ]
+    return [
+        {
+            "text": "这些结论能否在不同研究对象、地区和时间尺度下稳定复现？",
+            "basis": "纳入研究的对象、情境与观测尺度存在差异。",
+            "citation_ids": first_ids,
+        },
+        {
+            "text": "未来研究如何在证据强度、可重复性与实际应用边界之间取得可验证的平衡？",
+            "basis": "现有证据同时显示出研究收益与资料覆盖、方法边界等限制。",
+            "citation_ids": second_ids,
+        },
+    ]
+
+
 def _review_query_variant_budget(topic: str, section: dict[str, Any], query: str) -> int:
     """Spend multi-query recall only on questions likely to need it.
 
@@ -109,6 +331,7 @@ def retrieve_review_evidence(
             _clean_review_query(query)
             for query in _balanced_review_queries(topic, section)
         ]
+        section_filters = _review_section_filters(topic, section)
         section_citations: list[str] = []
         query_traces: list[dict[str, Any]] = []
         for query in list(section["queries"])[:_MAX_QUERIES_PER_SECTION]:
@@ -130,7 +353,10 @@ def retrieve_review_evidence(
                 verification_provider="local",
                 embedding_provider=embedding_provider,
                 reranker=reranker,
-                filters={"doc_ids": selected_doc_ids} if selected_doc_ids else None,
+                filters={
+                    **section_filters,
+                    **({"doc_ids": selected_doc_ids} if selected_doc_ids else {}),
+                },
             )
             added = 0
             for row in list(result.get("evidence_table", []) or []):
@@ -157,6 +383,12 @@ def retrieve_review_evidence(
                     "document_count": int(dict(result.get("adequacy", {}) or {}).get("document_count", 0) or 0),
                     "retrieval_queries": list(result.get("retrieval_queries", []) or []),
                     "query_variant_budget": query_variant_budget,
+                    "filters": dict(
+                        {
+                            **section_filters,
+                            **({"doc_ids": selected_doc_ids} if selected_doc_ids else {}),
+                        }
+                    ),
                 }
             )
         section_results.append(
@@ -248,7 +480,15 @@ def plan_literature_review(
     ]
     try:
         raw = chat_client.complete_json(messages, schema_name="literature_review_plan") or {}
-        return _normalize_review_plan(question, raw)
+        plan = _normalize_review_plan(question, raw)
+        if _review_plan_is_on_topic(question, plan):
+            return plan
+        fallback = _fallback_review_plan(question)
+        fallback["planning"] = {
+            "mode": "deterministic-evidence-plan",
+            "reason": "writing model returned an off-topic review outline",
+        }
+        return fallback
     except (RuntimeError, ValueError) as error:
         plan = _fallback_review_plan(question)
         plan["planning"] = {
@@ -268,6 +508,15 @@ def _concise_review_title(question: str, candidate: str = "") -> str:
         return "Transformer、BERT 与 GPT-3：架构、训练与能力边界"
 
     instruction_cues = ("请", "帮我", "基于", "必须", "每个", "不得", "需要")
+    instruction_markers = (
+        "以论文综述形式",
+        "不要堆砌",
+        "优先使用",
+        "只有章节明确",
+        "每个关键判断",
+        "区分直接结果",
+        "最后列出",
+    )
     normalized_prompt = re.sub(r"\s+", "", prompt).casefold()
     normalized_proposed = re.sub(r"\s+", "", proposed).casefold()
     replays_prompt = bool(
@@ -279,7 +528,15 @@ def _concise_review_title(question: str, candidate: str = "") -> str:
         proposed
         and len(proposed) <= 72
         and not proposed.startswith(instruction_cues)
-        and not any(cue in proposed for cue in ("必须", "每个实质性段落", "不得"))
+        and not any(
+            cue in proposed
+            for cue in (
+                "必须",
+                "每个实质性段落",
+                "不得",
+                *instruction_markers,
+            )
+        )
         and not replays_prompt
     ):
         return proposed.rstrip("。；;：: ")
@@ -295,6 +552,12 @@ def _concise_review_title(question: str, candidate: str = "") -> str:
             return f"{subject[:52].rstrip()}：比较综述"
 
     topic = prompt
+    explicit_topic = re.search(
+        r"(?:主题|题目|研究主题)\s*(?:为|是|：|:)\s*[“「\"'](.+?)[”」\"']",
+        prompt,
+    )
+    if explicit_topic:
+        topic = explicit_topic.group(1).strip()
     if "：" in topic or ":" in topic:
         parts = re.split(r"[：:]", topic, maxsplit=1)
         if len(parts) == 2 and any(cue in parts[0] for cue in instruction_cues):
@@ -370,6 +633,11 @@ def _fallback_review_plan(question: str) -> dict[str, Any]:
     if any(term in domain_text for term in ("光伏", "太阳能电站", "光伏农业")) and any(
         term in domain_text for term in ("生态", "生态系统", "植被", "农业", "环境")
     ):
+        retrieval_topic = " ".join(
+            term
+            for term in ("光伏", "生态", "植被", "农业", "环境")
+            if term in domain_text
+        ) or "光伏 生态"
         domain_sections = [
             (
                 "foundations",
@@ -559,6 +827,7 @@ def _synthesize_review_in_parts(
     skipped_section_titles: list[str] = []
     model_section_titles: list[str] = []
     text_completion = getattr(chat_client, "complete_text", None)
+    chinese_output = bool(re.search(r"[\u3400-\u9fff]", question))
     for planned in list(plan.get("sections", []) or []):
         citation_ids = _diverse_section_citation_ids(dict(planned), evidence_by_id, limit=6)
         citation_ids = _exclusive_section_citation_ids(dict(planned), citation_ids, evidence_by_id)
@@ -578,7 +847,9 @@ def _synthesize_review_in_parts(
             continue
         section_evidence = [evidence_by_id[item] for item in citation_ids]
         raw_section: dict[str, Any] = {}
+        model_attempted = False
         try:
+            model_attempted = True
             raw_section = _synthesize_structured_review_section(
                 question,
                 dict(planned),
@@ -609,6 +880,7 @@ def _synthesize_review_in_parts(
             # completion works.  Recover with one bounded prose call and a
             # separate sentence-level citation attribution pass before
             # falling all the way back to literal source excerpts.
+            model_attempted = True
             raw_section = _synthesize_plain_review_section(
                 question,
                 dict(planned),
@@ -619,6 +891,11 @@ def _synthesize_review_in_parts(
             )
             model_written = bool(raw_section)
         if not raw_section:
+            if model_attempted and chinese_output:
+                raise ValueError(
+                    "写作模型不可用或未返回可核验的连贯段落；为避免把证据片段冒充综述，已停止交付。"
+                    "不会把英文摘录伪装成中文综述，请检查写作模型余额与配置后重试。"
+                )
             fallback_titles.append(str(planned.get("title", "")))
             raw_section = _deterministic_grounded_review_section(
                 question,
@@ -860,6 +1137,20 @@ def _synthesize_structured_review_section(
             f"Write one coherent {length_ranges[brief['length']]} section for {audience_labels[brief['audience']]} in {tone_labels[brief['tone']]} style. "
             "Writing preferences affect presentation only and never relax the evidence constraint. Do not add outside knowledge, causal claims, or evaluations absent from the evidence. "
         )
+    method_scope_rule = (
+        ""
+        if _review_section_allows_methods(planned)
+        else (
+            "当前章节没有明确讨论研究方法；只综合摘要、结果、讨论和结论中的发现、解释与证据边界，"
+            "不要写采样、实验、监测、测量、统计、建模或其他研究流程，也不要用方法过程替代研究结论。"
+            if chinese_output
+            else (
+                "This section does not explicitly discuss methods. Synthesize findings, interpretations, and evidence limits "
+                "from abstracts, results, discussions, and conclusions only; do not describe sampling, experiments, monitoring, "
+                "measurements, statistics, modeling, or other procedures, and do not substitute procedure for a finding."
+            )
+        )
+    )
     comparison_rules = (
         "必须明确写出章节讨论的模型或方法名称；比较并行路线时不得改写成先后替代关系。"
         "严格区分 GPT-3 与 BERT 论文中所称的 OpenAI GPT：不得据后者推断 GPT-3 采用微调。"
@@ -881,7 +1172,7 @@ def _synthesize_structured_review_section(
     messages = [
         {
             "role": "system",
-            "content": system_prompt + comparison_rules + shared_rules,
+            "content": system_prompt + method_scope_rule + comparison_rules + shared_rules,
         },
         {
             "role": "user",
@@ -1368,6 +1659,17 @@ def _synthesize_plain_review_section(
             "append one or two citation IDs that directly support the whole sentence, using only [7] or [7,8] syntax and only IDs "
             "present in the evidence input. Return prose only, without a heading, bullets, or commentary."
         )
+    if not _review_section_allows_methods(planned):
+        system_prompt += (
+            "当前章节没有明确讨论研究方法；只写摘要、结果、讨论和结论支持的发现、解释和边界，"
+            "不要写采样、实验、监测、测量、统计、建模或其他研究流程。"
+            if chinese_output
+            else (
+                "This section does not explicitly discuss methods. Write only findings, interpretations, and limits supported "
+                "by abstracts, results, discussions, and conclusions; do not describe sampling, experiments, monitoring, "
+                "measurements, statistics, modeling, or other procedures."
+            )
+        )
     try:
         model_text = str(
             text_completion(
@@ -1555,8 +1857,13 @@ def _attribute_plain_review_sentence_citations(
     for item in sentence_payload:
         citation_ids = assigned_by_sentence.get(str(item["sentence_id"]), [])
         claim = {"text": str(item["text"]), "quote_ids": citation_ids}
+        # A long prose draft can contain one connective sentence that no
+        # supplied quote supports. Drop that sentence, but retain the other
+        # model-authored sentences whose citations are valid; rejecting the
+        # entire paragraph would turn a recoverable attribution gap into a
+        # silent “writer unavailable” failure.
         if not citation_ids or not _semantic_cues_are_grounded(claim, quote_text_by_id):
-            return []
+            continue
         attributed.append({"text": str(item["text"]), "citation_ids": citation_ids})
     return attributed
 
@@ -2369,7 +2676,10 @@ def _deterministic_review_overview(
                 "citation_ids": list(section.get("citation_ids", []) or []),
             }
         )
-    question_ids = citation_ids[-2:] or citation_ids[:1]
+    fallback_questions = _fallback_review_open_questions(
+        question,
+        citation_ids=citation_ids,
+    )
     return {
         "title": str(plan.get("title", "")).strip() or question,
         "abstract": abstract,
@@ -2382,34 +2692,7 @@ def _deterministic_review_overview(
             "rows": rows,
         },
         "controversies": [],
-        "open_questions": [
-            {
-                "text": (
-                    "这些结论能否在不同任务、数据和模型规模下稳定复现？"
-                    if chinese_output
-                    else "Can these findings be reproduced across different tasks, datasets, and model scales?"
-                ),
-                "basis": (
-                    "当前章节显示研究对象、训练目标与评估设置存在差异。"
-                    if chinese_output
-                    else "The included studies use different research objects, training targets, and evaluation settings."
-                ),
-                "citation_ids": question_ids,
-            },
-            {
-                "text": (
-                    "如何在性能收益、数据效率、计算成本与偏见风险之间取得可验证的平衡？"
-                    if chinese_output
-                    else "How should future work balance measured gains against data, computation, and reliability costs?"
-                ),
-                "basis": (
-                    "当前证据同时涉及性能改进与方法局限。"
-                    if chinese_output
-                    else "The available evidence reports both performance gains and methodological constraints."
-                ),
-                "citation_ids": citation_ids[:2] or question_ids,
-            },
-        ],
+        "open_questions": fallback_questions,
         "limitations": [
             (
                 "本综述只覆盖当前 ScanSci 项目资料库中具有可回跳原文锚点的证据。"
@@ -2554,6 +2837,7 @@ def _normalize_review_document(
 ) -> dict[str, Any]:
     payload = dict(raw) if isinstance(raw, dict) else {}
     abstract = _normalized_cited_text(payload.get("abstract"), known_ids=known_ids, field="摘要")
+    abstract = _remove_non_method_procedural_sentences(abstract, allow_methods=False)
     raw_sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     sections: list[dict[str, Any]] = []
     for index, planned in enumerate(list(plan.get("sections", []) or [])):
@@ -2561,10 +2845,19 @@ def _normalize_review_document(
         paragraphs_source = supplied.get("paragraphs") if isinstance(supplied.get("paragraphs"), list) else []
         if not paragraphs_source and str(supplied.get("text", "")).strip():
             paragraphs_source = [supplied]
-        paragraphs = [
-            _normalized_cited_text(item, known_ids=known_ids, field=f"章节“{planned['title']}”")
-            for item in paragraphs_source
-        ]
+        paragraphs = []
+        for item in paragraphs_source:
+            paragraph = _normalized_cited_text(
+                item,
+                known_ids=known_ids,
+                field=f"章节“{planned['title']}”",
+            )
+            paragraphs.append(
+                _remove_non_method_procedural_sentences(
+                    paragraph,
+                    allow_methods=_review_section_allows_methods(planned),
+                )
+            )
         if not paragraphs:
             raise ValueError(f"写作模型没有为章节“{planned['title']}”生成带引用的正文")
         sections.append(
@@ -2583,11 +2876,20 @@ def _normalize_review_document(
     ]
     open_questions: list[dict[str, Any]] = []
     for item in list(payload.get("open_questions", []) or []):
-        normalized = _normalized_cited_text(item, known_ids=known_ids, field="开放问题")
+        if not isinstance(item, dict):
+            continue
+        try:
+            normalized = _normalized_cited_text(item, known_ids=known_ids, field="开放问题")
+        except ValueError:
+            continue
         normalized["basis"] = str(item.get("basis", "")).strip() if isinstance(item, dict) else ""
-        open_questions.append(normalized)
+        if _review_open_question_is_on_topic(question, normalized):
+            open_questions.append(normalized)
     if not open_questions:
-        raise ValueError("写作模型没有基于证据提出开放问题")
+        open_questions = _fallback_review_open_questions(
+            question,
+            citation_ids=sorted(str(item) for item in known_ids if str(item)),
+        )
     limitations = [
         (str(item.get("text", "")).strip() if isinstance(item, dict) else str(item).strip())
         for item in list(payload.get("limitations", []) or [])

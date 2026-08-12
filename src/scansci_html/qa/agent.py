@@ -107,6 +107,7 @@ def answer_question(
         paper_recall_limit=paper_recall_limit,
     )
     hits = _expand_hits_with_neighbor_context(db_path, hits, query_plan=query_plan)
+    hits = _prioritize_evidence_sections(hits, query_plan)
     quotes = _extract_quotes_for_provider(
         question,
         hits,
@@ -167,6 +168,7 @@ def answer_question(
             )
             hits = _merge_hits(hits, followup_hits)
             hits = _expand_hits_with_neighbor_context(db_path, hits, query_plan=query_plan)
+            hits = _prioritize_evidence_sections(hits, query_plan)
             quotes = _extract_quotes_for_provider(
                 question,
                 hits,
@@ -195,16 +197,46 @@ def answer_question(
             )
             if bool(adequacy.get("is_sufficient", False)):
                 break
+    adequacy = _soften_adequacy_for_review(query_plan, adequacy)
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
     evidence_table = build_evidence_table(quotes, evidence_by_id)
     # Generic relevance gate: a question whose non-stopword domain terms
     # never appear in any retrieved quote has no topical connection to this
     # library.  The specialised causal grounding check above only covers
     # English "X caused Y" patterns; this fallback handles any question.
-    adequacy = _apply_topical_relevance_gate(question, evidence_table, adequacy)
+    adequacy = _apply_topical_relevance_gate(question, evidence_table, adequacy, hits=hits)
+    facet_coverage = assess_facet_coverage(query_plan, evidence_table)
+    if facet_coverage["status"] != "not_applicable":
+        current_answerability = str(adequacy.get("answerability", "")).strip()
+        facet_answerability = {
+            "complete": "answerable",
+            "partial": "partially_answerable",
+            "none": "not_enough_information",
+        }.get(str(facet_coverage["status"]), "not_enough_information")
+        # A borderline topical match must not be upgraded to a confident
+        # answer merely because one requested facet happens to overlap.
+        merged_answerability = (
+            "needs_review"
+            if current_answerability == "needs_review" and facet_coverage["status"] != "none"
+            else facet_answerability
+        )
+        adequacy = {
+            **adequacy,
+            "facet_coverage": facet_coverage,
+            "answerability": merged_answerability,
+        }
+        if str(facet_coverage["status"]) == "none" and bool(adequacy.get("is_sufficient", False)):
+            adequacy = {
+                **adequacy,
+                "is_sufficient": False,
+                "followup_reason": "retrieved evidence does not cover any requested research dimension",
+            }
+    if bool(adequacy.get("is_sufficient", False)) and not str(adequacy.get("answerability", "")).strip():
+        adequacy = {**adequacy, "answerability": "answerable"}
     answer_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
     verification_generation = {"provider": "local-evidence", "fallback": False, "reason": ""}
-    if not bool(adequacy.get("is_sufficient", False)):
+    can_generate_answer = _can_generate_answer(adequacy, evidence_table)
+    if not can_generate_answer:
         verified_answer = apply_verification_policy(_insufficient_adequacy_answer(question, adequacy))
     elif _uses_llm(answer_provider):
         if chat_client is None:
@@ -270,7 +302,7 @@ def answer_question(
         # a filtered claim as verified merely because it was verified before the
         # presentation constraint was applied.
         verified_answer = apply_verification_policy(verify_answer_claims(verified_answer, evidence_table))
-    if bool(adequacy.get("is_sufficient", False)) and _requires_chinese_claims(question, query_plan):
+    if can_generate_answer and _requires_chinese_claims(question, query_plan):
         if not _verified_answer_has_chinese_claims(verified_answer):
             # Citation integrity comes first: never discard supported material
             # merely because a provider ignored the requested output language.
@@ -286,13 +318,21 @@ def answer_question(
                 "fallback": True,
                 "reason": "generated claims did not meet the requested Chinese answer language",
             }
-    citation_verification = verify_citations(verified_answer, evidence_table)
+    citation_verification = verify_citations(
+        verified_answer,
+        evidence_table,
+        required_facets=list(query_plan.get("required_facets", []) or []) or None,
+    )
     citation_repair = {
         "attempted": False,
         "applied": False,
         "reason": "",
     }
-    if bool(adequacy.get("is_sufficient", False)) and not bool(citation_verification.get("passed", False)):
+    if (
+        can_generate_answer
+        and not bool(citation_verification.get("passed", False))
+        and citation_verification.get("citation_completeness", True) is not False
+    ):
         failed_verification = citation_verification
         citation_repair["attempted"] = True
         repaired_answer = synthesize_answer(question, evidence_table, query_plan=query_plan)
@@ -304,7 +344,11 @@ def answer_question(
             if notice not in limitations:
                 limitations.append(notice)
             repaired_answer["limitations"] = limitations
-        repaired_verification = verify_citations(repaired_answer, evidence_table)
+        repaired_verification = verify_citations(
+            repaired_answer,
+            evidence_table,
+            required_facets=list(query_plan.get("required_facets", []) or []) or None,
+        )
         if bool(repaired_verification.get("passed", False)):
             citation_repair.update(
                 {
@@ -336,6 +380,38 @@ def answer_question(
             )
             verified_answer["citation_repair"] = citation_repair
     verified_answer["citation_verification"] = citation_verification
+    answerability = str(adequacy.get("answerability", "")).strip()
+    if answerability:
+        verified_answer["answerability"] = answerability
+    if answerability == "needs_review":
+        verified_answer["review_required"] = True
+        limitations = list(verified_answer.get("limitations", []) or [])
+        notice = (
+            "Evidence relevance is borderline. The answer is generated from the available excerpts, "
+            "but should be reviewed or followed by corrective retrieval."
+        )
+        if notice not in limitations:
+            limitations.append(notice)
+        verified_answer["limitations"] = limitations
+    if facet_coverage["status"] != "not_applicable":
+        answer_completeness = {
+            "status": facet_coverage["status"],
+            "covered_facets": list(facet_coverage["covered_facets"]),
+            "missing_facets": list(facet_coverage["missing_facets"]),
+            "coverage_ratio": facet_coverage["coverage_ratio"],
+        }
+        verified_answer["answer_completeness"] = answer_completeness
+        if facet_coverage["status"] == "partial":
+            limitations = list(verified_answer.get("limitations", []) or [])
+            notice = (
+                "The retrieved evidence covers only part of the requested dimensions; "
+                "missing facets: "
+                + ", ".join(str(item) for item in facet_coverage["missing_facets"])
+                + "."
+            )
+            if notice not in limitations:
+                limitations.append(notice)
+            verified_answer["limitations"] = limitations
     reader_answer = build_reader_answer(verified_answer, evidence_table, query_plan=query_plan)
     verified_answer["reader_answer"] = reader_answer
     agentic_steps.append(
@@ -395,6 +471,54 @@ def _insufficient_adequacy_answer(question: str, adequacy: dict[str, object]) ->
             )
         ],
         "insufficient_evidence": True,
+        "answerability": str(adequacy.get("answerability", "not_enough_information")),
+    }
+
+
+def _can_generate_answer(
+    adequacy: dict[str, object],
+    evidence_table: list[dict[str, Any]],
+) -> bool:
+    """Allow a transparent review answer without weakening hard evidence gates."""
+
+    if bool(adequacy.get("is_sufficient", False)):
+        return True
+    return (
+        str(adequacy.get("answerability", "")).strip() == "needs_review"
+        and any(str(row.get("exact_quote", "")).strip() for row in evidence_table if isinstance(row, dict))
+    )
+
+
+def _soften_adequacy_for_review(
+    query_plan: dict[str, Any] | None,
+    adequacy: dict[str, object],
+) -> dict[str, object]:
+    """Turn recoverable source scarcity into review instead of silent refusal.
+
+    A synthesis or comparison based on one source is not complete, but it can
+    still expose the supported evidence while clearly asking for review.  A
+    conflict question remains strict because one source cannot establish two
+    sides of a disagreement.
+    """
+
+    if bool(adequacy.get("is_sufficient", False)):
+        return adequacy
+    if int(adequacy.get("quote_count", 0) or 0) <= 0:
+        return adequacy
+    question_type = str((query_plan or {}).get("question_type", "")).strip().lower()
+    if question_type not in {"synthesis", "comparison"}:
+        return adequacy
+    reason = str(adequacy.get("followup_reason", "")).strip().lower()
+    if reason not in {"not enough source-document diversity", "not enough validated quotes"}:
+        return adequacy
+    return {
+        **adequacy,
+        "answerability": "needs_review",
+        "retryable": True,
+        "followup_reason": (
+            "only part of the requested synthesis/comparison was retrieved; "
+            "the available evidence is shown for review"
+        ),
     }
 
 
@@ -518,10 +642,141 @@ def assess_evidence_adequacy(
     }
 
 
+def assess_facet_coverage(
+    query_plan: dict[str, Any] | None,
+    evidence_rows: list[dict[str, Any]],
+    *,
+    strict: bool = False,
+) -> dict[str, object]:
+    """Measure whether retrieved evidence covers each explicit question facet.
+
+    The check is deliberately lexical and transparent.  It is a completeness
+    signal, not a substitute for claim-level entailment verification.  A
+    partial result may still be generated, but the caller can expose the
+    missing dimensions instead of presenting it as a complete review.
+    """
+
+    facets = list((query_plan or {}).get("required_facets", []) or [])
+    normalized_facets: list[dict[str, object]] = []
+    for raw in facets:
+        if not isinstance(raw, dict):
+            continue
+        facet_id = " ".join(str(raw.get("id", raw.get("label", ""))).split()).strip()
+        if not facet_id:
+            continue
+        terms = [
+            " ".join(str(term).split()).strip().casefold()
+            for term in list(raw.get("terms", []) or [])
+            if " ".join(str(term).split()).strip()
+        ]
+        normalized_facets.append({"id": facet_id, "terms": terms or [facet_id.casefold()]})
+    if not normalized_facets:
+        return {
+            "status": "not_applicable",
+            "required_facets": [],
+            "covered_facets": [],
+            "missing_facets": [],
+            "coverage_ratio": 1.0,
+            "facet_scores": {},
+        }
+
+    text = " ".join(
+        " ".join(
+            str(row.get(field, ""))
+            for field in ("exact_quote", "claim_target", "context_text")
+            if str(row.get(field, "")).strip()
+        )
+        for row in evidence_rows
+        if isinstance(row, dict)
+    ).casefold()
+    covered: list[str] = []
+    missing: list[str] = []
+    facet_scores: dict[str, float] = {}
+    for facet in normalized_facets:
+        facet_id = str(facet["id"])
+        terms = [str(term) for term in facet["terms"]]
+        score = _facet_match_score(terms, text, strict=strict)
+        facet_scores[facet_id] = round(score, 6)
+        if score >= 0.6:
+            covered.append(facet_id)
+        else:
+            missing.append(facet_id)
+    ratio = len(covered) / len(normalized_facets)
+    status = "complete" if not missing else "partial" if covered else "none"
+    return {
+        "status": status,
+        "required_facets": [str(facet["id"]) for facet in normalized_facets],
+        "covered_facets": covered,
+        "missing_facets": missing,
+        "coverage_ratio": round(ratio, 6),
+        "facet_scores": facet_scores,
+    }
+
+
+def _facet_match_score(terms: list[str], evidence_text: str, *, strict: bool = False) -> float:
+    """Score a facet with phrase, token, and light morphology fallbacks.
+
+    Exact phrase matching remains the strongest signal, but scientific writing
+    often changes ``storage`` to ``stocks`` or inserts modifiers such as
+    ``organic``.  A two-of-three content-token match is therefore enough to
+    mark a facet as covered; claim-level citation verification remains the hard
+    integrity check later in the pipeline.
+    """
+
+    normalized_text = " ".join(str(evidence_text or "").split()).casefold()
+    if not normalized_text:
+        return 0.0
+    # Tokenize the evidence package once.  The previous implementation rebuilt
+    # this set for every facet term, which multiplied memory use on large local
+    # libraries and could trigger a native/Python OOM during verification.
+    evidence_tokens = set(lexical_tokens(normalized_text)) if not strict else set()
+    best = 0.0
+    for raw_term in terms:
+        term = " ".join(str(raw_term or "").split()).casefold()
+        if not term:
+            continue
+        if term in normalized_text:
+            best = max(best, 1.0)
+            continue
+        if strict:
+            continue
+        term_tokens = [token for token in lexical_tokens(term) if len(token) > 2 and token not in STOPWORDS]
+        if not term_tokens:
+            term_tokens = [token for token in re.findall(r"[a-z0-9][a-z0-9./+-]*", term) if len(token) > 2]
+        if not term_tokens:
+            # CJK phrases are intentionally kept exact because character
+            # n-grams would make unrelated compounds look equivalent.
+            continue
+        matched_tokens = 0
+        for token in term_tokens:
+            if token in evidence_tokens or token in normalized_text:
+                matched_tokens += 1
+                continue
+            stem = _light_stem(token)
+            if stem and any(_light_stem(candidate) == stem for candidate in evidence_tokens):
+                matched_tokens += 1
+        best = max(best, matched_tokens / len(term_tokens))
+    return min(1.0, best)
+
+
+def _light_stem(token: str) -> str:
+    """Apply conservative suffix normalization for English scientific terms."""
+
+    value = str(token or "").casefold().strip()
+    if len(value) <= 5:
+        return value
+    for suffix in ("ies", "ing", "ed", "es", "s"):
+        if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+            return value[: -len(suffix)]
+    return value
+
+
 def _apply_topical_relevance_gate(
     question: str,
     evidence_table: list[dict[str, Any]],
     adequacy: dict[str, object],
+    *,
+    hits: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     """Fail evidence adequacy when no quote shares a domain term with the question.
 
@@ -534,6 +789,7 @@ def _apply_topical_relevance_gate(
 
     if not bool(adequacy.get("is_sufficient", False)):
         return adequacy
+    semantic_score = _semantic_relevance_score(hits or [])
     domain_terms = [term for term in lexical_tokens(question) if term not in STOPWORDS and len(term) >= 3]
     # ``lexical_tokens`` deliberately emits CJK n-grams for retrieval.  Using
     # those raw n-grams as a ratio denominator makes short Chinese questions
@@ -589,43 +845,233 @@ def _apply_topical_relevance_gate(
     ).casefold()
     matched = [term for term in domain_terms if term in combined_text]
     if not matched:
+        if semantic_score >= 0.78 and evidence_table:
+            return {
+                **adequacy,
+                "is_sufficient": False,
+                "answerability": "needs_review",
+                "retryable": True,
+                "followup_reason": "semantic relevance is promising but lexical topic evidence is sparse; review or corrective retrieval is recommended",
+                "topical_relevance": {
+                    "status": "review",
+                    "score": round(semantic_score, 6),
+                    "lexical_score": 0.0,
+                    "semantic_score": round(semantic_score, 6),
+                    "domain_terms": domain_terms[:12],
+                    "matched_terms": [],
+                    "checked_quotes": len(evidence_table),
+                },
+            }
         return {
             **adequacy,
             "is_sufficient": False,
+            "answerability": "not_enough_information",
             "followup_reason": "retrieved evidence does not share topical terms with the question; the library may not contain relevant material",
-            "topical_relevance": {"domain_terms": domain_terms[:12], "checked_quotes": len(evidence_table)},
+            "topical_relevance": {
+                "status": "insufficient",
+                "score": 0.0,
+                "lexical_score": 0.0,
+                "semantic_score": round(semantic_score, 6),
+                "domain_terms": domain_terms[:12],
+                "matched_terms": [],
+                "checked_quotes": len(evidence_table),
+            },
         }
     # A one-word match among many domain terms can pass the gate while
     # every substantive term is absent.  Require a meaningful fraction.
     matched_chinese = [term for term in chinese_topic_terms if term in combined_text]
-    # One unambiguous 3-gram (or two independent 2-grams) is enough for a
-    # concise CJK question.  Latin queries retain the existing fraction gate.
-    if matched_chinese and (
-        any(len(term) >= 3 for term in matched_chinese)
-        or len(matched_chinese) >= 2
-    ):
+    # Generic research scaffolding such as “影响/研究/结果/发电” can make an
+    # unrelated paper look topical. Require at least one independent,
+    # non-generic scientific term (or two non-overlapping short terms) before
+    # accepting a CJK match. This is the answerability gate, not a recall
+    # filter: English/Latin queries retain their existing ratio logic.
+    cjk_generic_terms = frozenset(
+        {
+            "影响", "研究", "结果", "方法", "作用", "分析", "比较", "变化", "过程",
+            "性能", "系统", "环境", "生态", "发电", "问题", "因素", "方面", "项目",
+            "建设", "年份", "不同", "如何", "什么", "是否", "数据", "实验", "模型",
+        }
+    )
+    specific_chinese = [
+        term
+        for term in matched_chinese
+        if len(term) >= 3
+        and not any(generic in term for generic in cjk_generic_terms if len(generic) >= 2)
+    ]
+    short_specific = [
+        term
+        for term in matched_chinese
+        if len(term) == 2
+        and not any(generic in term for generic in cjk_generic_terms if len(generic) >= 2)
+    ]
+    independent_short = []
+    for term in short_specific:
+        if not any(term in other or other in term for other in independent_short):
+            independent_short.append(term)
+    if specific_chinese or len(independent_short) >= 2:
+        lexical_score = min(1.0, len(specific_chinese or independent_short) / max(1, len(chinese_topic_terms)))
+        score = max(lexical_score, semantic_score * 0.85)
         return {
             **adequacy,
             "topical_relevance": {
+                "status": "strong",
+                "score": round(score, 6),
+                "lexical_score": round(lexical_score, 6),
+                "semantic_score": round(semantic_score, 6),
                 "domain_terms": domain_terms[:12],
-                "matched_terms": matched[:8],
+                "matched_terms": (specific_chinese or independent_short)[:8],
                 "checked_quotes": len(evidence_table),
             },
         }
-    if len(matched) >= 3 or len(matched) / len(domain_terms) >= 0.2:
-        return adequacy
-    long_match = any(len(term) >= 5 and term in combined_text for term in domain_terms)
-    if long_match:
-        return adequacy
+    if chinese_topic_terms:
+        if matched_chinese and semantic_score >= 0.58:
+            lexical_score = min(1.0, len(matched_chinese) / max(1, len(chinese_topic_terms)))
+            score = max(0.35, lexical_score * 0.65 + semantic_score * 0.35)
+            return {
+                **adequacy,
+                "is_sufficient": False,
+                "answerability": "needs_review",
+                "retryable": True,
+                "followup_reason": "evidence has a partial Chinese topic match; semantic relevance should be reviewed before treating it as complete",
+                "topical_relevance": {
+                    "status": "review",
+                    "score": round(score, 6),
+                    "lexical_score": round(lexical_score, 6),
+                    "semantic_score": round(semantic_score, 6),
+                    "domain_terms": domain_terms[:12],
+                    "matched_terms": matched_chinese[:8],
+                    "checked_quotes": len(evidence_table),
+                },
+            }
+        return {
+            **adequacy,
+            "is_sufficient": False,
+            "answerability": "not_enough_information",
+            "followup_reason": "retrieved evidence overlaps only generic Chinese research terms; the library may not contain relevant material",
+            "topical_relevance": {
+                "status": "insufficient",
+                "score": 0.0,
+                "lexical_score": 0.0,
+                "semantic_score": round(semantic_score, 6),
+                "domain_terms": domain_terms[:12],
+                "matched_terms": [],
+                "checked_quotes": len(evidence_table),
+            },
+        }
+    # Apply the same conservative answerability rule to English.  Generic
+    # words such as “evidence”, “effect” and “power” are not enough to prove
+    # that an unrelated paper answers the question. Two independent topic
+    # terms are preferred; one long term is accepted when it is distinctive
+    # (or is an explicitly named model/entity).
+    english_generic_terms = frozenset(
+        {
+            "evidence", "link", "links", "linked", "study", "studies", "research", "paper", "papers",
+            "result", "results", "effect", "effects", "impact", "impacts", "influence", "influences",
+            "change", "changes", "changed", "cause", "causes", "caused", "relationship", "association",
+            "associated", "analysis", "data", "model", "models", "system", "systems", "method", "methods",
+            "approach", "approaches", "factor", "factors", "different", "construction", "year", "years",
+            "power", "generation", "show", "shows", "what", "which", "how", "does", "do", "is", "are",
+            "can", "could", "would", "use", "uses", "using",
+        }
+    )
+    english_terms = [
+        term.casefold()
+        for term in domain_terms
+        if re.fullmatch(r"[a-z0-9][a-z0-9.+/-]*", term.casefold())
+        and term.casefold() not in english_generic_terms
+    ]
+    matched_english = [term for term in english_terms if term in combined_text]
+    named_terms = {
+        token.casefold()
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9+./-]{2,}\b", str(question or ""))
+        if token.casefold() not in english_generic_terms
+    }
+    if len(matched_english) >= 2 or any(
+        term in named_terms or len(term) >= 6
+        for term in matched_english
+    ):
+        lexical_score = min(1.0, len(matched_english) / max(1, len(english_terms)))
+        score = max(lexical_score, semantic_score * 0.85)
+        return {
+            **adequacy,
+            "topical_relevance": {
+                "status": "strong",
+                "score": round(score, 6),
+                "lexical_score": round(lexical_score, 6),
+                "semantic_score": round(semantic_score, 6),
+                "domain_terms": domain_terms[:12],
+                "matched_terms": matched_english[:8],
+                "checked_quotes": len(evidence_table),
+            },
+        }
+    if matched_english or semantic_score >= 0.58:
+        lexical_score = min(1.0, len(matched_english) / max(1, len(english_terms)))
+        score = max(0.35, lexical_score * 0.65 + semantic_score * 0.35)
+        return {
+            **adequacy,
+            "is_sufficient": False,
+            "answerability": "needs_review",
+            "retryable": True,
+            "followup_reason": "evidence has a partial English topic match; semantic relevance should be reviewed before treating it as complete",
+            "topical_relevance": {
+                "status": "review",
+                "score": round(score, 6),
+                "lexical_score": round(lexical_score, 6),
+                "semantic_score": round(semantic_score, 6),
+                "domain_terms": domain_terms[:12],
+                "matched_terms": matched_english[:8],
+                "checked_quotes": len(evidence_table),
+            },
+        }
     return {
         **adequacy,
         "is_sufficient": False,
+        "answerability": "not_enough_information",
         "followup_reason": "too few domain terms overlap retrieved evidence; the library may not contain relevant material",
         "topical_relevance": {
-            "domain_terms": domain_terms[:12], "matched_terms": matched[:8],
+            "status": "insufficient",
+            "score": 0.0,
+            "lexical_score": 0.0,
+            "semantic_score": round(semantic_score, 6),
+            "domain_terms": domain_terms[:12], "matched_terms": matched_english[:8],
             "checked_quotes": len(evidence_table),
         },
     }
+
+
+def _semantic_relevance_score(hits: list[dict[str, Any]]) -> float:
+    """Return a bounded semantic signal without trusting raw reranker scales."""
+
+    neural_scores: list[float] = []
+    dense_scores: list[float] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        for field in ("siliconflow_score", "cross_encoder_score", "jina_score", "semantic_score"):
+            value = hit.get(field)
+            if value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= numeric <= 1.0:
+                neural_scores.append(numeric)
+            else:
+                neural_scores.append(1.0 / (1.0 + pow(2.718281828, -numeric)))
+        value = hit.get("dense_score")
+        try:
+            if value is not None:
+                dense_scores.append(max(0.0, min(1.0, float(value))))
+        except (TypeError, ValueError):
+            pass
+    if neural_scores:
+        return round(max(neural_scores), 6)
+    if dense_scores:
+        # Dense scores are useful for triage, but should not outrank a neural
+        # reranker because local/hash embeddings can be poorly calibrated.
+        return round(max(dense_scores) * 0.75, 6)
+    return 0.0
 
 
 _CJK_QUERY_SCAFFOLDING = (
@@ -739,6 +1185,7 @@ def _apply_relation_grounding_gate(
     return {
         **adequacy,
         "is_sufficient": False,
+        "answerability": "not_enough_information",
         "followup_reason": "no single source supports both sides of the requested causal relation",
         "relation_grounding": {
             "relation": "causal",
@@ -831,6 +1278,8 @@ def _agentic_trace_step(
         "hit_count": int(hit_count),
         "quote_count": int(quote_count),
         "evidence_sufficient": bool(adequacy.get("is_sufficient", False)),
+        "answerability": str(adequacy.get("answerability", "")),
+        "retryable": bool(adequacy.get("retryable", False)),
         "followup_reason": str(adequacy.get("followup_reason", "")),
         "reason": reason,
     }
@@ -844,6 +1293,8 @@ def _agentic_stop_reason(
 ) -> str:
     if bool(adequacy.get("is_sufficient", False)):
         return "evidence_sufficient_after_followup" if slow_path_triggered else "evidence_sufficient_initially"
+    if str(adequacy.get("answerability", "")).strip() == "needs_review":
+        return "needs_review_after_retrieval"
     if max_followup_queries <= 0:
         return "followup_disabled"
     return "followup_budget_exhausted"
@@ -1108,6 +1559,44 @@ def _apply_agent_per_document_limit(
     return capped
 
 
+def _prioritize_evidence_sections(
+    hits: list[dict[str, Any]],
+    query_plan: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Prefer sections that normally contain findings without hard filtering.
+
+    PDF extraction still labels many useful spans as ``other``.  Therefore the
+    policy is a stable ranking preference rather than a filter: known abstract,
+    results, discussion and conclusion rows win when available, while ``other``
+    remains a fallback for libraries with incomplete section metadata.
+    """
+
+    if len(hits) < 2:
+        return list(hits)
+    plan = query_plan or {}
+    hints = {
+        str(value).strip().casefold()
+        for value in list(plan.get("section_hints", []) or [])
+        if str(value).strip()
+    }
+    question_type = str(plan.get("question_type", "")).strip().casefold()
+    if not hints and question_type in {"synthesis", "comparison", "conflict", "mechanism", "evidence"}:
+        hints = {"abstract", "results", "discussion", "conclusion"}
+    if not hints:
+        return list(hits)
+
+    indexed = list(enumerate(hits))
+
+    def key(item: tuple[int, dict[str, Any]]) -> tuple[int, float, int]:
+        index, hit = item
+        section_kind = str(hit.get("section_kind", "") or hit.get("section", "")).strip().casefold()
+        preferred = 0 if section_kind in hints else 1
+        score = float(hit.get("score", 0.0) or 0.0)
+        return preferred, -score, index
+
+    return [hit for _, hit in sorted(indexed, key=key)]
+
+
 def _expand_hits_with_neighbor_context(
     db_path: str | Path,
     hits: list[dict[str, Any]],
@@ -1261,7 +1750,12 @@ def _search_evidence(
     return capped[:resolved_limit]
 
 
-def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]]) -> dict[str, Any]:
+def verify_citations(
+    answer: dict[str, Any],
+    evidence_table: list[dict[str, Any]],
+    *,
+    required_facets: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     rows_by_quote_id: dict[str, list[dict[str, Any]]] = {}
     for row in evidence_table:
         quote_id = str(row.get("quote_id", ""))
@@ -1333,6 +1827,15 @@ def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]
                 "exact_anchor_evidence_ids": exact_anchor_ids,
             }
         )
+    citation_completeness = True
+    facet_coverage: dict[str, object] | None = None
+    if required_facets:
+        facet_coverage = assess_facet_coverage(
+            {"required_facets": required_facets},
+            cited_rows,
+            strict=True,
+        )
+        citation_completeness = facet_coverage["status"] == "complete"
     passed = (
         bool(claims)
         and not uncited_claim_ids
@@ -1340,8 +1843,9 @@ def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]
         and not missing_quote_ids
         and not missing_source_anchors
         and not missing_exact_quotes
+        and citation_completeness
     )
-    return {
+    result = {
         "passed": passed,
         "claim_count": len(claims),
         "supported_claim_count": len(supported_claims),
@@ -1357,6 +1861,17 @@ def verify_citations(answer: dict[str, Any], evidence_table: list[dict[str, Any]
         "audited_claim_count": len(claim_audit),
         "supported_anchor_claim_count": sum(1 for item in claim_audit if item["audit_status"] == "supported"),
     }
+    if facet_coverage is not None:
+        result.update(
+            {
+                "citation_completeness": citation_completeness,
+                "required_facets": facet_coverage["required_facets"],
+                "covered_facets": facet_coverage["covered_facets"],
+                "missing_facets": facet_coverage["missing_facets"],
+                "facet_coverage_ratio": facet_coverage["coverage_ratio"],
+            }
+        )
+    return result
 
 
 def build_reader_answer(

@@ -73,6 +73,15 @@ WORKFLOW_ANSWER_METRICS = [
     "abstention_accuracy",
 ]
 
+MATURE_QUALITY_METRICS = [
+    "answer_completeness_rate",
+    "facet_coverage",
+    "context_precision",
+    "reference_contamination_rate",
+    "abstention_precision",
+    "abstention_recall",
+]
+
 
 def run_benchmark(
     db_path: str | Path,
@@ -118,6 +127,16 @@ def run_benchmark(
     answer_accuracy_total = 0
     citation_verification_passes = 0
     citation_verification_total = 0
+    mature_answer_complete_hits = 0
+    mature_answer_complete_total = 0
+    mature_facet_coverage_sum = 0.0
+    mature_facet_coverage_total = 0
+    mature_context_precision_sum = 0.0
+    mature_context_precision_total = 0
+    mature_reference_hits = 0
+    mature_retrieved_hits = 0
+    mature_predicted_abstentions = 0
+    mature_abstention_true_positives = 0
     question_results: list[dict[str, Any]] = []
 
     for row in gold_rows:
@@ -155,6 +174,14 @@ def run_benchmark(
                 search_kwargs["paper_recall_limit"] = int(workflow_config["paper_recall_limit"])
             hits = search_evidence_store(db_path, question, **search_kwargs)
         hit_ids = {str(hit.get("evidence_id", "")) for hit in hits}
+        if str(workflow_config["benchmark_mode"]) == "enhanced":
+            mature_reference_hits += sum(1 for hit in hits if _is_reference_hit(hit))
+            mature_retrieved_hits += len(hits)
+        predicted_abstention = bool(result.get("answer", {}).get("insufficient_evidence", False))
+        if str(workflow_config["benchmark_mode"]) == "enhanced":
+            mature_predicted_abstentions += int(predicted_abstention)
+            if not answerable and predicted_abstention:
+                mature_abstention_true_positives += 1
         retrieved_gold_ids: set[str] = set()
         if answerable and gold_ids:
             retrieved_gold_ids = gold_ids.intersection(hit_ids)
@@ -192,10 +219,39 @@ def run_benchmark(
                 )
                 if answer_matches_points:
                     answer_accuracy_hits += 1
+            if str(workflow_config["benchmark_mode"]) == "enhanced":
+                gold_facets = _gold_facets(row)
+                result_completeness = dict(result.get("answer", {}).get("answer_completeness", {}) or {})
+                result_facet_coverage = dict(
+                    result.get("adequacy", {}).get("facet_coverage", {}) or {}
+                )
+                if gold_facets:
+                    mature_facet_coverage_total += 1
+                    coverage_ratio = _coverage_ratio_for_facets(
+                        result_completeness or result_facet_coverage,
+                        result.get("answer", {}),
+                        gold_facets,
+                    )
+                    mature_facet_coverage_sum += coverage_ratio
+                    complete = coverage_ratio >= 1.0
+                else:
+                    mature_facet_coverage_total += 1
+                    mature_facet_coverage_sum += 1.0
+                    complete = bool(answer_matches_points) if required_points else not bool(
+                        result.get("answer", {}).get("insufficient_evidence", False)
+                    )
+                mature_answer_complete_total += 1
+                if complete:
+                    mature_answer_complete_hits += 1
         else:
             unanswerable_count += 1
-            if bool(result.get("answer", {}).get("insufficient_evidence", False)):
+            if predicted_abstention:
                 abstention_correct += 1
+
+        if str(workflow_config["benchmark_mode"]) == "enhanced":
+            if answerable and hit_ids:
+                mature_context_precision_total += 1
+                mature_context_precision_sum += len(retrieved_gold_ids) / len(hit_ids)
 
         claims = list(result.get("answer", {}).get("answer", []) or [])
         if claims:
@@ -264,6 +320,39 @@ def run_benchmark(
         "unsupported_claim_rate": _ratio(unsupported_claims, total_claims),
         "abstention_accuracy": _ratio(abstention_correct, unanswerable_count),
     }
+    if str(workflow_config["benchmark_mode"]) == "enhanced":
+        metrics["metric_groups"] = {
+            **dict(metrics["metric_groups"]),
+            "mature_quality": MATURE_QUALITY_METRICS,
+        }
+        metrics.update(
+            {
+                "answer_completeness_rate": _ratio(
+                    mature_answer_complete_hits,
+                    mature_answer_complete_total,
+                ),
+                "facet_coverage": _ratio(
+                    mature_facet_coverage_sum,
+                    mature_facet_coverage_total,
+                ),
+                "context_precision": _ratio(
+                    mature_context_precision_sum,
+                    mature_context_precision_total,
+                ),
+                "reference_contamination_rate": _ratio(
+                    mature_reference_hits,
+                    mature_retrieved_hits,
+                ),
+                "abstention_precision": _ratio(
+                    mature_abstention_true_positives,
+                    mature_predicted_abstentions,
+                ),
+                "abstention_recall": _ratio(
+                    mature_abstention_true_positives,
+                    unanswerable_count,
+                ),
+            }
+        )
     if include_details:
         metrics["question_results"] = question_results
     return metrics
@@ -1338,7 +1427,58 @@ def _answer_matches_points(
     )
 
 
-def _ratio(numerator: int, denominator: int) -> float:
+def _is_reference_hit(hit: dict[str, Any]) -> bool:
+    section = " ".join(
+        str(hit.get(field, "")).strip().casefold()
+        for field in ("section_kind", "section", "block_type", "block_type_name")
+        if str(hit.get(field, "")).strip()
+    )
+    return bool(re.search(r"(?:reference|bibliography|works cited|literature cited|参考文献|引用文献)", section))
+
+
+def _gold_facets(row: dict[str, Any]) -> list[dict[str, object]]:
+    raw = row.get("required_facets", row.get("facets", []))
+    if not isinstance(raw, list):
+        return []
+    facets: list[dict[str, object]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            facet_id = " ".join(str(item.get("id", item.get("label", ""))).split()).strip()
+            terms = [
+                " ".join(str(term).split()).strip()
+                for term in list(item.get("terms", []) or [])
+                if " ".join(str(term).split()).strip()
+            ]
+        else:
+            facet_id = " ".join(str(item).split()).strip()
+            terms = [facet_id] if facet_id else []
+        if facet_id and terms:
+            facets.append({"id": facet_id, "terms": terms})
+    return facets
+
+
+def _coverage_ratio_for_facets(
+    coverage: dict[str, Any],
+    answer: dict[str, Any],
+    facets: list[dict[str, object]],
+) -> float:
+    if coverage:
+        try:
+            ratio = float(coverage.get("coverage_ratio", ""))
+        except (TypeError, ValueError):
+            ratio = -1.0
+        if ratio >= 0:
+            return max(0.0, min(1.0, ratio))
+    text = " ".join(str(claim.get("text", "")) for claim in list(answer.get("answer", []) or [])).casefold()
+    covered = 0
+    for facet in facets:
+        terms = [str(term).casefold() for term in list(facet.get("terms", []) or [])]
+        if any(term and term in text for term in terms):
+            covered += 1
+    return _ratio(covered, len(facets))
+
+
+def _ratio(numerator: float, denominator: int | float) -> float:
     if denominator <= 0:
         return 0.0
     return round(numerator / denominator, 6)

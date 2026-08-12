@@ -1,5 +1,6 @@
 from scansci_html.qa.agent import (
     _apply_topical_relevance_gate,
+    assess_facet_coverage,
     _filter_answer_to_requested_source_language,
 )
 
@@ -51,3 +52,32 @@ def test_explicit_chinese_source_request_drops_english_claims():
 
     assert [item["claim_id"] for item in filtered["answer"]] == ["c1"]
     assert filtered["source_language_filter"] == "zh_source_excerpt"
+
+
+def test_topical_gate_marks_borderline_overlap_for_review_instead_of_abstaining():
+    result = _apply_topical_relevance_gate(
+        "What evidence links tidal power to coral reef bleaching?",
+        [{"quote_id": "q0001", "exact_quote": "Tidal currents influence coastal ecosystems."}],
+        {"is_sufficient": True, "profile": "manual"},
+        hits=[{"siliconflow_score": 0.72}],
+    )
+
+    assert result["is_sufficient"] is False
+    assert result["answerability"] == "needs_review"
+    assert result["retryable"] is True
+    assert result["topical_relevance"]["status"] == "review"
+
+
+def test_facet_coverage_accepts_scientific_phrase_variants():
+    coverage = assess_facet_coverage(
+        {
+            "required_facets": [
+                {"id": "soil carbon storage", "terms": ["soil carbon storage"]},
+            ]
+        },
+        [{"quote_id": "q0001", "exact_quote": "The study measured soil organic carbon stocks."}],
+    )
+
+    assert coverage["status"] == "complete"
+    assert coverage["covered_facets"] == ["soil carbon storage"]
+    assert coverage["facet_scores"]["soil carbon storage"] >= 0.6

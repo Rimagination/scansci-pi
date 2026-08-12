@@ -143,6 +143,16 @@ def test_substantive_filter_keeps_concise_research_predicates():
     assert all(is_substantive_evidence_hit({"section": "Results", "text": text}) for text in statements)
 
 
+def test_substantive_filter_rejects_reference_section_metadata_even_with_factual_words():
+    assert not is_substantive_evidence_hit(
+        {
+            "section_kind": "references",
+            "section": "References",
+            "text": "Photovoltaic arrays increased vegetation cover in arid regions.",
+        }
+    )
+
+
 def test_extract_quotes_prefers_span_text_when_hit_contains_parent_context():
     hits = [
         {

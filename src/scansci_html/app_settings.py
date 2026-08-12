@@ -19,6 +19,7 @@ from .local_model_market import QWEN3_ASR_LEGACY_MODEL_ID, QWEN3_ASR_NATIVE_MODE
 
 from .builtin_skills import default_skill_records
 from .artifact_plugins import default_plugin_records, enrich_builtin_plugins
+from .vector_storage import configure_vector_index_root
 
 
 _CONFIG_NAME = ".scansci-notebook.json"
@@ -33,6 +34,8 @@ _DEEPSEEK_PROVIDER_ID = "deepseek"
 _DEEPSEEK_FLASH_MODEL_ID = "deepseek-v4-flash"
 _DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro"
 _DEEPSEEK_LEGACY_MODEL_IDS = frozenset({"deepseek-chat", "deepseek-reasoner"})
+_STORAGE_ENV_BASELINE: dict[str, str | None] = {}
+_STORAGE_ENV_LAST_APPLIED: dict[str, str | None] = {}
 
 
 def _provider_preset(
@@ -170,7 +173,7 @@ _PROVIDER_PRESETS: list[dict[str, Any]] = [
     _provider_preset("moonshot", "Kimi", category="国内直连", base_url="https://api.moonshot.ai/v1", models=[_model_preset("kimi-k2.5", "Kimi K2.5", group="Kimi", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("moonshot-v1-128k", "Moonshot 128K", group="Kimi", capabilities=["reasoning", "tool"])]),
     _provider_preset("minimax", "MiniMax", category="国内直连", base_url="https://api.minimaxi.com/v1", models=[_model_preset("MiniMax-M2.7", "MiniMax M2.7", group="MiniMax", capabilities=["reasoning", "tool", "coding"]), _model_preset("MiniMax-VL-01", "MiniMax VL", group="MiniMax", capabilities=["reasoning", "vision"])]),
     _provider_preset("xiaomi-mimo", "Xiaomi MiMo", category="国内直连", models=[_model_preset("mimo-v2-flash", "MiMo V2 Flash", group="MiMo", capabilities=["reasoning", "tool", "coding"])]),
-    _provider_preset("siliconflow", "硅基流动", category="云端推理", base_url="https://api.siliconflow.cn/v1", models=[_model_preset("deepseek-ai/DeepSeek-V3", "DeepSeek V3", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]), _model_preset("Qwen/Qwen2.5-VL-72B-Instruct", "Qwen VL 72B", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("BAAI/bge-m3", "BGE-M3", group="BAAI", capabilities=["embedding"]), _model_preset("BAAI/bge-reranker-v2-m3", "BGE Reranker V2 M3", group="BAAI", capabilities=["reranking"])]),
+    _provider_preset("siliconflow", "硅基流动", category="云端推理", base_url="https://api.siliconflow.cn/v1", models=[_model_preset("deepseek-ai/DeepSeek-V3", "DeepSeek V3", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]), _model_preset("Qwen/Qwen2.5-VL-72B-Instruct", "Qwen VL 72B", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("Qwen/Qwen3-VL-8B-Instruct", "Qwen3 VL 8B", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("PaddlePaddle/PaddleOCR-VL-1.5", "PaddleOCR VL 1.5", group="Paddle", capabilities=["vision"]), _model_preset("BAAI/bge-m3", "BGE-M3", group="BAAI", capabilities=["embedding"]), _model_preset("Qwen/Qwen3-Embedding-8B", "Qwen3 Embedding 8B", group="Qwen", capabilities=["embedding"]), _model_preset("BAAI/bge-reranker-v2-m3", "BGE Reranker V2 M3", group="BAAI", capabilities=["reranking"]), _model_preset("Qwen/Qwen3-Reranker-8B", "Qwen3 Reranker 8B", group="Qwen", capabilities=["reranking"])]),
     _provider_preset("modelscope", "ModelScope", category="云端推理", base_url="https://api-inference.modelscope.cn/v1", models=[_model_preset("Qwen/Qwen2.5-72B-Instruct", "Qwen 2.5 72B", group="Qwen", capabilities=["reasoning", "tool", "coding"]), _model_preset("Qwen/Qwen2.5-VL-72B-Instruct", "Qwen VL 72B", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("iic/nlp_gte-rerank", "GTE Rerank", group="Rerankers", capabilities=["reranking"])]),
     _provider_preset("ppio", "PPIO Cloud", category="云端推理", models=[_model_preset("deepseek-ai/DeepSeek-V3", "DeepSeek V3", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]), _model_preset("Qwen/Qwen2.5-72B-Instruct", "Qwen 2.5 72B", group="Qwen", capabilities=["reasoning", "tool", "coding"])]),
     _provider_preset("volcengine", "火山引擎", category="云端推理", base_url="https://ark.cn-beijing.volces.com/api/v3", models=[_model_preset("doubao-seed-1-6-thinking", "Doubao Seed Thinking", group="Doubao", capabilities=["reasoning", "tool", "coding"]), _model_preset("doubao-1-5-vision-pro", "Doubao Vision Pro", group="Doubao", capabilities=["reasoning", "vision"]), _model_preset("doubao-embedding-large", "Doubao Embedding", group="Embeddings", capabilities=["embedding"])]),
@@ -329,6 +332,13 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "directories": {
             "default_workspace": "",
             "conversation_workspace": "",
+            # These storage paths are optional overrides.  Empty values preserve
+            # the platform defaults and existing environment configuration.
+            "model_cache": "",
+            "local_runtime": "",
+            # Vector indexes are isolated per knowledge base.  Empty keeps the
+            # legacy location next to the application evidence database.
+            "vector_index": "",
         },
     },
     "skills": default_skill_records(),
@@ -950,7 +960,89 @@ def _normalize_general(value: object) -> dict[str, Any]:
         "directories": {
             "default_workspace": _text(directories_source.get("default_workspace"), limit=1000),
             "conversation_workspace": _text(directories_source.get("conversation_workspace"), limit=1000),
+            "model_cache": _normalize_storage_path(directories_source.get("model_cache")),
+            "local_runtime": _normalize_storage_path(directories_source.get("local_runtime")),
+            "vector_index": _normalize_storage_path(directories_source.get("vector_index")),
         },
+    }
+
+
+def _normalize_storage_path(value: object) -> str:
+    """Normalize an optional absolute directory without creating it.
+
+    A selected location may not exist yet (for example, a new empty drive),
+    so validation is intentionally lexical and does not require ``is_dir``.
+    Relative paths are ignored rather than interpreted relative to the
+    workspace, avoiding an unexpected C: drive allocation.
+    """
+
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or any(ord(char) < 32 for char in text):
+        return ""
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            return ""
+        # ``absolute`` normalizes ``.``/``..`` without case-folding a Windows
+        # drive path; retaining user-visible casing makes the setting easier
+        # to recognize in the UI and in support reports.
+        return str(path.absolute())
+    except (OSError, RuntimeError, ValueError):
+        return ""
+
+
+def vector_index_directory(settings: object) -> str:
+    """Return the normalized vector-index directory override from settings."""
+
+    source = settings if isinstance(settings, dict) else {}
+    general = source.get("general") if isinstance(source.get("general"), dict) else {}
+    directories = general.get("directories") if isinstance(general.get("directories"), dict) else {}
+    return _normalize_storage_path(directories.get("vector_index"))
+
+
+def apply_storage_directories(settings: object) -> dict[str, str]:
+    """Apply persisted model/runtime/vector locations to the current process.
+
+    The desktop creates download/runtime managers after loading settings, so
+    this function is called during startup and after a settings save.  The
+    original environment is restored when a user resets a location, which is
+    important for developer shells and packaged upgrades.  Vector indexes use
+    a process-local resolver instead of an environment variable.
+    """
+
+    source = settings if isinstance(settings, dict) else {}
+    general = source.get("general") if isinstance(source.get("general"), dict) else {}
+    directories = general.get("directories") if isinstance(general.get("directories"), dict) else {}
+    values = {
+        "HF_HUB_CACHE": _normalize_storage_path(directories.get("model_cache")),
+        "SCANSCI_LOCAL_RUNTIME_ROOT": _normalize_storage_path(directories.get("local_runtime")),
+    }
+    vector_index = vector_index_directory(settings)
+    configure_vector_index_root(vector_index or None)
+    for name, value in values.items():
+        current = os.environ.get(name)
+        # A test harness, shell, or host application can change the process
+        # environment after ScanSci has applied a setting.  Treat that as a
+        # new baseline; otherwise clearing a setting would restore the value
+        # from an earlier startup instead of the host's current value.
+        if name not in _STORAGE_ENV_BASELINE or (
+            name in _STORAGE_ENV_LAST_APPLIED and current != _STORAGE_ENV_LAST_APPLIED[name]
+        ):
+            _STORAGE_ENV_BASELINE[name] = current
+        baseline = _STORAGE_ENV_BASELINE[name]
+        if value:
+            os.environ[name] = value
+        elif baseline is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = baseline
+        _STORAGE_ENV_LAST_APPLIED[name] = os.environ.get(name)
+    return {
+        "model_cache": values["HF_HUB_CACHE"],
+        "local_runtime": values["SCANSCI_LOCAL_RUNTIME_ROOT"],
+        "vector_index": vector_index,
     }
 
 
@@ -1091,6 +1183,27 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
                     **deepcopy(model),
                 }
                 for model in preset["models"]
+            ]
+        elif row.get("id") == "siliconflow":
+            # SiliconFlow's evidence models are product catalog entries too.
+            # Merge newly shipped presets into an existing workspace while
+            # retaining any user-added model IDs that are not in the catalog.
+            existing_models = {
+                str(model.get("id", "")): model
+                for model in refreshed["models"]
+                if str(model.get("id", ""))
+            }
+            preset_ids = {str(model["id"]) for model in preset["models"]}
+            refreshed["models"] = [
+                {
+                    **existing_models.get(str(model["id"]), {}),
+                    **deepcopy(model),
+                }
+                for model in preset["models"]
+            ] + [
+                model
+                for model in refreshed["models"]
+                if str(model.get("id", "")) not in preset_ids
             ]
         elif row.get("id") == _DEEPSEEK_PROVIDER_ID:
             # DeepSeek's old Chat/Reasoner aliases are no longer offered by

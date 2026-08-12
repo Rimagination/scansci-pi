@@ -491,6 +491,7 @@ def test_desktop_component_passes_a_persistent_state_directory_to_the_daemon(
     executable.write_bytes(b"fake")
     monkeypatch.setattr(component, "executable", lambda: executable)
     health = iter(["", "Qwen/Qwen3.5-2B"])
+    monkeypatch.setattr(component, "_health_payload", lambda _base_url: None)
     monkeypatch.setattr(component, "_health_model", lambda _base_url: next(health))
     captured: dict[str, object] = {}
 
@@ -516,8 +517,32 @@ def test_desktop_component_passes_a_persistent_state_directory_to_the_daemon(
     component.ensure_process("Qwen/Qwen3.5-2B")
 
     command = list(captured["command"])
-    assert "--state-dir" in command
-    assert command[command.index("--state-dir") + 1] == str((component.root / "state").resolve())
+    assert "--state-dir" not in command
+    environment = dict(captured["kwargs"]["env"])
+    assert environment["SCANSCI_LOCAL_RUNTIME_STATE_DIR"] == str((component.root / "state").resolve())
+
+
+def test_local_runtime_pagefile_failure_has_an_actionable_message() -> None:
+    component_module = _required_module("scansci_html.local_runtime_component")
+
+    message = component_module.LocalRuntimeComponent._actionable_runtime_message(
+        "页面文件太小，无法完成操作。 (os error 1455)"
+    )
+
+    assert "增大虚拟内存" in message
+    assert "云端视觉模型或 OCR" in message
+
+
+def test_lazy_runtime_status_ok_is_ready_for_non_vision_models() -> None:
+    component_module = _required_module("scansci_html.local_runtime_component")
+
+    assert component_module.LocalRuntimeComponent._health_readiness(
+        {"model": "Qwen/Qwen3-Embedding-0.6B", "status": "ok", "loaded": False}
+    ) == "ready"
+    assert component_module.LocalRuntimeComponent._health_needs_probe(
+        {"model": "openbmb/MiniCPM-V-4.6-BNB", "status": "ok", "loaded": False},
+        "openbmb/MiniCPM-V-4.6-BNB",
+    ) is True
 
 
 def test_single_component_entry_dispatches_daemon_and_worker_modes(

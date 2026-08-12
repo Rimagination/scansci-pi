@@ -188,6 +188,10 @@ def build_local_evidence_stack(
             "precision_max_length": max(256, int(precision_max_length)),
             "local_neural_embedding": embedding_identity.startswith("sentence-transformers:"),
             "local_neural_reranker": reranker_identity.startswith(("cross-encoder:", "qwen3:")),
+            "remote_embedding_active": (
+                embedding_identity.startswith(("siliconflow:", "openai-compatible:"))
+                or embedding_device == "remote"
+            ),
             "remote_reranker_active": reranker_identity.startswith("siliconflow:"),
             "qwen_embedding_active": (
                 embedding_identity.startswith("sentence-transformers:")

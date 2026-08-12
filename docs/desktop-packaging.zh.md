@@ -127,6 +127,10 @@ python .\scripts\verify_update_channel.py `
 %LOCALAPPDATA%\ScanSci\runtimes\local-transformers\versions\<version>\
 ```
 
+首次运行引导和“设置 · 常规 · 目录与文件”允许用户分别选择“模型缓存目录”“本地运行组件目录”和“向量索引目录”。留空时沿用上面的 `%LOCALAPPDATA%` 默认位置；选择后，新下载会写入用户指定目录，已有运行中的进程不会被强制中断，下一次启动会完整采用新目录。模型缓存目录使用 Hugging Face hub 目录语义，运行组件目录仍包含 `versions/`、`downloads/` 和 `active.json`。
+
+向量索引目录只影响每个知识库的 `*.libraries/<notebook>.sqlite` 证据/向量数据库。更换目录时，应用先通过 SQLite 备份和完整性校验，再更新 workspace 中的路径；原目录保留为可恢复副本，不会直接删除用户数据，也不会重新调用嵌入模型。资料增量索引会按证据文本摘要复用未变向量，只为新增或变更的证据重新嵌入。
+
 `active.json` 指向当前版本。更新 core 不触碰该目录；只有组件版本变化才下载新的运行时。组件下载和启用均经过 SHA256 校验，失败时会保留已经可用的旧版本。
 
 主程序必须比较 `active.json` 中的组件版本与当前 core 要求的组件契约版本。旧版本仍保留在版本目录中，但在完成兼容更新前不能被误报为“已就绪”；设置页应明确显示“更新本地运行组件”。组件更新只原子切换运行时目录，不删除 `%LOCALAPPDATA%\ScanSci\models\`、Hugging Face 缓存或用户配置的其他模型根目录，因此已经下载并校验过的模型权重不会重复下载。

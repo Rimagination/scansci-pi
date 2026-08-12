@@ -92,6 +92,28 @@ def test_cloud_vision_is_used_when_no_local_runtime_is_ready(tmp_path: Path, mon
     assert route["provider_id"] == "cloud"
 
 
+def test_cloud_vision_prefers_available_qwen3_vl_over_legacy_72b(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(vision_routing, "get_provider_api_key", lambda *_args: "secret")
+    cloud = _provider(
+        "cloud",
+        models=[
+            {"id": "Qwen/Qwen2.5-VL-72B-Instruct", "capabilities": ["vision"]},
+            {"id": "Qwen/Qwen3-VL-8B-Instruct", "capabilities": ["vision"]},
+            {"id": "PaddlePaddle/PaddleOCR-VL-1.5", "capabilities": ["vision"]},
+        ],
+    )
+
+    route = vision_routing.select_vision_route(
+        tmp_path,
+        {"providers": [cloud]},
+        active_provider_id="text",
+        active_model_id="text-model",
+    )
+
+    assert route is not None
+    assert route["model_id"] == "Qwen/Qwen3-VL-8B-Instruct"
+
+
 def test_ocr_fallback_reports_unavailable_without_raising(monkeypatch):
     monkeypatch.setattr(vision_routing, "_tesseract_path", lambda: "")
 

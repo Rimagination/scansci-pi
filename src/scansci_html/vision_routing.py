@@ -31,7 +31,7 @@ from typing import Any
 
 import requests
 
-from .app_settings import get_document_service_api_key, get_provider_api_key
+from .app_settings import apply_storage_directories, get_document_service_api_key, get_provider_api_key
 from .ollama_runtime import ollama_status
 
 
@@ -62,8 +62,61 @@ def _model_candidates(provider: dict[str, Any], *, capability: str = "") -> list
         capabilities = {str(value).strip().lower() for value in list(item.get("capabilities", []) or [])}
         if capability and capability not in capabilities:
             continue
+        if capability == "vision" and not _is_image_understanding_model(model_id, item):
+            continue
         rows.append((model_id, dict(item)))
     return rows
+
+
+def _is_image_understanding_model(model_id: str, model: dict[str, Any]) -> bool:
+    """Exclude image generators and visual embedding/reranking models from chat routing."""
+
+    label = f"{model_id} {model.get('name', '')}".casefold()
+    return not any(
+        marker in label
+        for marker in (
+            "embedding",
+            "reranker",
+            "rerank",
+            "z-image",
+            "kolors",
+            "wan2",
+            "ernie-image",
+            "text-to-image",
+            "image-to-video",
+            "i2v",
+            "t2v",
+        )
+    )
+
+
+def _vision_model_priority(model_id: str, model: dict[str, Any]) -> tuple[int, str]:
+    """Prefer broadly available captioning/VL models over fragile legacy entries.
+
+    Provider catalogs are user-editable and often contain image generators,
+    rerankers, and retired 72B checkpoints side by side.  When more than one
+    vision model is enabled, a small instruction model or OCR-VL model is a
+    safer first attempt: it starts faster, costs less, and is less likely to be
+    excluded by a provider account's model allow-list.  The explicit priority
+    can still be overridden by selecting a model in the composer.
+    """
+
+    explicit = model.get("vision_priority")
+    try:
+        if explicit is not None:
+            return int(explicit), str(model_id)
+    except (TypeError, ValueError):
+        pass
+    marker = f"{model_id} {model.get('name', '')}".casefold()
+    if "qwen3-vl-8b-instruct" in marker:
+        return 0, str(model_id)
+    if "paddleocr-vl" in marker:
+        return 1, str(model_id)
+    if "qwen3-vl" in marker or "qwen3-omni" in marker:
+        return 2, str(model_id)
+    if "qwen2.5-vl-72b" in marker:
+        return 20, str(model_id)
+    return 10, str(model_id)
 
 
 def _provider_api_key(workspace: str | os.PathLike[str], provider: dict[str, Any]) -> str:
@@ -83,6 +136,22 @@ def _provider_ready(workspace: str | os.PathLike[str], provider: dict[str, Any],
     if not str(provider.get("base_url", "")).strip():
         return False
     provider_id = str(provider.get("id", "")).strip()
+    if provider_id == "local-huggingface":
+        # A model snapshot can be present while its last isolated generation
+        # probe failed (for example because the Windows page file is too
+        # small).  Do not keep selecting that model on every image turn; the
+        # caller will use another vision provider or the OCR fallback instead.
+        try:
+            from .local_model_market import installed_models
+
+            local = next(
+                (item for item in installed_models() if str(item.get("id", "")) == str(model_id)),
+                None,
+            )
+            if isinstance(local, dict) and str(local.get("runtime_probe_state", "")) == "failed":
+                return False
+        except Exception:
+            pass
     if str(provider.get("logo", "")).strip().lower() == "ollama" or provider_id.startswith("local-runtime-") and str(provider.get("runtime", "")).lower() == "ollama":
         status = ollama_status(str(provider.get("base_url", "")))
         if not status.get("reachable"):
@@ -126,6 +195,7 @@ def select_vision_route(
     active_provider_id: str = "",
     active_model_id: str = "",
     allow_cloud: bool = True,
+    excluded_routes: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any] | None:
     """Choose a usable vision endpoint without making the user reselect it.
 
@@ -136,19 +206,28 @@ def select_vision_route(
     local vision or OCR instead.
     """
 
+    # Routing can be called by the research worker without first constructing
+    # the web app.  Apply the persisted runtime root here as well, otherwise a
+    # failed local probe in a user-selected directory would be invisible and
+    # the same broken vision model would be launched again on every turn.
+    apply_storage_directories(settings)
+    excluded = set(excluded_routes or set())
     providers = [item for item in list(settings.get("providers", []) or []) if isinstance(item, dict)]
     active = next((item for item in providers if str(item.get("id", "")) == str(active_provider_id)), None)
     if active is not None:
         active_model = _model_record(active, active_model_id)
         if "vision" in {str(value).lower() for value in list(active_model.get("capabilities", []) or [])}:
             selected = _route(workspace, active, str(active_model_id), active_model, "selected")
-            if selected is not None:
+            if selected is not None and (str(active.get("id", "")), str(active_model_id)) not in excluded:
                 return selected
 
     local_candidates = []
     cloud_candidates = []
     for provider in providers:
-        models = _model_candidates(provider, capability="vision")
+        models = sorted(
+            _model_candidates(provider, capability="vision"),
+            key=lambda item: _vision_model_priority(item[0], item[1]),
+        )
         if not models:
             continue
         provider_id = str(provider.get("id", ""))
@@ -164,12 +243,16 @@ def select_vision_route(
     # that path was handled above as mode="selected".
     for provider, models in local_candidates:
         for model_id, model in models:
+            if (str(provider.get("id", "")), model_id) in excluded:
+                continue
             selected = _route(workspace, provider, model_id, model, "local")
             if selected is not None:
                 return selected
     if allow_cloud:
         for provider, models in cloud_candidates:
             for model_id, model in models:
+                if (str(provider.get("id", "")), model_id) in excluded:
+                    continue
                 selected = _route(workspace, provider, model_id, model, "cloud")
                 if selected is not None:
                     return selected
@@ -185,6 +268,7 @@ def select_text_route(
 ) -> dict[str, Any] | None:
     """Find a normal text endpoint for OCR-assisted answers."""
 
+    apply_storage_directories(settings)
     providers = [item for item in list(settings.get("providers", []) or []) if isinstance(item, dict)]
     ordered = []
     active = next((item for item in providers if str(item.get("id", "")) == str(active_provider_id)), None)

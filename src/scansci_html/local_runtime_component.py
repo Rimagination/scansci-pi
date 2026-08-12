@@ -34,6 +34,7 @@ from .local_runtime_contract import COMPONENT_ID, COMPONENT_VERSION, EXECUTABLE_
 RUNTIME_MANIFEST_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_URL"
 RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
+RUNTIME_ROOT_ENV = "SCANSCI_LOCAL_RUNTIME_ROOT"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json"
 DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.4"
@@ -109,7 +110,8 @@ class LocalRuntimeComponent:
         self._embedded_profiles = frozenset(embedded_profiles or ())
         self._source_dependency_modules = tuple(source_dependency_modules or ())
         local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        self.root = Path(root or Path(local_app_data) / "ScanSci" / "runtimes" / self.component_id).resolve()
+        configured_root = os.getenv(RUNTIME_ROOT_ENV, "").strip()
+        self.root = Path(root or configured_root or Path(local_app_data) / "ScanSci" / "runtimes" / self.component_id).resolve()
         build = current_build_info()
         packaged_core_fallback = (
             self.default_manifest_url
@@ -196,12 +198,13 @@ class LocalRuntimeComponent:
         return None
 
     def ensure_process(self, model_id: str) -> str:
-        """Start the installed runtime sidecar and return its local ``/v1`` URL.
+        """Start the isolated runtime and return its URL only after it is usable.
 
-        The core desktop package intentionally does not import PyTorch or
-        Transformers.  A downloaded component therefore has to be used as a
-        real loopback service, rather than merely being shown as installed.
-        The child watches the parent PID and exits when ScanSci closes.
+        A daemon can answer ``/health`` while its model worker is still loading.
+        Returning that URL early made the UI report an opaque exit-code error on
+        the first image request.  New runtimes therefore have to report
+        ``available=true`` (or ``status=ok``); legacy runtimes that only expose
+        ``model`` remain supported.
         """
 
         wanted = str(model_id or "").strip()
@@ -212,11 +215,31 @@ class LocalRuntimeComponent:
             raise RuntimeError("本地运行组件尚未安装，请先在设置 → 本地模型中安装")
         with self._install_lock:
             base_url = self._component_base_url()
-            health_model = self._health_model(base_url)
+            health = self._health_snapshot(base_url)
+            health_model = self._health_model_from_payload(health)
             if health_model == wanted:
-                self._process_model_id = wanted
-                self._process_base_url = base_url
-                return base_url
+                if self._health_needs_probe(health, wanted):
+                    self._probe_generation(base_url, wanted)
+                    self._process_model_id = wanted
+                    self._process_base_url = base_url
+                    return base_url
+                readiness = self._health_readiness(health)
+                if readiness == "ready":
+                    self._process_model_id = wanted
+                    self._process_base_url = base_url
+                    return base_url
+                if readiness == "failed":
+                    raise RuntimeError(self._health_failure_message(health, wanted))
+                if self._wait_for_health_locked(base_url, wanted):
+                    self._process_model_id = wanted
+                    self._process_base_url = base_url
+                    return base_url
+                if self._process is None:
+                    raise RuntimeError(
+                        f"本地模型 {wanted} 启动超时（已等待 {int(_RUNTIME_START_TIMEOUT_SECONDS)} 秒）。"
+                        "请打开设置 → 本地模型检查显存、模型文件和运行组件。"
+                    )
+                health_model = ""
             if health_model and health_model != wanted:
                 if self._process is not None and self._process.poll() is None:
                     self._stop_process_locked()
@@ -225,7 +248,8 @@ class LocalRuntimeComponent:
                         f"本地运行组件正在服务 {health_model}，请等待当前本地模型请求完成后再切换。"
                     )
             if self._process is not None and self._process.poll() is None:
-                if self._process_model_id == wanted and self._health_model(base_url) == wanted:
+                if self._process_model_id == wanted and self._wait_for_health_locked(base_url, wanted):
+                    self._process_base_url = base_url
                     return base_url
                 self._stop_process_locked()
             command = [
@@ -238,10 +262,14 @@ class LocalRuntimeComponent:
                 str(self._component_port()),
                 "--parent-pid",
                 str(os.getpid()),
-                "--state-dir",
-                str((self.root / "state").resolve()),
             ]
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # The bundled 1.0.4 executable reads its state directory from the
+            # environment; passing the unsupported --state-dir flag exits 2.
+            worker_environment = os.environ.copy()
+            worker_environment["SCANSCI_LOCAL_RUNTIME_STATE_DIR"] = str(
+                (self.root / "state").resolve()
+            )
             try:
                 self._process = subprocess.Popen(
                     command,
@@ -250,6 +278,7 @@ class LocalRuntimeComponent:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=creationflags,
+                    env=worker_environment,
                 )
             except OSError as error:
                 raise RuntimeError(f"无法启动本地运行组件：{error}") from error
@@ -258,11 +287,25 @@ class LocalRuntimeComponent:
                 if self._process.poll() is not None:
                     code = self._process.returncode
                     self._process = None
-                    raise RuntimeError(f"本地运行组件启动失败（退出码 {code}）")
-                if self._health_model(base_url) == wanted:
-                    self._process_model_id = wanted
-                    self._process_base_url = base_url
-                    return base_url
+                    raise RuntimeError(
+                        f"本地运行组件启动失败（退出码 {code}）。"
+                        "请打开设置 → 本地模型查看运行组件和模型状态。"
+                    )
+                health = self._health_snapshot(base_url)
+                if self._health_model_from_payload(health) == wanted:
+                    if self._health_needs_probe(health, wanted):
+                        self._probe_generation(base_url, wanted)
+                        self._process_model_id = wanted
+                        self._process_base_url = base_url
+                        return base_url
+                    readiness = self._health_readiness(health)
+                    if readiness == "failed":
+                        self._stop_process_locked()
+                        raise RuntimeError(self._health_failure_message(health, wanted))
+                    if readiness == "ready":
+                        self._process_model_id = wanted
+                        self._process_base_url = base_url
+                        return base_url
                 time.sleep(0.25)
             self._stop_process_locked()
             raise RuntimeError(
@@ -279,6 +322,169 @@ class LocalRuntimeComponent:
 
     def _component_base_url(self) -> str:
         return f"http://127.0.0.1:{self._component_port()}/v1"
+
+    @staticmethod
+    def _health_payload(base_url: str) -> dict[str, Any] | None:
+        try:
+            root = base_url[:-3] if base_url.endswith("/v1") else base_url.rstrip("/")
+            with urlopen(f"{root}/health", timeout=1.5) as response:  # noqa: S310 - loopback only
+                payload = json.loads(response.read(256_000).decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _health_snapshot(self, base_url: str) -> dict[str, Any] | None:
+        payload = self._health_payload(base_url)
+        if payload is not None:
+            if not any(key in payload for key in ("available", "status", "error")):
+                payload = dict(payload)
+                payload["_legacy_health"] = True
+            return payload
+        # Older components expose only {model: ...}; preserve compatibility.
+        model = self._health_model(base_url)
+        return {"model": model, "_legacy_health": True} if model else None
+
+    @staticmethod
+    def _health_model_from_payload(payload: dict[str, Any] | None) -> str:
+        return str(payload.get("model", "")).strip() if isinstance(payload, dict) else ""
+
+    @staticmethod
+    def _health_readiness(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict) or payload.get("_legacy_health"):
+            return "ready" if isinstance(payload, dict) else "unknown"
+        # The bundled 1.0.4 lazy server reports ``status=ok`` before it loads
+        # a snapshot.  Vision/chat models are probed separately above; other
+        # model kinds do not necessarily implement chat generation, so their
+        # healthy daemon status must remain sufficient for compatibility.
+        if payload.get("available") is True or str(payload.get("status", "")).lower() == "ok":
+            return "ready"
+        if str(payload.get("status", "")).lower() == "degraded" or isinstance(payload.get("error"), dict):
+            return "failed"
+        return "starting"
+
+    @classmethod
+    def _health_failure_message(cls, payload: dict[str, Any] | None, wanted: str) -> str:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = str(error.get("code", "")) if isinstance(error, dict) else ""
+        message = str(error.get("message", "")) if isinstance(error, dict) else ""
+        message = " ".join(message.split())[:320]
+        detail = f"（{code}）" if code else ""
+        if message:
+            return f"本地模型 {wanted} 未能就绪{detail}：{cls._actionable_runtime_message(message)}"
+        return f"本地模型 {wanted} 未能就绪。请打开设置 → 本地模型检查模型文件、显存和运行组件。"
+
+    @staticmethod
+    def _actionable_runtime_message(message: str) -> str:
+        """Turn common native loader failures into a next step users can follow."""
+
+        normalized = " ".join(str(message or "").split())
+        lowered = normalized.casefold()
+        if "1455" in lowered or "页面文件太小" in normalized or "page file" in lowered:
+            return (
+                f"{normalized}。请在 Windows 系统设置中增大虚拟内存（页面文件），"
+                "关闭占用显存的程序后重试；也可以改用云端视觉模型或 OCR，图片问答不会因此中断。"
+            )
+        if "out of memory" in lowered or "显存不足" in normalized or "cuda" in lowered and "memory" in lowered:
+            return (
+                f"{normalized}。请关闭其他 GPU 程序、选择更小的 4-bit 模型，"
+                "或改用云端视觉模型/OCR。"
+            )
+        return normalized
+
+    @staticmethod
+    def _health_needs_probe(payload: dict[str, Any] | None, wanted: str) -> bool:
+        """Identify the older lazy-loading runtime used by the 1.0.4 binary."""
+
+        if not isinstance(payload, dict) or payload.get("available") is not None:
+            return False
+        if payload.get("loaded") is not False:
+            return False
+        lowered = str(wanted or "").casefold()
+        return any(token in lowered for token in ("minicpm", "qwen3.5", "qwen3-vl", "llava", "internvl"))
+
+    def _probe_generation(self, base_url: str, wanted: str) -> None:
+        """Force lazy runtimes to load a chat/vision model before UI requests."""
+
+        request = Request(
+            f"{base_url.rstrip('/')}/chat/completions",
+            data=json.dumps(
+                {
+                    "model": wanted,
+                    "messages": [{"role": "user", "content": "Reply with one word: ready"}],
+                    "stream": False,
+                    "max_tokens": 1,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=min(_RUNTIME_START_TIMEOUT_SECONDS, 180.0)) as response:  # noqa: S310 - loopback only
+                payload = json.loads(response.read(256_000).decode("utf-8"))
+            if not isinstance(payload, dict) or not payload.get("choices"):
+                raise RuntimeError("最小生成没有返回有效文本")
+        except Exception as error:  # noqa: BLE001 - normalize sidecar errors for the UI
+            message = str(error).strip()
+            if hasattr(error, "read"):
+                try:
+                    raw = error.read(256_000).decode("utf-8", errors="replace")
+                    detail = json.loads(raw)
+                    nested = detail.get("error") if isinstance(detail, dict) else None
+                    if isinstance(nested, dict):
+                        message = str(nested.get("message") or nested.get("code") or message).strip()
+                except Exception:
+                    pass
+            message = self._actionable_runtime_message(message[:500])
+            self._record_probe_failure(wanted, message)
+            raise RuntimeError(f"本地模型 {wanted} 无法完成最小生成：{message}") from error
+
+    def _record_probe_failure(self, wanted: str, message: str) -> None:
+        """Persist a model-specific failure so routing stops retrying it blindly."""
+
+        try:
+            from .local_model_market import installed_models
+            from .local_runtime_compatibility import ModelCompatibilityStore
+
+            record = next(
+                (item for item in installed_models() if str(item.get("id", "")) == wanted),
+                None,
+            )
+            if not isinstance(record, dict) or not str(record.get("path", "")).strip():
+                return
+            ModelCompatibilityStore(self.root / "state" / "model-compatibility.json").record_failure(
+                record,
+                component_version=self.component_version,
+                error={
+                    "code": "model_probe_failed",
+                    "message": message[:500],
+                    "model": wanted,
+                    "phase": "load_or_generate",
+                },
+            )
+        except Exception:
+            # Diagnostics must never hide the original model error.
+            return
+
+    def _wait_for_health_locked(self, base_url: str, wanted: str) -> bool:
+        deadline = time.monotonic() + _RUNTIME_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self._process is not None and self._process.poll() is not None:
+                return False
+            health = self._health_snapshot(base_url)
+            if self._health_model_from_payload(health) == wanted:
+                if self._health_needs_probe(health, wanted):
+                    self._probe_generation(base_url, wanted)
+                    return True
+                readiness = self._health_readiness(health)
+                if readiness == "ready":
+                    return True
+                if readiness == "failed":
+                    raise RuntimeError(self._health_failure_message(health, wanted))
+            elif self._health_model_from_payload(health):
+                return False
+            time.sleep(0.25)
+        return False
 
     @staticmethod
     def _health_model(base_url: str) -> str:

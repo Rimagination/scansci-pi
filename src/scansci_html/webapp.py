@@ -31,6 +31,7 @@ from uuid import uuid4
 import webbrowser
 
 from .app_settings import (
+    apply_storage_directories,
     ensure_local_model_preset,
     get_provider_api_key,
     load_settings,
@@ -40,6 +41,7 @@ from .app_settings import (
     set_notion_api_token,
     set_document_service_api_key,
     set_provider_api_key,
+    vector_index_directory,
 )
 from .app_update import AppUpdateService
 from .build_info import current_build_info
@@ -72,6 +74,7 @@ from .local_model_market import (
     market_catalog,
 )
 from .local_runtime_component import LocalRuntimeComponent
+from .local_transformers_runtime import ensure_local_transformers_runtime
 from .runtime_components import default_node_component, default_tectonic_component
 from .model_health import build_model_health
 from .ollama_runtime import OLLAMA_VISION_MODEL, OllamaInstallManager, ollama_status
@@ -113,6 +116,7 @@ from .slide_studio import save_browser_rendered_deck
 from .tesseract_installer import TesseractInstallManager
 from .telemetry import diagnostic_span, diagnostics_summary, export_diagnostics_bundle
 from .vector_index import vector_cache_status
+from .vector_storage import migrate_vector_indexes
 from .vision_routing import system_ocr_status, tesseract_status
 from .workspace import (
     add_note_to_notebook,
@@ -372,6 +376,11 @@ class NotebookWebApp:
         self.evidence_db = Path(evidence_db).resolve()
         self.slides_root = Path(slides_root).resolve() if slides_root is not None else None
         self.update_service = update_service or AppUpdateService()
+        # Apply persisted storage choices before constructing any model or
+        # runtime manager.  A second load lets model discovery include a
+        # newly selected Hugging Face cache in the normalized catalog.
+        apply_storage_directories(load_settings(self.workspace))
+        load_settings(self.workspace)
         # A dedicated component URL embedded in the lightweight package takes
         # precedence over the application-update channel. The latter remains
         # a compatibility fallback for combined release manifests.
@@ -391,6 +400,9 @@ class NotebookWebApp:
         self.direct_chat_history = DirectChatHistoryStore(self.workspace)
         self._retrieval_setup_errors: dict[str, str] = {}
         self._retrieval_setup_lock = threading.RLock()
+        self._local_runtime_activation_lock = threading.RLock()
+        self._local_runtime_connection_lock = threading.Lock()
+        self._local_runtime_activation_models: set[str] = set()
         self._site_icon_cache: dict[str, tuple[float, str, bytes]] = {}
         self._site_icon_cache_lock = threading.RLock()
         self.research_agent = ResearchAgentRuntime(
@@ -560,6 +572,72 @@ class NotebookWebApp:
             # must not turn a successful download into a false download error.
             return
 
+    def _connect_downloaded_local_models(self, job: dict[str, Any]) -> None:
+        """Start Transformers for downloaded chat/vision snapshots in the background.
+
+        The download job only establishes that the snapshot files are present.
+        The isolated runtime remains the authority for loading and probing the
+        model, which is especially important for Qwen3.5 compatibility records.
+        """
+
+        requested = [
+            str(item).strip()
+            for item in list(job.get("models", []) or [])
+            if str(item).strip()
+        ]
+        if not requested:
+            return
+        records = {
+            str(item.get("id", "")): item
+            for item in installed_models()
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+        if not self._local_runtime_connection_lock.acquire(blocking=False):
+            return
+
+        def connect() -> None:
+            try:
+                for model_id in requested:
+                    record = records.get(model_id)
+                    if not record:
+                        continue
+                    kind = str(record.get("kind", "")).strip().lower()
+                    model_format = str(record.get("format", "")).strip().lower()
+                    architecture = str(record.get("architecture", "")).lower().replace("_", "")
+                    generation_architecture = (
+                        "forcausallm" in architecture or "forconditionalgeneration" in architecture
+                    )
+                    files_present = bool(record.get("model_files_present", record.get("ready")))
+                    if (
+                        not files_present
+                        or model_format not in {"transformers", "huggingface"}
+                        or kind not in {"chat", "vision"}
+                        or not (generation_architecture or kind == "vision")
+                    ):
+                        continue
+                    with self._local_runtime_activation_lock:
+                        if model_id in self._local_runtime_activation_models:
+                            continue
+                        self._local_runtime_activation_models.add(model_id)
+                    try:
+                        ensure_local_transformers_runtime(model_id)
+                    except Exception:
+                        # The compatibility store records the isolated failure
+                        # where applicable.  A later explicit retry can attempt it
+                        # again, so failed starts are not latched in memory.
+                        pass
+                    finally:
+                        with self._local_runtime_activation_lock:
+                            self._local_runtime_activation_models.discard(model_id)
+            finally:
+                self._local_runtime_connection_lock.release()
+
+        threading.Thread(
+            target=connect,
+            name="scansci-local-model-auto-connect",
+            daemon=True,
+        ).start()
+
     def dispatch(self, method: str, target: str, body: bytes = b"") -> WebResponse:
         parsed_target = urlparse(target)
         path = parsed_target.path
@@ -713,6 +791,18 @@ class NotebookWebApp:
             )
         if path == "/api/local-models/installed":
             models = installed_models()
+            pending_runtime_models = [
+                str(item.get("id", "")).strip()
+                for item in models
+                if isinstance(item, dict)
+                and bool(item.get("model_files_present"))
+                and str(item.get("runtime_probe_state", "")) == "pending"
+                and str(item.get("id", "")).strip()
+            ]
+            if pending_runtime_models:
+                # This also covers snapshots downloaded before the current
+                # app session; the connector itself remains asynchronous.
+                self._connect_downloaded_local_models({"models": pending_runtime_models})
             return self._json(HTTPStatus.OK, {"models": models})
         if path == "/api/local-models/market":
             search = str(parse_qs(query).get("q", [""])[0] or "")
@@ -838,6 +928,14 @@ class NotebookWebApp:
             return self._json(
                 HTTPStatus.OK,
                 self._evidence_index_status(parts[2]),
+            )
+        if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "local-ai-status":
+            return self._json(
+                HTTPStatus.OK,
+                self.research_agent.local_evidence_status(
+                    notebook_id=parts[2],
+                    quality_profile="precision",
+                ),
             )
         if len(parts) == 4 and parts[:3] == ["api", "library", "import-jobs"]:
             return self._json(HTTPStatus.OK, self.library_imports.status(parts[3]))
@@ -970,9 +1068,25 @@ class NotebookWebApp:
             # must not unexpectedly turn a reusable cache into a GPU build.
             requested_mode = payload.get("auto", payload.get("automatic", True))
             automatic = bool(requested_mode) and not bool(payload.get("force", False))
+            local_ai = (
+                self.research_agent.prepare_local_evidence(
+                    notebook_id=notebook_id,
+                    quality_profile="precision",
+                    force=bool(payload.get("force", False)),
+                )
+                if install.get("state") == "ready"
+                else {
+                    "notebook_id": str(notebook_id),
+                    "state": "idle",
+                    "phase": "idle",
+                    "progress": 0.0,
+                    "message": "检索组件尚未就绪，暂不加载本地 AI 模型",
+                    "error": "",
+                }
+            )
             run = (
                 self.research_agent.start_evidence_index(notebook_id, automatic=automatic)
-                if install.get("state") == "ready"
+                if install.get("state") == "ready" and local_ai.get("state") != "preparing"
                 else None
             )
             return self._json(
@@ -980,9 +1094,29 @@ class NotebookWebApp:
                 {
                     "run": run,
                     "model_install": install,
+                    "local_ai": local_ai,
                     "status": self._evidence_index_status(notebook_id, install=install),
                 },
             )
+        if len(parts) == 4 and parts[:2] == ["api", "notebooks"] and parts[3] == "local-ai-status":
+            install = self._ensure_retrieval_models(parts[2])
+            result = (
+                self.research_agent.prepare_local_evidence(
+                    notebook_id=parts[2],
+                    quality_profile=str(payload.get("quality_profile", "precision") or "precision"),
+                    force=bool(payload.get("force", False)),
+                )
+                if install.get("state") == "ready"
+                else {
+                    "notebook_id": str(parts[2]),
+                    "state": "idle",
+                    "phase": "idle",
+                    "progress": 0.0,
+                    "message": "检索组件尚未就绪，暂不加载本地 AI 模型",
+                    "error": "",
+                }
+            )
+            return self._json(HTTPStatus.ACCEPTED, result)
         if path == "/api/settings":
             return self._save_settings(payload)
         if path == "/api/app/update/check":
@@ -1340,14 +1474,23 @@ class NotebookWebApp:
             blocked = self._audio_model_download_requires_runtime() if repo_id == QWEN3_ASR_NATIVE_MODEL_ID else self._model_download_requires_runtime()
             if blocked is not None:
                 return blocked
-            on_complete = None
+            on_complete = self._connect_downloaded_local_models
             if repo_id == QWEN3_ASR_NATIVE_MODEL_ID:
-                on_complete = lambda _job: self._enable_installed_local_model("qwen3-asr-0.6b")
+                previous = on_complete
+
+                def on_complete(job: dict[str, Any]) -> None:
+                    previous(job)
+                    self._enable_installed_local_model("qwen3-asr-0.6b")
+
             elif repo_id in {DEFAULT_LOCAL_EMBEDDING_MODEL, DEFAULT_LOCAL_RERANKER_MODEL}:
                 # Either model may be downloaded independently from the new
                 # resource page. Once both are present, start any pending
                 # semantic indexes just as the legacy combined download did.
-                on_complete = lambda _job: self._after_retrieval_models_ready()
+                previous = on_complete
+
+                def on_complete(job: dict[str, Any]) -> None:
+                    previous(job)
+                    self._after_retrieval_models_ready()
             install = self.model_installs.start(
                 [repo_id],
                 job_id=f"model:{repo_id}",
@@ -1566,7 +1709,64 @@ class NotebookWebApp:
 
     def _save_settings(self, payload: dict[str, Any]) -> WebResponse:
         settings = payload.get("settings", payload)
-        return self._json(HTTPStatus.OK, save_settings(self.workspace, settings))
+        previous_settings = load_settings(self.workspace)
+        previous_runtime_root = self.local_runtime.root
+        saved = save_settings(self.workspace, settings)
+        previous_vector_root = vector_index_directory(previous_settings)
+        next_vector_root = vector_index_directory(saved)
+        vector_migration: dict[str, Any] = {
+            "migrated": 0,
+            "source_root": "",
+            "destination_root": "",
+            "updated_workspace_paths": 0,
+        }
+        if previous_vector_root.casefold() != next_vector_root.casefold():
+            try:
+                vector_migration = migrate_vector_indexes(
+                    workspace=self.workspace,
+                    evidence_db=self.evidence_db,
+                    old_root=previous_vector_root or None,
+                    new_root=next_vector_root or None,
+                )
+            except Exception as error:
+                # The old index files were never removed, so restoring the
+                # settings file is enough to keep the running app consistent.
+                save_settings(self.workspace, previous_settings)
+                apply_storage_directories(previous_settings)
+                raise ValueError(f"向量索引迁移失败，已保留原目录：{error}") from error
+        applied = apply_storage_directories(saved)
+        # Managers are intentionally recreated only while idle.  This makes a
+        # directory selected during first-run immediately useful, without
+        # interrupting an in-progress download; the next app launch always
+        # applies the persisted paths before creating managers.
+        try:
+            runtime_job = self.local_runtime.install_status()
+            if (
+                previous_runtime_root != LocalRuntimeComponent(
+                    fallback_manifest_url=self.update_service.manifest_url or None
+                ).root
+                and not runtime_job.get("active")
+                and self.local_runtime.executable() is None
+            ):
+                self.local_runtime = LocalRuntimeComponent(
+                    fallback_manifest_url=self.update_service.manifest_url or None
+                )
+            install_status = self.model_installs.status()
+            if not install_status.get("active"):
+                self.model_installs = create_install_manager()
+        except Exception:
+            pass
+        return self._json(
+            HTTPStatus.OK,
+            {
+                **saved,
+                "storage": {
+                    "applied": applied,
+                    "vector_index_migration": vector_migration,
+                    "restart_required_for_running_process": bool(self.local_runtime.executable()),
+                },
+            },
+        )
 
     def _set_provider_api_key(self, provider_id: str, payload: dict[str, Any]) -> WebResponse:
         settings = set_provider_api_key(self.workspace, provider_id, str(payload.get("api_key", "")))
@@ -1821,9 +2021,37 @@ class NotebookWebApp:
         payload = dict(result)
         install = self._ensure_retrieval_models(notebook_id)
         payload["model_install"] = install
+        if install.get("state") == "ready":
+            try:
+                local_ai = self.research_agent.prepare_local_evidence(
+                    notebook_id=notebook_id,
+                    quality_profile="precision",
+                )
+            except FileNotFoundError:
+                # A stale import response may refer to a notebook removed by
+                # another session. Do not turn that bookkeeping race into a
+                # failed library response.
+                local_ai = {
+                    "notebook_id": str(notebook_id),
+                    "state": "idle",
+                    "phase": "idle",
+                    "progress": 0.0,
+                    "message": "知识库尚未准备本地 AI 模型",
+                    "error": "",
+                }
+        else:
+            local_ai = {
+                "notebook_id": str(notebook_id),
+                "state": "idle",
+                "phase": "idle",
+                "progress": 0.0,
+                "message": "检索组件尚未就绪，暂不加载本地 AI 模型",
+                "error": "",
+            }
+        payload["local_ai"] = local_ai
         run = (
             self.research_agent.start_evidence_index(notebook_id, automatic=True)
-            if install.get("state") == "ready"
+            if install.get("state") == "ready" and local_ai.get("state") != "preparing"
             else None
         )
         if run is not None:
@@ -1955,6 +2183,10 @@ class NotebookWebApp:
         """Combine vector, model-download, and runtime readiness truthfully."""
 
         status = dict(self.research_agent.evidence_index_status(notebook_id))
+        status["local_ai"] = self.research_agent.local_evidence_status(
+            notebook_id=notebook_id,
+            quality_profile="precision",
+        )
         model_install = dict(install or self.model_installs.status("retrieval-core"))
         runtime = self.local_runtime.status()
         with self._retrieval_setup_lock:

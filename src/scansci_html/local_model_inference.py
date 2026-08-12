@@ -89,7 +89,13 @@ def choose_local_model_plan(
     properties = torch_module.cuda.get_device_properties(0)
     total_vram_gib = round(float(properties.total_memory) / (1024**3), 2)
     gpu_name = str(getattr(properties, "name", "") or torch_module.cuda.get_device_name(0))
-    native_budget_gib = max(1.0, total_vram_gib - 1.5)
+    # A vision model needs memory for the processor, image tokens, CUDA
+    # kernels and generation KV cache in addition to its weight files.  On an
+    # 8 GB card, loading a 4.2 GB checkpoint in fp16 is therefore not a safe
+    # default even though the raw file appears to fit.  Keep roughly half of
+    # VRAM available for those runtime allocations; larger cards still use
+    # native precision for genuinely small models.
+    native_budget_gib = max(1.0, total_vram_gib * 0.5)
     use_4bit = requested_quantization == "4bit" or (
         requested_quantization == "auto"
         and (
@@ -173,9 +179,27 @@ def _load_local_vision_model(model_path: str | Path, model_id: str) -> LoadedLoc
         # Quantized checkpoints carry their own quantization config.  Passing
         # dtype=auto preserves BNB/GPTQ storage choices and is supported by
         # Transformers 5.x.
-        kwargs["dtype"] = "auto" if quantization_method else (
-            torch.bfloat16 if plan.compute_dtype == "bfloat16" else torch.float16
-        )
+        if quantization_method:
+            kwargs["dtype"] = "auto"
+        elif plan.quantization == "4bit":
+            try:
+                quantization = importlib.import_module("transformers.utils.quantization_config")
+                BitsAndBytesConfig = getattr(quantization, "BitsAndBytesConfig")
+                importlib.import_module("bitsandbytes")
+            except (ImportError, AttributeError) as exc:
+                raise RuntimeError(
+                    "检测到显存有限的 NVIDIA GPU，但 4-bit CUDA 组件 bitsandbytes 未安装；"
+                    "请在本地运行组件中安装 GPU 依赖，或改用云端视觉模型。"
+                ) from exc
+            compute_dtype = torch.bfloat16 if plan.compute_dtype == "bfloat16" else torch.float16
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+        else:
+            kwargs["dtype"] = torch.bfloat16 if plan.compute_dtype == "bfloat16" else torch.float16
 
     try:
         processor = AutoProcessor.from_pretrained(str(resolved_path), local_files_only=True)

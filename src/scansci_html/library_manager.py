@@ -13,13 +13,14 @@ import shutil
 import sqlite3
 import time
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from .evidence_store import build_library_overview, index_evidence_library, index_markdown_library
 from .evidence_doctor import assess_evidence_structure
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
 from .source_filters import is_ignored_library_path
+from .vector_storage import vector_library_root
 from .vector_index import migrate_embedding_caches
 from .workspace import (
     load_workspace_summary,
@@ -142,8 +143,7 @@ def _count_reusable_vectors(db_path: str | Path) -> int:
 def notebook_evidence_db(evidence_db: str | Path, notebook_id: str) -> Path:
     """Return the isolated evidence index owned by one knowledge library."""
 
-    base = Path(evidence_db).resolve()
-    root = base.parent / f"{base.stem}.libraries"
+    root = vector_library_root(evidence_db)
     root.mkdir(parents=True, exist_ok=True)
     return root / f"{_safe_folder_name(notebook_id)}.sqlite"
 
@@ -451,13 +451,32 @@ def import_library_files(
         original, is_new = item
         try:
             with TemporaryDirectory(prefix=".extract-", dir=managed) as extraction_dir:
-                source = extract_local_document(original, output_dir=extraction_dir)
+                source = extract_local_document(
+                    original,
+                    output_dir=extraction_dir,
+                    workspace=workspace_path,
+                )
                 text = Path(str(source["text_path"])).read_text(encoding="utf-8")
             return original, is_new, source, text, ""
         except Exception as error:
             return original, is_new, None, "", f"{type(error).__name__}: {error}"
 
-    workers = min(8, max(1, len(work_items)))
+    # MinerU is an asynchronous cloud conversion service.  Keep its queue
+    # deliberately small so a large folder import does not exhaust the user's
+    # quota or create a burst of signed-upload requests.  Local parsers retain
+    # the faster eight-worker path.
+    mineru_enabled = False
+    if any(path.suffix.lower() == ".pdf" for path, _is_new in work_items):
+        try:
+            from .app_settings import get_document_service_api_key, load_settings
+
+            mineru_config = dict(load_settings(workspace_path).get("document_processing", {}).get("mineru", {}) or {})
+            mineru_enabled = bool(mineru_config.get("enabled")) and bool(
+                get_document_service_api_key(workspace_path, "mineru")
+            )
+        except Exception:
+            mineru_enabled = False
+    workers = min(2 if mineru_enabled else 8, max(1, len(work_items)))
     extracted_items: list[tuple[Path, bool, dict[str, Any] | None, str, str] | None] = [None] * len(work_items)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -483,18 +502,32 @@ def import_library_files(
             stem = _safe_folder_name(original.stem)
             target = _unique_path(managed, stem, ".md")
             supplied_metadata = dict((source_metadata or {}).get(str(original.resolve()), {}) or {})
+            embedded_metadata = dict(source.get("metadata", {}) or {})
             metadata = {
-                "title": str(supplied_metadata.get("title") or original.stem),
+                "title": str(
+                    supplied_metadata.get("title")
+                    or embedded_metadata.get("title")
+                    or _title_from_extracted_text(text)
+                    or original.stem
+                ),
                 "source_file": original.name,
                 "source_url": str(original),
                 "source_suffix": original.suffix.lower(),
                 "parser": str(source.get("parser", "")),
                 "source_storage": "external-reference",
             }
-            for key in ("doi", "date"):
-                value = str(supplied_metadata.get(key, "") or "").strip()
+            for key in ("doi", "date", "year", "author", "metadata_source", "metadata_confidence"):
+                value = _scalar_metadata_value(
+                    supplied_metadata.get(key)
+                    or (supplied_metadata.get("DOI") if key == "doi" else "")
+                    or embedded_metadata.get(key, "")
+                )
                 if value:
                     metadata[key] = value
+            if not metadata.get("author"):
+                creators = _scalar_metadata_value(supplied_metadata.get("creators"))
+                if creators:
+                    metadata["author"] = creators
             target.write_text(_markdown_document(metadata, text), encoding="utf-8")
             extracted_sources.append(
                 {
@@ -504,6 +537,11 @@ def import_library_files(
                     "page_count": int(source.get("page_count", 0) or 0),
                     "character_count": int(source.get("character_count", 0) or 0),
                     "original_path": str(original),
+                    "metadata": {
+                        key: str(value)
+                        for key, value in metadata.items()
+                        if key in {"title", "author", "doi", "date", "year", "metadata_source", "metadata_confidence"}
+                    },
                 }
             )
             if is_new:
@@ -1380,6 +1418,37 @@ def _unique_path(destination: Path, stem: str, suffix: str) -> Path:
         candidate = destination / f"{stem}-{counter}{suffix}"
         counter += 1
     return candidate
+
+
+def _scalar_metadata_value(value: Any) -> str:
+    """Serialize common Zotero/PDF metadata into a stable front-matter value."""
+
+    if isinstance(value, Mapping):
+        name = " ".join(
+            part
+            for part in (
+                str(value.get("name", "")).strip(),
+                str(value.get("firstName", "")).strip(),
+                str(value.get("lastName", "")).strip(),
+            )
+            if part
+        )
+        return name or str(value.get("value", "")).strip()
+    if isinstance(value, (list, tuple, set)):
+        return "; ".join(item for item in (_scalar_metadata_value(raw) for raw in value) if item)
+    return str(value or "").replace("\n", " ").strip()
+
+
+def _title_from_extracted_text(text: str) -> str:
+    """Use an explicit Markdown/HTML heading when no catalog title exists."""
+
+    for raw_line in str(text or "").splitlines()[:40]:
+        line = raw_line.strip()
+        if line.startswith("#"):
+            candidate = line.lstrip("#").strip()
+            if candidate and len(candidate) <= 300:
+                return candidate
+    return ""
 
 
 def _markdown_document(metadata: dict[str, str], text: str) -> str:

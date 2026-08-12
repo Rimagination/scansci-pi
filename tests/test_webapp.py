@@ -37,6 +37,103 @@ from scansci_html.research_runs import StageSpec
 from scansci_html.workspace import attach_annotation_layers_to_notebook, sync_sources_from_evidence_store
 
 
+def test_local_ai_status_route_starts_and_reads_background_preparation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        app,
+        "_ensure_retrieval_models",
+        lambda _notebook_id: {"job_id": "retrieval-core", "state": "ready", "progress": 1.0},
+    )
+
+    def prepare(**kwargs):
+        observed.append(dict(kwargs))
+        return {
+            "notebook_id": "immunotherapy",
+            "state": "preparing",
+            "phase": "loading_models",
+            "progress": 0.1,
+            "message": "正在加载本地 AI 模型",
+        }
+
+    monkeypatch.setattr(app.research_agent, "prepare_local_evidence", prepare)
+    monkeypatch.setattr(
+        app.research_agent,
+        "local_evidence_status",
+        lambda **kwargs: {
+            "notebook_id": kwargs["notebook_id"],
+            "state": "ready",
+            "phase": "ready",
+            "progress": 1.0,
+        },
+    )
+
+    started = app.dispatch(
+        "POST",
+        "/api/notebooks/immunotherapy/local-ai-status",
+        json.dumps({"quality_profile": "precision"}).encode("utf-8"),
+    )
+    current = app.dispatch("GET", "/api/notebooks/immunotherapy/local-ai-status")
+
+    assert started.status == 202
+    assert json.loads(started.body)["phase"] == "loading_models"
+    assert json.loads(current.body)["state"] == "ready"
+    assert observed == [{"notebook_id": "immunotherapy", "quality_profile": "precision", "force": False}]
+
+
+def test_import_index_waits_for_background_local_ai_preparation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        app,
+        "_ensure_retrieval_models",
+        lambda _notebook_id: {"job_id": "retrieval-core", "state": "ready", "progress": 1.0},
+    )
+    monkeypatch.setattr(
+        app.research_agent,
+        "prepare_local_evidence",
+        lambda **_kwargs: {
+            "state": "preparing",
+            "phase": "loading_models",
+            "progress": 0.1,
+        },
+    )
+    monkeypatch.setattr(
+        app.research_agent,
+        "start_evidence_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("index must wait for model preparation")),
+    )
+
+    result = app._with_evidence_index_run({"ok": True}, notebook_id="immunotherapy")
+
+    assert result["local_ai"]["state"] == "preparing"
+    assert "index_run" not in result
+
+
+def test_local_ai_status_does_not_prepare_before_retrieval_components_are_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        app,
+        "_ensure_retrieval_models",
+        lambda _notebook_id: {"job_id": "retrieval-core", "state": "blocked", "progress": 0.0},
+    )
+    monkeypatch.setattr(
+        app.research_agent,
+        "prepare_local_evidence",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not load models before install")),
+    )
+
+    response = app.dispatch(
+        "POST",
+        "/api/notebooks/immunotherapy/local-ai-status",
+        b"{}",
+    )
+    payload = json.loads(response.body)
+
+    assert response.status == 202
+    assert payload["state"] == "idle"
+    assert "尚未就绪" in payload["message"]
+
+
 def test_notebook_webapp_tests_saved_mcp_connection_and_reports_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Keep this route-level test independent from the real stdio bridge. The
     # latter is covered by tests/test_mcp_bridge.py in the release gate.
@@ -413,6 +510,8 @@ def test_general_settings_tabs_are_configurable_and_hide_desktop_system_page(tmp
     assert 'data-action="choose-general-directory"' in script
     assert 'directoryControl("directory-default-workspace"' in script
     assert 'directoryControl("directory-conversation-workspace"' in script
+    assert 'directoryControl("directory-vector-index"' in script
+    assert 'vectorIndexDirectory: "向量索引目录"' in script
     assert "function collectGeneralSettingsForm" in script
     assert 'option("shift-enter"' in script
     assert 'data-settings-tab="desktop"' not in script
@@ -923,6 +1022,16 @@ def test_research_document_ui_preserves_request_conversation_and_source_navigati
     assert ".review-request-context" in styles
     assert '--editorial: "Iowan Old Style", "Noto Serif SC", "Songti SC", Georgia, serif;' in styles
     assert "font-size: clamp(23px, 1.7vw, 28px)" in styles
+
+
+def test_research_document_ui_distinguishes_reviewable_evidence_from_hard_abstention(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'const answerability = String(payload.adequacy?.answerability || answer.answerability || "");' in script
+    assert "const needsReview = answerability === \"needs_review\"" in script
+    assert "const insufficientEvidence = !needsReview" in script
+    assert "model.needsReview ? \"需要复核\"" in script
 
 
 def test_academic_writing_routes_source_backed_requests_to_research_documents(tmp_path: Path):
@@ -1856,6 +1965,53 @@ def test_notebook_webapp_reads_and_saves_redacted_settings(tmp_path: Path):
     assert (workspace.parent / ".scansci-notebook.json").exists()
 
 
+def test_notebook_webapp_persists_storage_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, workspace, _evidence = _build_app(tmp_path)
+    model_cache = tmp_path / "models"
+    runtime_root = tmp_path / "runtime"
+    # The developer machine may already have a managed runtime under the
+    # platform default.  Model the first-run/idle case where changing the
+    # destination can safely retarget the component immediately.
+    monkeypatch.setattr(app.local_runtime, "executable", lambda: None)
+
+    saved = _payload(
+        app.dispatch(
+            "POST",
+            "/api/settings",
+            json.dumps(
+                {
+                    "general": {
+                        "directories": {
+                            "model_cache": str(model_cache),
+                            "local_runtime": str(runtime_root),
+                        }
+                    }
+                }
+            ).encode("utf-8"),
+        )
+    )
+
+    assert saved["general"]["directories"]["model_cache"] == str(model_cache.resolve())
+    assert saved["general"]["directories"]["local_runtime"] == str(runtime_root.resolve())
+    assert app.local_runtime.root == runtime_root.resolve()
+    persisted = _payload(app.dispatch("GET", "/api/settings"))
+    assert persisted["general"]["directories"] == saved["general"]["directories"]
+
+
+def test_settings_ui_and_first_run_guide_expose_storage_directory_controls(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert "model_cache" in script
+    assert "local_runtime" in script
+    assert 'data-action="choose-storage-directory"' in script
+    assert 'resource-guide-page is-retrieval">${onboardingStorageMarkup()}' in script
+    assert "嵌入模型、重排模型和其他本地模型都会写入模型缓存目录" in script
+    assert "function ensureOnboardingStorageConfigured" in script
+    assert "先设置存储目录再开始下载" in script
+    assert "FIRST RUN" in script
+
+
 def test_notebook_webapp_reports_system_ocr_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app, _workspace, _evidence = _build_app(tmp_path)
     monkeypatch.setattr(
@@ -2374,6 +2530,200 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
     assert result["agent_runtime"]["vision_route"]["model_id"] == "vision-model"
     assert result["user_images"] == [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}]
     assert isinstance(observed["messages"][-1]["content"], list)
+
+
+def test_image_question_replaces_scientific_system_prompt_without_dropping_image_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Vision models must receive a direct image prompt, not the tool gate."""
+
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "vision-provider", "model_id": "vision-model"},
+            "providers": [{
+                "id": "vision-provider",
+                "name": "Vision provider",
+                "kind": "openai-compatible",
+                "base_url": "https://vision.example/v1",
+                "models": [{"id": "vision-model", "name": "Vision model", "capabilities": ["vision"]}],
+            }],
+        },
+    )
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    observed: dict[str, object] = {}
+
+    def direct_model_stream(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        yield {"type": "delta", "content": "这是一个聊天界面截图。"}
+        yield {"type": "done", "usage": {"total_tokens": 8}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    events = list(runtime.chat_stream({
+        "chat_mode": "general",
+        "messages": [{"role": "user", "content": "请识别这张图"}],
+        "images": [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    messages = observed["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["role"] == "system"
+    assert "科学助手" not in messages[0]["content"]
+    assert "scientific assistant" in messages[0]["content"]
+    assert isinstance(messages[-1]["content"], list)
+
+
+def test_image_question_falls_back_to_ocr_when_local_vision_cannot_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A present-but-unusable local model must not make image chat unusable."""
+
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "text-provider", "model_id": "text-model"},
+            "providers": [
+                {
+                    "id": "text-provider",
+                    "name": "Text provider",
+                    "kind": "openai-compatible",
+                    "base_url": "https://text.example/v1",
+                    "enabled": True,
+                    "models": [{"id": "text-model", "capabilities": ["reasoning"]}],
+                },
+                {
+                    "id": "local-huggingface",
+                    "name": "Local vision",
+                    "kind": "local",
+                    "auth_mode": "local",
+                    "base_url": "http://127.0.0.1:17863/v1",
+                    "enabled": True,
+                    "models": [{"id": "local-vision", "capabilities": ["vision"]}],
+                },
+            ],
+            "model_roles": {"vision": "provider:local-huggingface:local-vision"},
+        },
+    )
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.ensure_local_transformers_runtime",
+        lambda _model: (_ for _ in ()).throw(RuntimeError("页面文件太小，无法完成操作。 (os error 1455)")),
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.ocr_image_blocks",
+        lambda *_args, **_kwargs: {"available": True, "backend": "test-ocr", "text": "群聊截图中的文字"},
+    )
+
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    request = runtime._direct_chat_request(
+        {
+            "chat_mode": "general",
+            "messages": [{"role": "user", "content": "请识别图片"}],
+            "images": [{"name": "figure.png", "mime_type": "image/png", "data_url": "data:image/png;base64,aGVsbG8="}],
+        }
+    )
+
+    assert request.vision_route["mode"] == "ocr-fallback"
+    assert request.vision_route["fallback_reason"] == "local_vision_unavailable"
+    assert "群聊截图中的文字" in request.messages[-1]["content"]
+    assert request.provider_id == "text-provider"
+
+
+def test_sync_image_question_retries_an_unavailable_vision_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The non-streaming API must use the same vision failover as chat/stream."""
+
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "vision-provider", "model_id": "vision-model"},
+            "providers": [
+                {
+                    "id": "vision-provider",
+                    "name": "Vision provider",
+                    "kind": "openai-compatible",
+                    "base_url": "https://vision.example/v1",
+                    "enabled": True,
+                    "models": [{"id": "vision-model", "capabilities": ["vision"]}],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    original_request = runtime._direct_chat_request(
+        {
+            "messages": [{"role": "user", "content": "请识别图片"}],
+            "images": [{"name": "figure.png", "data_url": "data:image/png;base64,aGVsbG8="}],
+        }
+    )
+    backup_request = replace(
+        original_request,
+        provider_id="backup-vision",
+        provider_name="Backup vision",
+        model_id="backup-model",
+    )
+    monkeypatch.setattr(runtime, "_vision_fallback_chat_request", lambda _request, **_kwargs: backup_request)
+    calls: list[str] = []
+
+    def model_stream(*_args, **kwargs):
+        calls.append(str(kwargs["model"]))
+        if len(calls) == 1:
+            raise RuntimeError("模型服务鉴权失败（HTTP 403）")
+        yield {"type": "delta", "content": "这是备用视觉模型的结果。"}
+        yield {"type": "done", "usage": {"total_tokens": 7}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", model_stream)
+    result = runtime.chat(
+        {
+            "messages": [{"role": "user", "content": "请识别图片"}],
+            "images": [{"name": "figure.png", "data_url": "data:image/png;base64,aGVsbG8="}],
+        }
+    )
+
+    assert calls == ["vision-model", "backup-model"]
+    assert result["message"]["content"] == "这是备用视觉模型的结果。"
+    assert result["agent_runtime"]["vision_fallback"]["to_model"] == "backup-model"
+    assert result["agent_runtime"]["vision_route"]["effective_model_id"] == "backup-model"
+    assert result["agent_runtime"]["vision_route"]["model_id"] == "backup-model"
+    assert result["agent_runtime"]["vision_route"]["provider_name"] == "Backup vision"
 
 
 def test_direct_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
@@ -4292,6 +4642,70 @@ def test_notebook_webapp_rejects_unsafe_or_invalid_requests(tmp_path: Path):
         assert server.server_port > 0
     finally:
         server.server_close()
+
+
+def test_downloaded_generation_model_is_connected_to_local_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    model_id = "Qwen/Qwen3.5-2B"
+    calls: list[str] = []
+    connected = threading.Event()
+    monkeypatch.setattr(
+        "scansci_html.webapp.installed_models",
+        lambda: [
+            {
+                "id": model_id,
+                "ready": False,
+                "model_files_present": True,
+                "runtime_probe_state": "pending",
+                "kind": "vision",
+                "format": "transformers",
+                "architecture": "Qwen3_5ForConditionalGeneration",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scansci_html.webapp.ensure_local_transformers_runtime",
+        lambda selected: (calls.append(selected), connected.set()) or "http://127.0.0.1:17863/v1",
+    )
+
+    app._connect_downloaded_local_models({"models": [model_id]})
+
+    assert connected.wait(2)
+    assert calls == [model_id]
+
+
+def test_model_install_poll_waits_for_runtime_probe_before_stopping(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'runtime_probe_state === "pending"' in script
+    assert "scheduleLocalModelInstallPoll(1500)" in script
+
+
+def test_installed_model_refresh_retries_pending_runtime_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    model_id = "Qwen/Qwen3.5-2B"
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "scansci_html.webapp.installed_models",
+        lambda: [
+            {
+                "id": model_id,
+                "ready": False,
+                "model_files_present": True,
+                "runtime_probe_state": "pending",
+                "kind": "vision",
+                "format": "transformers",
+                "architecture": "Qwen3_5ForConditionalGeneration",
+            }
+        ],
+    )
+    monkeypatch.setattr(app, "_connect_downloaded_local_models", lambda job: calls.append(dict(job)))
+
+    response = app.dispatch("GET", "/api/local-models/installed")
+
+    assert response.status == 200
+    assert calls == [{"models": [model_id]}]
 
 
 def test_resource_setup_starts_the_retrieval_download_only_after_runtime_is_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

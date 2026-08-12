@@ -71,6 +71,7 @@ agent-browser.json
 .scansci-pi-agent/
 .pi-verification/
 evidence.libraries/
+runtimes/
 
 # Browser and UI verification artifacts
 .playwright-cli/

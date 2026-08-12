@@ -120,6 +120,8 @@ const state = {
   knowledgeSearchOpen: false,
   knowledgeVisibleLimit: 200,
   knowledgeIndexStatuses: {},
+  localAiStatuses: {},
+  localAiStatusPollTimers: {},
   knowledgeScopeRefreshing: false,
   knowledgePreviewCollapsed: window.localStorage.getItem("scansci.knowledge.preview.collapsed") === "true",
   knowledgeSettingsPreview: {
@@ -276,7 +278,7 @@ const applicationCopy = Object.freeze({
     subagentCompletionNotifications: "子代理完成通知",
     subagentCompletionNotificationsHint: "子代理会话完成时，显示系统通知。",
     directoriesTitle: "目录与文件",
-    directoriesDescription: "选择工作区和对话文件的默认保存位置；留空则继续使用应用默认目录。",
+    directoriesDescription: "选择工作区、对话文件和知识库向量索引的默认保存位置；留空则继续使用应用默认目录。",
     defaultWorkspace: "默认工作目录",
     defaultWorkspaceHint: "新建资料库和研究项目时优先使用此目录。",
     conversationWorkspace: "对话工作目录",
@@ -285,6 +287,14 @@ const applicationCopy = Object.freeze({
     resetDefault: "恢复默认",
     defaultWorkspacePlaceholder: "使用应用默认工作区",
     conversationWorkspacePlaceholder: "使用应用默认对话目录",
+    modelCacheDirectory: "模型缓存目录",
+    modelCacheDirectoryHint: "Hugging Face 模型文件保存在此目录，可避免占用 C 盘空间。",
+    localRuntimeDirectory: "本地运行组件目录",
+    localRuntimeDirectoryHint: "Transformers 运行组件与版本放在此目录，新版本会复用已下载内容。",
+    vectorIndexDirectory: "向量索引目录",
+    vectorIndexDirectoryHint: "知识库的向量索引和检索缓存保存在此目录；更换后会迁移现有索引。",
+    storageDirectoryPlaceholder: "使用应用默认位置",
+    storageDirectoryRestartHint: "改变后将按新目录下载；向量索引会先校验再迁移，已启动的运行不会被中断。",
   },
   en: {
     brand: "ScanSci | Research Science",
@@ -362,7 +372,7 @@ const applicationCopy = Object.freeze({
     subagentCompletionNotifications: "Subagent completion notifications",
     subagentCompletionNotificationsHint: "Show a system notification when a subagent session finishes.",
     directoriesTitle: "Directories & files",
-    directoriesDescription: "Choose where workspaces and conversation files are saved by default; leave blank to use application defaults.",
+    directoriesDescription: "Choose where workspaces, conversation files, and knowledge-base vector indexes are saved; leave blank to use application defaults.",
     defaultWorkspace: "Default workspace directory",
     defaultWorkspaceHint: "Prefer this directory when creating libraries and research projects.",
     conversationWorkspace: "Conversation workspace",
@@ -371,6 +381,14 @@ const applicationCopy = Object.freeze({
     resetDefault: "Restore default",
     defaultWorkspacePlaceholder: "Use application default workspace",
     conversationWorkspacePlaceholder: "Use application default conversation folder",
+    modelCacheDirectory: "Model cache directory",
+    modelCacheDirectoryHint: "Hugging Face model files are stored here so they do not fill the system drive.",
+    localRuntimeDirectory: "Local runtime directory",
+    localRuntimeDirectoryHint: "Versioned Transformers runtime components are kept here and reused across updates.",
+    vectorIndexDirectory: "Vector index directory",
+    vectorIndexDirectoryHint: "Knowledge-base vector indexes and retrieval caches are stored here; existing indexes are migrated when changed.",
+    storageDirectoryPlaceholder: "Use application default location",
+    storageDirectoryRestartHint: "New downloads use this location; vector indexes are validated before migration, and an already running runtime is not interrupted.",
   },
 });
 
@@ -448,6 +466,9 @@ function collectGeneralSettingsForm() {
     directories: {
       default_workspace: readDirectory("directory-default-workspace", current.directories.default_workspace),
       conversation_workspace: readDirectory("directory-conversation-workspace", current.directories.conversation_workspace),
+      model_cache: readDirectory("directory-model-cache", current.directories.model_cache),
+      local_runtime: readDirectory("directory-local-runtime", current.directories.local_runtime),
+      vector_index: readDirectory("directory-vector-index", current.directories.vector_index),
     },
   };
   return state.settings.general;
@@ -2378,12 +2399,19 @@ async function ensureActiveKnowledgeIndex(requestedNotebookId = "", { force = fa
   const notebookId = String(requestedNotebookId || state.notebook?.notebook_id || "").trim();
   if (!notebookId) return;
   try {
+    // Retrying the vector index must not reload already prepared model
+    // weights. Model retries have their own explicit action below.
+    await refreshLocalAiStatus(notebookId, { prepare: true });
     const result = await request(`/api/notebooks/${encodeURIComponent(notebookId)}/evidence-index`, {
       method: "POST",
       body: JSON.stringify(force ? { force: true } : { auto: true }),
     });
     if (result?.status) {
       state.knowledgeIndexStatuses[notebookId] = result.status;
+      syncKnowledgeIndexBadge(notebookId);
+    }
+    if (result?.local_ai) {
+      state.localAiStatuses[notebookId] = result.local_ai;
       syncKnowledgeIndexBadge(notebookId);
     }
     if (result?.model_install) {
@@ -2595,6 +2623,15 @@ function scheduleLocalModelInstallPoll(delay = 900) {
         scheduleLocalModelInstallPoll(900);
       } else if ((status.jobs || []).some((item) => item.state === "ready")) {
         await refreshLocalModelMarket();
+        // A completed download is not necessarily a usable Transformers
+        // model: Qwen3.5 still needs the isolated runtime load/generation
+        // probe. Keep refreshing until that probe changes the snapshot from
+        // pending to ready (or failed), so the derived local provider appears
+        // without requiring a manual settings refresh.
+        const pendingRuntimeProbe = (state.localModelMarket?.installed || []).some((item) =>
+          Boolean(item?.model_files_present) && item?.runtime_probe_state === "pending"
+        );
+        if (pendingRuntimeProbe) scheduleLocalModelInstallPoll(1500);
       }
     } catch (error) {
       state.downloadStatusError = error?.message || "无法读取模型下载进度";
@@ -2779,6 +2816,44 @@ function runtimeComponentsSettingsMarkup() {
   return `<section class="runtime-components-panel"><header><div><span>APP COMPONENTS</span><h2>应用运行组件</h2><p>只在组件缺失或安装未完成时显示操作；已就绪的内部组件不会占用设置页。</p></div><button type="button" class="quiet-text-button" data-action="refresh-runtime-components">重新检测</button></header><div class="runtime-component-list">${cards}</div></section>`;
 }
 
+function scheduleLocalAiStatusPoll(notebookId) {
+  const id = String(notebookId || "").trim();
+  if (!id) return;
+  if (state.localAiStatusPollTimers[id]) window.clearTimeout(state.localAiStatusPollTimers[id]);
+  state.localAiStatusPollTimers[id] = window.setTimeout(() => {
+    delete state.localAiStatusPollTimers[id];
+    void refreshLocalAiStatus(id);
+  }, 1500);
+}
+
+async function refreshLocalAiStatus(notebookId = state.notebook?.notebook_id || "", { prepare = false, force = false } = {}) {
+  const id = String(notebookId || "").trim();
+  if (!id) return null;
+  const previous = state.localAiStatuses[id] || {};
+  try {
+    const result = await request(`/api/notebooks/${encodeURIComponent(id)}/local-ai-status`, {
+      method: prepare ? "POST" : "GET",
+      ...(prepare ? { body: JSON.stringify({ quality_profile: "precision", force }) } : {}),
+    });
+    state.localAiStatuses[id] = result;
+    syncKnowledgeIndexBadge(id);
+    if (result?.state === "preparing") {
+      scheduleLocalAiStatusPoll(id);
+      if (previous.state !== "preparing") toast(result.message || "正在加载本地 AI 模型");
+    }
+    else if (state.localAiStatusPollTimers[id]) {
+      window.clearTimeout(state.localAiStatusPollTimers[id]);
+      delete state.localAiStatusPollTimers[id];
+    }
+    if (previous.state === "preparing" && ["ready", "fallback", "error"].includes(String(result?.state || ""))) {
+      void ensureActiveKnowledgeIndex(id);
+    }
+    return result;
+  } catch (_error) {
+    return null;
+  }
+}
+
 async function refreshRuntimeComponents({ render = true } = {}) {
   const payload = await request("/api/runtime-components");
   state.runtimeComponents = { ...state.runtimeComponents, ...(payload?.components || {}) };
@@ -2881,6 +2956,7 @@ async function refreshKnowledgeIndexStatus(notebookId = state.notebook?.notebook
     const status = await request(`/api/notebooks/${encodeURIComponent(id)}/evidence-index`);
     state.knowledgeIndexStatuses[id] = status;
     syncKnowledgeIndexBadge(id);
+    void refreshLocalAiStatus(id);
     return status;
   } catch (_error) {
     return null;
@@ -5148,6 +5224,9 @@ function generalPreferences() {
     directories: {
       default_workspace: String(directories.default_workspace || "").trim(),
       conversation_workspace: String(directories.conversation_workspace || "").trim(),
+      model_cache: String(directories.model_cache || "").trim(),
+      local_runtime: String(directories.local_runtime || "").trim(),
+      vector_index: String(directories.vector_index || "").trim(),
     },
   };
 }
@@ -5952,7 +6031,15 @@ async function askQuestion(event, inputId) {
   const activatedSendButton = event.submitter === button;
   const currentRun = activeResearchRun();
   const currentJob = !state.activeTaskId ? directChatJob() : null;
-  if (activatedSendButton && currentRun) {
+  // A completed/failed run can remain selected in the history state.  It must
+  // not turn the composer into a no-op: only an interactive run owns the
+  // send button for pause/resume.  Otherwise the next message starts a new
+  // task directly, without requiring the user to click “新建研究” first.
+  const currentRunIsInteractive = currentRun && (
+    currentRun.status === "paused" ||
+    (!currentRun.pause_requested && ["queued", "planning", "running", "verifying"].includes(String(currentRun.status || "")))
+  );
+  if (activatedSendButton && currentRunIsInteractive) {
     if (currentRun.status === "paused" && !currentRun.pause_requested) {
       resumeRun(currentRun.run_id).catch((error) => toast(error.message, true));
     } else if (!currentRun.pause_requested && ["queued", "planning", "running", "verifying"].includes(String(currentRun.status || ""))) {
@@ -6400,9 +6487,17 @@ function renderDirectLiveControls() {
   }
   const paused = job.status === "paused" && !job.pauseRequested;
   if (!job.queue.length) {
-    surface.hidden = true;
-    surface.innerHTML = "";
-    form?.classList.remove("has-live-direct-job");
+    // The queue is empty while the active direct response is being prepared
+    // or streamed. Keep a compact status surface visible so the user gets
+    // feedback and the composer remains clearly in a busy state.
+    const active = ["starting", "running", "retrying", "queued"].includes(String(job.status || ""));
+    const parallelCount = Math.max(0, directChatJobs.size - 1);
+    const parallelSummary = parallelCount
+      ? `<em>另有 ${parallelCount} 个对话并行</em>`
+      : "<em>可以继续输入下一条消息</em>";
+    surface.hidden = false;
+    surface.innerHTML = `<div class="direct-live-summary"><i class="direct-live-pulse ${paused ? "is-paused" : ""}" aria-hidden="true"></i><strong>${paused ? "回复已暂停" : active ? "正在生成回复" : "正在准备回复"}</strong>${parallelSummary}</div>`;
+    form?.classList.add("has-live-direct-job");
     if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
     if (send) send.setAttribute("aria-label", paused ? "继续回复" : "发送下一条消息");
     renderComposerSendButtons();
@@ -6730,9 +6825,13 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       ? directEvidenceAnswerMarkup(message, index, cursor)
       : (message.content ? `<div class="answer-sentence">${renderAssistantContent(message.content)}${cursor}</div>` : "");
     const visionRoute = message.agent_runtime?.vision_route || null;
-    const visionNotice = visionRoute?.model_id
-      ? `<p class="vision-route-notice">图片由 ${escapeHtml(visionRoute.provider_name || visionRoute.provider_id || "本地视觉模型")} 的 ${escapeHtml(visionRoute.model_id)} 处理${visionRoute.mode === "cloud" ? "（云端）" : "（本地）"}</p>`
+    const visionFallback = message.agent_runtime?.vision_fallback || null;
+    const visionFallbackNotice = visionFallback?.to_model
+      ? `<p class="vision-route-notice is-fallback">原视觉模型 ${escapeHtml(visionFallback.from_model || "当前模型")} 暂时不可用，已自动切换到 ${escapeHtml(visionFallback.to_provider_name || visionFallback.to_provider || "备用服务商")} 的 ${escapeHtml(visionFallback.to_model)}。</p>`
       : "";
+    const visionNotice = visionRoute?.model_id
+      ? `${visionFallbackNotice}<p class="vision-route-notice">图片由 ${escapeHtml(visionRoute.provider_name || visionRoute.provider_id || "本地视觉模型")} 的 ${escapeHtml(visionRoute.model_id)} 处理${visionRoute.mode === "cloud" ? "（云端）" : visionRoute.mode === "ocr-fallback" ? "（OCR + 文本模型）" : "（本地）"}</p>`
+      : visionFallbackNotice;
     const generation = message.streaming ? '<div class="generation-indicator" role="status" aria-label="正在生成回复"><span class="generation-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>' : "";
     const paused = message.paused ? '<p class="stream-paused" role="status">已暂停，点击发送键中的播放图标继续</p>' : "";
     const error = message.error && !message.paused ? directFailureMarkup(message, index) : "";
@@ -7832,6 +7931,10 @@ async function applyLibraryImport(result, message) {
   }
   persistKnowledgeScopes();
   state.capabilities = await request("/api/capabilities");
+  if (result.local_ai && activeNotebookId) {
+    state.localAiStatuses[activeNotebookId] = result.local_ai;
+    if (result.local_ai.state === "preparing") scheduleLocalAiStatusPoll(activeNotebookId);
+  }
   closeLibraryPathDialog();
   renderWorkspace();
   if (byId("knowledgeScopeDialog")?.open) renderKnowledgeScopeDialog();
@@ -8845,7 +8948,9 @@ function buildReviewDocumentModel(run, artifact) {
   const evidenceNotice = String(payload.evidence_notice || "");
   const evidenceLevel = String(payload.evidence_level || payload.evidence_status || "");
   const researchTrace = payload.research_trace || {};
-  const insufficientEvidence = Boolean(payload.answer?.insufficient_evidence || payload.adequacy?.is_sufficient === false);
+  const answerability = String(payload.adequacy?.answerability || answer.answerability || "");
+  const needsReview = answerability === "needs_review" || Boolean(answer.review_required);
+  const insufficientEvidence = !needsReview && Boolean(payload.answer?.insufficient_evidence || payload.adequacy?.is_sufficient === false);
   const verified = !legacy && !insufficientEvidence && Boolean(payload.citation_verification?.passed ?? payload.answer?.citation_verification?.passed ?? payload.verification?.supported_claims?.length);
   const title = reviewDisplayTitle(run, supplied);
   const model = {
@@ -8867,6 +8972,8 @@ function buildReviewDocumentModel(run, artifact) {
     citationCount: Number(reader.citation_count || citations.length || 0),
     evidenceNotice,
     evidenceLevel,
+    answerability,
+    needsReview,
     sourceScope: payload.source_scope && typeof payload.source_scope === "object" ? { ...payload.source_scope } : {},
     researchTrace,
     verified,
@@ -9037,7 +9144,7 @@ function renderReviewDocument(run, artifact, model = null) {
   const currentStage = (run.stages || []).find((stage) => stage.status === "running")
     || (run.stages || []).find((stage) => stage.key === run.current_stage);
   const title = ready ? presentation.toolbarTitle : compact(runDisplayTitle(run) || `正在生成${presentation.toolbarTitle}`, 72);
-  const summary = ready ? (model.legacy ? "旧版任务 · 仅包含证据摘录，请重新生成" : model.insufficientEvidence ? `证据不足 · ${model.discoveryLeads.length} 条检索线索` : `${model.documentCount} 篇来源 · ${model.citationCount} 个证据锚点${model.verified ? " · 引用已核验" : ""}`) : `${percent}% · ${currentStage?.title || runStatusLabel(run)}`;
+  const summary = ready ? (model.legacy ? "旧版任务 · 仅包含证据摘录，请重新生成" : model.needsReview ? `需要复核 · ${model.documentCount} 篇来源 · ${model.citationCount} 个证据锚点` : model.insufficientEvidence ? `证据不足 · ${model.discoveryLeads.length} 条检索线索` : `${model.documentCount} 篇来源 · ${model.citationCount} 个证据锚点${model.verified ? " · 引用已核验" : ""}`) : `${percent}% · ${currentStage?.title || runStatusLabel(run)}`;
   const tabButtons = `<nav class="review-document-tabs" aria-label="稿件视图"><button type="button" class="is-active" data-action="review-document-tab" data-review-tab="preview" ${ready ? "" : "disabled"}>预览</button><button type="button" data-action="review-document-tab" data-review-tab="source" ${ready ? "" : "disabled"}>Markdown</button></nav>`;
   const toolbar = `<header class="review-panel-toolbar"><div class="review-toolbar-leading"><button type="button" class="review-back-conversation" data-action="return-review-conversation">${uiIcon("arrow-left")}<span>返回对话</span></button><div class="review-document-identity"><span class="review-file-icon">${uiIcon("file-plus")}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></div></div></div><div class="review-toolbar-cluster">${tabButtons}<div class="review-toolbar-actions"><button type="button" class="review-save-note" data-action="save-review-note" ${ready ? "" : "disabled"}>保存为笔记</button><button type="button" class="review-icon-button" data-action="copy-review-document" aria-label="复制稿件" title="复制稿件" ${ready ? "" : "disabled"}>${uiIcon("copy")}</button><button type="button" class="review-icon-button" data-action="refresh-review-document" aria-label="刷新稿件" title="刷新稿件">${uiIcon("refresh")}</button><button type="button" class="review-icon-button" data-action="download-review-document" aria-label="下载 Markdown" title="下载 Markdown" ${ready ? "" : "disabled"}>${uiIcon("download")}</button></div></div></header>`;
   if (!ready) {
@@ -9062,7 +9169,7 @@ function renderReviewDocument(run, artifact, model = null) {
   const fulltextEvidence = ["fulltext", "task_acquired_fulltext"].includes(model.evidenceLevel);
   const evidenceNotice = model.evidenceNotice ? `<div class="review-evidence-notice"><strong>${fulltextEvidence ? "全文证据链" : "证据范围"}</strong><p>${escapeHtml(model.evidenceNotice)}</p></div>` : "";
   const requestContext = reviewRequestContextMarkup(run, model, presentation);
-  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">${escapeHtml(presentation.kicker)} <span>${model.legacy ? "旧版摘录" : model.insufficientEvidence ? "证据不足" : model.verified ? "引用已核验" : "待人工复核"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${escapeHtml(presentation.originLabel)}</span><span>${model.insufficientEvidence ? "证据不足，未生成科学结论" : model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${requestContext}${legacyNotice}${evidenceNotice}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${reviewCitedTextMarkup(model.abstract)}</p></section>${sections}${comparison}${controversies}${openQuestions}${discovery}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
+  const preview = `<div class="review-document-view review-preview-view is-active" data-review-view="preview"><article class="review-paper"><div class="review-paper-kicker">${escapeHtml(presentation.kicker)} <span>${model.legacy ? "旧版摘录" : model.needsReview ? "需要复核" : model.insufficientEvidence ? "证据不足" : model.verified ? "引用已核验" : "待人工复核"}</span></div><h1>${escapeHtml(model.title)}</h1><div class="review-paper-meta"><span><b>${model.documentCount}</b> 篇来源</span><span><b>${model.citationCount}</b> 个证据锚点</span><span>${escapeHtml(presentation.originLabel)}</span><span>${model.needsReview ? "相关性临界，建议补充检索或人工复核" : model.insufficientEvidence ? "证据不足，未生成科学结论" : model.verified ? "引用核验通过" : model.legacy ? "旧版摘录" : "建议人工复核"}</span></div>${requestContext}${legacyNotice}${evidenceNotice}<section id="review-abstract"><h2>摘要</h2><p class="review-lead">${reviewCitedTextMarkup(model.abstract)}</p></section>${sections}${comparison}${controversies}${openQuestions}${discovery}<section id="review-limitations"><h2>证据边界</h2><div class="review-limitations">${limitations}</div></section><section id="review-references"><h2>参考文献</h2><ol class="review-reference-list">${references}</ol></section></article></div>`;
   const source = `<div class="review-document-view review-source-view" data-review-view="source"><pre><code>${escapeHtml(model.markdown)}</code></pre></div>`;
   target.innerHTML = `${toolbar}<div class="review-document-body">${preview}${source}<aside class="review-evidence-drawer" id="reviewEvidenceDrawer" aria-live="polite"></aside></div>`;
   bindReviewCitationInteractions(model, target);
@@ -9725,6 +9832,8 @@ function renderKnowledgeSourceGroup(title, kind, notebooks) {
 function knowledgeIndexStatusMarkup(notebook) {
   const notebookId = String(notebook?.notebook_id || "");
   const status = state.knowledgeIndexStatuses[notebookId] || {};
+  const localAi = state.localAiStatuses[notebookId] || {};
+  const localAiState = String(localAi.state || "");
   const sourceCount = Number(notebook?.counts?.sources || knowledgeSourceItems(notebook).length || 0);
   const binding = notebook?.metadata?.local_binding || {};
   const bindingState = String(binding.index_state || "");
@@ -9738,7 +9847,10 @@ function knowledgeIndexStatusMarkup(notebook) {
           ? "pending"
           : "empty";
   const statusState = String(status.state || fallbackState);
-  const progress = Math.max(0, Math.min(100, Math.round(Number(status.progress || 0) * 100)));
+  const progress = Math.max(
+    0,
+    Math.min(100, Math.round(Number(localAiState === "preparing" ? localAi.progress : status.progress || 0) * 100)),
+  );
   const labels = {
     ready: "检索已就绪",
     // Source text can be searched as soon as document evidence has been
@@ -9756,11 +9868,23 @@ function knowledgeIndexStatusMarkup(notebook) {
     labels.pending = "可按需优化";
     labels.degraded = "可按需优化";
   }
+  const localLabel = localAiState === "preparing"
+    ? "正在准备本地 AI"
+    : localAiState === "fallback" || localAiState === "error"
+      ? "基础检索可用"
+      : "";
+  const label = localLabel || labels[statusState] || "等待同步";
   const retryable = ["failed", "degraded", "pending"].includes(statusState);
-  const title = status.error
-    ? `检索索引：${labels[statusState] || "等待同步"}。${String(status.error)}`
-    : `检索索引：${labels[statusState] || "等待同步"}`;
-  return `<button type="button" class="ima-index-status is-${escapeHtml(statusState)}" data-knowledge-index-status data-action="${retryable ? "retry-evidence-index" : "refresh-evidence-index"}" data-notebook-id="${escapeHtml(notebookId)}" title="${escapeHtml(title)}" ${statusState === "empty" ? "disabled" : ""}><svg viewBox="0 0 12 12" aria-hidden="true"><circle class="track" cx="6" cy="6" r="4.5"></circle><circle class="value" cx="6" cy="6" r="4.5" pathLength="100" stroke-dasharray="${progress} 100"></circle></svg><span>${escapeHtml(labels[statusState] || "等待同步")}</span></button>`;
+  const localRetryable = ["fallback", "error"].includes(localAiState);
+  const action = localRetryable ? "retry-local-ai" : retryable ? "retry-evidence-index" : "refresh-evidence-index";
+  const visualState = localAiState === "preparing"
+    ? "indexing"
+    : localRetryable
+      ? "degraded"
+      : statusState;
+  const details = [status.error, localAi.message, localAi.error].filter(Boolean).join(" · ");
+  const title = details ? `检索索引：${label}。${String(details)}` : `检索索引：${label}`;
+  return `<button type="button" class="ima-index-status is-${escapeHtml(visualState)}" data-knowledge-index-status data-action="${action}" data-notebook-id="${escapeHtml(notebookId)}" title="${escapeHtml(title)}" ${statusState === "empty" ? "disabled" : ""}><svg viewBox="0 0 12 12" aria-hidden="true"><circle class="track" cx="6" cy="6" r="4.5"></circle><circle class="value" cx="6" cy="6" r="4.5" pathLength="100" stroke-dasharray="${progress} 100"></circle></svg><span>${escapeHtml(label)}</span></button>`;
 }
 
 function syncKnowledgeIndexBadge(notebookId) {
@@ -10203,6 +10327,9 @@ function resourceInstallStatusCopy(resource) {
 function resourceSetupCard(resource) {
   const copy = resourceInstallStatusCopy(resource);
   const active = ["queued", "downloading", "installing", "runtime_installing"].includes(resource.state);
+  const storageLocked = state.onboardingMode === "resources"
+    && resource.state !== "ready"
+    && !onboardingStorageDirectoriesConfigured();
   const retryable = ["failed", "interrupted", "cancelled"].includes(resource.state);
   const actionLabel = resource.state === "ready"
     ? "已就绪"
@@ -10218,7 +10345,9 @@ function resourceSetupCard(resource) {
   const progress = active
     ? `<div class="resource-download-detail"><small>${escapeHtml(downloadJobTelemetry(resource.job) || "正在建立下载连接")}</small><div class="resource-setup-progress" role="progressbar" aria-label="${escapeHtml(resource.title)} 下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${resource.progress}"><span class="${progressWidthClass(resource.progress)}"></span></div></div>`
     : "";
-  const action = ["runtime_required", "runtime_failed"].includes(resource.state)
+  const action = storageLocked
+    ? `<button type="button" class="resource-setup-storage-required" data-action="focus-onboarding-storage">先设置存储目录</button>`
+    : ["runtime_required", "runtime_failed"].includes(resource.state)
     ? `<button type="button" data-action="start-onboarding-resource" data-resource-id="${escapeHtml(resource.id)}">${uiIcon(resource.state === "runtime_failed" ? "refresh" : "download")}${escapeHtml(actionLabel)}</button>`
     : resource.state === "runtime_installing"
       ? `<span class="resource-install-running">${uiIcon("loader-circle")}</span>`
@@ -10320,7 +10449,7 @@ function resourceGuidePageMarkup(step) {
   if (step.id === "knowledge") return resourceGuideKnowledgePage();
   const resources = step.resourceIds.map((resourceId) => resourceSetupCard(resourceInstallSnapshot(resourceId))).join("");
   if (step.id === "retrieval") {
-    return `<div class="resource-guide-page is-retrieval">${runtimeComponentCardMarkup("node", { compact: true })}<div class="resource-guide-model-grid">${resources}</div><aside class="resource-guide-cuda-card"><span class="resource-guide-cuda-icon">${uiIcon("gpu")}</span><div><strong>CUDA 加速（可选）</strong><p>检测到 NVIDIA GPU 时会自动优先使用；没有 CUDA 也可以继续使用 CPU，不影响基础检索。</p><span class="resource-guide-cuda-status" data-cuda-status>正在检测本机 CUDA…</span></div></aside></div>`;
+    return `<div class="resource-guide-page is-retrieval">${onboardingStorageMarkup()}${runtimeComponentCardMarkup("node", { compact: true })}<div class="resource-guide-model-grid">${resources}</div><aside class="resource-guide-cuda-card"><span class="resource-guide-cuda-icon">${uiIcon("gpu")}</span><div><strong>CUDA 加速（可选）</strong><p>检测到 NVIDIA GPU 时会自动优先使用；没有 CUDA 也可以继续使用 CPU，不影响基础检索。</p><span class="resource-guide-cuda-status" data-cuda-status>正在检测本机 CUDA…</span></div></aside></div>`;
   }
   if (step.id === "chat") {
     return `<div class="resource-guide-page is-chat"><div class="resource-guide-optional-banner">${uiIcon("info")}<span>这是可选的第四页，不安装也不影响 ScanSci 的基础对话、联网模型和关键词检索。</span></div><div class="resource-guide-model-grid is-single">${resources}</div></div>`;
@@ -10385,6 +10514,24 @@ function renderLegacyResourceOnboarding() {
   host.innerHTML = `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("sparkles")}</div><h1 id="resourceOnboardingTitle">先把研究桌面<br />准备好。</h1><p>ScanSci 已包含基础能力；需要下载的模型由你决定，并始终保存在这台电脑上。</p><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>下载可断点续传。跳过不会影响基础使用，之后可在设置里继续。</p></div></aside><main class="resource-onboarding-main"><header><div><span>本地模型</span><h2>按能力分别添加</h2><p>嵌入和重排负责知识库检索；视觉、语音和本地对话按需开启。</p></div><span class="resource-onboarding-step">01 / 02</span></header><div class="resource-setup-cards">${resourceSetupCardsMarkup()}</div><footer><p>每项模型都可单独下载。跳过不会影响基础使用，之后可在设置里继续。</p><div><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button><button type="button" class="resource-finish-button" data-action="advance-resource-onboarding">下一步：接入资料 ${uiIcon("arrow-right")}</button></div></footer></main></section></div>`;
   installResourceOnboardingDragHandle(host);
   hydrateIcons(host);
+}
+
+function onboardingStorageMarkup() {
+  const directories = generalPreferences().directories;
+  const picker = (setting, value, label, hint) => `<div class="onboarding-storage-row"><div><strong>${escapeHtml(label)}</strong><small>${escapeHtml(hint)}</small><code>${escapeHtml(value || copy("storageDirectoryPlaceholder"))}</code></div><button type="button" class="guide-destination-action" data-action="choose-storage-directory" data-directory-setting="${escapeHtml(setting)}">${escapeHtml(copy("chooseDirectory"))}</button></div>`;
+  return `<section class="onboarding-storage-panel"><header><span>${uiIcon("folder-open")}</span><div><strong>下载前先确认存储位置</strong><p>嵌入模型、重排模型和其他本地模型都会写入模型缓存目录；Transformers 运行组件会写入运行组件目录。留空则使用应用默认目录。</p></div></header>${picker("model_cache", directories.model_cache, copy("modelCacheDirectory"), copy("modelCacheDirectoryHint"))}${picker("local_runtime", directories.local_runtime, copy("localRuntimeDirectory"), copy("localRuntimeDirectoryHint"))}<small class="onboarding-storage-footnote">${escapeHtml(copy("storageDirectoryRestartHint"))}</small></section>`;
+}
+
+function onboardingStorageDirectoriesConfigured() {
+  const directories = generalPreferences().directories;
+  return Boolean(String(directories.model_cache || "").trim() && String(directories.local_runtime || "").trim());
+}
+
+function ensureOnboardingStorageConfigured() {
+  if (state.onboardingMode !== "resources" || onboardingStorageDirectoriesConfigured()) return true;
+  toast("先设置存储目录再开始下载");
+  document.querySelector(".onboarding-storage-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  return false;
 }
 
 function renderResourceOnboarding() {
@@ -10471,6 +10618,7 @@ async function startOnboardingResource(resourceId) {
   await refreshInstalledModelInventory({ render: false });
   const resource = resourceInstallSnapshot(resourceId);
   if (["ready", "queued", "downloading", "installing"].includes(resource.state)) return;
+  if (!ensureOnboardingStorageConfigured()) return;
   if (["runtime_required", "runtime_installing", "runtime_failed"].includes(resource.state)) {
     state.pendingLocalModelResource = resource.id;
     if (resource.state === "runtime_installing") {
@@ -11198,14 +11346,18 @@ function renderGeneralSettings() {
         <label class="settings-row"><span><strong>${escapeHtml(copy("subagentCompletionNotifications"))}</strong><small>${escapeHtml(copy("subagentCompletionNotificationsHint"))}</small></span>${toggleControl("subagent_completion_notifications", general.conversation.subagent_completion_notifications, copy("subagentCompletionNotifications"))}</label>
       </section>
     </form>`;
-  const directoryControl = (name, value, placeholder) => {
+  const directoryControl = (name, value, placeholder, setting) => {
     const displayValue = String(value || "").trim() || placeholder;
-    return `<div class="settings-path-control"><input name="${name}" value="${escapeHtml(displayValue)}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" /><div class="settings-path-actions"><button type="button" class="settings-inline-link" data-action="choose-general-directory" data-directory-setting="${name === "directory-default-workspace" ? "default_workspace" : "conversation_workspace"}">${escapeHtml(copy("chooseDirectory"))}</button><button type="button" class="settings-inline-link" data-action="reset-general-directory" data-directory-setting="${name === "directory-default-workspace" ? "default_workspace" : "conversation_workspace"}">${escapeHtml(copy("resetDefault"))}</button></div></div>`;
+    return `<div class="settings-path-control"><input name="${name}" value="${escapeHtml(displayValue)}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" /><div class="settings-path-actions"><button type="button" class="settings-inline-link" data-action="choose-general-directory" data-directory-setting="${escapeHtml(setting)}">${escapeHtml(copy("chooseDirectory"))}</button><button type="button" class="settings-inline-link" data-action="reset-general-directory" data-directory-setting="${escapeHtml(setting)}">${escapeHtml(copy("resetDefault"))}</button></div></div>`;
   };
   const directoriesContent = `<form id="generalDirectoriesForm" class="settings-minimal-form">
       <section class="settings-minimal-section"><h2>${escapeHtml(copy("directoriesTitle"))}</h2><p class="settings-section-intro">${escapeHtml(copy("directoriesDescription"))}</p>
-        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("defaultWorkspace"))}</strong><small>${escapeHtml(copy("defaultWorkspaceHint"))}</small></span>${directoryControl("directory-default-workspace", general.directories.default_workspace, defaultWorkspacePlaceholder)}</label>
-        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("conversationWorkspace"))}</strong><small>${escapeHtml(copy("conversationWorkspaceHint"))}</small></span>${directoryControl("directory-conversation-workspace", general.directories.conversation_workspace, conversationWorkspacePlaceholder)}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("defaultWorkspace"))}</strong><small>${escapeHtml(copy("defaultWorkspaceHint"))}</small></span>${directoryControl("directory-default-workspace", general.directories.default_workspace, defaultWorkspacePlaceholder, "default_workspace")}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("conversationWorkspace"))}</strong><small>${escapeHtml(copy("conversationWorkspaceHint"))}</small></span>${directoryControl("directory-conversation-workspace", general.directories.conversation_workspace, conversationWorkspacePlaceholder, "conversation_workspace")}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("modelCacheDirectory"))}</strong><small>${escapeHtml(copy("modelCacheDirectoryHint"))}</small></span>${directoryControl("directory-model-cache", general.directories.model_cache, copy("storageDirectoryPlaceholder"), "model_cache")}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("localRuntimeDirectory"))}</strong><small>${escapeHtml(copy("localRuntimeDirectoryHint"))}</small></span>${directoryControl("directory-local-runtime", general.directories.local_runtime, copy("storageDirectoryPlaceholder"), "local_runtime")}</label>
+        <label class="settings-row settings-row-path"><span><strong>${escapeHtml(copy("vectorIndexDirectory"))}</strong><small>${escapeHtml(copy("vectorIndexDirectoryHint"))}</small></span>${directoryControl("directory-vector-index", general.directories.vector_index, copy("storageDirectoryPlaceholder"), "vector_index")}</label>
+        <p class="settings-section-note">${escapeHtml(copy("storageDirectoryRestartHint"))}</p>
       </section>
     </form>`;
   const configurableTabContent = {
@@ -11339,14 +11491,16 @@ function renderLegacyLocalModelsSettings() {
   const capabilityLabel = (kind) => ({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用");
   const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
   const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
-  const incompatibleInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible === false).length;
+  const incompatibleInstalledCount = installedItems.filter((item) => item.runtime_compatible === false || item.runtime_probe_state === "failed").length;
   const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
   const installed = installedItems.map((item) => {
     const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
     const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
     const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
-    const status = unsupportedAudio ? "需下载原生格式" : item.ready ? "已就绪" : "下载未完成";
-    const detail = unsupportedAudio && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : "";
+    const unavailable = item.runtime_compatible === false || item.runtime_probe_state === "failed";
+    const pendingProbe = item.runtime_probe_state === "pending";
+    const status = unavailable ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : pendingProbe ? "待验证" : item.ready ? "已就绪" : "下载未完成";
+    const detail = (unavailable || pendingProbe) && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : "";
     return `<article class="quiet-model-row"><span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span><div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${capabilityLabel(kind)}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${detail}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span></article>`;
   }).join("") || '<div class="quiet-empty">未发现本地模型。</div>';
   const ollama = state.ollama || {};
@@ -11591,7 +11745,7 @@ function renderLocalModelsSettings() {
   const installedItems = state.localModelMarket?.installed || [];
   const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
   const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
-  const incompatibleInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible === false).length;
+   const incompatibleInstalledCount = installedItems.filter((item) => item.runtime_compatible === false || item.runtime_probe_state === "failed").length;
   const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
   const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
@@ -11600,12 +11754,13 @@ function renderLocalModelsSettings() {
     const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
     const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
     const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
-    const incompatible = item.runtime_compatible === false;
-    const status = incompatible ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : item.ready ? "可用" : "未完成";
+    const incompatible = item.runtime_compatible === false || item.runtime_probe_state === "failed";
+    const pendingProbe = item.runtime_probe_state === "pending";
+    const status = incompatible ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : pendingProbe ? "待验证" : item.ready ? "可用" : "未完成";
     const icon = item.icon_url
       ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />`
       : `<span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span>`;
-    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${incompatible && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span><button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}">删除</button></article>`;
+    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${(incompatible || pendingProbe) && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span><button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}">删除</button></article>`;
   }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
   const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
   const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
@@ -11690,7 +11845,7 @@ function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", e
   return `${heading}
     <form id="${escapeHtml(formId)}" class="document-processing-form${embedded ? " embedded-document-processing-form" : ""}">
       <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">O</span><div><h2>OCR ${settingHelpMarkup("用于识别图片内文字。", "OCR 说明")}</h2><p>从扫描 PDF、图像和无法直接复制的页面提取文字。</p></div></div><label class="switch-label"><input name="ocr-enabled" type="checkbox" ${ocr.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>OCR 服务提供商</span><select name="ocr-provider"><option value="tesseract" ${tesseractSelected ? "selected" : ""}>Tesseract OCR</option><option value="system" ${ocr.provider === "system" ? "selected" : ""}>Windows OCR</option><option value="paddle" ${paddleSelected ? "selected" : ""}>PaddleOCR（AI Studio）</option><option value="deepseek" ${deepseekSelected ? "selected" : ""}>DeepSeek-OCR（硅基流动）</option><option value="custom" ${ocr.provider === "custom" ? "selected" : ""}>自定义 OCR API</option></select></label>${paddleGuide}<label class="document-language-row"><span>识别语言</span><select name="ocr-language" multiple size="2" aria-label="识别语言">${ocrLanguageOptions}</select></label>${ocrConnection}</section>
-      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档处理 ${settingHelpMarkup("用于按版面解析论文，保留段落、表格、公式和图片结构。", "文档处理说明")}</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">可填写多个 MinerU 密钥时请使用英文逗号分隔；密钥仅保存在当前电脑的系统凭据管理器中。</p></section>
+      <section class="document-service-card"><div class="document-service-heading"><div><span class="document-service-icon">M</span><div><h2>文档处理 ${settingHelpMarkup("用于按版面解析论文，保留段落、表格、公式和图片结构。", "文档处理说明")}</h2><p>按版面保留论文的段落、表格、公式与图片结构。</p></div></div><label class="switch-label"><input name="mineru-enabled" type="checkbox" ${mineru.enabled ? "checked" : ""} />启用</label></div><div class="document-service-rule"></div><label class="document-select-row"><span>文档处理服务商</span><select name="mineru-provider"><option value="mineru" ${mineru.provider === "mineru" ? "selected" : ""}>MinerU</option><option value="custom" ${mineru.provider === "custom" ? "selected" : ""}>自定义解析 API</option></select></label><div class="document-service-fields"><label class="setting-field"><span>${escapeHtml(mineruName)} API 密钥</span><input name="mineru-api-key" type="password" autocomplete="new-password" placeholder="${mineru.api_key_configured ? "已保存在系统凭据管理器；输入新值以替换" : "输入后仅保存至系统凭据管理器"}" /></label><label class="setting-field"><span>API 地址</span><input name="mineru-base-url" value="${escapeHtml(mineru.base_url || "")}" placeholder="https://mineru.net" maxlength="500" /></label></div><p class="document-service-note">密钥仅保存在当前电脑的系统凭据管理器中；启用后，PDF 导入会优先使用 MinerU，失败时回退本地解析。</p></section>
       <div class="settings-footer-actions"><button type="submit" class="save-button">保存文档处理配置</button></div>
     </form>`.replace('<h2>OCR 服务</h2>', '<h2>OCR</h2>').replace('<h2>文档解析</h2>', '<h2>文档处理</h2>');
 }
@@ -12302,14 +12457,16 @@ function ensureActiveModel() {
 
 async function persistSettings(message = "设置已保存") {
   ensureActiveModel();
-  state.settings = await request("/api/settings", { method: "POST", body: JSON.stringify({ settings: state.settings }) });
+  const saved = await request("/api/settings", { method: "POST", body: JSON.stringify({ settings: state.settings }) });
+  state.settings = saved;
   applyAppearancePreferences();
   state.selectedProviderId = selectedProvider()?.id || state.settings.providers[0]?.id || "";
   renderModelSelectors();
   if (state.activeView === "settings") renderSettings();
   if (state.activeView === "extensions") renderExtensions();
   if (state.activeView === "mcp") renderMcpMarketplaceView();
-  toast(message);
+  const migrated = Number(saved?.storage?.vector_index_migration?.migrated || 0);
+  toast(migrated > 0 ? `${message} 已迁移 ${migrated} 个知识库索引` : message);
 }
 
 function newRecord(kind, form) {
@@ -12325,6 +12482,11 @@ function newRecord(kind, form) {
 async function handleSettingsAction(action, element) {
   if (action === "open-resource-guide") {
     openResourceGuideOverlay();
+    return;
+  }
+  if (action === "focus-onboarding-storage") {
+    document.querySelector(".onboarding-storage-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    toast("先设置存储目录再开始下载");
     return;
   }
   if (action === "close-resource-guide") {
@@ -12442,8 +12604,26 @@ async function handleSettingsAction(action, element) {
     renderSettings();
     return;
   }
+  if (action === "choose-storage-directory") {
+    const setting = ["model_cache", "local_runtime", "vector_index"].includes(element.dataset.directorySetting)
+      ? element.dataset.directorySetting
+      : "model_cache";
+    const picker = window.pywebview?.api?.choose_library_folder;
+    if (typeof picker !== "function") {
+      toast("浏览器预览不能读取本机目录，请在 ScanSci 桌面应用中选择文件夹。", true);
+      return;
+    }
+    const selected = String(await picker() || "").trim();
+    if (!selected) return;
+    const general = generalPreferences();
+    general.directories[setting] = selected;
+    state.settings.general = general;
+    await persistSettings("存储目录设置已保存；新下载将使用新位置");
+    renderResourceOnboarding();
+    return;
+  }
   if (action === "choose-general-directory") {
-    const setting = ["default_workspace", "conversation_workspace"].includes(element.dataset.directorySetting)
+    const setting = ["default_workspace", "conversation_workspace", "model_cache", "local_runtime", "vector_index"].includes(element.dataset.directorySetting)
       ? element.dataset.directorySetting
       : "default_workspace";
     const picker = window.pywebview?.api?.choose_library_folder;
@@ -12466,7 +12646,7 @@ async function handleSettingsAction(action, element) {
     return;
   }
   if (action === "reset-general-directory") {
-    const setting = ["default_workspace", "conversation_workspace"].includes(element.dataset.directorySetting)
+    const setting = ["default_workspace", "conversation_workspace", "model_cache", "local_runtime", "vector_index"].includes(element.dataset.directorySetting)
       ? element.dataset.directorySetting
       : "default_workspace";
     const general = generalPreferences();
@@ -13111,6 +13291,10 @@ document.addEventListener("click", (event) => {
     };
     syncKnowledgeIndexBadge(notebookId);
     ensureActiveKnowledgeIndex(notebookId, { force: true }).catch((error) => toast(error.message, true));
+  }
+  else if (action === "retry-local-ai") {
+    const notebookId = element.dataset.notebookId || state.notebook?.notebook_id || "";
+    refreshLocalAiStatus(notebookId, { prepare: true, force: true }).catch((error) => toast(error.message, true));
   }
   else if (action === "refresh-evidence-index") refreshKnowledgeIndexStatus(element.dataset.notebookId || "").catch(() => {});
   else if (action === "refresh-knowledge-scope-counts") refreshKnowledgeScopeCounts();

@@ -98,16 +98,28 @@ def wait_for_semantic_index(
         time.sleep(max(0.0, float(poll_seconds)))
 
 
+def _is_pdf(path: Path) -> bool:
+    """Reject HTML/error pages that were saved with a ``.pdf`` suffix."""
+
+    try:
+        with path.open("rb") as handle:
+            return handle.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _sample_pdfs(source: Path, limit: int) -> list[Path]:
     preferred = [
+        "光伏电站对区域小气候-植被-土壤特征影响的Meta分析_丁成翔.pdf",
+        "光伏电板对地表土壤颗粒及小气候的影响_赵鹏宇.pdf",
         "光伏电站建设对土壤和植被的影响_王涛.pdf",
         "西北地区光伏电站植被恢复模式研究综述_崔永琴.pdf",
         "生态脆弱区光伏电站植被修复策略_王大春.pdf",
         "浅谈光伏电站建设对荒漠地区治理意义——以甘肃为例_樊桢.pdf",
     ]
-    found = [source / name for name in preferred if (source / name).is_file()]
+    found = [source / name for name in preferred if (source / name).is_file() and _is_pdf(source / name)]
     for path in sorted(source.rglob("*.pdf"), key=lambda item: (item.stat().st_size, item.name)):
-        if path not in found:
+        if _is_pdf(path) and path not in found:
             found.append(path)
         if len(found) >= limit:
             break

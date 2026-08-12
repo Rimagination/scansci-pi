@@ -90,7 +90,16 @@ def is_substantive_evidence_hit(hit: dict[str, Any]) -> bool:
     text = " ".join(str(hit.get("text", "")).split()).strip()
     if not text:
         return False
-    section = " ".join(str(hit.get("section", "")).split()).strip()
+    section = " ".join(
+        str(value).strip()
+        for value in (
+            hit.get("section", ""),
+            hit.get("section_kind", ""),
+            hit.get("block_type", ""),
+            hit.get("block_type_name", ""),
+        )
+        if str(value).strip()
+    )
     context = " ".join(
         str(value)
         for value in (
@@ -100,7 +109,11 @@ def is_substantive_evidence_hit(hit: dict[str, Any]) -> bool:
         )
         if str(value).strip()
     )
-    if _REFERENCE_SECTION_RE.search(section):
+    if _REFERENCE_SECTION_RE.search(section) or re.search(
+        r"(?:^|\s)(?:references?|bibliography|works\s+cited|literature\s+cited|参考文献|引用文献)(?:\s|$)",
+        section,
+        re.IGNORECASE,
+    ):
         return False
     if re.search(r"\bhow\s+to\s+cite\b|\bjournal\s+item\b", context, re.IGNORECASE):
         return False
