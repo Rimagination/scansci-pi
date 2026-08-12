@@ -41,7 +41,11 @@ def plan_query(question: str, *, max_routes: int = 8, enable_hyde: bool = False)
         "rewrite_strategy": "deterministic_query_rewrite_plan_v1",
         "routes": routes,
         "query_variants": legacy_variants,
-        "followup_queries": _followup_queries(core_terms, answer_type=answer_type),
+        "followup_queries": _followup_queries(
+            core_terms,
+            answer_type=answer_type,
+            required_facets=required_facets,
+        ),
     }
 
 
@@ -341,9 +345,26 @@ def _required_facets(question: str, *, question_type: str) -> list[dict[str, obj
     ]
 
 
-def _followup_queries(core_terms: list[str], *, answer_type: str = "evidence") -> list[str]:
+def _followup_queries(
+    core_terms: list[str],
+    *,
+    answer_type: str = "evidence",
+    required_facets: list[dict[str, object]] | None = None,
+) -> list[str]:
+    # Multi-part questions need facet-specific recovery queries.  A broad
+    # query can satisfy the document/quote count while still omitting one
+    # requested dimension (for example, retrieving vegetation and soil but
+    # not microclimate).  Keep the legacy generic followups for all other
+    # questions, but put explicit facets first so the agent can spend its
+    # small followup budget on missing dimensions.
+    facet_queries = [
+        " ".join(str(facet.get("id", facet.get("label", ""))).split())
+        for facet in list(required_facets or [])
+        if isinstance(facet, dict)
+        and " ".join(str(facet.get("id", facet.get("label", ""))).split())
+    ]
     content_terms = [term for term in core_terms if term not in {"compare", "comparison", "after", "since"} and not term.isdigit()]
-    followups: list[str] = []
+    followups: list[str] = list(facet_queries)
     if content_terms:
         followups.append(" ".join(content_terms[:4]))
     if answer_type in {"named_list", "factoid"} and content_terms:

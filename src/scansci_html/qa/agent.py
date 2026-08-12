@@ -108,6 +108,7 @@ def answer_question(
     )
     hits = _expand_hits_with_neighbor_context(db_path, hits, query_plan=query_plan)
     hits = _prioritize_evidence_sections(hits, query_plan)
+    hits = _prioritize_required_facet_hits(hits, query_plan)
     quotes = _extract_quotes_for_provider(
         question,
         hits,
@@ -123,6 +124,13 @@ def answer_question(
         profile=str(adequacy_thresholds["profile"]),
     )
     adequacy = _apply_relation_grounding_gate(question, hits, adequacy)
+    # Check facet coverage before deciding whether the initial retrieval is
+    # sufficient.  Count/doc thresholds alone can pass while one explicit
+    # research dimension is absent, which previously prevented the slow path
+    # from issuing a targeted recovery query.
+    initial_evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
+    initial_evidence_table = build_evidence_table(quotes, initial_evidence_by_id)
+    facet_coverage = assess_facet_coverage(query_plan, initial_evidence_table)
     agentic_steps: list[dict[str, Any]] = [
         _agentic_trace_step(
             "initial_retrieval",
@@ -135,14 +143,29 @@ def answer_question(
         )
     ]
     slow_path_triggered = False
-    if not bool(adequacy.get("is_sufficient", False)):
+    if (
+        not bool(adequacy.get("is_sufficient", False))
+        or facet_coverage["status"] in {"partial", "none"}
+    ):
         followup_budget = max(0, int(max_followup_queries))
-        for followup_index, followup_query in enumerate(list(query_plan.get("followup_queries", []) or [])[:followup_budget], start=1):
+        executed_followups = 0
+        for followup_index, followup_query in enumerate(
+            list(query_plan.get("followup_queries", []) or []), start=1
+        ):
+            if executed_followups >= followup_budget:
+                break
             followup = str(followup_query).strip()
             if not followup or followup in retrieval_queries:
                 continue
+            # Skip a facet query that is already covered, leaving the budget
+            # for the first missing dimension instead of burning a request on
+            # a duplicate.
+            covered_facets = set(facet_coverage.get("covered_facets", []) or [])
+            if followup in covered_facets:
+                continue
             if model_retrieval_queries and not _followup_preserves_query_identity(followup, model_retrieval_queries):
                 continue
+            executed_followups += 1
             slow_path_triggered = True
             followup_route = {
                 "label": f"followup_{followup_index}",
@@ -169,6 +192,7 @@ def answer_question(
             hits = _merge_hits(hits, followup_hits)
             hits = _expand_hits_with_neighbor_context(db_path, hits, query_plan=query_plan)
             hits = _prioritize_evidence_sections(hits, query_plan)
+            hits = _prioritize_required_facet_hits(hits, query_plan)
             quotes = _extract_quotes_for_provider(
                 question,
                 hits,
@@ -184,6 +208,9 @@ def answer_question(
                 profile=str(adequacy_thresholds["profile"]),
             )
             adequacy = _apply_relation_grounding_gate(question, hits, adequacy)
+            evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
+            evidence_table = build_evidence_table(quotes, evidence_by_id)
+            facet_coverage = assess_facet_coverage(query_plan, evidence_table)
             agentic_steps.append(
                 _agentic_trace_step(
                     "followup_retrieval",
@@ -195,7 +222,10 @@ def answer_question(
                     reason=str(adequacy.get("followup_reason", "")) or "evidence_adequacy_followup",
                 )
             )
-            if bool(adequacy.get("is_sufficient", False)):
+            if bool(adequacy.get("is_sufficient", False)) and facet_coverage["status"] in {
+                "complete",
+                "not_applicable",
+            }:
                 break
     adequacy = _soften_adequacy_for_review(query_plan, adequacy)
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
@@ -669,6 +699,14 @@ def assess_facet_coverage(
             for term in list(raw.get("terms", []) or [])
             if " ".join(str(term).split()).strip()
         ]
+        # Scientific Chinese sources use near-synonyms for the same requested
+        # dimension (e.g. “微气候” is often written as “小气候”, and soil
+        # moisture as “土壤含水量”).  Keep the plan's canonical facet label
+        # stable while allowing transparent lexical coverage across those
+        # source variants.
+        for alias in _facet_aliases(facet_id):
+            if alias.casefold() not in terms:
+                terms.append(alias.casefold())
         normalized_facets.append({"id": facet_id, "terms": terms or [facet_id.casefold()]})
     if not normalized_facets:
         return {
@@ -757,6 +795,56 @@ def _facet_match_score(terms: list[str], evidence_text: str, *, strict: bool = F
                 matched_tokens += 1
         best = max(best, matched_tokens / len(term_tokens))
     return min(1.0, best)
+
+
+def _facet_aliases(facet_id: str) -> tuple[str, ...]:
+    return {
+        "微气候": ("小气候", "局地气候"),
+        "植被覆盖": ("植被盖度", "覆盖度"),
+        "土壤水分": ("土壤含水量", "土壤湿度"),
+    }.get(str(facet_id).strip(), ())
+
+
+def _prioritize_required_facet_hits(
+    hits: list[dict[str, Any]],
+    query_plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep at least one candidate for every explicit facet in the quote window.
+
+    Retrieval scores are useful for ranking but can crowd a multi-part question
+    with several near-duplicate climate excerpts.  This stable partition only
+    changes the bounded quote window; claim verification still operates on the
+    exact source text and IDs.
+    """
+
+    facets = [
+        str(facet.get("id", facet.get("label", ""))).strip()
+        for facet in list(query_plan.get("required_facets", []) or [])
+        if isinstance(facet, dict)
+    ]
+    if not facets or not hits:
+        return hits
+    selected_ids: set[str] = set()
+    prioritized: list[dict[str, Any]] = []
+    for facet in facets:
+        terms = [facet.casefold(), *[alias.casefold() for alias in _facet_aliases(facet)]]
+        for hit in hits:
+            evidence_id = str(hit.get("evidence_id", ""))
+            text = " ".join(
+                str(hit.get(field, ""))
+                for field in ("text", "claim_target", "context_quote_text")
+                if str(hit.get(field, "")).strip()
+            ).casefold()
+            if evidence_id and evidence_id not in selected_ids and any(term in text for term in terms):
+                prioritized.append(hit)
+                selected_ids.add(evidence_id)
+                break
+    prioritized.extend(
+        hit
+        for hit in hits
+        if str(hit.get("evidence_id", "")) not in selected_ids
+    )
+    return prioritized
 
 
 def _light_stem(token: str) -> str:

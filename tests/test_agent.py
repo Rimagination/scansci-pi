@@ -217,6 +217,21 @@ def test_plan_query_extracts_facets_from_chinese_consensus_and_conflict_question
         {"id": "土壤水分", "label": "土壤水分", "terms": ["土壤水分"]},
         {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
     ]
+    assert plan["followup_queries"][:3] == ["植被覆盖", "土壤水分", "微气候"]
+
+
+def test_facet_coverage_accepts_common_chinese_microclimate_synonym():
+    plan = {
+        "required_facets": [
+            {"id": "微气候", "label": "微气候", "terms": ["微气候"]},
+        ]
+    }
+    rows = [{"exact_quote": "光伏板遮阴改变了场区小气候和空气湿度。"}]
+
+    coverage = assess_facet_coverage(plan, rows)
+
+    assert coverage["status"] == "complete"
+    assert coverage["covered_facets"] == ["微气候"]
 
 
 def test_plan_query_extracts_clean_english_facets_after_effects_clause():

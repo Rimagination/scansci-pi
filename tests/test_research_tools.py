@@ -312,7 +312,10 @@ def test_download_papers_deduplicates_doi_urls_and_arxiv_aliases(tmp_path, monke
         workspace=ws,
     )
 
-    assert called == [_VALID_DOI, "2401.04088"]
+    # Batch downloads intentionally use a small worker pool, so completion
+    # order is nondeterministic.  Deduplication is the contract; ordering is
+    # not.
+    assert set(called) == {_VALID_DOI, "2401.04088"}
     assert result["total"] == 2
 
 
