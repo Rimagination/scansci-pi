@@ -8,9 +8,11 @@
 
 当前任务写在 `config/release-scope.json`：
 
+- `version`：当前唯一候选版本，必须与 `release-gate.json`、Python/Node 包和桌面构建默认值一致；
 - `p0_objective`：本轮唯一目标；
 - `acceptance`：可观察、可复核的验收项；
 - `non_goals`：本轮明确不做的内容。
+- `release_history`：只读冻结的旧 P0；v0.3.1 当前为 `superseded/frozen_unverified`，不等于 released。
 
 目标或验收项变化时必须修改该文件。门禁会记录它的 SHA256；修改后不得沿用旧构建的测试证据。
 
@@ -57,7 +59,7 @@
 它在源码门禁之后只构建一次，并继续检查包完整性、Windows 安装包、隔离目录中的安装→运行诊断→卸载、运行时诊断、正式 EXE `/api/health` 和桌面进程存活。每次输出到唯一目录：
 
 ```text
-releases\0.2.0+<build_id>\
+releases\<version>+<build_id>\
   ScanSci\ScanSci.exe
   update\ScanSci-<version>-windows-x64.zip
   update\ScanSci-<version>-windows-x64.zip.blockmap
@@ -70,6 +72,30 @@ releases\0.2.0+<build_id>\
 ```
 
 正式门禁强制 clean build；直接调用 `build_desktop.ps1` 的开发构建默认保留以 `build_id` 隔离的 PyInstaller 缓存。不同构建不共享 `dist`、workpath、specpath 或 metadata 目录。
+
+### Pi capability report v2 是内层强制证据
+
+`release-report.json` 是发布编排器的外层报告；Pi 的内层能力证据是 `report_kind=scansci.pi-capabilities`、`schema_version=2` 的 JSON。外层报告只能在解析、重算并验证内层内容后晋级，文件“存在”不算通过。
+
+targeted/source 的 Pi 步骤固定生成：
+
+```text
+<diagnostics>/pi-targeted-junit.xml
+<diagnostics>/pi-capability-matrix.json
+<diagnostics>/pi-capability-workspace.sqlite
+<diagnostics>/pi-capabilities-deterministic.json
+```
+
+real gate 另生成：
+
+```text
+<diagnostics>/pi-capability-real-workspace.sqlite
+<diagnostics>/pi-capabilities-real.json
+```
+
+内层报告必须包含 `protocol_version=7`、SDK 版本、`source_sha256`、bundle/matrix 的 path+SHA256+bytes、`fallback_count = 0`、run manifests、精确 10 轴、provider 状态与 mode-specific evidence。deterministic 报告证明当前 bundle 的真实 sidecar 工具循环；provider-real 还必须证明 10 次动态 schema 序列化和 10 个 image+tool 任务。无 provider 凭据时 real 状态只能为 `not_run` 并阻塞公开发布，不能用 deterministic 报告顶替。
+
+对应命令由 `config/release-gate.json` 固定：`npm.cmd run build:pi-runtime`、`scripts/verify_pi_capabilities.py --validate-matrix-only`、`--mode deterministic` 和 real gate 的 `--mode real`。任何 direct fallback 或隐式 OCR/Host 交付都不算 Pi 成功；`fallback_count > 0` 直接拒绝。
 
 ## 3. EXE 人工验收不能被自动测试替代
 
@@ -90,7 +116,7 @@ visual-evidence\visual-evidence.json
 ```powershell
 .\scripts\release_gate.ps1 `
   -Profile release `
-  -ResumeReport "<legacy-repo>\releases\0.2.0+<build_id>\release-report.json"
+  -ResumeReport "<repo>\releases\<version>+<build_id>\release-report.json"
 ```
 
 晋级仅在 `contract_sha256`、`scope_sha256` 和发布相关源码指纹 `source_sha256` 均未变化时成立；任一代码、安装器或契约发生变化，门禁拒绝复用。续跑会复用已通过步骤和同一个 EXE，不再重新跑模型、知识库或 20 分钟打包。只有 `release-report.json` 最终为 `passed`，才可以说“已交付候选”。
@@ -145,7 +171,7 @@ visual-evidence\visual-evidence.json
 ```powershell
 .\scripts\release_gate.ps1 `
   -Profile beta `
-  -PromoteReport ".scansci-diagnostics\release-gates\0.2.0+<source-build-id>\release-report.json" `
+  -PromoteReport ".scansci-diagnostics\release-gates\<version>+<source-build-id>\release-report.json" `
   -BuildId "beta-20260729"
 ```
 
@@ -154,8 +180,8 @@ visual-evidence\visual-evidence.json
 交付目录为：
 
 ```text
-internal-beta-releases\0.2.0+<build-id>\
-  installer\ScanSci-0.2.0-windows-x64-setup.exe
+internal-beta-releases\<version>+<build-id>\
+  installer\ScanSci-<version>-windows-x64-setup.exe
   beta-delivery\SHA256SUMS.txt
   beta-delivery\BETA-README.zh-CN.md
   beta-delivery\BETA-FEEDBACK-TEMPLATE.md

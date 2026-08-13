@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from scansci_html.app_settings import load_settings, save_settings
-from scansci_html.llm import managed_gateway_session
+from scansci_html.pi_agent import PiAgentClient
 from scansci_html.literature_review import (
     _atomic_review_claims,
     _balanced_review_queries,
@@ -717,8 +717,8 @@ def test_managed_writing_client_disables_hidden_reasoning_for_bounded_workflows(
 
     client = runtime._writing_chat_client()
 
-    assert client.thinking_mode == "disabled"
-    assert client.session is managed_gateway_session()
+    assert client.thinking_mode == "off"
+    assert client.session is None
     assert runtime._writing_chat_client() is client
 
 
@@ -734,7 +734,139 @@ def test_siliconflow_writing_client_disables_hidden_reasoning_for_review(tmp_pat
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
     client = runtime._writing_chat_client()
 
-    assert client.thinking_mode == "disabled"
+    assert client.thinking_mode == "off"
+
+@pytest.mark.parametrize(
+    ("factory_name", "role"),
+    [
+        ("_writing_chat_client", "writing"),
+        ("_slides_chat_client", "slides"),
+    ],
+)
+def test_durable_role_json_clients_use_independent_empty_lease_pi_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+    role: str,
+):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    observed: list[dict[str, object]] = []
+
+    def forbidden_direct_client(*_args, **_kwargs):
+        raise AssertionError("durable role model calls must not bypass Pi")
+
+    def fake_pi_stream(self, **kwargs):
+        del self
+        observed.append(dict(kwargs))
+        yield {"type": "delta", "content": '{"role":"' + role + '"}'}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 5}}}
+
+    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_client)
+    monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
+
+    client = getattr(runtime, factory_name)()
+    result = client.complete_json(
+        [
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "Build the bounded workflow result."},
+        ],
+        schema_name=f"{role}_adapter_fixture",
+    )
+
+    assert result == {"role": role}
+    assert len(observed) == 1
+    request = observed[0]
+    assert request["session_id"] is None
+    assert request["task_mode"] == "model-json"
+    assert request["task_contract"]["schema_version"] == "scansci.task-contract.v2"
+    assert request["task_contract"]["allowed_tools"] == []
+    assert request["task_contract"]["initial_tools"] == []
+    assert request["task_contract"]["allowed_mcp_servers"] == []
+    assert f"role: {role}" in request["messages"][0]["content"].lower()
+
+
+def test_managed_writing_primary_and_fallback_models_both_remain_inside_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    settings = load_settings(runtime.workspace)
+    settings["active_model"] = {"provider_id": "managed-fixture", "model_id": "primary-model"}
+    settings["providers"] = [{
+        "id": "managed-fixture",
+        "name": "Managed fixture",
+        "kind": "openai-compatible",
+        "base_url": "https://fixture.invalid/v1",
+        "enabled": True,
+        "auth_mode": "managed",
+        "models": [
+            {"id": "primary-model", "name": "Primary"},
+            {"id": "fallback-model", "name": "Fallback"},
+        ],
+    }]
+    settings["model_roles"]["writing"] = "provider:managed-fixture:primary-model"
+    observed_models: list[str] = []
+
+    monkeypatch.setattr("scansci_html.research_agent.load_settings", lambda _workspace: settings)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.build_chat_json_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("primary and fallback must both use Pi")
+        ),
+    )
+
+    def fake_pi_stream(self, **kwargs):
+        del self
+        model = str(kwargs["model_id"])
+        observed_models.append(model)
+        if model == "primary-model":
+            raise RuntimeError("primary unavailable")
+        yield {"type": "delta", "content": '{"model":"fallback-model"}'}
+        yield {"type": "done", "stats": {}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
+
+    result = runtime._writing_chat_client().complete_json(
+        [{"role": "user", "content": "Return the review plan."}],
+        schema_name="writing_fallback_fixture",
+    )
+
+    assert result == {"model": "fallback-model"}
+    assert observed_models == ["primary-model", "fallback-model"]
+
+
+def test_pi_role_json_adapter_rejects_non_json_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    def fake_pi_stream(self, **_kwargs):
+        del self
+        yield {"type": "delta", "content": "This is not JSON."}
+        yield {"type": "done", "stats": {}}
+
+    monkeypatch.setattr(
+        "scansci_html.research_agent.build_chat_json_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("strict JSON validation must happen after a Pi turn")
+        ),
+    )
+    monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
+    with pytest.raises(ValueError):
+        runtime._slides_chat_client().complete_json(
+            [{"role": "user", "content": "Return a deck plan."}],
+            schema_name="slides_strict_json_fixture",
+        )
 
 
 def test_review_planning_keeps_an_evidence_plan_when_gateway_is_rate_limited():

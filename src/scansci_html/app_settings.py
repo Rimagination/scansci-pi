@@ -26,6 +26,9 @@ _CONFIG_NAME = ".scansci-notebook.json"
 _SERVICE_NAME = "scansci-html-notebook"
 _SAFE_ID = re.compile(r"[^a-z0-9._-]+")
 _MAX_ITEMS = 128
+_MAX_MCP_TOOL_POLICIES = 64
+_MAX_MCP_TOOL_NAME_LENGTH = 160
+_MCP_TOOL_EFFECTS = frozenset({"read", "reversible", "write", "high"})
 _MANAGED_GATEWAY_BASE_URL = "https://scansci-glm-gateway.932196440.workers.dev/v1"
 _MANAGED_PROVIDER_ID = "scansci-managed"
 _MANAGED_PROVIDER_NAME = "ScanSci"
@@ -861,7 +864,17 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
         )
 
     def capabilities_for(item: dict[str, Any]) -> list[str]:
-        capabilities = ["reasoning", "coding"]
+        # Preserve every capability discovered from the local snapshot.  A
+        # vision-language model is usually also a conversation model; do not
+        # collapse it to a single exclusive ``kind`` when building the local
+        # provider catalog.
+        discovered = item.get("capabilities") if isinstance(item.get("capabilities"), list) else []
+        capabilities = [
+            str(value).strip().lower()
+            for value in discovered
+            if str(value).strip().lower() in {"chat", "vision", "audio", "embedding", "reranking"}
+        ]
+        capabilities.extend(["reasoning", "coding"])
         marker = " ".join(
             [
                 str(item.get("id", "")),
@@ -872,7 +885,7 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
         architecture = str(item.get("architecture", "")).casefold()
         if str(item.get("kind", "")).casefold() == "vision" or "minicpmv" in marker or "vision" in marker or "image" in architecture:
             capabilities.append("vision")
-        return capabilities
+        return list(dict.fromkeys(capabilities))
 
     models = [
         {
@@ -1304,6 +1317,72 @@ def _normalize_models(value: object, *, fallback: str) -> list[dict[str, Any]]:
     }]
 
 
+def _mcp_tool_name(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    name = value.strip()
+    if not name or len(name) > _MAX_MCP_TOOL_NAME_LENGTH:
+        return ""
+    if any(not character.isprintable() or character.isspace() for character in name):
+        return ""
+    return name
+
+
+def _mcp_tool_effect(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    effect = value.strip().lower()
+    return effect if effect in _MCP_TOOL_EFFECTS else ""
+
+
+def _normalize_mcp_tool_effects(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    effects: dict[str, str] = {}
+    for raw_name, raw_effect in list(value.items())[:_MAX_ITEMS]:
+        name = _mcp_tool_name(raw_name)
+        effect = _mcp_tool_effect(raw_effect)
+        if name and effect and name not in effects:
+            effects[name] = effect
+        if len(effects) >= _MAX_MCP_TOOL_POLICIES:
+            break
+    return effects
+
+
+def _normalize_mcp_tool_policies(value: object) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        source: list[object] = [
+            {**raw_policy, "name": raw_name}
+            if isinstance(raw_policy, dict)
+            else {"name": raw_name, "effect": raw_policy}
+            for raw_name, raw_policy in list(value.items())[:_MAX_ITEMS]
+        ]
+    elif isinstance(value, list):
+        source = value[:_MAX_ITEMS]
+    else:
+        return []
+    policies: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for raw_policy in source:
+        if not isinstance(raw_policy, dict):
+            continue
+        name = _mcp_tool_name(raw_policy.get("name") or raw_policy.get("tool"))
+        effect = _mcp_tool_effect(raw_policy.get("effect"))
+        if not name or not effect or name in used:
+            continue
+        policy: dict[str, Any] = {"name": name, "effect": effect}
+        if isinstance(raw_policy.get("idempotent"), bool):
+            policy["idempotent"] = raw_policy["idempotent"]
+        freshness = str(raw_policy.get("freshness", "") or "").strip().lower()
+        if freshness in {"volatile", "turn", "run"}:
+            policy["freshness"] = freshness
+        policies.append(policy)
+        used.add(name)
+        if len(policies) >= _MAX_MCP_TOOL_POLICIES:
+            break
+    return policies
+
+
 def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
     source = value if isinstance(value, list) else []
     rows: list[dict[str, Any]] = []
@@ -1365,6 +1444,13 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
             # Read-only is the product default.  A saved MCP cannot expose
             # write-like tools to Pi until the user explicitly opts in.
             row["allow_write"] = bool(item.get("allow_write", False))
+            # Tool effect classifications are host-owned policy.  Remote MCP
+            # annotations are advisory and must never manufacture read access.
+            row["tool_effects"] = _normalize_mcp_tool_effects(item.get("tool_effects"))
+            row["tool_policies"] = _normalize_mcp_tool_policies(item.get("tool_policies"))
+            call_timeout = item.get("call_timeout_ms")
+            if isinstance(call_timeout, (int, float)) and not isinstance(call_timeout, bool):
+                row["call_timeout_ms"] = max(250, min(120_000, int(call_timeout)))
             # Deferred servers expose a compact search/call surface and only
             # start the MCP process when the agent actually needs a tool.
             # Keep direct mode as the migration-safe default for existing

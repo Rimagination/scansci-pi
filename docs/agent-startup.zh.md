@@ -26,6 +26,8 @@ ScanSci 会由多个 agent 并行维护。每个 agent 都可能只负责一个�
 - 如果会改变，先更新设计文档/计划，再实现代码；如果只是修复实现，则保持现有契约不变；
 - 为新行为写失败测试，至少覆盖旧清单兼容、失败回退和用户数据不受影响的路径。
 
+如果任务触及 Pi，启动时还要读取 `bench/pi_capability_tasks.json`、`config/release-report.schema.json` 和 `config/release-gate.json`，确认当前是 `protocol v7`、TaskContract v2、10 轴能力矩阵以及 report schema v2；不能从旧会话、旧文档或已生成 bundle 推断当前协议。
+
 ## 当前产品策略速查
 
 | 主题 | 当前决定 | agent 不应自行改成 |
@@ -63,5 +65,19 @@ ScanSci 会由多个 agent 并行维护。每个 agent 都可能只负责一个�
 是否改变了 P0、清单字段、默认运行时或用户数据位置：是/否
 下一 agent 必须先看：
 ```
+
+Pi 任务在上述模板后追加：
+
+```text
+Pi protocol / SDK：
+10 轴 matrix（routing/dynamic_tools/parallelism/long_context/skills/subagents/mcp/multimodal/safety/observability）：
+fallback_count / degradation / not_run：
+验证命令：
+capability report / release-report / run manifests：
+source_sha256 / matrix.sha256 / bundle.sha256：
+未完成轴与 provider-real、签名、打包或人工验收 blocker：
+```
+
+`fallback_count > 0`、缺失 `bundle.sha256`、哈希不绑定当前源码或 provider 轴为 `not_run` 时，必须如实写出；direct fallback 和显式 degradation 都不等价于 Pi 轴通过。
 
 如果发现新的长期决策，必须把它写入根目录 `AGENTS.md` 或相应 `docs/`，并在交接中链接到具体文件；不能只说“之前已经讨论过”。

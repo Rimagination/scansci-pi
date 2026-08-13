@@ -8,11 +8,49 @@ import pytest
 
 import scansci_html.research_agent as research_agent
 from scansci_html.deep_research_evidence import _evidence_level, build_task_fulltext_evidence
+from scansci_html.context_policy import build_token_envelope
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.pi_agent import PiAgentRunError
 from scansci_html.research_agent import ResearchAgentRuntime, _is_restart_request
-from scansci_html.research_runs import ResearchRunStore, StageSpec
+from scansci_html.research_runs import RESEARCH_SCHEMA_NAME, RESEARCH_SCHEMA_VERSION, ResearchRunStore, StageSpec
 from scansci_html.workspace import initialize_notebook, sync_sources_from_evidence_store
+
+
+def test_research_store_upgrades_a_schema_v3_workspace_to_v4_without_rebuilding_data(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    ResearchRunStore(workspace)
+    connection = sqlite3.connect(workspace)
+    try:
+        connection.execute(
+            "update schema_meta set schema_version = 3 where schema_name = ?",
+            (RESEARCH_SCHEMA_NAME,),
+        )
+        connection.execute(
+            "delete from schema_migrations where schema_name = ? and version = 4",
+            (RESEARCH_SCHEMA_NAME,),
+        )
+        connection.execute("drop table research_subagent_children")
+        connection.execute("drop table research_subagent_batches")
+        connection.commit()
+    finally:
+        connection.close()
+
+    ResearchRunStore(workspace)
+    connection = sqlite3.connect(workspace)
+    try:
+        version = connection.execute(
+            "select schema_version from schema_meta where schema_name = ?",
+            (RESEARCH_SCHEMA_NAME,),
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type = 'table'")
+        }
+    finally:
+        connection.close()
+
+    assert version == RESEARCH_SCHEMA_VERSION == 4
+    assert {"research_subagent_batches", "research_subagent_children"} <= tables
 
 
 def test_local_evidence_preparation_runs_in_background_and_reports_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -230,15 +268,22 @@ def test_direct_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path,
     )
     attempted_models: list[str] = []
 
-    def fake_stream(*_args, **kwargs):
-        model = str(kwargs["model"])
+    def fake_pi_events(chat_request, **_kwargs):
+        model = str(chat_request.model_id)
         attempted_models.append(model)
         if model == "glm-4.7-flash":
             raise RuntimeError("HTTP 429 provider_rate_limited")
         yield {"type": "delta", "content": "已由备用模型完成回答。"}
         yield {"type": "done", "usage": {"total_tokens": 7}, "truncated": False}
 
-    monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
+    monkeypatch.setattr(
+        research_agent,
+        "stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an approved managed backup must remain inside Pi")
+        ),
+    )
     monkeypatch.setattr(
         runtime,
         "_managed_fallback_chat_request",
@@ -272,13 +317,20 @@ def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: P
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
-    attempted_models: list[str] = []
+    pi_models: list[str] = []
+    compatibility_models: list[str] = []
+
+    def fake_pi_events(chat_request, **_kwargs):
+        pi_models.append(str(chat_request.model_id))
+        raise RuntimeError("invalid request: unsupported response schema")
+        yield  # pragma: no cover - generator protocol
 
     def fake_stream(*_args, **kwargs):
-        attempted_models.append(str(kwargs["model"]))
+        compatibility_models.append(str(kwargs["model"]))
         raise RuntimeError("invalid request: unsupported response schema")
-        yield  # pragma: no cover - keep this a generator for the streaming API
+        yield  # pragma: no cover - streaming compatibility protocol
 
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
     monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
 
     events = list(runtime.chat_stream({
@@ -287,7 +339,8 @@ def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: P
         "messages": [{"role": "user", "content": "用一句话解释显著性水平。"}],
     }))
 
-    assert attempted_models == ["glm-4.7-flash"]
+    assert pi_models == ["glm-4.7-flash"]
+    assert compatibility_models == ["glm-4.7-flash"]
     assert events[-1]["type"] == "RUN_ERROR"
 
 
@@ -296,13 +349,20 @@ def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
-    attempted_models: list[str] = []
+    pi_models: list[str] = []
+    compatibility_models: list[str] = []
+
+    def fake_pi_events(chat_request, **_kwargs):
+        pi_models.append(str(chat_request.model_id))
+        raise RuntimeError("HTTP 429 provider_rate_limited")
+        yield  # pragma: no cover - generator protocol
 
     def fake_stream(*_args, **kwargs):
-        attempted_models.append(str(kwargs["model"]))
+        compatibility_models.append(str(kwargs["model"]))
         raise RuntimeError("HTTP 429 provider_rate_limited")
-        yield  # pragma: no cover - keep this a generator for the streaming API
+        yield  # pragma: no cover - streaming compatibility protocol
 
+    monkeypatch.setattr(runtime, "_pi_model_events", fake_pi_events)
     monkeypatch.setattr(research_agent, "stream_chat_text", fake_stream)
 
     events = list(runtime.chat_stream({
@@ -313,7 +373,8 @@ def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path
 
     # Qwen is a reachable standby route, but it cannot become a user-visible
     # automatic answer until it passes the same structured quality contract.
-    assert attempted_models == ["glm-4.7-flash"]
+    assert pi_models == ["glm-4.7-flash"]
+    assert compatibility_models == ["glm-4.7-flash"]
     assert events[-1]["type"] == "RUN_ERROR"
 
 
@@ -645,7 +706,10 @@ def test_scientific_subagents_are_bounded_and_share_parent_evidence_scope(tmp_pa
         assert child["metadata"]["subagent"]["output_schema"]["schema_version"] == "scansci.subagent-result.v1"
 
 
-def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_path: Path):
+def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(
+    tmp_path: Path,
+    monkeypatch,
+):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     parent = runtime.store.create_run(
         notebook_id="library",
@@ -654,18 +718,11 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
         input_payload={"question": "Compare evidence"},
         stages=_stages(),
     )
-    child = runtime.store.create_run(
-        notebook_id="library",
-        workflow_type="ask",
-        title="Scout",
-        input_payload={"question": "Scout"},
-        stages=[StageSpec("deliver", "Deliver", "delivery")],
-        metadata={
-            "runtime": "scansci-scientific-subagent.v1",
-            "subagent": {"role": "literature_scout", "label": "Scout"},
-        },
-        parent_run_id=parent["run_id"],
-    )
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    child = runtime.delegate_scientific_agents(
+        parent["run_id"],
+        {"roles": ["literature_scout"], "idempotency_key": "valid-handoff"},
+    )["children"][0]
     artifact = runtime.store.create_artifact(
         child["run_id"],
         artifact_type="evidence_answer",
@@ -673,9 +730,10 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
         summary="JSON handoff",
         payload={
             "reader_answer": {
-                "text": '{"role":"literature_scout","findings":["candidate paper"],"evidence_uris":["scansci://paper/10.1%2Fexample"],"uncertainties":[],"recommended_next_action":"verify DOI"}'
+                "text": '{"role":"literature_scout","findings":["candidate paper"],"evidence_uris":["scansci://evidence/doc-1/ev-1"],"uncertainties":[],"recommended_next_action":"verify DOI"}'
             }
         },
+        evidence_links=[{"doc_id": "doc-1", "evidence_id": "ev-1"}],
     )
     runtime.store.complete_run(child["run_id"], output_artifact_id=artifact["artifact_id"])
 
@@ -685,7 +743,7 @@ def test_scientific_agent_collection_only_aggregates_valid_json_handoffs(tmp_pat
     assert collected["completed"] == 1
     assert collected["children"][0]["handoff_status"] == "valid"
     assert collected["aggregated_findings"][0]["handoff"]["role"] == "literature_scout"
-    assert collected["evidence_uris"] == ["scansci://paper/10.1%2Fexample"]
+    assert collected["evidence_uris"] == ["scansci://evidence/doc-1/ev-1"]
 
 
 def test_advisor_action_forks_an_evidence_safe_follow_up(tmp_path: Path, monkeypatch) -> None:
@@ -1373,7 +1431,10 @@ def test_deep_research_is_standalone_and_builds_external_abstract_evidence(tmp_p
 
     assert run["notebook_id"] == ""
     assert run["task_contract"]["task_mode"] == "web"
-    assert "kb_search" not in run["task_contract"]["allowed_tools"]
+    # The full ready read-only catalog remains discoverable; the product mode
+    # only controls initial hints and this standalone run carries no notebook.
+    assert "kb_search" in run["task_contract"]["allowed_tools"]
+    assert "kb_search" not in run["task_contract"]["initial_tools"]
 
     plan = {
         "title": "Scientific RAG evaluation",
@@ -2570,12 +2631,25 @@ def test_long_follow_up_history_is_compacted_without_losing_recent_turns():
         {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn-{index} " + "x" * 6000}
         for index in range(30)
     ]
-    compacted = ResearchAgentRuntime._follow_up_messages(messages, max_recent=10, max_chars=12_000)
-    assert compacted[0]["role"] == "system"
-    assert "turn-0" in compacted[0]["content"]
-    assert "turn-29" in compacted[-1]["content"]
-    assert len(compacted) == 11
-    assert sum(len(item["content"]) for item in compacted) <= 12_000
+    messages.append({"role": "user", "content": "turn-30 FINAL-SENTINEL"})
+    normalized = ResearchAgentRuntime._follow_up_messages(messages, max_recent=10, max_chars=12_000)
+    descriptor = research_agent.descriptor_from_model_record(
+        provider_id="fixture",
+        provider_kind="openai-compatible",
+        model_id="fixture",
+        model_record={"id": "fixture", "context_window": "32K", "capabilities": ["reasoning"]},
+    )
+    compacted, report = build_token_envelope(normalized, descriptor=descriptor)
+
+    assert "FINAL-SENTINEL" in compacted[-1]["content"]
+    assert report.estimated_tokens <= descriptor.provider_input_tokens
+    assert report.omitted_messages > 0
+    # Optional dialogue is admitted as whole user/assistant turns.
+    optional_roles = [item["role"] for item in compacted[:-1]]
+    assert all(
+        optional_roles[index : index + 2] == ["user", "assistant"]
+        for index in range(0, len(optional_roles), 2)
+    )
 
 
 def test_restart_request_restarts_terminal_run_in_place_without_model_call(tmp_path: Path, monkeypatch):
@@ -2713,6 +2787,31 @@ def test_research_run_follow_ups_reuse_the_same_persistent_pi_session(tmp_path: 
         "user",
         "assistant",
     ]
+
+
+def test_follow_up_final_user_turn_is_not_rejected_by_a_fixed_character_limit(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="ask",
+        title="Long model-aware follow-up",
+        input_payload={"question": "Start"},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    sentinel = "FINAL-LONG-FOLLOW-UP-SENTINEL"
+    question = sentinel + ("x" * 12_500)
+    observed: dict[str, object] = {}
+
+    def fake_complete(request, **_kwargs):
+        observed["messages"] = request.messages
+        return "accepted", {}, {"harness": "pi-agent-sdk", "tool_calls": []}
+
+    monkeypatch.setattr(runtime, "_complete_with_pi", fake_complete)
+
+    result = runtime.continue_run_conversation(run["run_id"], {"content": question})
+
+    assert result["message"]["content"] == "accepted"
+    assert sentinel in str(observed["messages"][-1]["content"])
 
 
 @pytest.mark.parametrize(

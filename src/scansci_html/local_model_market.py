@@ -256,6 +256,46 @@ def _kind(identifier: str, config: dict[str, Any]) -> str:
     return "chat"
 
 
+def _capabilities(identifier: str, config: dict[str, Any]) -> list[str]:
+    """Return all capabilities a snapshot may provide, not one exclusive kind.
+
+    ``kind`` remains as a compatibility/display primary label, but a
+    generative vision checkpoint is also a conversation model and future
+    multimodal checkpoints may expose more than one route.  Keep the full
+    capability set on the installed-model record so settings and the Agent
+    can filter by an entry point without hiding other supported uses.
+    """
+
+    value = f"{identifier} {config.get('architectures', '')} {config.get('model_type', '')}".lower()
+    capabilities: list[str] = []
+    is_reranker = any(token in value for token in ("rerank", "reranker"))
+    if is_reranker:
+        capabilities.append("reranking")
+    if any(token in value for token in ("embedding", "embed", "gte", "e5-")) or (
+        "bge" in value and not is_reranker
+    ):
+        capabilities.append("embedding")
+    if any(token in value for token in ("whisper", "asr", "speech")) or isinstance(config.get("audio_config"), dict):
+        capabilities.append("audio")
+    is_vision = (
+        any(token in value for token in ("vision", "-vl", "llava", "image", "minicpmv", "minicpm-v"))
+        or isinstance(config.get("vision_config"), dict)
+    )
+    if is_vision:
+        capabilities.append("vision")
+    architectures = config.get("architectures")
+    architecture_text = " ".join(str(item) for item in architectures) if isinstance(architectures, list) else str(architectures or "")
+    is_generative = any(
+        marker in architecture_text.casefold()
+        for marker in ("forcausallm", "forconditionalgeneration")
+    )
+    if is_generative and not any(item in capabilities for item in ("embedding", "reranking", "audio")):
+        capabilities.insert(0, "chat")
+    if not capabilities:
+        capabilities.append("chat" if is_generative else "unknown")
+    return list(dict.fromkeys(capabilities))
+
+
 def _audio_runtime_info(identifier: str, config: dict[str, Any]) -> dict[str, Any]:
     """Describe whether the snapshot matches ScanSci's in-process ASR backend.
 
@@ -308,6 +348,7 @@ def installed_models() -> list[dict[str, Any]]:
             "size_bytes": _bytes(snapshot),
             "ready": bool(weights),
             "kind": kind,
+            "capabilities": _capabilities(repo_id, config),
             "architecture": ", ".join(config.get("architectures", [])[:2]) if isinstance(config.get("architectures"), list) else "",
             "model_type": str(config.get("model_type", "")),
             "format": "gguf" if any(item.suffix.lower() == ".gguf" for item in weights) else "transformers",

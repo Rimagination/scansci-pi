@@ -1,7 +1,7 @@
 # ScanSci-Pi 迁移实施计划
 
 日期：2026-07-21  
-状态：Runnable MVP（2026-07-21）  
+状态：v0.4.0 capability contract（2026-08-10）；下文 Phase 0–6 保留为迁移历史
 源项目：`D:\scansci-html`  
 目标项目：`F:\AI\scansci-pi`
 
@@ -14,7 +14,17 @@ ScanSci-Pi 不是对现有 ScanSci 的完整重写，也不是 Pi 终端界面�
 3. 由 Python 主进程持有业务真相；Pi 运行在 Node.js sidecar 中，通过版本化 JSONL 协议通信。
 4. 先完成最小研究闭环和同模型评测，达到切换门槛后才迁移更多工具或考虑替代原项目。
 
-当前实现进度：现有桌面 UI 已复用；Pi SDK sidecar、JSONL 双向工具回调、Python 白名单 dispatcher、独立桌面数据目录、Node runtime 捆绑和 `scanscipi.exe` 构建链已经落地。用户配置的 OpenAI/Anthropic 兼容文本模型已走 Pi；托管网关、视觉消息和本地引擎保留明确标识的兼容传输。仍需在真实生产模型上完成 A/B 质量评测和长会话取消/恢复；本轮发布契约暂不把代码签名作为阻塞条件。
+当前实现进度：现有桌面 UI、Pi SDK sidecar、protocol v7 双向工具回调、Python fail-closed dispatcher、模型感知上下文、动态工具、并行 hooks/取消、渐进 Skill、只读科研子代理、延迟 MCP、多模态和完整 session 控制已经落地。所有模型介导文本 Pi-first；托管网关、本地引擎或视觉能力不支持时必须产生显式 degradation/not_run，direct fallback 不计 Pi 成功。v0.4.0 的正式发布仍需 Task10 的完整回归、provider-real、打包/人工验收等相应证据；代码签名仍非本轮自动阻塞项。
+
+### v0.4.0 当前契约（取代旧阶段性限制）
+
+- TaskContract v2 只写、旧版兼容读一个窗口；capability lease v1 把 `allowed_tools` 与 `initial_tools` 分开。
+- protocol v7 严格协商 required features，所有 request/run/generation、tool call/result 和控制 ack fail-closed。
+- `research_runs schema v4` additive migration 保留现有 session、stage、tool、artifact；model-runtime、subagent-result、mcp-effect 各使用 v1 schema。
+- Pi 自主规划，但 Host 保留租约、审批、effect、Evidence/Workspace、引用验证、Artifact 和 UI 事件权威。
+- Skills 只改变指令；P0 MCP 路径延迟连接且未知 effect 拒绝（旧 direct/eager 仅兼容且不计该轴证据）；子代理最多 3 个、严格只读、无 MCP/write/递归；多模态只接受受限内存内容。
+- session 支持 queue、abort-compaction、close/load、clone/fork；语义是 `abort + resume`，不是 suspend。
+- `config/release-scope.json` 的 10 个 acceptance ID 对齐 Task8 10 轴和 report schema v2；“100%”不承诺无限资源、任意 shell/文件系统/extension 或真实 provider 在缺凭据时通过。
 
 最小闭环定义：
 
@@ -43,7 +53,7 @@ ScanSci-Pi 不是对现有 ScanSci 的完整重写，也不是 Pi 终端界面�
 | LangChain 模型适配 | 最终移除 | Pi 达到切换门槛后再删除依赖 |
 | Pi TUI | 不采用 | ScanSci 有自己的桌面交互界面 |
 | 通用文件和 Shell 工具 | 禁用 | 产品运行时不暴露主机文件系统和任意命令 |
-| 多 Agent、MCP、PPT | 暂缓 | 不阻塞第一条闭环 |
+| 科研子 Agent、MCP、PPT | 子 Agent/MCP 已进入 v0.4.0；PPT 仍走 Host 产物工具 | 子 Agent 不得继承写/MCP/递归权限；MCP 未知 effect 拒绝 |
 
 ## 3. 现有代码迁移映射
 
@@ -119,7 +129,7 @@ flowchart LR
 - 不让 Pi 直接修改数据库。
 - 不让 Pi 直接写最终研究产物文件。
 - 不默认启用 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls`。
-- 不在第一阶段启用第三方扩展、MCP 或子 Agent。
+- 不启用任意第三方 extension；v0.4.0 的 MCP capability 路径使用 Host 授权的 deferred 边界，旧 direct/eager 路径只作显式兼容并逐次授权、不计本轴证据；科研子 Agent 只能使用 Host 授权的只读边界。
 
 ## 5. 集成方式
 
@@ -135,13 +145,13 @@ flowchart LR
 
 不直接使用 `pi --mode rpc` 作为最终架构的原因：ScanSci 需要双向工具回调、业务级 run_id、细粒度事件映射和确定性的进程监管。可以复用 Pi RPC 的设计思想，但协议应由 ScanSci-Pi 自己版本化。
 
-### 5.2 协议最小字段
+### 5.2 protocol v7 字段与兼容
 
 每条消息一行 JSON：
 
 ```json
 {
-  "protocol_version": "1.0",
+  "protocol_version": 7,
   "type": "run.start",
   "request_id": "req_...",
   "run_id": "run_...",
@@ -178,10 +188,12 @@ sidecar → Python：
 - 未知消息类型返回结构化错误，不能静默忽略。
 - stdout 禁止混入普通日志。
 - 单条消息和工具结果设置大小上限；大结果落入 Python 管理的临时 Artifact，只传引用。
-- 第一阶段每个 sidecar 只允许一个活跃 run，先避免并发复用问题。
+- sidecar 可维持多个隔离 session；每条消息必须绑定当前 request/run/generation，队列、控制 ack 和 late result 不能跨 run/session。
 - 取消后先调用 `session.abort()`；超过宽限时间仍未退出则由 Python 终止子进程。
 
-## 6. 第一阶段工具面
+旧 protocol/TaskContract/session 文件只作为兼容输入；当前运行统一迁移到 protocol v7、TaskContract v2 和 research_runs schema v4，不能用兼容读取绕过 feature negotiation 或权限检查。
+
+## 6. 历史第一阶段工具面与当前扩展
 
 只开放完成研究简报闭环所需工具：
 
@@ -203,6 +215,8 @@ sidecar → Python：
 - Python 使用现有确定性验证链做一次安全回退；
 - 回退仍失败则标记 run 失败；
 - 不把模型自由文本保存为“已验证研究简报”。
+
+上述四工具是历史最小闭环，不再代表 v0.4.0 全部活动能力。当前目录由 contract-authorized builtins、渐进 Skills、P0 deferred MCP 和只读科学子代理按需发现，同时保留显式旧 direct MCP 兼容面；搜索、激活、调用都重验租约，effectful 工具形成顺序屏障。Host 的终止和证据门槛保持不变。
 
 ## 7. 建议项目结构
 

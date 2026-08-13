@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 
-THINKING_LEVELS = frozenset({"auto", "low", "medium", "high"})
+THINKING_LEVELS = frozenset({"auto", "low", "medium", "high", "xhigh", "max"})
 
 
 def managed_glm_thinking_mode(*, thinking_level: object, messages: list[dict[str, str]]) -> str:
@@ -26,7 +26,7 @@ def managed_glm_thinking_mode(*, thinking_level: object, messages: list[dict[str
     level = normalize_thinking_level(thinking_level)
     if level == "low":
         return "disabled"
-    if level in {"medium", "high"}:
+    if level in {"medium", "high", "xhigh", "max"}:
         return "enabled"
 
     prompt = next(
@@ -59,7 +59,10 @@ def evidence_budget_for_thinking(level: object, *, default: int = 8) -> int:
     """Bound the number of evidence items the Agent can explore for a run."""
 
     normalized = normalize_thinking_level(level)
-    return {"low": 5, "medium": 9, "high": 14}.get(normalized, max(1, min(20, int(default))))
+    return {"low": 5, "medium": 9, "high": 14, "xhigh": 18, "max": 20}.get(
+        normalized,
+        max(1, min(20, int(default))),
+    )
 
 
 def native_reasoning_options(

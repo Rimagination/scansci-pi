@@ -39,7 +39,7 @@ ACTIVE_RUN_STATUSES = {"queued", "planning", "running", "verifying"}
 RESUMABLE_RUN_STATUSES = {"paused", "failed", "cancelled", "needs_confirmation", "waiting_input"}
 SCIENTIFIC_EVENT_SCHEMA_VERSION = "scientific_event.v1"
 RESEARCH_SCHEMA_NAME = "research_runs"
-RESEARCH_SCHEMA_VERSION = 3
+RESEARCH_SCHEMA_VERSION = 4
 
 _CANONICAL_EVENT_TYPES = {
     "task.created": "run.created",
@@ -255,11 +255,45 @@ def _apply_research_event_migration(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def _apply_scientific_subagent_migration(connection: sqlite3.Connection) -> None:
+    """Add host-owned parent membership and idempotent batch reservations."""
+
+    connection.execute(
+        """
+        create table if not exists research_subagent_batches (
+          parent_run_id text not null,
+          idempotency_key text not null,
+          child_run_ids_json text not null default '[]',
+          created_at text not null,
+          primary key(parent_run_id, idempotency_key),
+          foreign key(parent_run_id) references research_runs(run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        create table if not exists research_subagent_children (
+          child_run_id text primary key,
+          parent_run_id text not null,
+          batch_key text not null,
+          role_id text not null,
+          created_at text not null,
+          foreign key(child_run_id) references research_runs(run_id),
+          foreign key(parent_run_id) references research_runs(run_id)
+        )
+        """
+    )
+    connection.execute(
+        "create index if not exists idx_research_subagent_parent on research_subagent_children(parent_run_id, created_at)"
+    )
+
+
 def _research_migrations() -> tuple[Migration, ...]:
     return (
         Migration(1, "research baseline registry", lambda _connection: None),
         Migration(2, "scientific event v1 and recovery primitives", _apply_research_event_migration),
         Migration(3, "cooperative user pause requests", lambda connection: _add_column_if_missing(connection, "research_runs", "pause_requested", "integer not null default 0")),
+        Migration(4, "atomic scientific sub-agent reservation", _apply_scientific_subagent_migration),
     )
 
 
@@ -380,6 +414,165 @@ class ResearchRunStore:
             connection.commit()
         return self.get_run(run_id)
 
+    def reserve_scientific_children(
+        self,
+        parent_run_id: str,
+        *,
+        idempotency_key: str,
+        child_specs: Sequence[dict[str, Any]],
+        max_children: int = 3,
+    ) -> dict[str, Any]:
+        """Atomically reserve bounded durable child runs for one parent.
+
+        The reservation commits before a worker is submitted.  This makes the
+        durable rows the source of truth across retries and process restarts,
+        while ``BEGIN IMMEDIATE`` prevents concurrent callers from exceeding
+        the parent's child limit.
+        """
+
+        batch_key = str(idempotency_key or "").strip()
+        if not batch_key:
+            raise ValueError("Scientific delegation requires an idempotency key")
+        bounded_max = max(0, min(3, int(max_children)))
+        selected_ids: list[str] = []
+        accepted = 0
+        replayed = False
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            connection.execute("begin immediate")
+            parent = self._require_run(connection, str(parent_run_id))
+            recursive = connection.execute(
+                "select 1 from research_subagent_children where child_run_id = ?",
+                (str(parent_run_id),),
+            ).fetchone()
+            if recursive is not None:
+                raise PermissionError("Scientific child runs cannot delegate recursively")
+            existing = connection.execute(
+                "select child_run_ids_json from research_subagent_batches where parent_run_id = ? and idempotency_key = ?",
+                (str(parent_run_id), batch_key),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    loaded = json.loads(str(existing[0]))
+                except json.JSONDecodeError:
+                    loaded = []
+                selected_ids = [str(item) for item in loaded] if isinstance(loaded, list) else []
+                replayed = True
+                connection.commit()
+            else:
+                current_count = int(
+                    connection.execute(
+                        "select count(*) from research_subagent_children where parent_run_id = ?",
+                        (str(parent_run_id),),
+                    ).fetchone()[0]
+                    or 0
+                )
+                capacity = max(0, bounded_max - current_count)
+                now = _utc_now()
+                for spec in list(child_specs)[:capacity]:
+                    stages = list(spec.get("stages", []) or [])
+                    if not stages or not all(isinstance(stage, StageSpec) for stage in stages):
+                        raise ValueError("A scientific child requires durable stage specifications")
+                    child_run_id = _new_id("run")
+                    role_id = str(spec.get("role_id", "") or "").strip()
+                    run_key = f"scientific:{parent_run_id}:{batch_key}:{role_id}"
+                    metadata = dict(spec.get("metadata", {}) or {})
+                    connection.execute(
+                        """
+                        insert into research_runs (
+                          run_id, notebook_id, workflow_type, title, status,
+                          current_stage, progress, input_json, output_artifact_id,
+                          cancel_requested, pause_requested, error_code, error_message,
+                          model_provider_id, model_id, created_at, updated_at,
+                          started_at, completed_at, metadata_json, parent_run_id,
+                          branch_from_message_id, background, idempotency_key, interaction_json, recovery_json,
+                          task_contract_json
+                        ) values (?, ?, ?, ?, 'queued', ?, 0, ?, '', 0, 0, '', '', ?, ?, ?, ?, '', '', ?, ?, '', 1, ?, '{}', '{}', ?)
+                        """,
+                        (
+                            child_run_id,
+                            str(parent["notebook_id"]),
+                            str(spec.get("workflow_type", "scientific_subagent")),
+                            str(spec.get("title", "")).strip() or "Scientific sub-agent",
+                            stages[0].key,
+                            _json_dumps(dict(spec.get("input_payload", {}) or {})),
+                            str(spec.get("model_provider_id", parent["model_provider_id"])),
+                            str(spec.get("model_id", parent["model_id"])),
+                            now,
+                            now,
+                            _json_dumps(metadata),
+                            str(parent_run_id),
+                            run_key,
+                            _json_dumps(_redact_sensitive_value(dict(spec.get("task_contract", {}) or {}))),
+                        ),
+                    )
+                    for position, stage in enumerate(stages):
+                        connection.execute(
+                            """
+                            insert into research_stages (
+                              stage_id, run_id, stage_key, position, title, kind,
+                              tool_name, status, attempt, started_at, completed_at,
+                              summary, error_message, input_json, output_json
+                            ) values (?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', '', '', '', '{}', '{}')
+                            """,
+                            (
+                                _new_id("stage"),
+                                child_run_id,
+                                stage.key,
+                                position,
+                                stage.title,
+                                stage.kind,
+                                stage.tool_name,
+                            ),
+                        )
+                    self._append_event(
+                        connection,
+                        child_run_id,
+                        event_type="task.created",
+                        summary="Scientific sub-agent reserved",
+                        payload={"workflow_type": str(spec.get("workflow_type", "scientific_subagent")), "background": True},
+                        created_at=now,
+                    )
+                    connection.execute(
+                        """
+                        insert into research_subagent_children (
+                          child_run_id, parent_run_id, batch_key, role_id, created_at
+                        ) values (?, ?, ?, ?, ?)
+                        """,
+                        (child_run_id, str(parent_run_id), batch_key, role_id, now),
+                    )
+                    selected_ids.append(child_run_id)
+                accepted = len(selected_ids)
+                connection.execute(
+                    """
+                    insert into research_subagent_batches (
+                      parent_run_id, idempotency_key, child_run_ids_json, created_at
+                    ) values (?, ?, ?, ?)
+                    """,
+                    (str(parent_run_id), batch_key, _json_dumps(selected_ids), now),
+                )
+                connection.commit()
+        return {
+            "children": [self.get_run(run_id) for run_id in selected_ids],
+            "accepted": accepted,
+            "replayed": replayed,
+        }
+
+    def list_scientific_children(self, parent_run_id: str) -> list[dict[str, Any]]:
+        """Return the durable membership list for one parent in creation order."""
+
+        with self._connect() as connection:
+            self._initialize_schema(connection)
+            self._require_run(connection, str(parent_run_id))
+            rows = connection.execute(
+                """
+                select child_run_id from research_subagent_children
+                where parent_run_id = ? order by created_at, rowid
+                """,
+                (str(parent_run_id),),
+            ).fetchall()
+        return [self.get_run(str(row[0])) for row in rows]
+
     def list_runs(
         self,
         *,
@@ -444,6 +637,30 @@ class ResearchRunStore:
             self._initialize_schema(connection)
             row = self._require_manageable_run(connection, run_id)
             title = str(row["title"])
+            child_membership = connection.execute(
+                "select parent_run_id, batch_key from research_subagent_children where child_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if child_membership is not None:
+                connection.execute(
+                    "delete from research_subagent_batches where parent_run_id = ? and idempotency_key = ?",
+                    (str(child_membership["parent_run_id"]), str(child_membership["batch_key"])),
+                )
+                connection.execute(
+                    "delete from research_subagent_children where child_run_id = ?",
+                    (run_id,),
+                )
+            # Deleting one parent conversation preserves its independently
+            # auditable child runs, but removes the ownership/batch rows whose
+            # foreign keys point at that parent.
+            connection.execute(
+                "delete from research_subagent_batches where parent_run_id = ?",
+                (run_id,),
+            )
+            connection.execute(
+                "delete from research_subagent_children where parent_run_id = ?",
+                (run_id,),
+            )
             connection.execute("delete from research_evidence_links where run_id = ?", (run_id,))
             connection.execute("delete from research_tool_calls where run_id = ?", (run_id,))
             connection.execute("delete from research_run_messages where run_id = ?", (run_id,))

@@ -8,7 +8,7 @@ param(
     [string]$PackageProfile = "core",
     [string]$OutputDir = "",
     [string]$Name = "ScanSci",
-    [string]$Version = "0.3.1",
+    [string]$Version = "0.4.0",
     [string]$BuildId = "",
     # Populated only by scripts/release_gate.py. This binds an auditable
     # release candidate to the exact source fingerprint that passed its gate.
@@ -151,6 +151,7 @@ $buildInfo = [ordered]@{
     cache_key = $CacheKey
     source_tree_sha256 = $sourceTreeHash
     release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()
+    pi_bundle_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $piBundle).Hash.ToLowerInvariant()
 }
 $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $auditBuildInfoPath -Encoding utf8
 

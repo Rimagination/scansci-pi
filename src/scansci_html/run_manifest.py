@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from collections.abc import Mapping
 import re
+import time
+from tempfile import NamedTemporaryFile
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +24,84 @@ def _now() -> str:
 
 def _hash(value: object) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+_TASK_CONTRACT_AUDIT_FIELDS = frozenset({
+    "schema_version",
+    "version",
+    "source_contract_valid",
+    "contract_id",
+    "workflow_type",
+    "task_mode",
+    "autonomy",
+    "risk_level",
+    "confidence",
+    "requires_plan",
+    "allowed_tools",
+    "initial_tools",
+    "required_tool_groups",
+    "initial_tool_budget",
+    "max_tool_budget",
+    "recovery_budget",
+    "model_token_budget",
+    "max_model_token_budget",
+    "allow_external_write",
+    "task_profile",
+    "unavailable_tools",
+    "allowed_mcp_servers",
+    "capability_lease",
+})
+_TASK_CONTRACT_TEXT_KEYS = frozenset({"goal", "request", "prompt", "usertext", "question"})
+
+
+def _contract_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _contract_text_reference(value: object) -> dict[str, Any]:
+    raw = str(value or "")
+    return {"sha256": _hash(raw), "chars": len(raw)}
+
+
+def _contract_audit_value(value: object) -> Any:
+    """Redact contract text recursively without truncating authority lists."""
+
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        references: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _sensitive(name):
+                continue
+            normalized = _contract_key(name)
+            if normalized in _TASK_CONTRACT_TEXT_KEYS:
+                references[normalized] = _contract_text_reference(item)
+                continue
+            result[name] = _contract_audit_value(item)
+        if references:
+            result["text_references"] = references
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_contract_audit_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return {"type": type(value).__name__}
+
+
+def _manifest_task_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a full TaskContract into a secret-free authorization audit."""
+
+    projected: dict[str, Any] = {"projection_schema": "scansci.task-contract-audit.v1"}
+    for key in _TASK_CONTRACT_AUDIT_FIELDS:
+        if key in value:
+            projected[key] = _contract_audit_value(value[key])
+    for key, item in value.items():
+        normalized = _contract_key(key)
+        if normalized in _TASK_CONTRACT_TEXT_KEYS:
+            projected.setdefault(f"{normalized}_reference", _contract_text_reference(item))
+    return projected
 
 
 @dataclass
@@ -146,9 +226,40 @@ class RunManifest:
 
     def persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f"{self.path.name}.{uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self.path)
+        # Keep the atomic staging name independent from the already long run
+        # filename.  Appending a full UUID to that filename crosses the legacy
+        # Windows MAX_PATH boundary in release-gate diagnostic directories.
+        # NamedTemporaryFile also creates the staging inode with O_EXCL.  A
+        # random-name collision therefore cannot overwrite or unlink another
+        # process's in-flight manifest.
+        temporary: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=".",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n")
+            assert temporary is not None
+            # Windows may briefly deny replacing a file while the shell,
+            # antivirus, or a diagnostic reader is closing its handle.  Keep
+            # the staging file private and retry only this transient failure;
+            # permanent errors still surface to the caller.
+            for attempt in range(12):
+                try:
+                    temporary.replace(self.path)
+                    break
+                except PermissionError:
+                    if attempt >= 11:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -162,7 +273,7 @@ class RunManifest:
             "prompt_version": self.prompt_version,
             "tool_set_version": self.tool_set_version,
             "prefix_shape": dict(self.prefix_shape),
-            "task_contract": dict(self.task_contract),
+            "task_contract": _manifest_task_contract(self.task_contract),
             "context_policy": dict(self.context_policy),
             "max_turns": self.max_turns,
             "timeout_seconds": self.timeout_seconds,

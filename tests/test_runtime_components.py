@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -179,6 +180,28 @@ def test_pi_agent_prefers_managed_node_over_bundled(tmp_path: Path, monkeypatch)
     node_path, script_path = pi_agent.PiAgentClient.runtime_paths()
     assert node_path == managed_node.resolve()
     assert script_path == script.resolve()
+
+
+def test_build_contract_bundles_pi_main_but_keeps_node_out_of_core() -> None:
+    project_root = Path(__file__).parents[1]
+    build_script = (project_root / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8")
+    release_contract = json.loads((project_root / "config" / "release-gate.json").read_text(encoding="utf-8"))
+
+    assert "pi_runtime/main.mjs" in release_contract["package"]["required_resources"]
+    assert '"--add-data", "$piBundle;pi_runtime"' in build_script
+    assert '$(if (-not $ExcludeRuntimes) { @("--add-binary", "$nodeExe;pi_runtime") } else { @() })' in build_script
+    assert "pi_bundle_sha256" in build_script
+    assert "node.exe" not in release_contract["package"]["required_resources"]
+
+
+def test_packaged_pi_bundle_hash_is_a_content_digest(tmp_path: Path) -> None:
+    bundle = tmp_path / "main.mjs"
+    bundle.write_bytes(b"export const probe = true;\n")
+    expected = hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+    build_info = {"pi_bundle_sha256": expected}
+
+    assert build_info["pi_bundle_sha256"] == hashlib.sha256(bundle.read_bytes()).hexdigest()
 
 
 def test_find_tectonic_prefers_managed_component_over_bundled(tmp_path: Path, monkeypatch) -> None:

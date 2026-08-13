@@ -1,187 +1,134 @@
-# ScanSci 科研 Agent 架构演进
+# ScanSci 科研 Agent 架构（v0.4.0）
 
-本文是 ScanSci 面向“好用的科研 Agent”的架构基线和演进清单。目标不是
-把 ScanSci 变成另一个通用编码 Agent，而是让 Agent 能够在可追溯、可复核、
-可恢复的约束下完成科研工作：发现问题、检索文献、获取合法全文、建立证据、
-比较方法、生成带引用的研究产物，并在不确定时明确暴露不确定性。
+本文是 ScanSci 科研 Agent 的当前权威契约。目标不是把 ScanSci 变成无边界的通用编码 Agent，而是在可追溯、可复核、可恢复的科研业务边界内充分使用 Pi Agent SDK。
 
-## 当前基线
+## P0 与历史状态
 
-ScanSci 当前已经具备以下核心基础设施：
+唯一当前 P0 是 `config/release-scope.json` 中的 v0.4.0。原 v0.3.1 P0 已完整冻结到 `release_history`，状态为 `superseded` / `frozen_unverified`：仓库没有可复核的 v0.3.1 tag 或通过的 release report，因此不得把冻结历史写成 released。
 
-- `@earendil-works/pi-coding-agent` sidecar runtime；
-- Python 主控的任务契约、风险等级、工具白名单和预算；
-- 可恢复的 Pi session、JSONL 运行记录和跨轮次会话；
-- 自己实现的 MCP bridge，支持 stdio、SSE、Streamable HTTP、工具发现和写工具授权；
-- 论文发现、合法获取、清洁 HTML、证据库、检索、引用核验和科研产物工具；
-- 面向 UI 的 MCP 市场，但保存配置不会自动执行服务器。
+“100% Pi 能力”只表示本仓库声明的 13 项能力在权限边界内实现，并由 Task8 的 10 个报告轴验收；它不等于无限资源、无限上下文、无限并发、任意模型质量或整个 Pi/第三方生态的所有 extension。
 
-因此，当前的主要问题不是“缺一个 MCP 包”，而是运行时能力还没有完全形成
-一个统一的科研 Agent 控制面。
+13 项声明能力是：
 
-## 实施状态（v0.2）
+1. protocol/feature 协商与 fail-closed 租约；
+2. 所有模型介导轮次 Pi-first 自主规划；
+3. 动态工具搜索、激活、撤销与逐次授权；
+4. 只读并行、effect 顺序屏障、hooks 与取消隔离；
+5. 模型感知长上下文、压缩和恢复；
+6. 渐进式 Skill 发现与有界资源加载；
+7. 最多三个只读科研子代理及结构化交接；
+8. 队列、abort-compaction、close/load、clone/fork 等会话控制；
+9. 延迟 MCP 目录、连接、真实 schema 与 effect 审计；
+10. 受限多模态 Pi 消息与显式不支持降级；
+11. 审批、路径、秘密、未知 effect 与 late-result 安全隔离；
+12. 重试、只读缓存、幂等与断连/超时恢复；
+13. run/effect/subagent/compaction 的可观测性和哈希绑定发布证据。
 
-以下基础能力已经落地并有回归测试：
+10 个报告轴是 `routing`、`dynamic_tools`、`parallelism`、`long_context`、`skills`、`subagents`、`mcp`、`multimodal`、`safety`、`observability`。能力实现与发布通过是两回事：缺少 real provider 凭据时可以完成确定性实现，但 provider-dependent 轴和正式发布仍为 `not_run`/blocked。
 
-- `scansci.capability.v1`：Python 主控的统一能力目录，覆盖内置科研工具、插件状态和 MCP 服务器的风险、审批、幂等性与激活方式；
-- deferred MCP：MCP 可选择按需模式，启动时仅暴露 `search` / `call` 代理，真正使用时才启动服务器并获取工具 schema；direct 模式仍是已有配置的默认兼容行为；
-- 科研子 Agent：委派时自动生成只读任务契约，禁止继承写工具或外部写权限，并要求结构化交接；
-- `scansci.contract-advisor.v1`：任务交付后读取持久化 run、工具调用和证据链接，记录完成缺口与建议，但不自动执行补救；
-- 稳定资源 URI：run、artifact、evidence 与 paper 使用 `scansci://` 引用，避免会话和子 Agent 重复携带大段材料；
-- `scansci.agent-benchmark.v1`：对持久化 run 做能力调用、证据链接和缺口处理的可重复验收。
+## 权责边界
 
-## 对外部项目的取舍
-
-### 官方 Pi
-
-官方 Pi 的核心策略是保持最小内核，通过 extension、skill、package 和 SDK
-构建工作流。它明确把 MCP、子 Agent、计划模式和权限弹窗留给扩展层；同时提供
-动态工具、运行时启停工具、会话分叉和可定制 compaction。
-
-ScanSci 应吸收：
-
-1. 动态工具注册与运行时工具集合，而不是每个任务都固定加载全部工具；
-2. 把工具提示、工具权限和工具结果渲染元数据作为同一个能力描述；
-3. 保留完整会话历史，同时允许按任务策略压缩上下文。
-
-ScanSci 不应照搬：
-
-- 放弃 Python 主控的权限契约；
-- 把科研证据规则交给模型或 Pi extension；
-- 用通用 shell 工具替代论文获取、证据锚点和引用核验。
-
-参考：
-
-- https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md
-- https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
-
-### `pi-mcp-adapter`
-
-它的关键价值不是“提供 MCP”，而是把大量 MCP 工具折叠成少量代理工具，
-按需搜索、延迟连接并避免启动时把数百个工具 schema 全塞进上下文。
-
-ScanSci 当前 bridge 会在创建 session 时连接全部启用服务器，并直接暴露读取工具。
-这便于权限审计和现有测试，但在多服务器、多工具的科研工作区里会增加启动延迟、
-上下文占用和失败面。后续应吸收它的按需发现思想，同时保留 ScanSci 的写权限闸门。
-
-### `oh-my-pi`
-
-`oh-my-pi` 是 Pi 的增强版分支，不是一个普通 MCP 插件。它值得借鉴的方向包括：
-
-- deferred tool discovery：工具默认可发现但不全部进入活动工具集；
-- LSP、浏览器、Python/JS 持久执行和更强的文件/搜索语义；
-- 子 Agent 的隔离、计划模式下的工具收缩和父 Agent 的 spawn policy；
-- advisor/第二模型对已完成轮次做质量复核；
-- 结构化输出、内部 URI 和跨工具的统一资源寻址。
-
-ScanSci 会把这些能力改造成科研语义：论文、证据片段、引用、数据集、图表和
-实验结果是统一资源，而不是简单文件；子 Agent 默认只返回结构化发现和证据引用，
-不能直接改变主工作区。
-
-参考：https://github.com/can1357/oh-my-pi
-
-## 目标架构
-
-```text
-用户任务
-   ↓
-任务理解与科研路由
-   ↓
-主控层：任务契约 / 风险 / 预算 / 审批 / 恢复
-   ↓
-能力目录：工具、MCP、技能、知识库、浏览器、产物插件
-   ↓
-执行层：Pi session / 子 Agent / 检索流水线 / 浏览器 / MCP
-   ↓
-证据与产物层：Evidence Graph / 引用对象 / 报告 / PPT / Notebook
-   ↓
-质量层：证据充分性 / 引用核验 / 结果自评 / 回归 benchmark
+```mermaid
+flowchart TD
+  USER["用户任务"] --> HOST["Host 权威层\nTaskContract / lease / evidence / persistence"]
+  HOST <-->|"protocol v7 JSONL"| PI["Pi 编排层\nmodel loop / planning / context / sessions"]
+  PI --> CAT["授权能力目录\nTools / Skills / deferred MCP / subagents"]
+  CAT --> HOST
+  HOST --> STORE["Workspace / Evidence / Research Runs / Artifacts"]
+  HOST --> UI["流式 UI 与审计事件"]
 ```
 
-各层边界：
+### Host 权威层
 
-- **主控层**决定能不能做、最多做多少、是否需要用户确认；模型不能扩大权限。
-- **能力目录**只描述能力和状态，不在保存配置时自动执行外部程序。
-- **执行层**负责调用和恢复，不负责解释科学结论。
-- **证据层**负责来源、精确引用、锚点和版本；自然语言不能替代证据对象。
-- **质量层**既评估答案，也评估检索路径、工具失败、成本和可复现性。
+Python Host 负责：
 
-## 首批改进顺序
+- 编译 `scansci.task-contract.v2` 和 capability lease，逐次校验 request/run/generation、风险、预算、调用次数和审批 token；
+- 执行所有 ScanSci 工具、Workspace/Evidence/ResearchRun/Artifact 读写和稳定 `scansci://` URI 校验；
+- 执行证据充分性、引用验证、科学改写/时间交付等后处理；这些护栏保留，但不能冒充 Pi 的模型能力；
+- 把模型、工具、effect、子代理、MCP、压缩和降级事件写入有界、脱敏、可恢复的记录；
+- 在危险或未知状态 fail-closed。空租约不暴露可执行工具，只有显式 `approve` 能产生 request-scoped approval token。
 
-### P0：能力目录统一化
+### Pi 编排层
 
-新增一个跨 Python/TypeScript 的能力描述协议，统一记录：
+Node sidecar 中的 Pi AgentSession 负责：
 
-- `id`、`kind`、`source`、`version`、`status`；
-- 输入/输出 schema；
-- 风险级别、是否需要审批、是否允许子 Agent；
-- 估计 token/cost、超时、重试和幂等语义；
-- 证据要求和可生成的科研产物类型。
+- 在 Host 授权目录内读取完整的模型感知上下文，自主规划路线；
+- 使用 `search_tools` / `search_skills` / `load_skill` 逐步发现能力；
+- 批量并行 thread-safe 只读工具，按顺序执行 effectful 工具；
+- 使用 hooks、steer/follow-up、compaction、queue、abort、clone/fork 和 session resume；
+- 委派安全科研子代理、使用延迟 MCP 和经验证的图像内容；
+- 把工具请求发给 Host，而不是直接触碰业务数据库或任意主机能力。
 
-这样 MCP、内置科研工具、插件和未来子 Agent 不再各自维护一套能力判断。
+Pi 不决定租约、审批、证据真伪、引用是否通过、Artifact 是否提交，也不能修改 Host 的完成判定。
 
-### P0：MCP 按需发现
+### 不对任何模型开放的能力
 
-保留当前 direct-tool 模式作为兼容模式，新增 deferred 模式：
+- 不开放任意 shell、任意文件系统读写、Pi 内置 `bash/read/write/edit/find/grep/ls` 或任意第三方 extension；
+- 不允许 Skill、MCP annotations、工具描述、模型文本或子代理结果改变 capability lease；
+- 不把 Session JSONL 当作 Workspace/ResearchRunStore 的业务真相；
+- 不把未经验证的模型自由文本保存为“已验证研究简报”。
 
-- session 启动只加载服务器摘要和工具索引；
-- Agent 先搜索能力，再激活具体工具；
-- 服务器连接延迟到真正调用；
-- 写工具仍必须通过 ScanSci 任务契约和 `allow_write` 双重授权；
-- 记录服务器、工具、schema、调用和失败的完整 trace。
+## protocol v7 与 schema 迁移
 
-### P1：科研子 Agent
+当前 wire 只写 `protocol v7`，启动必须协商严格 required features；Node 和 Python 都校验消息大小、类型、schema、当前 request/run/generation、工具调用 ID 和结果归属。过期、未知、跨请求或 late result 不得进入当前历史或持久化结果。
 
-子 Agent 不直接共享主 session 的完整上下文。每个子任务拥有：
+迁移规则：
 
-- 明确的目标、输入证据范围和只读工具租约；
-- 独立预算和取消信号；
-- 结构化输出 schema，例如 `paper_candidates`、`evidence_findings`、
-  `method_comparison`；
-- 只能通过 artifact/evidence patch 向主 Agent 返回结果。
+- TaskContract 只写 v2；旧 v1/整数版本只在一个兼容窗口内读取，再编译为当前租约，不能沿用旧权限语义；
+- `research_runs schema v4` 采用 additive migration，保存已存在 run、stage、tool、artifact 和 session 引用；
+- capability lease、model-runtime descriptor、subagent-result 与 mcp-effect 各自使用 v1 schema；未知字段不产生权限；
+- 旧 eager/direct MCP 配置保留为显式兼容执行路径并继续逐次授权；它可能在构建 direct 工具目录时连接，不能作为“deferred 启动零连接”的证据。v0.4 新增/选择的 P0 路径使用 deferred 目录→连接→激活→调用；旧兼容路径不计 deferred capability 成功；
+- 会话、checkpoint、artifact、evidence URI 和旧报告保留，不通过删除用户数据完成迁移；
+- session 的“暂停”语义是 `abort + resume`，不是进程级 suspend。压缩可 abort 后恢复，不能宣称冻结了任意远端副作用。
 
-第一批适合并行的子任务是：多源论文发现、DOI 元数据核验、局部证据抽取、
-引用一致性检查；不把“最终科学结论”拆给多个模型各自自由发挥。
+## 工具、Skill、MCP 与子代理
 
-### P1：Advisor 与任务结束判定
+### 动态工具与 effect
 
-参考 `oh-my-pi` 的 advisor 思路，增加轻量的完成后检查，但检查对象必须是
-科研任务契约：
+`allowed_tools` 是硬权限包络，`initial_tools` 只是初始活动子集。模型可以搜索并激活已授权工具，但搜索、激活、调用和结果提交每一步都重新检查当前契约。只有明确标记 thread-safe/read-only 的调用可并行；任一 effectful sibling 形成顺序屏障。超时或取消后的 late result 被丢弃，文件、wire 与 history 结果必须原子提交。
 
-- 是否完成用户目标；
-- 是否满足必需工具组；
-- 每个结论是否有可追溯证据；
-- 是否把“发现线索”误写成“已验证事实”；
-- 是否留下未解决风险和下一步。
+### Skills
 
-Advisor 只能提出结构化缺口，不能绕过权限自动补做高风险动作。
+Skill 只改变指令，不改变租约、风险、证据来源或完成判定。显式 `$skill` 可以预载；推断候选只是提示，模型通过搜索/加载读取有界资源。Skill 路径必须在包根内，拒绝 traversal/symlink escape，记录 hash/provenance 并限制单次与累计字节。
 
-### P2：科研资源 URI
+### MCP
 
-借鉴 `oh-my-pi` 的内部 URI 思路，ScanSci 已定义并开始返回：
+deferred MCP 服务器启动连接数为 0。模型先搜索有界目录，再按需连接、注册真实远端 schema、激活和调用。未知 effect 拒绝；annotations 只可提高风险，不能降低 Host policy。server raw ID、alias、remote name、transport、effect、duration、decision、digest 和有界结果引用进入审计。重试仅限 idempotent 调用，缓存仅限当前 run 的只读结果并服从 freshness。旧 direct/eager 配置只作兼容，可能立即连接且不计本轮 deferred 轴证据。
 
-- `scansci://paper/<doi-or-id>`
-- `scansci://evidence/<doc-id>/<evidence-id>`
-- `scansci://artifact/<run-id>/<artifact-id>`
-- `scansci://run/<run-id>`
+### 科研子代理
 
-所有工具都能返回这些稳定引用，UI、子 Agent、报告和 session 压缩都引用资源
-而不是重复复制大段文本。
+每个父任务最多 3 个并发 child。child lease 必须是 `role ∩ parent.allowed ∩ host-ready ∩ subagent_allowed ∩ read-only`，无 MCP、无外部/本地写入、无递归委派。每个 child 有独立预算、trace、取消与结构化 handoff，只能返回经 Host 校验的 `scansci://` evidence/artifact/run URI。一项失败不能取消 sibling；父 Agent 可收集部分有效结果或取消剩余任务。
 
-## 不变的产品原则
+## 上下文与多模态
 
-1. 证据优先：没有来源锚点的结论必须标记为推测或待核验。
-2. 主控优先：模型、MCP、子 Agent 都不能扩大自己的权限。
-3. 可恢复：长任务可以暂停、重试、分叉和从事件记录重建。
-4. 可观察：每次检索、工具调用、引用选择和失败都能解释。
-5. 可替换：Pi 是运行时，不是科研领域模型；未来可以替换模型、MCP 或 UI。
-6. 渐进增强：没有外部服务、API key 或本地模型时，核心证据工作流仍然可用。
+上下文预算来自受信 model-runtime descriptor，而不是固定字符/轮数裁剪。Host contract、最终用户任务、显式 Skill、最近对话、attachments、recap 和被引用 tool result 按优先级进入 envelope；当前 tool-call/result 原子保留。长会话用可恢复 sidecar compaction，不销毁持久化业务记录。
 
-## 近期验收指标
+图像只以通过 MIME、magic、base64、尺寸、像素、单项/累计字节和数量限制的内存内容过 wire；不接收路径或 URL，不把 raw base64 写入日志/manifest。支持图像的模型用 Pi 原生 image+tool 路径；unsupported 模型必须记录显式 degradation，并使用声明的 OCR/text 或 alternate-model 路径。该降级交付不计 Pi multimodal 成功。
 
-- 多 MCP 服务器启动时，未使用工具不进入模型活动工具集；
-- 子 Agent 不会获得父任务未授权的写工具；
-- 恢复同一任务不会重复产生不可幂等的下载、写入或外部提交；
-- 生成的科研答案能回到证据片段、原文锚点和检索 trace；
-- 复杂任务的失败能区分为：能力缺失、权限拒绝、来源不可达、证据不足、模型判断不足；
-- 每个新能力都有至少一个回归测试和一个可观测指标。
+## fallback、退化与完成判定
+
+所有模型介导文本默认 Pi-first。允许的 Host direct 路径只有不需要模型的确定性产品事实、模型调用前的 effect/安全拒绝，以及明确的安全降级交付；它们必须标记来源。
+
+任何 direct fallback 都不计 Pi 成功，`fallback_count` 必须为 0 才能通过 `scansci.pi-capabilities` report。模型/transport 不支持时记录 `degraded`，缺少真实 provider、凭据或外部环境时记录 `not_run`；不得把 deterministic mock、OCR 文本或 Host 改写包装成 provider-real 通过。
+
+科研完成仍由 Host 检查：通过引用验证的终止工具、结构化 evidence gap 或获批准的专用交付工具。Pi 的自然语言结束不是业务完成证明。
+
+## 发布证据
+
+能力矩阵源是 `bench/pi_capability_tasks.json`（schema v2），能力报告遵循 `config/release-report.schema.json`：
+
+- `schema_version=2`、`report_kind=scansci.pi-capabilities`、`mode`、`status`；
+- `protocol_version=7`、`sdk_version`、`source_sha256`；
+- `bundle.path/sha256/bytes`、`matrix.path/sha256/bytes/schema_version`；
+- `fallback_count=0`、`run_manifests`、精确 10 个 `axes`、`provider` 与 mode-specific `evidence`。
+
+`passed` 必须绑定当前源码、matrix、bundle、JUnit/runtime proofs 和至少一个 run manifest。deterministic 报告证明本地协议与工具循环；`dynamic_tools` 和 `multimodal` 的真实 provider 序列化仍要求 real 模式。未配置 provider 的 real 报告必须是 `not_run` 并阻塞公开发布。
+
+## 不变的科研原则
+
+1. 证据优先：没有来源锚点的结论标记为推测或待核验。
+2. 权威状态在 Host：模型、MCP、Skill 与子代理都不能扩大权限或越过人审。
+3. 可恢复：长任务从 Research Run、session 和 artifact 引用重建。
+4. 可观察：每次调用、effect、委派、压缩、fallback 与失败都有有界记录。
+5. 可替换：Pi 是运行时，模型、MCP、UI 与本地组件仍可独立更新。
+6. 包边界不变：core 不携带 PyTorch/Transformers/模型权重；Node 与 local-transformers 是独立组件；完整 Windows ZIP 始终是更新回退入口。

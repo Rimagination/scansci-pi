@@ -13,6 +13,9 @@ from scansci_html.task_contract import TaskContract
 from scansci_html.run_manifest import RunManifest, load_manifest
 
 
+PROJECT_ROOT = Path(__file__).parents[1]
+
+
 def test_prefix_shape_is_stable_redacted_and_cache_metrics_are_normalized() -> None:
     first = build_prefix_shape(
         provider="openai",
@@ -121,3 +124,43 @@ def test_manifest_and_cli_expose_the_new_diagnostics(tmp_path: Path, capsys) -> 
     output = json.loads(capsys.readouterr().out)
     assert exit_code in {0, 1}
     assert output["schema_version"] == "scansci.capability-doctor.v1"
+
+
+def test_pi_capability_matrix_has_unique_cases_and_release_thresholds() -> None:
+    payload = json.loads((PROJECT_ROOT / "bench" / "pi_capability_tasks.json").read_text(encoding="utf-8"))
+    axes = {str(item["id"]): item for item in payload["axes"]}
+
+    assert payload["schema_version"] == 2
+    assert set(axes) == {
+        "routing", "dynamic_tools", "parallelism", "long_context", "skills",
+        "subagents", "mcp", "multimodal", "safety", "observability",
+    }
+    assert axes["routing"]["threshold"] >= 40
+    assert axes["dynamic_tools"]["threshold"] >= 10
+    assert axes["parallelism"]["threshold"] >= 3
+    assert axes["skills"]["threshold"] >= 20
+    assert axes["multimodal"]["threshold"] >= 10
+    assert axes["safety"]["threshold"] >= 100
+    observability = axes["observability"]["requirements"]
+    assert set(observability["kind_selectors"]) == {"run", "effect", "subagent", "compaction"}
+    assert all(observability["kind_selectors"].values())
+    assert all(axis["requirements"]["proof_batches"] for axis in axes.values())
+    assert {
+        batch["source"]
+        for axis in axes.values()
+        for batch in axis["requirements"]["proof_batches"]
+    } == {"junit", "runtime"}
+    case_ids = [str(case["id"]) for axis in axes.values() for case in axis["cases"]]
+    assert len(case_ids) == len(set(case_ids))
+    assert all(len(axis["cases"]) >= int(axis["threshold"]) for axis in axes.values())
+
+
+def test_pi_capability_matrix_requires_real_provider_for_serialization_and_multimodal() -> None:
+    payload = json.loads((PROJECT_ROOT / "bench" / "pi_capability_tasks.json").read_text(encoding="utf-8"))
+    by_id = {str(item["id"]): item for item in payload["axes"]}
+
+    assert by_id["dynamic_tools"]["provider_real_required"] is True
+    assert by_id["multimodal"]["provider_real_required"] is True
+    assert by_id["parallelism"]["requirements"]["timing_rounds"] == 3
+    assert by_id["long_context"]["requirements"]["minimum_tokens"] >= 100_000
+    assert by_id["long_context"]["requirements"]["sentinel_recovery"] == "20/20"

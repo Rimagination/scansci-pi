@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from urllib.request import urlopen
 from zipfile import ZipFile
 
@@ -46,6 +47,43 @@ def test_installed_component_is_preferred_even_when_source_has_torch(tmp_path: P
     assert local_transformers_runtime.ensure_local_transformers_runtime("Qwen/Qwen3.5-2B") == (
         "http://127.0.0.1:17863/v1"
     )
+
+
+def test_runtime_component_omits_new_state_flag_for_legacy_sidecar_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 1.0.4 sidecar must not exit argparse(2) on the newer optional flag."""
+
+    executable = tmp_path / "ScanSciLocalRuntime.exe"
+    executable.write_bytes(b"runtime-binary")
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+    monkeypatch.setattr(component, "executable", lambda: executable)
+
+    health_values = iter(("", "Qwen/Test"))
+    monkeypatch.setattr(component, "_health_model", lambda _url: next(health_values, "Qwen/Test"))
+    probe = {}
+
+    def fake_run(command, **_kwargs):
+        probe["command"] = list(command)
+        return SimpleNamespace(stdout="--model-id MODEL --parent-pid PID", stderr="", returncode=0)
+
+    class FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **_kwargs):
+        probe["launch"] = list(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(local_runtime_component.subprocess, "run", fake_run)
+    monkeypatch.setattr(local_runtime_component.subprocess, "Popen", fake_popen)
+
+    assert component.ensure_process("Qwen/Test") == "http://127.0.0.1:17863/v1"
+    assert probe["command"][-1] == "--help"
+    assert "--state-dir" not in probe["launch"]
 
 
 def _component_manifest(tmp_path: Path) -> Path:

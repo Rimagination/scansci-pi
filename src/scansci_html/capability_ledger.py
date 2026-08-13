@@ -33,6 +33,7 @@ _READ_ONLY_TOOLS = frozenset(
     {
         "inspect_workspace",
         "inspect_available_tools",
+        "search_tools",
         "read_task_documents",
         "summarize_documents",
         "check_task_completion",

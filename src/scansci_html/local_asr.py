@@ -58,7 +58,12 @@ class LocalASRRuntime:
         if not path.is_file():
             raise FileNotFoundError("待识别的音频文件不存在")
         wanted, record = self._validated_record(model_id)
-        if not _in_process_dependencies_available():
+        # A desktop process may already have a chat/vision model resident.
+        # Loading the 1.5 GB ASR checkpoint into that same Windows process can
+        # exhaust the page file (WinError 1455/Errno 22).  When the optional
+        # isolated runtime is installed, let it own the heavyweight model and
+        # keep in-process Transformers as the source-only fallback.
+        if _installed_runtime_component_available() or not _in_process_dependencies_available():
             return _transcribe_with_component(wanted, path, language=language)
         with self._lock:
             self._ensure_model(wanted, record)
@@ -212,6 +217,15 @@ def _in_process_dependencies_available() -> bool:
     try:
         return find_spec("torch") is not None and find_spec("transformers") is not None
     except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _installed_runtime_component_available() -> bool:
+    """Return whether a verified local-model sidecar executable is present."""
+
+    try:
+        return default_local_runtime_component().executable() is not None
+    except (OSError, RuntimeError, ValueError):
         return False
 
 

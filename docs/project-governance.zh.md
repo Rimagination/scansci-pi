@@ -242,6 +242,17 @@ NotebookLM-like 产品的优点应主要吸收到本层：notebook/source/note/l
 
 ## 编排层和 CLI
 
+### Pi 编排层与 Host 权威层
+
+v0.4.0 把编排拆成两类职责，二者不得混写：
+
+- **Pi 编排层**消费当前上下文与授权目录，由模型决定研究路线、工具发现与只读并行、Skill 指令加载、科研子代理委派、延迟 MCP 激活、多模态消息以及压缩/分叉等会话动作。
+- **Host 权威层**拥有 Workspace、Evidence Store、ResearchRunStore、任务契约、租约、审批 token、effect policy、证据/引用验证、Artifact 提交与发布审计；任何 Pi 输出都只是请求或候选，不是授权事实。
+
+两层通过 `protocol v7` 和当前 request/run/generation 绑定；搜索、激活、调用、结果提交都重新授权。空租约、未知工具、未知 MCP effect、过期请求、越界 URI 或 schema 不匹配一律 fail-closed。Skill 只增加指令，不增加证据或权限；子代理最多 3 个且只有父租约的只读子集；MCP annotations 只能抬高风险，不能降低 Host policy。
+
+Host 的确定性产品事实、effect 前拒绝、引用后处理和 evidence gate 继续保留。它们若绕过模型调用，不算模型介导轮次，也不计入 Pi routing；任何 direct fallback 或 capability degradation 都必须在报告中显式出现。
+
 少数模块可以跨层编排，但它们只负责把层串起来，不应该把所有细节写在自己里面。
 
 | 模块 | 角色 |

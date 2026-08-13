@@ -163,6 +163,11 @@ class LocalRuntimeComponent:
         self._last_manifest_source = ""
         self._last_manifest_failures: list[dict[str, str]] = []
         self._manual_install_paths: tuple[str, ...] = ()
+        # Runtime components are versioned independently from the desktop
+        # core.  Keep a small per-process capability cache so a newly
+        # installed core can still start an older sidecar whose CLI predates
+        # optional flags such as ``--state-dir``.
+        self._cli_argument_support: dict[str, bool] = {}
         self._load_install_job()
 
     @property
@@ -263,6 +268,13 @@ class LocalRuntimeComponent:
                 "--parent-pid",
                 str(os.getpid()),
             ]
+            if self._supports_cli_argument(executable, "--state-dir"):
+                command.extend(
+                    [
+                        "--state-dir",
+                        str((self.root / "state").resolve()),
+                    ]
+                )
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             # The bundled 1.0.4 executable reads its state directory from the
             # environment; passing the unsupported --state-dir flag exits 2.
@@ -322,6 +334,44 @@ class LocalRuntimeComponent:
 
     def _component_base_url(self) -> str:
         return f"http://127.0.0.1:{self._component_port()}/v1"
+
+    def _supports_cli_argument(self, executable: Path, argument: str) -> bool:
+        """Return whether an installed sidecar advertises an optional flag.
+
+        The local runtime is a separately downloaded executable.  In the
+        field, an older runtime may remain installed while the core starts
+        sending a newer optional argument; argparse then exits with code 2
+        before the model server can start.  A bounded ``--help`` probe keeps
+        the launch command compatible in both directions and is cached for
+        the lifetime of this component manager.
+        """
+
+        key = str(executable.resolve())
+        cached = self._cli_argument_support.get(key)
+        if cached is not None:
+            return cached
+        try:
+            completed = subprocess.run(
+                [str(executable), "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+            )
+            output = f"{completed.stdout}\n{completed.stderr}"
+            supported = str(argument) in output if completed.returncode == 0 else True
+        except (OSError, subprocess.SubprocessError, TypeError):
+            # A probe failure is not evidence that the flag is unsupported:
+            # test doubles and locked-down launchers may reject ``--help``.
+            # Preserve the current command in that case; only an explicit,
+            # successful help response is allowed to remove an optional flag.
+            supported = True
+        self._cli_argument_support[key] = supported
+        return supported
 
     @staticmethod
     def _health_payload(base_url: str) -> dict[str, Any] | None:

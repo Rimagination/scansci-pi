@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+from scansci_html.agent_capabilities import builtin_capability_catalog
 from scansci_html.agent_contract import classify_task_profile, compile_task_contract
 
 
-def test_plain_conversation_gets_no_tool_authority() -> None:
+def _ready_read_only_tools() -> set[str]:
+    return {
+        str(item["id"])
+        for item in builtin_capability_catalog()
+        if item.get("status") == "ready" and item.get("risk_level") == "read_only"
+    }
+
+
+def test_plain_conversation_gets_full_read_authority_but_bootstrap_only_activation() -> None:
     contract = compile_task_contract(
         task_mode="general",
         user_text="解释一下什么是置信区间",
     )
 
-    assert contract["autonomy"] == "direct"
-    assert contract["risk_level"] == "none"
-    assert contract["allowed_tools"] == []
+    assert contract["autonomy"] == "read_only"
+    assert contract["risk_level"] == "read_only"
+    assert set(contract["allowed_tools"]) == _ready_read_only_tools()
     assert contract["requires_plan"] is False
     assert contract["task_profile"]["route"] == "direct_chat"
     assert contract["task_profile"]["execution_complexity"] == "none"
+    assert contract["schema_version"] == "scansci.task-contract.v2"
+    assert contract["version"] == 2
+    assert contract["initial_tools"] == []
 
 
 def test_research_download_is_reversible_and_progress_budgeted() -> None:
@@ -41,6 +53,7 @@ def test_research_download_is_reversible_and_progress_budgeted() -> None:
         ["summarize_documents"],
         ["check_task_completion"],
     ]
+    assert set(contract["initial_tools"]).issubset(contract["allowed_tools"])
 
 
 def test_external_or_destructive_request_requires_plan() -> None:
@@ -66,7 +79,7 @@ def test_large_reversible_batch_requires_plan_without_becoming_high_risk() -> No
     assert contract["allow_external_write"] is False
 
 
-def test_plain_knowledge_chat_does_not_receive_research_run_tools() -> None:
+def test_plain_knowledge_chat_keeps_the_full_read_inventory_deferred() -> None:
     contract = compile_task_contract(
         task_mode="knowledge",
         user_text="只使用选中的知识库比较两篇论文",
@@ -74,8 +87,9 @@ def test_plain_knowledge_chat_does_not_receive_research_run_tools() -> None:
 
     assert "search_local_evidence" in contract["allowed_tools"]
     assert "build_verified_answer" in contract["allowed_tools"]
-    assert "summarize_documents" not in contract["allowed_tools"]
-    assert "check_task_completion" not in contract["allowed_tools"]
+    assert "summarize_documents" in contract["allowed_tools"]
+    assert "check_task_completion" in contract["allowed_tools"]
+    assert set(contract["initial_tools"]) < set(contract["allowed_tools"])
 
 
 def test_auto_web_toggle_grants_read_only_web_tools_to_ordinary_turn() -> None:
@@ -85,11 +99,9 @@ def test_auto_web_toggle_grants_read_only_web_tools_to_ordinary_turn() -> None:
     )
 
     assert contract["task_profile"]["route"] == "direct_chat"
-    assert contract["autonomy"] == "direct"
-    # Web-auto mode now preserves read-only web tools so the model can
-    # decide whether to search — without tools, it would report "I cannot
-    # search" even when the user has the toggle set to "auto".
-    assert set(contract["allowed_tools"]) == {"agent_reach", "browser_access", "discover_papers", "search_web", "self_assess", "verify_doi"}
+    assert contract["autonomy"] == "read_only"
+    assert set(contract["allowed_tools"]) == _ready_read_only_tools()
+    assert contract["initial_tools"] == []
     assert contract["initial_tool_budget"] == 4
     assert contract["max_tool_budget"] == 8
     assert contract["model_token_budget"] == 96_000
@@ -103,14 +115,7 @@ def test_explicit_web_toggle_keeps_scholarly_discovery_tools() -> None:
         required_tool_groups=[{"search_web", "agent_reach", "browser_access", "discover_papers"}],
     )
 
-    assert set(contract["allowed_tools"]) == {
-        "agent_reach",
-        "browser_access",
-        "discover_papers",
-        "search_web",
-        "self_assess",
-        "verify_doi",
-    }
+    assert set(contract["allowed_tools"]) == _ready_read_only_tools()
     assert contract["required_tool_groups"] == [[
         "agent_reach",
         "browser_access",

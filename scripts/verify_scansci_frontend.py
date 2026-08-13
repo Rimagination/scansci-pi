@@ -30,29 +30,96 @@ from scansci_html.research_agent import ResearchAgentRuntime  # noqa: E402
 from scansci_html.webapp import create_notebook_server  # noqa: E402
 
 
+_PARALLEL_PROBE_LOCK = threading.Lock()
+_PARALLEL_PROBE_ACTIVE = 0
+_PARALLEL_PROBE_MAX_ACTIVE = 0
+_STREAM_EVENT_LOCK = threading.Lock()
+_STREAM_EVENTS: list[tuple[str, str]] = []
+
+
+def _reset_parallel_probe() -> None:
+    global _PARALLEL_PROBE_ACTIVE, _PARALLEL_PROBE_MAX_ACTIVE
+    with _PARALLEL_PROBE_LOCK:
+        _PARALLEL_PROBE_ACTIVE = 0
+        _PARALLEL_PROBE_MAX_ACTIVE = 0
+
+
+def _parallel_probe_enter() -> None:
+    global _PARALLEL_PROBE_ACTIVE, _PARALLEL_PROBE_MAX_ACTIVE
+    with _PARALLEL_PROBE_LOCK:
+        _PARALLEL_PROBE_ACTIVE += 1
+        _PARALLEL_PROBE_MAX_ACTIVE = max(_PARALLEL_PROBE_MAX_ACTIVE, _PARALLEL_PROBE_ACTIVE)
+
+
+def _parallel_probe_exit() -> None:
+    global _PARALLEL_PROBE_ACTIVE
+    with _PARALLEL_PROBE_LOCK:
+        _PARALLEL_PROBE_ACTIVE -= 1
+
+
+def _parallel_probe_max_active() -> int:
+    with _PARALLEL_PROBE_LOCK:
+        return _PARALLEL_PROBE_MAX_ACTIVE
+
+
+def _reset_stream_events() -> None:
+    with _STREAM_EVENT_LOCK:
+        _STREAM_EVENTS.clear()
+
+
+def _record_stream_event(kind: str, question: str) -> None:
+    with _STREAM_EVENT_LOCK:
+        _STREAM_EVENTS.append((kind, question))
+
+
+def _stream_events() -> list[tuple[str, str]]:
+    with _STREAM_EVENT_LOCK:
+        return list(_STREAM_EVENTS)
+
+
+def _assert_follow_up_sequence(
+    events: list[tuple[str, str]],
+    questions: list[str],
+) -> list[str]:
+    expected = [event for question in questions for event in (("start", question), ("finish", question))]
+    selected = [event for event in events if event[1] in set(questions)]
+    if selected != expected:
+        raise AssertionError(f"Follow-up queue did not execute in FIFO order: {selected}")
+    return questions[1:]
+
+
 def _fake_chat_stream(_self: ResearchAgentRuntime, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
     messages = list(payload.get("messages", []) or [])
     question = str(messages[-1].get("content", "")) if messages else ""
     reply = f"frontend submit regression passed: {question}"
-    yield {"type": "RUN_STARTED", "run_id": f"frontend-submit-{uuid4().hex}"}
-    if question.startswith("hold: "):
-        chunk_size = max(1, len(reply) // 6)
-        for offset in range(0, len(reply), chunk_size):
-            time.sleep(0.25)
-            yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply[offset : offset + chunk_size]}
-    else:
-        yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply}
-    yield {
-        "type": "RUN_FINISHED",
-        "result": {
-            "message": {
-                "role": "assistant",
-                "content": reply,
-                "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+    track_parallel = question.startswith("hold: explain parallel conversation ")
+    if track_parallel:
+        _parallel_probe_enter()
+    _record_stream_event("start", question)
+    try:
+        yield {"type": "RUN_STARTED", "run_id": f"frontend-submit-{uuid4().hex}"}
+        if question.startswith("hold: "):
+            chunk_size = max(1, len(reply) // 6)
+            for offset in range(0, len(reply), chunk_size):
+                time.sleep(0.25)
+                yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply[offset : offset + chunk_size]}
+        else:
+            yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply}
+        yield {
+            "type": "RUN_FINISHED",
+            "result": {
+                "message": {
+                    "role": "assistant",
+                    "content": reply,
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
+                },
+                "model": {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"},
             },
-            "model": {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"},
-        },
-    }
+        }
+    finally:
+        _record_stream_event("finish", question)
+        if track_parallel:
+            _parallel_probe_exit()
 
 
 def _fake_transcribe_audio(_self: ResearchAgentRuntime, _payload: dict[str, Any]) -> dict[str, Any]:
@@ -210,35 +277,63 @@ def verify() -> dict[str, Any]:
                     raise AssertionError("The Enter-submitted text remained in the chat composer")
 
                 queue_parent = "hold: explain deterministic follow-up queues"
-                queue_child = "summarize the queued turn"
+                queue_child = "summarize the first queued turn"
+                queue_child_two = "summarize the second queued turn"
+                _reset_stream_events()
                 page.locator("#chatQuestionInput").fill(queue_parent)
                 page.locator("#chatAskForm button[type=submit]").click()
-                page.locator("#chatLiveControls").wait_for(state="visible", timeout=8_000)
+                page.locator(
+                    '#chatAskForm button[type=submit][data-composer-state="running"]'
+                ).wait_for(state="visible", timeout=8_000)
                 page.locator("#chatQuestionInput").fill(queue_child)
                 page.locator("#chatAskForm button[type=submit]").click()
+                page.locator("#chatLiveControls").wait_for(state="visible", timeout=3_000)
                 page.locator(".direct-live-queue").get_by_text(queue_child, exact=True).wait_for(timeout=3_000)
+                page.locator("#chatQuestionInput").fill(queue_child_two)
+                page.locator("#chatAskForm button[type=submit]").click()
+                page.locator(".direct-live-queue").get_by_text(queue_child_two, exact=True).wait_for(timeout=3_000)
                 page.get_by_text(f"frontend submit regression passed: {queue_child}", exact=True).wait_for(timeout=10_000)
+                page.get_by_text(f"frontend submit regression passed: {queue_child_two}", exact=True).wait_for(
+                    timeout=10_000
+                )
+                follow_up_order = _assert_follow_up_sequence(
+                    _stream_events(),
+                    [queue_parent, queue_child, queue_child_two],
+                )
 
                 parallel_a = "hold: explain parallel conversation A"
                 parallel_b = "hold: explain parallel conversation B"
+                _reset_parallel_probe()
                 page.locator("#chatQuestionInput").fill(parallel_a)
                 page.locator("#chatAskForm button[type=submit]").click()
-                page.locator("#chatLiveControls").wait_for(state="visible", timeout=8_000)
+                page.locator(
+                    '#chatAskForm button[type=submit][data-composer-state="running"]'
+                ).wait_for(state="visible", timeout=8_000)
                 page.locator('.sidebar-action[data-action="new-task"]').click()
                 page.locator("#homeQuestionInput").fill(parallel_b)
                 page.locator("#homeAskForm button[type=submit]").click()
-                page.locator("#chatLiveControls").wait_for(state="visible", timeout=8_000)
-                page.get_by_text("另有 1 个对话并行", exact=True).wait_for(timeout=3_000)
-                if page.locator(".task-status.running").count() < 2:
+                page.locator(
+                    '#chatAskForm button[type=submit][data-composer-state="running"]'
+                ).wait_for(state="visible", timeout=8_000)
+                for _ in range(30):
+                    if page.locator(".task-status.running").count() >= 2:
+                        break
+                    page.wait_for_timeout(100)
+                else:
                     raise AssertionError("Direct chat jobs were still serialized across conversations")
                 page.get_by_text(f"frontend submit regression passed: {parallel_b}", exact=True).wait_for(timeout=10_000)
+                parallel_max_active = _parallel_probe_max_active()
+                if parallel_max_active < 2:
+                    raise AssertionError("Direct chat model streams did not overlap")
                 if any("currentTarget" in item or "querySelector" in item for item in console_errors):
                     raise AssertionError(f"Composer emitted a stale-event console error: {console_errors}")
                 return {
                     "click_submit": True,
                     "enter_submit": True,
                     "follow_up_queue": True,
+                    "follow_up_order": follow_up_order,
                     "parallel_conversations": True,
+                    "parallel_max_active": parallel_max_active,
                     "voice_to_text": True,
                     "conversation_visible": True,
                     "console_errors": console_errors,

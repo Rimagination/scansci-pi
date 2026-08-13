@@ -155,7 +155,7 @@ const state = {
   sidebarCollapsed: sidebarCollapsedPreference === "true"
     || (sidebarCollapsedPreference === null && window.innerWidth <= 900),
   sidebarWidth: Math.max(260, Math.min(520, Number(window.localStorage.getItem("scansci.sidebar.width")) || 352)),
-  thinkingLevel: ["auto", "low", "medium", "high"].includes(window.localStorage.getItem("scansci.thinking.level"))
+  thinkingLevel: ["auto", "low", "medium", "high", "xhigh", "max"].includes(window.localStorage.getItem("scansci.thinking.level"))
     ? window.localStorage.getItem("scansci.thinking.level")
     : "auto",
   webSearchMode: ["auto", "on", "off"].includes(window.localStorage.getItem("scansci.web-search.mode"))
@@ -3635,6 +3635,8 @@ const thinkingLevels = [
   { value: "low", label: "\u4f4e", detail: "\u66f4\u5feb\u54cd\u5e94\uff0c\u8f83\u5c11\u68c0\u7d22\u4e0e\u5de5\u5177\u9884\u7b97" },
   { value: "medium", label: "\u4e2d", detail: "\u5e73\u8861\u63a8\u7406\u3001\u68c0\u7d22\u8303\u56f4\u4e0e\u54cd\u5e94\u901f\u5ea6" },
   { value: "high", label: "\u9ad8", detail: "\u66f4\u5927\u7684 Agent \u8bc1\u636e\u9884\u7b97\u4e0e\u539f\u751f\u63a8\u7406\u5f3a\u5ea6" },
+  { value: "xhigh", label: "\u6781\u9ad8", detail: "\u66f4\u6df1\u63a8\u7406\u4e0e\u66f4\u5927\u7684 Agent \u8bc1\u636e\u9884\u7b97" },
+  { value: "max", label: "\u6700\u9ad8", detail: "\u8bf7\u6c42 Pi \u4e0e\u6a21\u578b\u652f\u6301\u7684\u6700\u9ad8\u601d\u8003\u5f3a\u5ea6\uff1b\u4e0d\u652f\u6301\u65f6\u5b89\u5168\u964d\u7ea7" },
 ];
 
 function currentThinkingLevel() {
@@ -3708,6 +3710,15 @@ function composerModelMenuMarkup(current = {}) {
     ["on", "开启"],
     ["off", "关闭"],
   ].map(([value, label]) => `<button type="button" class="web-search-option ${webMode === value ? "is-selected" : ""}" data-action="select-web-search" data-web-search-value="${value}" role="option" aria-selected="${webMode === value ? "true" : "false"}">${label}</button>`).join("");
+  const installedSnapshots = Array.isArray(state.localModelMarket?.installed) ? state.localModelMarket.installed : [];
+  const readyConversationSnapshots = installedSnapshots.filter((item) => {
+    if (!item?.ready || item?.runtime_compatible === false) return false;
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
+    return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
+  }).length;
+  const localInventoryNote = installedSnapshots.length
+    ? `<p class="composer-model-note">本机已发现 ${installedSnapshots.length} 个模型快照；其中 ${readyConversationSnapshots} 个可作为对话/视觉入口。一个模型可以同时拥有多项能力，其他已安装能力会由 Agent 按需调用。</p>`
+    : "";
   return `<div class="composer-settings-panel">
     <section class="composer-settings-section web-search-picker" data-web-search-picker>
       <header><span data-ui-icon="globe"></span><span>联网搜索</span></header>
@@ -3722,7 +3733,7 @@ function composerModelMenuMarkup(current = {}) {
       ${empty}
       <div class="composer-model-manage"><button type="button" data-action="open-settings" data-settings-panel="models">${uiIcon("plus")}管理模型</button></div>
     </section>
-  </div>`;
+  </div>`.replace('<div class="composer-model-manage">', `${localInventoryNote}<div class="composer-model-manage">`);
 }
 
 async function setActiveComposerModel(value) {
@@ -5377,11 +5388,11 @@ function queueDirectChatTurn(job, turn, { front = false, announce = true } = {})
 }
 
 async function steerDirectChat(job, turn) {
-  if (!job?.runId || !turn?.question || turn.images.length || turn.audio.length || turn.sourceFiles.length) return false;
+  if (!job?.runId || !turn?.question || turn.audio.length || turn.sourceFiles.length) return false;
   try {
     const result = await request("/api/chat/steer", {
       method: "POST",
-      body: JSON.stringify({ run_id: job.runId, text: turn.question }),
+      body: JSON.stringify({ run_id: job.runId, text: turn.question, images: turn.images }),
     });
     if (!result?.ok) return false;
     job.pendingSteer = turn;
@@ -10915,7 +10926,7 @@ function renderSettings() {
   if (state.activeSettings === "knowledge-preview") settingsMarkup = renderKnowledgeSettingsPreview();
   else if (state.activeSettings === "defaults") settingsMarkup = renderDefaultCapabilitiesSettings();
   else if (state.activeSettings === "models") settingsMarkup = renderModelsSettings();
-  else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettings();
+  else if (state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettingsPage();
   else if (state.activeSettings === "runtime") settingsMarkup = renderRuntimeSettings();
   else if (state.activeSettings === "document-processing") settingsMarkup = renderDocumentProcessingSettings();
   else if (state.activeSettings === "about") settingsMarkup = renderSoftwareUpdateSettings();
@@ -11794,6 +11805,34 @@ function renderLocalModelsSettings() {
   return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>只在这里查看已安装模型，或从模型市场按需下载。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
     <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
     <details class="local-model-disclosure local-model-market-disclosure" open><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details></section>`;
+}
+
+// Local model routing is automatic and is already represented by the default
+// capabilities page. Keep the local-model page focused on installation and
+// runtime management instead of rendering the same routing matrix twice.
+function renderLocalModelsSettingsPage() {
+  const page = renderLocalModelsSettings();
+  const installed = Array.isArray(state.localModelMarket?.installed)
+    ? state.localModelMarket.installed
+    : [];
+  const ready = installed.filter((item) => item?.ready && item?.runtime_compatible !== false);
+  const conversationReady = ready.filter((item) => {
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
+    return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
+  }).length;
+  const auxiliaryReady = ready.filter((item) => {
+    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [item?.kind];
+    return capabilities.some((capability) => ["embedding", "reranking", "audio"].includes(String(capability)));
+  }).length;
+  const detectionNote = installed.length
+    ? `已发现 ${installed.length} 个本地模型快照；${conversationReady} 个可进入对话/视觉入口，${auxiliaryReady} 个用于检索、重排或语音。一个模型可以同时拥有多项能力，聊天下拉框只筛选当前入口可用的模型。`
+    : "尚未发现本地模型快照；下载完成后点击刷新，Agent 会按能力入口自动识别。";
+  return page
+    .replace(/<section class="local-agent-routing-card">[\s\S]*?<\/section>\s*/, "")
+    .replace(
+      '<section class="local-installed-panel">',
+      `<section class="local-model-detection-note">${escapeHtml(detectionNote)}</section><section class="local-installed-panel">`,
+    );
 }
 
 function renderDocumentProcessingFormMarkup(formId = "documentProcessingForm", embedded = false) {

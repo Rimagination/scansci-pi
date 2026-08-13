@@ -55,6 +55,7 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "size_bytes": (snapshot / "config.json").stat().st_size + len(b"weights"),
             "ready": True,
             "kind": "chat",
+            "capabilities": ["chat"],
             "architecture": "Qwen2ForCausalLM",
             "model_type": "qwen2",
             "format": "transformers",
@@ -240,7 +241,30 @@ def test_installed_minicpm_snapshot_is_vision(tmp_path: Path, monkeypatch):
 
     assert row["ready"] is True
     assert row["kind"] == "vision"
+    assert row["capabilities"] == ["chat", "vision"]
     assert row["architecture"] == "MiniCPMV4_6ForConditionalGeneration"
+
+
+def test_installed_model_capabilities_are_not_collapsed_to_primary_kind(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    snapshot = tmp_path / "Qwen-multimodal"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "fixture",
+                "architectures": ["FixtureForConditionalGeneration"],
+                "vision_config": {"model_type": "fixture-vision"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    row = local_model_market.installed_models()[0]
+
+    assert row["kind"] == "vision"
+    assert row["capabilities"] == ["chat", "vision"]
 
 
 def test_installed_vision_snapshot_is_exposed_with_vision_capability(monkeypatch):

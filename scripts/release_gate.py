@@ -25,6 +25,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
+import xml.etree.ElementTree as ET
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,7 @@ CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({
     "node.exe",
     "tectonic.exe",
 })
+FROZEN_V031_SCOPE_SHA256 = "a253baca5ae32f0edaba4baf5b2a77e1023d84db714014b5032768c8fb16acc4"
 
 
 class GateFailure(RuntimeError):
@@ -104,11 +106,33 @@ def _source_fingerprint() -> str:
     # The desktop client and its managed Worker are released as one service
     # contract. A gateway change must invalidate an otherwise reusable
     # desktop release candidate.
-    for directory in ("src", "scripts", "tests", "config", "installer", "services"):
+    for directory in (
+        "src", "scripts", "tests", "config", "installer", "services", "pi-runtime", "bench", "docs",
+    ):
         root = PROJECT_ROOT / directory
         if root.is_dir():
-            files.update(path for path in root.rglob("*") if path.is_file())
-    for name in ("pyproject.toml", "requirements.txt", "package.json", "package-lock.json"):
+            files.update(
+                path
+                for path in root.rglob("*")
+                if path.is_file()
+                and not (
+                    directory == "pi-runtime"
+                    and any(part in {"dist", "node_modules"} for part in path.relative_to(root).parts)
+                )
+            )
+    for name in (
+        "AGENTS.md",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "package-lock.json",
+        "docs/agent-startup.zh.md",
+        "docs/project-governance.zh.md",
+        "docs/desktop-packaging.zh.md",
+        "docs/release-workflow.zh.md",
+        "docs/research-agent-architecture.zh.md",
+        "docs/agent-harness-p0-p2.zh.md",
+    ):
         path = PROJECT_ROOT / name
         if path.is_file():
             files.add(path)
@@ -125,34 +149,676 @@ def _source_fingerprint() -> str:
     return digest.hexdigest()
 
 
+def _required_int(value: object, *, label: str) -> int:
+    if type(value) is not int:
+        raise GateFailure(f"{label} must be an integer")
+    return value
+
+
+_PI_AXIS_THRESHOLDS = {
+    "routing": 40,
+    "dynamic_tools": 10,
+    "parallelism": 3,
+    "long_context": 20,
+    "skills": 20,
+    "subagents": 3,
+    "mcp": 10,
+    "multimodal": 10,
+    "safety": 100,
+    "observability": 10,
+}
+
+_PI_REQUIRED_RUNTIME_FEATURES = {
+    "deferred_mcp_v2",
+    "dynamic_tools",
+    "lifecycle_hooks_v1",
+    "mcp_effect_audit_v1",
+    "mcp_run_cache_v1",
+    "multimodal_turns",
+    "parallel_tool_dispatch",
+    "progressive_skills",
+    "scientific_subagents_v1",
+}
+
+
+def _pi_batch_case_ids(axis: dict[str, Any], batch: dict[str, Any]) -> list[str]:
+    cases = [dict(case) for case in list(axis.get("cases", []) or []) if isinstance(case, dict)]
+    probe = str(batch.get("case_probe", ""))
+    prefix = str(batch.get("case_prefix", ""))
+    selected = [
+        case
+        for case in cases
+        if (not probe or str(case.get("probe", "")) == probe)
+        and (not prefix or str(case.get("id", "")).startswith(prefix))
+    ]
+    start = max(1, int(batch.get("case_start", 1) or 1))
+    count = int(batch.get("case_count", 0) or 0)
+    selected = selected[start - 1:start - 1 + count]
+    if count < 1 or len(selected) != count:
+        raise GateFailure(f"Pi capability matrix proof batch {batch.get('id')} has invalid case coverage")
+    return [str(case.get("id", "")) for case in selected]
+
+
+def _strict_object(
+    raw: object,
+    *,
+    label: str,
+    required: set[str],
+    allowed: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise GateFailure(f"Pi capability report {label} must be an object")
+    payload = dict(raw)
+    allowed_keys = set(allowed if allowed is not None else required)
+    missing = required - set(payload)
+    unknown = set(payload) - allowed_keys
+    if missing:
+        raise GateFailure(f"Pi capability report {label} is missing: {', '.join(sorted(missing))}")
+    if unknown:
+        raise GateFailure(f"Pi capability report {label} has unknown fields: {', '.join(sorted(unknown))}")
+    return payload
+
+
+def _validated_file_evidence(
+    raw: object,
+    *,
+    label: str,
+    extra_required: set[str] | None = None,
+    extra_allowed: set[str] | None = None,
+) -> Path:
+    extra_required = set(extra_required or set())
+    extra_allowed = set(extra_allowed or extra_required)
+    payload = _strict_object(
+        raw,
+        label=f"{label} evidence",
+        required={"path", "sha256", "bytes", *extra_required},
+        allowed={"path", "sha256", "bytes", *extra_allowed},
+    )
+    path = Path(str(payload.get("path", ""))).expanduser().resolve()
+    digest = str(payload.get("sha256", "")).strip().casefold()
+    if not path.is_file():
+        raise GateFailure(f"Pi capability report {label} evidence is missing: {path}")
+    if not re.fullmatch(r"[a-f0-9]{64}", digest) or _sha256(path).casefold() != digest:
+        raise GateFailure(f"Pi capability report {label} SHA256 does not match its file")
+    if int(payload.get("bytes", -1)) != path.stat().st_size:
+        raise GateFailure(f"Pi capability report {label} byte size does not match its file")
+    return path
+
+
+def _validate_tool_loop(raw: object, *, label: str, require_mutations: bool = False) -> dict[str, Any]:
+    keys = {
+        "ok", "tool_calls", "done", "marker_seen", "fallback_count", "provider_requests",
+        "dynamic_mutations", "mutation_evidence", "image_tool_tasks", "duration_seconds",
+        "image_serialized_tasks",
+    }
+    payload = _strict_object(raw, label=label, required=keys)
+    if (
+        payload.get("ok") is not True
+        or payload.get("done") is not True
+        or payload.get("marker_seen") is not True
+        or int(payload.get("tool_calls", 0) or 0) < 1
+        or int(payload.get("provider_requests", 0) or 0) < 1
+        or int(payload.get("fallback_count", -1)) != 0
+    ):
+        raise GateFailure(f"Pi capability report {label} did not prove a complete zero-fallback tool loop")
+    proofs = list(payload.get("mutation_evidence", []) or [])
+    if require_mutations and (
+        int(payload.get("dynamic_mutations", 0) or 0) != 10 or len(proofs) != 10
+    ):
+        raise GateFailure(f"Pi capability report {label} did not prove ten dynamic mutations")
+    for proof in proofs:
+        record = _strict_object(
+            proof,
+            label=f"{label} mutation",
+            required={
+                "turn", "session_id", "target_tool", "search_tools_completed",
+                "target_activated", "target_completed",
+            },
+        )
+        if not all(record.get(key) is True for key in ("search_tools_completed", "target_activated", "target_completed")):
+            raise GateFailure(f"Pi capability report {label} contains an unverified mutation")
+    if require_mutations and len({str(item.get("session_id", "")) for item in proofs}) != 10:
+        raise GateFailure(f"Pi capability report {label} mutation sessions are not isolated")
+    return payload
+
+
+def validate_pi_capability_report(
+    report_path: Path,
+    *,
+    expected_source_sha256: str,
+    expected_bundle_path: Path,
+    required_mode: str,
+) -> dict[str, Any]:
+    """Strictly validate capability evidence; file existence never suffices."""
+
+    try:
+        report = _read_json(report_path)
+    except Exception as error:
+        raise GateFailure(f"Pi capability report is not valid JSON: {error}") from error
+    report = _strict_object(
+        report,
+        label="root",
+        required={
+            "schema_version", "report_kind", "mode", "status", "protocol_version", "sdk_version",
+            "source_sha256", "bundle", "matrix", "fallback_count", "run_manifests", "axes",
+            "provider", "evidence",
+        },
+        allowed={
+            "schema_version", "report_kind", "mode", "status", "reason", "protocol_version",
+            "sdk_version", "source_sha256", "bundle", "matrix", "fallback_count", "run_manifests",
+            "axes", "provider", "evidence",
+        },
+    )
+    if int(report.get("schema_version", 0)) != 2:
+        raise GateFailure("Pi capability report schema_version must be 2")
+    if str(report.get("report_kind", "")) != "scansci.pi-capabilities":
+        raise GateFailure("Pi capability report_kind is invalid")
+    if str(report.get("mode", "")) != required_mode:
+        raise GateFailure(f"Pi capability report mode must be {required_mode}")
+    status = str(report.get("status", ""))
+    if status != "passed":
+        reason = str(report.get("reason", "")).strip()
+        raise GateFailure(f"Pi capability report is {status or 'invalid'}{f': {reason}' if reason else ''}")
+    if int(report.get("protocol_version", 0) or 0) != 7:
+        raise GateFailure("Pi capability report protocol_version must be 7")
+    if not str(report.get("sdk_version", "")).strip():
+        raise GateFailure("Pi capability report SDK version is missing")
+    source = str(report.get("source_sha256", "")).strip().casefold()
+    if source != str(expected_source_sha256).strip().casefold():
+        raise GateFailure("Pi capability report source SHA256 does not match the current gate")
+    if int(report.get("fallback_count", -1)) != 0:
+        raise GateFailure("Pi capability report fallback_count must be zero")
+
+    bundle_path = _validated_file_evidence(report.get("bundle"), label="bundle")
+    if bundle_path != expected_bundle_path.resolve():
+        raise GateFailure("Pi capability report bundle path does not match the current worktree")
+    matrix_record = _strict_object(
+        report.get("matrix"),
+        label="matrix evidence",
+        required={"path", "sha256", "bytes", "schema_version"},
+    )
+    matrix_path = _validated_file_evidence(
+        matrix_record,
+        label="matrix",
+        extra_required={"schema_version"},
+    )
+    if int(dict(report.get("matrix", {}) or {}).get("schema_version", 0)) != 2:
+        raise GateFailure("Pi capability report matrix schema_version must be 2")
+    expected_matrix = (PROJECT_ROOT / "bench" / "pi_capability_tasks.json").resolve()
+    if matrix_path != expected_matrix and expected_bundle_path.resolve().is_relative_to(PROJECT_ROOT.resolve()):
+        raise GateFailure("Pi capability report matrix path does not match the current worktree")
+
+    try:
+        matrix_payload = _read_json(matrix_path)
+    except Exception as error:
+        raise GateFailure(f"Pi capability report matrix is invalid: {error}") from error
+    matrix_axes = list(matrix_payload.get("axes", []) or [])
+    if int(matrix_payload.get("schema_version", 0) or 0) != 2 or len(matrix_axes) != len(_PI_AXIS_THRESHOLDS):
+        raise GateFailure("Pi capability report matrix is incomplete")
+    expected_axes = {str(axis.get("id", "")): dict(axis) for axis in matrix_axes if isinstance(axis, dict)}
+    if list(expected_axes) != list(_PI_AXIS_THRESHOLDS):
+        raise GateFailure("Pi capability report matrix axes are invalid")
+    for axis_id, matrix_axis in expected_axes.items():
+        matrix_case_ids = [str(case.get("id", "")) for case in list(matrix_axis.get("cases", []) or [])]
+        batches = list(dict(matrix_axis.get("requirements", {}) or {}).get("proof_batches", []) or [])
+        covered = [
+            case_id
+            for batch in batches
+            for case_id in _pi_batch_case_ids(matrix_axis, dict(batch))
+        ]
+        if not batches or covered != matrix_case_ids:
+            raise GateFailure(f"Pi capability report matrix proof batches do not cover axis {axis_id}")
+
+    axes = list(report.get("axes", []) or [])
+    if len(axes) != len(_PI_AXIS_THRESHOLDS):
+        raise GateFailure("Pi capability report axes are missing or duplicated")
+    axis_ids = [str(axis.get("id", "")) for axis in axes if isinstance(axis, dict)]
+    if axis_ids != list(_PI_AXIS_THRESHOLDS):
+        raise GateFailure("Pi capability report axes are missing, duplicated, or out of order")
+    reported_axes: dict[str, dict[str, Any]] = {}
+    for axis in axes:
+        axis = _strict_object(
+            axis,
+            label="axis",
+            required={
+                "id", "cases", "threshold", "passed", "status", "evidence_matches",
+                "verified_case_ids",
+            },
+        )
+        axis_id = str(axis["id"])
+        reported_axes[axis_id] = axis
+        cases = int(axis.get("cases", 0) or 0)
+        threshold = int(axis.get("threshold", 0) or 0)
+        passed = int(axis.get("passed", 0) or 0)
+        matrix_axis = expected_axes[axis_id]
+        matrix_cases = [
+            str(case.get("id", ""))
+            for case in list(matrix_axis.get("cases", []) or [])
+            if isinstance(case, dict)
+        ]
+        verified_case_ids = [str(value) for value in list(axis.get("verified_case_ids", []) or [])]
+        if (
+            threshold != int(matrix_axis.get("threshold", 0) or 0)
+            or threshold < _PI_AXIS_THRESHOLDS[axis_id]
+            or cases != len(matrix_cases)
+            or len(verified_case_ids) != len(set(verified_case_ids))
+            or not set(verified_case_ids).issubset(set(matrix_cases))
+            or passed != len(verified_case_ids)
+            or passed < threshold
+            or int(axis.get("evidence_matches", 0) or 0) < 1
+            or str(axis.get("status", "")) != "passed"
+        ):
+            raise GateFailure(f"Pi capability report axis {axis_id} did not match the hashed matrix threshold and cases")
+
+    manifests = list(report.get("run_manifests", []) or [])
+    if not manifests:
+        raise GateFailure("Pi capability report run manifest references are missing")
+    report_root = report_path.resolve().parent
+    seen_manifest_paths: set[Path] = set()
+    seen_run_ids: set[str] = set()
+    for raw in manifests:
+        manifest_record = _strict_object(
+            raw,
+            label="manifest evidence",
+            required={"path", "sha256", "bytes", "run_id"},
+        )
+        manifest_path = _validated_file_evidence(
+            manifest_record,
+            label="manifest",
+            extra_required={"run_id"},
+        )
+        if not manifest_path.is_relative_to(report_root):
+            raise GateFailure("Pi capability report manifest path is outside the current diagnostics directory")
+        manifest_payload = _read_json(manifest_path)
+        run_id = str(manifest_record.get("run_id", "")).strip()
+        if (
+            not run_id
+            or str(manifest_payload.get("run_id", "")).strip() != run_id
+            or manifest_payload.get("status") != "completed"
+            or int(dict(manifest_payload.get("metrics", {}) or {}).get("tool_calls", 0) or 0) < 1
+        ):
+            raise GateFailure("Pi capability report manifest run_id/status/tool call evidence is invalid")
+        if manifest_path in seen_manifest_paths or run_id in seen_run_ids:
+            raise GateFailure("Pi capability report manifest references are duplicated")
+        seen_manifest_paths.add(manifest_path)
+        seen_run_ids.add(run_id)
+    provider = _strict_object(
+        report.get("provider"),
+        label="provider",
+        required={"configured", "provider_id"},
+    )
+    if not str(provider.get("provider_id", "")).strip():
+        raise GateFailure("Pi capability report provider identity is missing")
+    if required_mode == "real" and provider.get("configured") is not True:
+        raise GateFailure("Pi capability report provider-real run is not configured")
+    deterministic_keys = {
+        "ping", "protocol_probe", "tool_loop", "targeted_tests", "dynamic_mutations",
+        "image_tool_tasks", "observability",
+    }
+    real_keys = {
+        "targeted_tests", "protocol_probe", "observability", "deterministic_tool_loop", "provider_real",
+    }
+    evidence = _strict_object(
+        report.get("evidence"),
+        label="evidence",
+        required=deterministic_keys if required_mode == "deterministic" else real_keys,
+    )
+    targeted = _strict_object(
+        evidence.get("targeted_tests"),
+        label="targeted tests",
+        required={
+            "path", "sha256", "bytes", "tests", "failures", "errors", "skipped",
+            "axis_selector_matches", "observability_selector_matches", "batch_matches",
+            "matched_testcase_timings",
+        },
+    )
+    targeted_path = _validated_file_evidence(
+        targeted,
+        label="targeted tests",
+        extra_required={
+            "tests", "failures", "errors", "skipped", "axis_selector_matches",
+            "observability_selector_matches", "batch_matches", "matched_testcase_timings",
+        },
+    )
+    if not targeted_path.is_relative_to(report_root):
+        raise GateFailure("Pi capability report targeted test path is outside the current diagnostics directory")
+    try:
+        junit_root = ET.parse(targeted_path).getroot()
+    except Exception as error:
+        raise GateFailure(f"Pi capability report targeted JUnit is invalid: {error}") from error
+    junit_suites = [junit_root] if junit_root.tag == "testsuite" else list(junit_root.findall("testsuite"))
+    junit_totals = {
+        key: sum(int(float(suite.attrib.get(key, "0") or 0)) for suite in junit_suites)
+        for key in ("tests", "failures", "errors", "skipped")
+    }
+    if any(int(targeted.get(key, -1)) != value for key, value in junit_totals.items()):
+        raise GateFailure("Pi capability report targeted JUnit totals do not match the report")
+    passed_testcases = [
+        (
+            f"{case.attrib.get('classname', '')}::{case.attrib.get('name', '')}",
+            max(0.0, float(case.attrib.get("time", "0") or 0)),
+        )
+        for suite in junit_suites
+        for case in suite.findall("testcase")
+        if case.find("skipped") is None and case.find("failure") is None and case.find("error") is None
+    ]
+    if len(passed_testcases) < 100:
+        raise GateFailure("Pi capability report targeted JUnit has fewer than 100 concrete passed testcases")
+    recomputed_batches: dict[str, dict[str, list[str]]] = {}
+    recomputed_axis_matches: dict[str, int] = {}
+    recomputed_proof_counts: dict[str, int] = {}
+    junit_verified_cases: dict[str, list[str]] = {}
+    matched_timings: dict[str, float] = {}
+    for axis_id, matrix_axis in expected_axes.items():
+        axis_batches: dict[str, list[str]] = {}
+        axis_nodes: set[str] = set()
+        verified: list[str] = []
+        proof_count = 0
+        for batch in list(dict(matrix_axis.get("requirements", {}) or {}).get("proof_batches", []) or []):
+            if str(batch.get("source", "")) != "junit":
+                continue
+            selector = str(batch.get("selector", ""))
+            matches = [node_id for node_id, _duration in passed_testcases if selector in node_id]
+            if len(matches) < int(batch.get("minimum_matches", 1) or 1):
+                raise GateFailure(f"Pi capability report JUnit proof batch {batch.get('id')} is incomplete")
+            axis_batches[str(batch.get("id", ""))] = matches
+            axis_nodes.update(matches)
+            proof_count += len(matches)
+            verified.extend(_pi_batch_case_ids(matrix_axis, dict(batch)))
+            for node_id, duration in passed_testcases:
+                if node_id in matches:
+                    matched_timings[node_id] = duration
+        recomputed_batches[axis_id] = axis_batches
+        recomputed_axis_matches[axis_id] = len(axis_nodes)
+        recomputed_proof_counts[axis_id] = proof_count
+        junit_verified_cases[axis_id] = verified
+    selector_matches = dict(targeted.get("axis_selector_matches", {}) or {})
+    reported_batches = dict(targeted.get("batch_matches", {}) or {})
+    reported_timings = dict(targeted.get("matched_testcase_timings", {}) or {})
+    if (
+        int(targeted.get("tests", 0) or 0) < 100
+        or int(targeted.get("failures", -1)) != 0
+        or int(targeted.get("errors", -1)) != 0
+        or set(selector_matches) != set(_PI_AXIS_THRESHOLDS)
+        or {key: int(value or 0) for key, value in selector_matches.items()} != recomputed_axis_matches
+        or reported_batches != recomputed_batches
+        or {key: float(value or 0) for key, value in reported_timings.items()} != matched_timings
+    ):
+        raise GateFailure("Pi capability report targeted selector/node evidence does not match JUnit")
+
+    protocol = _strict_object(
+        evidence.get("protocol_probe"),
+        label="protocol probe",
+        required={"ready", "protocol", "required_features", "capabilities"},
+    )
+    required_features = {str(value) for value in list(protocol.get("required_features", []) or [])}
+    capabilities = {str(value) for value in list(protocol.get("capabilities", []) or [])}
+    if (
+        protocol.get("ready") is not True
+        or int(protocol.get("protocol", 0) or 0) != 7
+        or not _PI_REQUIRED_RUNTIME_FEATURES.issubset(required_features)
+        or not required_features.issubset(capabilities)
+    ):
+        raise GateFailure("Pi capability report protocol probe is stale or incomplete")
+
+    observability_axis = expected_axes["observability"]
+    observability_requirements = dict(observability_axis.get("requirements", {}) or {})
+    observability = _strict_object(
+        evidence.get("observability"),
+        label="observability",
+        required={"required_fields", "kind_matches", "run_manifest_count", "records"},
+    )
+    required_kinds = {str(value) for value in list(observability_requirements.get("required_kinds", []) or [])}
+    required_fields = {str(value) for value in list(observability_requirements.get("required_fields", []) or [])}
+    kind_matches = dict(observability.get("kind_matches", {}) or {})
+    kind_selectors = dict(observability_requirements.get("kind_selectors", {}) or {})
+    recomputed_kind_matches = {
+        kind: sum(
+            1
+            for node_id, _duration in passed_testcases
+            if any(str(selector) in node_id for selector in list(kind_selectors.get(kind, []) or []))
+        )
+        for kind in required_kinds
+    }
+    if (
+        set(kind_matches) != required_kinds
+        or {key: int(value or 0) for key, value in kind_matches.items()} != recomputed_kind_matches
+        or any(value < 1 for value in recomputed_kind_matches.values())
+        or set(str(value) for value in list(observability.get("required_fields", []) or [])) != required_fields
+        or int(observability.get("run_manifest_count", 0) or 0) != len(manifests)
+        or dict(targeted.get("observability_selector_matches", {}) or {}) != kind_matches
+    ):
+        raise GateFailure("Pi capability report observability run/effect/subagent/compaction evidence is incomplete")
+    observability_cases = {
+        str(case.get("id", "")): dict(case)
+        for case in list(observability_axis.get("cases", []) or [])
+        if isinstance(case, dict)
+    }
+    allowed_nodes_by_kind: dict[str, set[str]] = {kind: set() for kind in required_kinds}
+    for batch in list(observability_requirements.get("proof_batches", []) or []):
+        kind = str(batch.get("case_probe", ""))
+        allowed_nodes_by_kind.setdefault(kind, set()).update(
+            recomputed_batches["observability"].get(str(batch.get("id", "")), [])
+        )
+    records = list(observability.get("records", []) or [])
+    record_ids: list[str] = []
+    for raw_record in records:
+        record = _strict_object(
+            raw_record,
+            label="observability record",
+            required={"id", "kind", "timing", "decision", "result_reference"},
+        )
+        record_id = str(record.get("id", ""))
+        kind = str(record.get("kind", ""))
+        timing = _strict_object(
+            record.get("timing"),
+            label="observability timing",
+            required={"source", "duration_seconds"},
+        )
+        reference = _strict_object(
+            record.get("result_reference"),
+            label="observability result reference",
+            required={"junit_sha256", "node_id"},
+        )
+        node_id = str(reference.get("node_id", ""))
+        expected_case = observability_cases.get(record_id)
+        if (
+            expected_case is None
+            or kind != str(expected_case.get("probe", ""))
+            or record.get("decision") != "passed"
+            or timing.get("source") != "junit"
+            or float(timing.get("duration_seconds", -1) or 0) != float(matched_timings.get(node_id, -1))
+            or str(reference.get("junit_sha256", "")) != str(targeted.get("sha256", ""))
+            or node_id not in allowed_nodes_by_kind.get(kind, set())
+            or not required_fields.issubset(set(record))
+        ):
+            raise GateFailure("Pi capability report observability record is not bound to a passed JUnit proof")
+        record_ids.append(record_id)
+    if record_ids != list(observability_cases):
+        raise GateFailure("Pi capability report observability records do not cover every case exactly once")
+
+    if required_mode == "deterministic":
+        ping = _strict_object(evidence.get("ping"), label="ping", required={"ready", "protocol"})
+        if ping.get("ready") is not True or int(ping.get("protocol", 0) or 0) != 7:
+            raise GateFailure("Pi capability report ping evidence is stale")
+        _validate_tool_loop(evidence.get("tool_loop"), label="tool loop")
+        dynamic = _validate_tool_loop(
+            evidence.get("dynamic_mutations"),
+            label="dynamic mutations",
+            require_mutations=True,
+        )
+        images = _validate_tool_loop(evidence.get("image_tool_tasks"), label="image+tool tasks")
+        if int(images.get("image_tool_tasks", 0) or 0) != 10:
+            raise GateFailure("Pi capability report image+tool evidence is incomplete")
+        if int(images.get("image_serialized_tasks", 0) or 0) != 10:
+            raise GateFailure("Pi capability report image serialization evidence is incomplete")
+        runtime_matches = {
+            "dynamic_mutations": int(dynamic.get("dynamic_mutations", 0) or 0),
+            "image_tool_tasks": int(images.get("image_tool_tasks", 0) or 0),
+        }
+    else:
+        _validate_tool_loop(evidence.get("deterministic_tool_loop"), label="deterministic tool loop")
+        provider_real = _strict_object(
+            evidence.get("provider_real"),
+            label="provider-real",
+            required={"dynamic_mutations", "image_tool_tasks", "mutation_evidence"},
+        )
+        proofs = list(provider_real.get("mutation_evidence", []) or [])
+        if (
+            int(provider_real.get("dynamic_mutations", 0) or 0) != 10
+            or int(provider_real.get("image_tool_tasks", 0) or 0) != 10
+            or len(proofs) != 10
+        ):
+            raise GateFailure("Pi capability report provider-real evidence is incomplete")
+        for proof in proofs:
+            record = _strict_object(
+                proof,
+                label="provider-real mutation",
+                required={
+                    "session_id", "target_tool", "search_tools_completed", "target_activated",
+                    "target_completed",
+                },
+                allowed={
+                    "turn", "session_id", "target_tool", "search_tools_completed", "target_activated",
+                    "target_completed",
+                },
+            )
+            if not all(record.get(key) is True for key in ("search_tools_completed", "target_activated", "target_completed")):
+                raise GateFailure("Pi capability report provider-real mutation is unverified")
+        if len({str(item.get("session_id", "")) for item in proofs}) != 10:
+            raise GateFailure("Pi capability report provider-real mutation sessions are not isolated")
+        runtime_matches = {
+            "dynamic_mutations": int(provider_real.get("dynamic_mutations", 0) or 0),
+            "image_tool_tasks": int(provider_real.get("image_tool_tasks", 0) or 0),
+        }
+    for axis_id, matrix_axis in expected_axes.items():
+        expected_verified = list(junit_verified_cases.get(axis_id, []))
+        expected_proof_count = int(recomputed_proof_counts.get(axis_id, 0) or 0)
+        for batch in list(dict(matrix_axis.get("requirements", {}) or {}).get("proof_batches", []) or []):
+            if str(batch.get("source", "")) != "runtime":
+                continue
+            match_count = int(runtime_matches.get(str(batch.get("selector", "")), 0) or 0)
+            expected_proof_count += match_count
+            if match_count >= int(batch.get("minimum_matches", 1) or 1):
+                expected_verified.extend(_pi_batch_case_ids(matrix_axis, dict(batch)))
+        reported_axis = reported_axes[axis_id]
+        if (
+            list(reported_axis.get("verified_case_ids", []) or []) != expected_verified
+            or int(reported_axis.get("passed", 0) or 0) != len(expected_verified)
+            or int(reported_axis.get("evidence_matches", 0) or 0) != expected_proof_count
+        ):
+            raise GateFailure(
+                f"Pi capability report axis {axis_id} verified cases do not match recomputed JUnit/runtime proof batches"
+            )
+    return report
+
+
 def _resolve_from_root(value: str | Path) -> Path:
     path = Path(value).expanduser()
     return (PROJECT_ROOT / path).resolve() if not path.is_absolute() else path.resolve()
 
 
 def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> None:
-    if int(contract.get("schema_version", 0)) != 1:
+    if _required_int(contract.get("schema_version", 0), label="release-gate.json schema_version") != 1:
         raise GateFailure("release-gate.json schema_version must be 1")
-    if not str(contract.get("version", "")).strip():
+    contract_version = str(contract.get("version", "")).strip()
+    if not contract_version:
         raise GateFailure("release-gate.json must define version")
-    if int(scope.get("schema_version", 0)) != 1:
-        raise GateFailure("release-scope.json schema_version must be 1")
+    scope_schema = _required_int(scope.get("schema_version", 0), label="release-scope.json schema_version")
+    if scope_schema not in {1, 2}:
+        raise GateFailure("release-scope.json schema_version must be 1 or 2")
+    version_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", contract_version)
+    if version_match and tuple(int(part) for part in version_match.groups()) >= (0, 4, 0) and scope_schema != 2:
+        raise GateFailure("release-scope.json schema v2 is required for v0.4.0 and newer release contracts")
+    if scope_schema == 2:
+        scope_version = str(scope.get("version", "")).strip()
+        if not scope_version:
+            raise GateFailure("release-scope.json schema v2 must define version")
+        if scope_version != str(contract.get("version", "")).strip():
+            raise GateFailure("release-scope.json scope version must match release-gate.json version")
     if not str(scope.get("p0_objective", "")).strip():
         raise GateFailure("release-scope.json must contain exactly one non-empty p0_objective")
     acceptance = list(scope.get("acceptance", []) or [])
     non_goals = list(scope.get("non_goals", []) or [])
     if not acceptance or not non_goals:
         raise GateFailure("release-scope.json requires non-empty acceptance and non_goals")
+    if not all(isinstance(item, dict) for item in acceptance):
+        raise GateFailure("release-scope.json acceptance entries must be objects")
     acceptance_ids = [str(item.get("id", "")).strip() for item in acceptance]
     if any(not item for item in acceptance_ids) or len(set(acceptance_ids)) != len(acceptance_ids):
         raise GateFailure("release-scope.json acceptance ids must be non-empty and unique")
+    if scope_schema == 2:
+        matrix_path = PROJECT_ROOT / "bench" / "pi_capability_tasks.json"
+        matrix = _read_json(matrix_path)
+        acceptance_id_by_axis = {
+            "routing": "pi-routing",
+            "dynamic_tools": "pi-dynamic-tools",
+            "parallelism": "pi-parallelism",
+            "long_context": "pi-long-context",
+            "skills": "pi-skills",
+            "subagents": "pi-subagents",
+            "mcp": "pi-mcp",
+            "multimodal": "pi-multimodal",
+            "safety": "pi-safety",
+            "observability": "pi-observability",
+        }
+        expected_mapping = {
+            acceptance_id_by_axis[str(axis.get("id", ""))]: (
+                str(axis.get("id", "")),
+                _required_int(axis.get("threshold", 0), label="Pi matrix threshold"),
+            )
+            for axis in list(matrix.get("axes", []) or [])
+            if str(axis.get("id", "")) in acceptance_id_by_axis
+        }
+        actual_mapping = {
+            str(item.get("id", "")).strip(): (
+                str(item.get("report_axis", "")).strip(),
+                _required_int(item.get("threshold", 0), label="Pi acceptance threshold"),
+            )
+            for item in acceptance
+        }
+        if actual_mapping != expected_mapping or len(expected_mapping) != 10:
+            raise GateFailure("release-scope.json Pi acceptance mapping must match the 10-axis capability matrix")
+        history = list(scope.get("release_history", []) or [])
+        if not all(isinstance(item, dict) for item in history):
+            raise GateFailure("release-scope.json release_history entries must be objects")
+        previous_v031 = [item for item in history if str(item.get("version", "")).strip() == "0.3.1"]
+        if len(previous_v031) != 1:
+            raise GateFailure("release-scope.json must preserve one v0.3.1 history entry")
+        previous = previous_v031[0]
+        if (
+            str(previous.get("state", "")) != "superseded"
+            or str(previous.get("verification", "")) != "frozen_unverified"
+            or not list(previous.get("acceptance", []) or [])
+            or not list(previous.get("non_goals", []) or [])
+        ):
+            raise GateFailure("release-scope.json v0.3.1 history must remain superseded/frozen_unverified and complete")
+        snapshot_digest = str(previous.get("snapshot_sha256", "")).strip().casefold()
+        canonical_previous = dict(previous)
+        canonical_previous.pop("snapshot_sha256", None)
+        actual_snapshot_digest = hashlib.sha256(
+            json.dumps(
+                canonical_previous,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if snapshot_digest != FROZEN_V031_SCOPE_SHA256 or actual_snapshot_digest != FROZEN_V031_SCOPE_SHA256:
+            raise GateFailure("release-scope.json v0.3.1 history snapshot is not the frozen original")
     command_ids: list[str] = []
+    allowed_result_kinds = {"", "pi_capability_report", "pi_matrix_validation", "pytest_junit"}
     for group in ("targeted_commands", "full_commands", "real_verifications"):
         for item in list(contract.get(group, []) or []):
             step_id = str(item.get("id", "")).strip()
             command = list(item.get("command", []) or [])
             if not step_id or not command or not all(isinstance(part, str) and part for part in command):
                 raise GateFailure(f"{group} entries require a non-empty id and command array")
+            result_kind = str(item.get("result_kind", "")).strip()
+            if result_kind not in allowed_result_kinds:
+                raise GateFailure(f"{group} contains an unknown result_kind: {result_kind}")
+            if result_kind and not str(item.get("result_file", "")).strip():
+                raise GateFailure(f"{group} result_kind requires result_file")
             retry = item.get("retry", {})
             if retry is not None and not isinstance(retry, dict):
                 raise GateFailure(f"{group} retry configuration must be an object")
@@ -179,6 +845,22 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
             command_ids.append(step_id)
     if len(set(command_ids)) != len(command_ids):
         raise GateFailure("release gate command ids must be unique")
+    pi_targeted_order = [
+        "pi-runtime-build",
+        "pi-targeted-python",
+        "pi-capability-matrix",
+        "pi-capabilities-deterministic",
+    ]
+    present_pi_steps = [step_id for step_id in pi_targeted_order if step_id in command_ids]
+    declares_pi_pipeline = any(step_id in command_ids for step_id in ("pi-runtime-build", "pi-targeted-python"))
+    if declares_pi_pipeline and present_pi_steps != pi_targeted_order:
+        raise GateFailure("Pi targeted release steps must include build, tests, matrix, and deterministic evidence")
+    if declares_pi_pipeline:
+        positions = [command_ids.index(step_id) for step_id in pi_targeted_order]
+        if positions != sorted(positions):
+            raise GateFailure("Pi targeted release steps are out of order")
+        if "pi-capabilities-real" not in command_ids:
+            raise GateFailure("Pi provider-real capability evidence is missing from the release contract")
     visual = dict(contract.get("visual_acceptance", {}) or {})
     if not list(visual.get("required_checks", []) or []) or not list(visual.get("required_screenshots", []) or []):
         raise GateFailure("visual_acceptance must define required checks and screenshots")
@@ -275,6 +957,104 @@ def _stop_process(process: subprocess.Popen[Any]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def _verification_popen_options() -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))}
+    return {"start_new_session": True}
+
+
+def _stop_verification_process_tree(process: subprocess.Popen[Any]) -> None:
+    """Terminate a timed-out verifier and every Node/MCP descendant."""
+
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+    else:
+        try:
+            os.killpg(process.pid, 15)
+        except (OSError, ProcessLookupError):
+            process.terminate()
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, 9)
+            except (OSError, ProcessLookupError):
+                process.kill()
+        else:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def _rewrite_promoted_pi_report_paths(
+    report_path: Path,
+    *,
+    source_diagnostics: Path,
+    target_diagnostics: Path,
+) -> None:
+    """Make copied capability evidence self-contained in its promoted report."""
+
+    payload = _read_json(report_path)
+
+    def remap(record: object) -> None:
+        if not isinstance(record, dict):
+            return
+        source = Path(str(record.get("path", ""))).resolve()
+        try:
+            relative = source.relative_to(source_diagnostics)
+        except ValueError:
+            return
+        target = (target_diagnostics / relative).resolve()
+        if not target.is_file():
+            raise GateFailure(f"Cannot promote because copied Pi evidence is missing: {target}")
+        record["path"] = str(target)
+        record["sha256"] = _sha256(target)
+        record["bytes"] = target.stat().st_size
+
+    for manifest in list(payload.get("run_manifests", []) or []):
+        remap(manifest)
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        remap(evidence.get("targeted_tests"))
+    _write_json(report_path, payload)
+
+
+def _pi_capability_summary(report: dict[str, Any], report_path: Path) -> dict[str, Any]:
+    return {
+        "report": str(report_path),
+        "report_sha256": _sha256(report_path),
+        "mode": str(report.get("mode", "")),
+        "protocol_version": int(report.get("protocol_version", 0) or 0),
+        "sdk_version": str(report.get("sdk_version", "")),
+        "source_sha256": str(report.get("source_sha256", "")),
+        "bundle_sha256": str(dict(report.get("bundle", {}) or {}).get("sha256", "")),
+        "matrix_sha256": str(dict(report.get("matrix", {}) or {}).get("sha256", "")),
+        "fallback_count": int(report.get("fallback_count", -1)),
+        "run_manifest_count": len(list(report.get("run_manifests", []) or [])),
+        "axes": [
+            {
+                "id": str(axis.get("id", "")),
+                "passed": int(axis.get("passed", 0) or 0),
+                "threshold": int(axis.get("threshold", 0) or 0),
+            }
+            for axis in list(report.get("axes", []) or [])
+            if isinstance(axis, dict)
+        ],
+    }
 
 
 class ReleaseGate:
@@ -378,6 +1158,23 @@ class ReleaseGate:
             if step.get("id") in allowed and step.get("status") == "passed"
         ]
         source_diagnostics = Path(str(source.get("release_dir", source_report_path.parent))).resolve() / "diagnostics"
+        configured = {
+            str(item.get("id", "")): dict(item)
+            for group in ("targeted_commands", "full_commands", "real_verifications")
+            for item in list(self.contract.get(group, []) or [])
+        }
+        for step in imported:
+            raw_result = str(step.get("result_file", "")).strip()
+            if not raw_result:
+                continue
+            source_result = Path(raw_result).resolve()
+            if not source_result.is_file():
+                raise GateFailure(f"Cannot promote because evidence is missing for {step.get('id')}")
+            recorded_hash = str(step.get("result_sha256", "")).strip().casefold()
+            if not recorded_hash or _sha256(source_result).casefold() != recorded_hash:
+                raise GateFailure(f"Cannot promote because evidence changed for {step.get('id')}")
+            result_kind = str(configured.get(str(step.get("id", "")), {}).get("result_kind", ""))
+            self._validate_required_result(source_result, result_kind=result_kind)
         if source_diagnostics.is_dir():
             for source_file in source_diagnostics.rglob("*"):
                 if not source_file.is_file():
@@ -385,6 +1182,32 @@ class ReleaseGate:
                 target = self.diagnostics_dir / source_file.relative_to(source_diagnostics)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_file, target)
+        for step in imported:
+            raw_result = str(step.get("result_file", "")).strip()
+            if not raw_result:
+                continue
+            source_result = Path(raw_result).resolve()
+            try:
+                relative = source_result.relative_to(source_diagnostics)
+            except ValueError:
+                continue
+            target_result = self.diagnostics_dir / relative
+            step["result_file"] = str(target_result)
+            result_kind = str(configured.get(str(step.get("id", "")), {}).get("result_kind", ""))
+            if result_kind == "pi_capability_report":
+                _rewrite_promoted_pi_report_paths(
+                    target_result,
+                    source_diagnostics=source_diagnostics,
+                    target_diagnostics=self.diagnostics_dir,
+                )
+            step["result_sha256"] = _sha256(target_result)
+            validated_result = self._validate_required_result(target_result, result_kind=result_kind)
+            if result_kind == "pi_capability_report" and isinstance(validated_result, dict):
+                capability_summary = _pi_capability_summary(validated_result, target_result)
+                step["capability_summary"] = capability_summary
+                self.report["artifacts"].setdefault("pi_capabilities", {})[
+                    capability_summary["mode"]
+                ] = capability_summary
         self.report["steps"] = imported
         self.report["promoted_from"] = {
             "report": str(source_report_path),
@@ -451,11 +1274,19 @@ class ReleaseGate:
         retry: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
         output_to_file: bool = False,
+        result_kind: str = "",
     ) -> dict[str, Any]:
         previous = self._previous(step_id)
-        if previous and previous.get("status") == "passed" and (required_result is None or required_result.is_file()):
-            _emit_console(f"[reuse] {title}")
-            return previous
+        if previous and previous.get("status") == "passed":
+            if required_result is None:
+                _emit_console(f"[reuse] {title}")
+                return previous
+            if required_result.is_file():
+                recorded_hash = str(previous.get("result_sha256", "")).strip().casefold()
+                if recorded_hash and _sha256(required_result).casefold() == recorded_hash:
+                    self._validate_required_result(required_result, result_kind=result_kind)
+                    _emit_console(f"[reuse] {title}")
+                    return previous
         log_path = self.diagnostics_dir / f"{step_id}.log"
         _emit_console(f"[run] {title}")
         _emit_console("      " + subprocess.list2cmdline(command))
@@ -469,12 +1300,7 @@ class ReleaseGate:
             "log": str(log_path),
         }
         self._record(step)
-        env = dict(os.environ)
-        # Keep the inherited environment intact. Injecting PYTHONPATH here
-        # leaks a Python-only import path into Node and its nested MCP stdio
-        # children; Windows can reject those child spawns with EPERM. The
-        # release environment installs the project package before running the
-        # gate, so source imports do not require this mutation.
+        env = self._command_environment(command)
         retry = dict(retry or {})
         max_attempts = max(1, int(retry.get("max_attempts", 1) or 1))
         retry_delay_seconds = max(0.0, float(retry.get("delay_seconds", 0) or 0))
@@ -505,13 +1331,14 @@ class ReleaseGate:
                             text=True,
                             encoding="utf-8",
                             errors="replace",
+                            **_verification_popen_options(),
                         )
                         try:
                             exit_code = process.wait(timeout=command_timeout)
                         except subprocess.TimeoutExpired:
                             timed_out = True
-                            process.kill()
-                            exit_code = process.wait()
+                            _stop_verification_process_tree(process)
+                            exit_code = process.returncode if process.returncode is not None else 124
                     else:
                         process = subprocess.Popen(
                             command,
@@ -522,6 +1349,7 @@ class ReleaseGate:
                             text=True,
                             encoding="utf-8",
                             errors="replace",
+                            **_verification_popen_options(),
                         )
                         assert process.stdout is not None
                         output_queue: Queue[str] = Queue()
@@ -543,7 +1371,7 @@ class ReleaseGate:
                             except Empty:
                                 if deadline is not None and time.monotonic() >= deadline:
                                     timed_out = True
-                                    process.kill()
+                                    _stop_verification_process_tree(process)
                                     break
                                 continue
                             if echo_output:
@@ -637,12 +1465,85 @@ class ReleaseGate:
             if exit_code == 0 and not required_result.is_file():
                 step["status"] = "failed"
                 step["error"] = "Command returned success but its required result file is missing"
+            elif exit_code == 0:
+                try:
+                    validated_result = self._validate_required_result(required_result, result_kind=result_kind)
+                except Exception as error:
+                    step["status"] = "failed"
+                    step["error"] = str(error)
+                else:
+                    step["result_sha256"] = _sha256(required_result)
+                    if result_kind == "pi_capability_report" and isinstance(validated_result, dict):
+                        capability_summary = _pi_capability_summary(validated_result, required_result)
+                        step["capability_summary"] = capability_summary
+                        self.report["artifacts"].setdefault("pi_capabilities", {})[
+                            capability_summary["mode"]
+                        ] = capability_summary
         self._record(step)
         if step["status"] != "passed":
             raise GateFailure(f"{title} failed; see {log_path}")
         if not echo_output:
             _emit_console(f"[ok] {title} ({step['duration_seconds']}s; log: {log_path})")
         return step
+
+    @staticmethod
+    def _command_environment(command: list[str]) -> dict[str, str]:
+        env = dict(os.environ)
+        executable = Path(str(command[0] if command else "")).name.casefold()
+        is_python = executable.startswith("python") or (
+            command and os.path.normcase(str(Path(command[0]).resolve())) == os.path.normcase(str(Path(sys.executable).resolve()))
+        )
+        if is_python:
+            source_root = str((PROJECT_ROOT / "src").resolve())
+            inherited = str(env.get("PYTHONPATH", "")).strip()
+            env["PYTHONPATH"] = os.pathsep.join([source_root, inherited]) if inherited else source_root
+            env["PYTHONUTF8"] = "1"
+        else:
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONUTF8", None)
+        return env
+
+    def _validate_required_result(self, path: Path, *, result_kind: str) -> dict[str, Any] | None:
+        kind = str(result_kind or "").strip()
+        if not kind:
+            return None
+        if kind == "pi_capability_report":
+            mode = "real" if "real" in path.stem.casefold() else "deterministic"
+            return validate_pi_capability_report(
+                path,
+                expected_source_sha256=self.source_sha256,
+                expected_bundle_path=PROJECT_ROOT / "pi-runtime" / "dist" / "main.mjs",
+                required_mode=mode,
+            )
+        if kind == "pi_matrix_validation":
+            payload = _read_json(path)
+            if int(payload.get("schema_version", 0)) != 2 or payload.get("status") != "passed":
+                raise GateFailure("Pi capability matrix validation report is invalid")
+            if int(payload.get("axis_count", 0) or 0) != 10 or int(payload.get("case_count", 0) or 0) < 226:
+                raise GateFailure("Pi capability matrix validation report is incomplete")
+            matrix_evidence = payload.get("matrix")
+            _validated_file_evidence(
+                matrix_evidence,
+                label="matrix",
+                extra_required={"schema_version"},
+            )
+            if int(dict(matrix_evidence or {}).get("schema_version", 0)) != 2:
+                raise GateFailure("Pi capability matrix evidence schema_version must be 2")
+            return payload
+        if kind == "pytest_junit":
+            try:
+                root = ET.parse(path).getroot()
+            except Exception as error:
+                raise GateFailure(f"Pytest JUnit evidence is invalid: {error}") from error
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            totals = {
+                key: sum(int(float(suite.attrib.get(key, "0") or 0)) for suite in suites)
+                for key in ("tests", "failures", "errors")
+            }
+            if totals["tests"] < 100 or totals["failures"] or totals["errors"]:
+                raise GateFailure("Pytest JUnit evidence is incomplete or failed")
+            return totals
+        raise GateFailure(f"Unknown release result_kind: {kind}")
 
     def _variables(self) -> dict[str, str]:
         return {
@@ -667,6 +1568,7 @@ class ReleaseGate:
                 retry=dict(item.get("retry", {}) or {}),
                 timeout_seconds=(float(item["timeout_seconds"]) if item.get("timeout_seconds") is not None else None),
                 output_to_file=str(item.get("output", "pipe")) == "file",
+                result_kind=str(item.get("result_kind", "")),
             )
 
     @property
@@ -909,6 +1811,16 @@ class ReleaseGate:
                 raise GateFailure(f"Packaged build-info.json does not match {key}")
         if str(build_info.get("release_source_sha256", "")).casefold() != self.source_sha256.casefold():
             raise GateFailure("Packaged build-info.json is not bound to the source fingerprint that passed this gate")
+        if "pi_runtime/main.mjs" in list(self.contract["package"].get("required_resources", []) or []):
+            pi_bundle_path = internal / "pi_runtime" / "main.mjs"
+            expected_pi_bundle_sha256 = str(build_info.get("pi_bundle_sha256", "")).strip().casefold()
+            if not pi_bundle_path.is_file():
+                raise GateFailure("Packaged resources are missing: pi_runtime/main.mjs")
+            if (
+                not re.fullmatch(r"[a-f0-9]{64}", expected_pi_bundle_sha256)
+                or _sha256(pi_bundle_path).casefold() != expected_pi_bundle_sha256
+            ):
+                raise GateFailure("Packaged Pi bundle SHA256 does not match build-info.json")
         package_bytes = sum(path.stat().st_size for path in self.package_dir.rglob("*") if path.is_file())
         maximum_bytes = int(self.contract["package"].get("max_package_bytes", 0) or 0)
         if maximum_bytes and package_bytes > maximum_bytes:
@@ -1377,6 +2289,15 @@ class ReleaseGate:
         payload = _read_json(output)
         if not bool(payload.get("ok")):
             raise GateFailure("Packaged runtime diagnostics reported ok=false")
+        tool_loop = payload.get("pi_tool_loop")
+        if (
+            not isinstance(tool_loop, dict)
+            or not bool(tool_loop.get("ok"))
+            or int(tool_loop.get("tool_calls", 0) or 0) < 1
+            or not bool(tool_loop.get("done"))
+            or int(tool_loop.get("fallback_count", -1)) != 0
+        ):
+            raise GateFailure("Packaged runtime diagnostics did not complete a Pi tool loop")
 
     def packaged_health(self) -> dict[str, Any]:
         port = _find_available_port()

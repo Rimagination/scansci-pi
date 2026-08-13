@@ -1,63 +1,103 @@
 {
-  "schema_version": 1,
-  "p0_objective": "发布 v0.3.1：统一版本与自动更新身份；隔离本地模型崩溃并以真实加载生成判定可用性；完成回复中消息队列和深色模式修复。",
+  "schema_version": 2,
+  "version": "0.4.0",
+  "p0_objective": "发布 v0.4.0 候选：以 Pi protocol v7 和 TaskContract v2 为 fail-closed 边界，使所有模型介导任务可由 Pi 自主规划，并用 10 轴 capability report v2 证明动态工具、并行、长上下文、Skill、科研子代理、MCP、多模态、安全与可观测性。",
   "acceptance": [
     {
-      "id": "app-icon",
-      "requirement": "打包产物（EXE、安装包、桌面快捷方式）使用新版应用图标，Windows 资源管理器中正常显示。"
+      "id": "pi-routing",
+      "report_axis": "routing",
+      "threshold": 40,
+      "requirement": "至少 40 个中英双语模型介导用例 100% 可达 Pi；Host 确定性事实与效应前拒绝必须单独标记，direct fallback 与静默降级均不计 Pi 成功。"
     },
     {
-      "id": "maximized-window",
-      "requirement": "窗口最大化时铺满显示器工作区（任务栏仍可见），四角直角无 DWM 圆角，边框无杂色条。"
+      "id": "pi-dynamic-tools",
+      "report_axis": "dynamic_tools",
+      "threshold": 10,
+      "requirement": "至少 10 次会话内动态工具变更通过搜索、激活和调用三级授权；库存等于当前租约，撤销后的调用 100% 拒绝。"
     },
     {
-      "id": "restored-window",
-      "requirement": "从最大化还原后窗口恢复圆角样式，标题栏与内容区域显示正常。"
+      "id": "pi-parallelism",
+      "report_axis": "parallelism",
+      "threshold": 3,
+      "requirement": "连续 3 轮各 3 个 2 秒只读工具在 3.5 秒内完成且并发度至少为 3；效应工具不重叠，取消在 2 秒内生效。"
     },
     {
-      "id": "narrow-window",
-      "requirement": "窗口宽度 ≥800px 时界面可用，侧栏在窄屏下自动折叠。"
+      "id": "pi-long-context",
+      "report_axis": "long_context",
+      "threshold": 20,
+      "requirement": "在至少 100K token、20 轮会话中 20/20 找回哨兵，压缩、恢复和模型窗口均不越界。"
     },
     {
-      "id": "edge-resize",
-      "requirement": "无边框窗口边缘与四角可通过鼠标拖拽调整大小。"
+      "id": "pi-skills",
+      "report_axis": "skills",
+      "threshold": 20,
+      "requirement": "至少 20 个 Skill 选择/搜索/加载用例通过路径、哈希和字节限制；Skill 只改变指令，租约扩张为 0。"
     },
     {
-      "id": "standard-package",
-      "requirement": "安装包不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"
+      "id": "pi-subagents",
+      "report_axis": "subagents",
+      "threshold": 3,
+      "requirement": "一个父任务最多原子启动 3 个只读科研子代理；子租约始终为父租约严格子集，无 MCP、写入或递归委派，并验证失败隔离与取消。"
     },
     {
-      "id": "local-runtime-upgrade",
-      "requirement": "core 能识别过期的 local-transformers 组件并引导独立升级；升级不重复下载或删除已有模型权重。"
+      "id": "pi-mcp",
+      "report_axis": "mcp",
+      "threshold": 10,
+      "requirement": "deferred stdio 与 deferred streamable HTTP 均保持启动连接数 0；10/10 搜索→连接→激活→调用通过，未知 effect 和全部未授权写入拒绝；旧 direct 配置只作显式兼容且不计本轴证据。"
     },
     {
-      "id": "package-identity",
-      "requirement": "应用版本、安装器版本、build_id、package_profile 与 SHA256 指向同一唯一构建。"
+      "id": "pi-multimodal",
+      "report_axis": "multimodal",
+      "threshold": 10,
+      "requirement": "至少 10 个真实 provider 图像+工具任务通过受限序列化；不支持图像的模型必须产生显式 degradation/not_run，不能静默绕过 Pi。"
     },
     {
-      "id": "app-update",
-      "requirement": "关于页、运行时身份与更新器版本一致；正式发布同时提供完整 Windows ZIP、64 KiB blockmap 和 stable.json，公开通道校验失败或不支持 Range 时自动回退完整包。"
+      "id": "pi-safety",
+      "report_axis": "safety",
+      "threshold": 128,
+      "requirement": "至少 128 个对抗用例证明未授权写入、路径穿越和秘密泄露均为 0；annotations 只能提高风险，未知能力 fail closed。"
     },
     {
-      "id": "local-runtime-isolation",
-      "requirement": "本地运行组件使用守护进程与模型子进程隔离；模型原生崩溃不会拖死服务，并向界面返回明确错误。"
-    },
-    {
-      "id": "local-model-readiness",
-      "requirement": "Qwen3.5 仅在隔离环境复用已有模型文件并真实完成加载与最小生成后显示可用；不得为兼容性检测重新下载模型。"
-    },
-    {
-      "id": "queued-followups",
-      "requirement": "回复进行中不显示常驻选择卡；发送第二条消息后才按顺序显示逐行队列，默认完成后继续，并可逐条选择立即调整。"
-    },
-    {
-      "id": "dark-theme-legibility",
-      "requirement": "深色模式由统一语义主题变量管理；AI 回复、历史列表、模型按钮、设置内页、模型服务、知识库、MCP 与插件市场均使用深色背景与浅色文字，同时保留错误和状态颜色语义。"
+      "id": "pi-observability",
+      "report_axis": "observability",
+      "threshold": 10,
+      "requirement": "10 类/条能力证据覆盖 run、effect、subagent 与 compaction，并包含 ID、时序、决策、有界结果引用、源码/矩阵/bundle 哈希和 manifest 引用。"
     }
   ],
   "non_goals": [
-    "本轮不购买或要求代码签名证书。",
-    "不把可选本地模型或推理依赖打进 core 安装包。",
-    "不修改发布渠道分级与门禁步骤顺序。"
+    "“100% Pi 能力”只指本仓库声明的 13 项运行时能力与 10 个发布报告轴，不代表无限 token、无限并发、任意生态扩展或模型质量保证。",
+    "不向模型、Skill、MCP 或科研子代理开放不受限 shell、任意文件系统写入、未知 effect 或第三方 extension 权限。",
+    "本轮不把缺少凭据的 provider-real、签名、公开上传或安装包人工验收伪装为已完成；这些仍由 Task10/正式发布门禁留下明确 not_run 或 blocker。",
+    "不改变 core、独立 Node/local-transformers 组件、模型权重和完整 Windows ZIP + 可选 blockmap 回退的既有交付边界。"
+  ],
+  "release_history": [
+    {
+      "version": "0.3.1",
+      "state": "superseded",
+      "verification": "frozen_unverified",
+      "snapshot_sha256": "a253baca5ae32f0edaba4baf5b2a77e1023d84db714014b5032768c8fb16acc4",
+      "note": "冻结自 v0.4.0 迁移前的完整 P0 范围。仓库中没有可复核的 v0.3.1 tag 或通过的 release-report，因此这里只保存历史，不能据此宣称已发布。",
+      "p0_objective": "发布 v0.3.1：统一版本与自动更新身份；隔离本地模型崩溃并以真实加载生成判定可用性；完成回复中消息队列和深色模式修复。",
+      "acceptance": [
+        {"id": "app-icon", "requirement": "打包产物（EXE、安装包、桌面快捷方式）使用新版应用图标，Windows 资源管理器中正常显示。"},
+        {"id": "maximized-window", "requirement": "窗口最大化时铺满显示器工作区（任务栏仍可见），四角直角无 DWM 圆角，边框无杂色条。"},
+        {"id": "restored-window", "requirement": "从最大化还原后窗口恢复圆角样式，标题栏与内容区域显示正常。"},
+        {"id": "narrow-window", "requirement": "窗口宽度 ≥800px 时界面可用，侧栏在窄屏下自动折叠。"},
+        {"id": "edge-resize", "requirement": "无边框窗口边缘与四角可通过鼠标拖拽调整大小。"},
+        {"id": "standard-package", "requirement": "安装包不内置 torch、transformers、sentence-transformers、tensorflow 或模型权重。"},
+        {"id": "local-runtime-upgrade", "requirement": "core 能识别过期的 local-transformers 组件并引导独立升级；升级不重复下载或删除已有模型权重。"},
+        {"id": "package-identity", "requirement": "应用版本、安装器版本、build_id、package_profile 与 SHA256 指向同一唯一构建。"},
+        {"id": "app-update", "requirement": "关于页、运行时身份与更新器版本一致；正式发布同时提供完整 Windows ZIP、64 KiB blockmap 和 stable.json，公开通道校验失败或不支持 Range 时自动回退完整包。"},
+        {"id": "local-runtime-isolation", "requirement": "本地运行组件使用守护进程与模型子进程隔离；模型原生崩溃不会拖死服务，并向界面返回明确错误。"},
+        {"id": "local-model-readiness", "requirement": "Qwen3.5 仅在隔离环境复用已有模型文件并真实完成加载与最小生成后显示可用；不得为兼容性检测重新下载模型。"},
+        {"id": "queued-followups", "requirement": "回复进行中不显示常驻选择卡；发送第二条消息后才按顺序显示逐行队列，默认完成后继续，并可逐条选择立即调整。"},
+        {"id": "dark-theme-legibility", "requirement": "深色模式由统一语义主题变量管理；AI 回复、历史列表、模型按钮、设置内页、模型服务、知识库、MCP 与插件市场均使用深色背景与浅色文字，同时保留错误和状态颜色语义。"}
+      ],
+      "non_goals": [
+        "本轮不购买或要求代码签名证书。",
+        "不把可选本地模型或推理依赖打进 core 安装包。",
+        "不修改发布渠道分级与门禁步骤顺序。"
+      ]
+    }
   ]
 }

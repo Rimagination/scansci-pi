@@ -7,33 +7,41 @@ receives shell or arbitrary filesystem tools.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import re
 import requests
 import shutil
 import subprocess
 import sys
+from tempfile import NamedTemporaryFile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .academic_search import search_academic_papers
 from .academic_planning import plan_academic_search
+from .agent_capabilities import builtin_capability_descriptor
+from .agent_contract import compile_task_contract as compile_host_task_contract
 from .agent_reach import run_agent_reach
+from .agent_skill_tools import ProgressiveSkillRuntime, SKILL_STATE_SCHEMA
 from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
 from .checkpoints import CheckpointError, CheckpointStore
-from .context_policy import prune_stale_tool_results
+from .context_policy import build_token_envelope, prune_stale_tool_results
+from .image_attachments import validate_pi_image_blocks
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
 from .library_manager import import_library_files
+from .model_metadata import ModelRuntimeDescriptor, descriptor_from_model_record
 from .qa.agent import answer_question
 from .research_runs import ResearchRunStore, StageSpec
 from .research_tools import (
@@ -66,10 +74,19 @@ from .obsidian_integration import obsidian_backlinks, obsidian_status, read_obsi
 from .prefix_diagnostics import build_prefix_shape
 from .run_manifest import RunManifest
 from .task_contract import TaskContract
+from .tool_authorization import (
+    ApprovalToken,
+    approval_token_from_response,
+    authorize_tool_call,
+)
 
 
 class PiRuntimeUnavailable(RuntimeError):
     """Raised when the bundled Pi sidecar or Node runtime cannot be found."""
+
+
+class PiMultimodalUnavailable(PiRuntimeUnavailable):
+    """Raised when a validated image turn targets a text-only descriptor."""
 
 
 class PiAgentRunError(RuntimeError):
@@ -87,11 +104,39 @@ _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
 _GATEWAY_TRANSPORT_ATTEMPTS = 3
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
+_PI_PROTOCOL_VERSION = 7
+_PI_REQUIRED_FEATURES = (
+    "task_contract_v2",
+    "explicit_empty_leases",
+    "host_tool_authorization",
+    "structured_mcp_effects",
+    "current_request_context",
+    "dynamic_tools",
+    "ephemeral_sessions",
+    "progressive_skills",
+    "parallel_tool_dispatch",
+    "lifecycle_hooks_v1",
+    "acked_session_commands",
+    "model_runtime_descriptor",
+    "token_envelope",
+    "multimodal_turns",
+    "scientific_subagents_v1",
+    "session_controls_v2",
+    "thinking_max",
+    "deferred_mcp_v2",
+    "mcp_effect_audit_v1",
+    "mcp_run_cache_v1",
+)
+_MAX_JSONL_LINE_BYTES = 20 * 1024 * 1024
 _TOOL_TAG_PATTERN = re.compile(r"<SCANSCI_TOOL_CALL>\s*(?P<body>.*?)\s*</SCANSCI_TOOL_CALL>", re.DOTALL)
 _TOOL_CALL_PATTERN = re.compile(
     r"tool_call\s*\(\s*name\s*=\s*[\"'](?P<name>[A-Za-z0-9_-]+)[\"']"
     r"(?:\s*,\s*arguments\s*=\s*(?P<arguments>\{.*?\}))?\s*\)",
     re.DOTALL,
+)
+_LEGACY_TOOL_TAG_PATTERN = re.compile(
+    r"<tool_call>\s*(?P<name>[A-Za-z0-9][A-Za-z0-9_-]{0,63})(?P<body>.*?)(?:</tool_call>|$)",
+    re.IGNORECASE | re.DOTALL,
 )
 _DOI_IN_TEXT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])10\.\d{4,9}/[A-Za-z0-9._;()/:+-]+",
@@ -101,6 +146,325 @@ _ARXIV_IN_TEXT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:arxiv:)?(?:\d{4}\.\d{4,5}|[a-z-]+/\d{7})(?:v\d+)?",
     re.IGNORECASE,
 )
+_SKILL_STATE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_SKILL_STATE_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_SESSION_STATE_ENTRIES = 200_000
+_MAX_SESSION_STATE_LINE_CHARS = 16_000_000
+_MAX_PERSISTED_SKILL_RESOURCES = 512
+
+# A read-only risk label alone does not prove thread safety.  This host-owned
+# allow-list intentionally excludes composite retrieval, mutable caches,
+# browser automation, control/loaders, MCP, and every effectful tool.
+_PARALLEL_SAFE_TOOL_NAMES = frozenset({
+    "inspect_available_tools",
+    "zotero_status",
+    "zotero_fulltext",
+    "zotero_attachment",
+    "zotero_export_bibtex",
+    "zotero_citations",
+    "obsidian_status",
+    "obsidian_search",
+    "obsidian_read",
+    "obsidian_backlinks",
+    "verify_doi",
+    "search_web",
+    "agent_reach",
+    "search_journal",
+    "audit_references",
+    "list_scientific_agents",
+    "collect_scientific_agents",
+    "list_subagents",
+    "collect_subagents",
+})
+_TOOL_EXECUTOR_WORKERS = 4
+_TOOL_EXECUTOR_CAPACITY = 16
+_TOOL_COMPLETION_CAPACITY = 32
+_DISPATCH_AUDIT_CAPACITY = 256
+_CANCEL_DRAIN_SECONDS = 1.5
+
+
+@dataclass(frozen=True)
+class _ToolCompletion:
+    request_id: str
+    generation: int
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    parallel_safe: bool = False
+    result: Any = None
+    error_type: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _PendingToolCall:
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    parallel_safe: bool
+
+
+@dataclass(frozen=True)
+class _PreparedToolResult:
+    temporary_path: Path
+    final_path: Path
+    reference: str
+    encoded_bytes: int
+
+
+@dataclass
+class _RunContext:
+    request_id: str
+    session_id: str
+    generation: int
+    supports_images: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    history: list[dict[str, Any]] = field(default_factory=list)
+    history_lock: threading.Lock = field(default_factory=threading.Lock)
+    completions: Queue[_ToolCompletion] = field(
+        default_factory=lambda: Queue(maxsize=_TOOL_COMPLETION_CAPACITY)
+    )
+    in_flight: dict[str, Future[_ToolCompletion]] = field(default_factory=dict)
+    deferred: deque[_PendingToolCall] = field(default_factory=deque)
+    parallel_in_flight: int = 0
+    sequential_in_flight: bool = False
+    authorized_call_count: int = 0
+    active: bool = True
+    pending_terminal: dict[str, Any] | None = None
+    terminal_tool_completed: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    # Linearizes the final tool.result wire commit against cancellation.  File
+    # preparation and rename stay outside this lock so cancellation remains
+    # responsive during slow disk I/O.
+    result_commit_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def has_pending_tools(self) -> bool:
+        with self.lock:
+            return bool(self.in_flight or self.deferred)
+
+
+class _ProtocolDispatcher:
+    """Route one sidecar stdout stream without letting waiters steal events."""
+
+    def __init__(
+        self,
+        raw_output: Queue[str | None],
+        *,
+        generation: int,
+        audit: deque[dict[str, Any]],
+    ) -> None:
+        self.raw_output = raw_output
+        self.generation = generation
+        self.audit = audit
+        self._lock = threading.Lock()
+        self._requests: dict[str, Queue[dict[str, Any] | None]] = {}
+        self._commands: dict[str, Queue[dict[str, Any] | None]] = {}
+        self._request_tombstones: set[str] = set()
+        self._command_tombstones: set[str] = set()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, daemon=True, name="scansci-pi-dispatch")
+            self._thread.start()
+
+    def register_request(self, request_id: str) -> Queue[dict[str, Any] | None]:
+        channel: Queue[dict[str, Any] | None] = Queue()
+        with self._lock:
+            if request_id in self._requests:
+                raise RuntimeError(f"Pi request {request_id} is already registered")
+            self._request_tombstones.discard(request_id)
+            self._requests[request_id] = channel
+        return channel
+
+    def unregister_request(self, request_id: str) -> None:
+        with self._lock:
+            self._requests.pop(request_id, None)
+            self._request_tombstones.add(request_id)
+            if len(self._request_tombstones) > _DISPATCH_AUDIT_CAPACITY:
+                self._request_tombstones.pop()
+
+    def register_command(self, command_id: str) -> Queue[dict[str, Any] | None]:
+        channel: Queue[dict[str, Any] | None] = Queue()
+        with self._lock:
+            if command_id in self._commands:
+                raise RuntimeError(f"Pi command {command_id} is already registered")
+            self._command_tombstones.discard(command_id)
+            self._commands[command_id] = channel
+        return channel
+
+    def unregister_command(self, command_id: str) -> None:
+        with self._lock:
+            self._commands.pop(command_id, None)
+            self._command_tombstones.add(command_id)
+            if len(self._command_tombstones) > _DISPATCH_AUDIT_CAPACITY:
+                self._command_tombstones.pop()
+
+    def _record(self, kind: str, event: dict[str, Any] | None = None) -> None:
+        record = {
+            "kind": kind,
+            "generation": self.generation,
+            "type": str((event or {}).get("type", ""))[:80],
+            "request_id": str((event or {}).get("request_id", ""))[:80],
+            "command_id": str((event or {}).get("command_id", ""))[:80],
+        }
+        with self._lock:
+            self.audit.append(record)
+
+    def _broadcast_eof(self) -> None:
+        with self._lock:
+            channels = [*self._requests.values(), *self._commands.values()]
+        for channel in channels:
+            channel.put(None)
+
+    def _run(self) -> None:
+        while True:
+            raw = self.raw_output.get()
+            if raw is None:
+                self._record("eof")
+                self._broadcast_eof()
+                return
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                self._record("invalid_json")
+                with self._lock:
+                    channels = [*self._requests.values(), *self._commands.values()]
+                failure = {"type": "protocol.error", "error": "Pi Agent returned invalid JSON"}
+                for channel in channels:
+                    channel.put(dict(failure))
+                continue
+            if not isinstance(event, dict):
+                self._record("invalid_message")
+                continue
+            request_id = str(event.get("request_id", ""))
+            command_id = str(event.get("command_id", ""))
+            event_generation = event.get("generation")
+            if command_id and (
+                event_generation is None
+                or not str(event_generation).isdigit()
+                or int(event_generation) != self.generation
+            ):
+                self._record("cross_generation", event)
+                continue
+            delivered = False
+            with self._lock:
+                request_channel = self._requests.get(request_id) if request_id else None
+                command_channel = self._commands.get(command_id) if command_id else None
+                sole_request_channel = (
+                    next(iter(self._requests.values()))
+                    if len(self._requests) == 1
+                    else None
+                )
+                late_request = bool(request_id and request_id in self._request_tombstones)
+                late_command = bool(command_id and command_id in self._command_tombstones)
+            # Correlated command acknowledgements take their command route.  If
+            # an event intentionally carries both identities, fan it out.
+            if command_channel is not None:
+                command_channel.put(event)
+                delivered = True
+            if request_channel is not None:
+                request_channel.put(event)
+                delivered = True
+            elif not request_id and not command_id and str(event.get("type", "")) == "protocol.error":
+                # An uncorrelated protocol error is generation-fatal.  Fan it
+                # out so no request or command silently waits until timeout.
+                with self._lock:
+                    channels = [*self._requests.values(), *self._commands.values()]
+                for channel in channels:
+                    channel.put(dict(event))
+                delivered = bool(channels)
+            elif (
+                sole_request_channel is not None
+                and str(event.get("type", "")) in {"tool.call", "skill.call"}
+                and not late_request
+            ):
+                # Executable messages with a missing/unknown request identity
+                # must reach the sole active host gate so it can return an
+                # explicit denial instead of leaving the sidecar promise hung.
+                sole_request_channel.put(event)
+                self._record("unauthorized_executable", event)
+                delivered = True
+            if not delivered:
+                self._record("late" if late_request or late_command else "orphan", event)
+
+
+def _persisted_skill_state(session_file: str | Path) -> dict[str, Any]:
+    """Read only bounded Skill metadata from the active Pi JSONL branch."""
+
+    path = Path(session_file) if str(session_file or "").strip() else None
+    if path is None or path.suffix.lower() != ".jsonl" or not path.is_file():
+        return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+    entries: dict[str, tuple[str | None, dict[str, Any] | None]] = {}
+    leaf_id = ""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= _MAX_SESSION_STATE_ENTRIES or len(line) > _MAX_SESSION_STATE_LINE_CHARS:
+                    return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+                raw = json.loads(line)
+                if not isinstance(raw, dict) or raw.get("type") == "session":
+                    continue
+                entry_id = str(raw.get("id", "") or "")
+                parent_value = raw.get("parentId")
+                parent_id = None if parent_value is None else str(parent_value)
+                if (
+                    not entry_id
+                    or len(entry_id) > 128
+                    or (parent_id is not None and len(parent_id) > 128)
+                ):
+                    return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+                custom = None
+                if raw.get("type") == "custom" and raw.get("customType") == SKILL_STATE_SCHEMA:
+                    data = raw.get("data")
+                    custom = dict(data) if isinstance(data, dict) else None
+                entries[entry_id] = (parent_id, custom)
+                leaf_id = entry_id
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+
+    loaded_by_key: dict[str, dict[str, Any]] = {}
+    visited: set[str] = set()
+    current = leaf_id
+    while current:
+        if current in visited or current not in entries:
+            return {"schema": SKILL_STATE_SCHEMA, "loaded": []}
+        visited.add(current)
+        parent_id, custom = entries[current]
+        if custom is not None:
+            skill_id = str(custom.get("skill_id", "") or "").strip().lower()
+            resource = str(custom.get("resource", "") or "")
+            package_hash = str(custom.get("package_hash", "") or "")
+            content_hash = str(custom.get("content_hash", "") or "")
+            provenance = str(custom.get("provenance", "resume") or "resume")[:32]
+            try:
+                byte_count = int(custom.get("bytes", -1))
+            except (TypeError, ValueError):
+                byte_count = -1
+            if (
+                _SKILL_STATE_ID_PATTERN.fullmatch(skill_id)
+                and 0 < len(resource) <= 500
+                and _SKILL_STATE_HASH_PATTERN.fullmatch(package_hash)
+                and _SKILL_STATE_HASH_PATTERN.fullmatch(content_hash)
+                and 0 <= byte_count <= 64 * 1024
+            ):
+                key = f"{skill_id}:{resource}"
+                if key not in loaded_by_key and len(loaded_by_key) < _MAX_PERSISTED_SKILL_RESOURCES:
+                    loaded_by_key[key] = {
+                        "skill_id": skill_id,
+                        "resource": resource,
+                        "package_hash": package_hash,
+                        "content_hash": content_hash,
+                        "provenance": provenance,
+                        "bytes": byte_count,
+                    }
+        current = parent_id or ""
+    return {
+        "schema": SKILL_STATE_SCHEMA,
+        "loaded": list(loaded_by_key.values()),
+    }
 
 
 def _explicit_paper_identifiers(text: str) -> list[str]:
@@ -354,7 +718,17 @@ class _ManagedGatewayAdapter:
                 started=started,
                 usage=dict(body.get("usage", {}) or {}),
             )
-            self._write_openai_response(handler, body, stream=expects_stream)
+            allowed_tool_names = {
+                str(dict(item.get("function", {}) or {}).get("name", ""))
+                for item in list(payload.get("tools", []) or [])
+                if isinstance(item, dict) and str(dict(item.get("function", {}) or {}).get("name", ""))
+            }
+            self._write_openai_response(
+                handler,
+                body,
+                stream=expects_stream,
+                allowed_tool_names=allowed_tool_names,
+            )
         except Exception as error:  # noqa: BLE001 - protocol adapter must return an HTTP error
             self._record_transport(request_summary, status=502, started=started, error=f"{type(error).__name__}: {error}")
             self._write_json(
@@ -759,7 +1133,13 @@ class _ManagedGatewayAdapter:
         handler.wfile.write(encoded)
 
     @staticmethod
-    def _write_openai_response(handler: BaseHTTPRequestHandler, body: dict[str, Any], *, stream: bool) -> None:
+    def _write_openai_response(
+        handler: BaseHTTPRequestHandler,
+        body: dict[str, Any],
+        *,
+        stream: bool,
+        allowed_tool_names: set[str] | None = None,
+    ) -> None:
         choice = dict((body.get("choices") or [{}])[0] or {})
         message = dict(choice.get("message") or {})
         model = str(body.get("model", ""))
@@ -769,7 +1149,9 @@ class _ManagedGatewayAdapter:
         content = str(message.get("content") or "")
         if not tool_calls:
             parsed_calls: list[dict[str, Any]] = []
-            for index, (name, arguments_value) in enumerate(_parse_text_tool_intents(content)):
+            for index, (name, arguments_value) in enumerate(
+                _parse_text_tool_intents(content, allowed_tool_names=allowed_tool_names)
+            ):
                 arguments = json.dumps(arguments_value, ensure_ascii=False, separators=(",", ":"))
                 parsed_calls.append(
                     {
@@ -824,7 +1206,26 @@ class _ManagedGatewayAdapter:
         handler.wfile.write(encoded)
 
 
-def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
+def _parse_text_tool_intents(
+    content: str,
+    *,
+    allowed_tool_names: set[str] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    allowed = {str(name).strip() for name in (allowed_tool_names or set()) if str(name).strip()}
+
+    def canonical_name(raw_name: str) -> str:
+        name = str(raw_name).strip()
+        if not allowed:
+            return name
+        if name in allowed:
+            return name
+        normalized = name.replace("-", "_")
+        return normalized if normalized in allowed else ""
+
+    def filter_call(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        canonical = canonical_name(name)
+        return (canonical, arguments) if canonical else None
+
     calls: list[tuple[str, dict[str, Any]]] = []
     stripped = content.strip()
     if stripped.startswith("```") and stripped.endswith("```"):
@@ -836,7 +1237,8 @@ def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
     if isinstance(payload, dict) and re.fullmatch(r"[A-Za-z0-9_-]+", str(payload.get("name", ""))):
         arguments = _coerce_tool_arguments(payload.get("arguments", {}))
         if arguments is not None:
-            return [(str(payload["name"]), arguments)]
+            call = filter_call(str(payload["name"]), arguments)
+            return [call] if call else []
     for match in _TOOL_TAG_PATTERN.finditer(content):
         try:
             payload = json.loads(match.group("body"))
@@ -846,15 +1248,48 @@ def _parse_text_tool_intents(content: str) -> list[tuple[str, dict[str, Any]]]:
             continue
         arguments = _coerce_tool_arguments(payload.get("arguments", {}))
         if arguments is not None:
-            calls.append((str(payload["name"]), arguments))
+            call = filter_call(str(payload["name"]), arguments)
+            if call:
+                calls.append(call)
     if calls:
         return calls
+    legacy_match = _LEGACY_TOOL_TAG_PATTERN.search(content)
+    if legacy_match:
+        call_name = canonical_name(legacy_match.group("name"))
+        if call_name:
+            arguments: dict[str, Any] = {}
+            for line in str(legacy_match.group("body") or "").splitlines():
+                line = line.strip().strip("`")
+                if not line or line.startswith("</"):
+                    continue
+                key_value = re.match(r"^(?P<key>[A-Za-z][A-Za-z0-9_-]{0,63})\s*[:=]\s*(?P<value>.*)$", line)
+                if not key_value:
+                    continue
+                key = key_value.group("key")
+                value = key_value.group("value").strip().strip("`").strip()
+                if value[:1] == value[-1:] and value[:1] in {"'", '"'} and len(value) >= 2:
+                    value = value[1:-1]
+                arguments[key] = value
+            if call_name == "agent_reach":
+                source = str(arguments.pop("source", "")).strip().casefold()
+                if "operation" not in arguments:
+                    arguments["operation"] = "read" if arguments.get("target") else "search" if arguments.get("query") else "status"
+                if source == "public_web" and "channel" not in arguments:
+                    arguments["channel"] = "web"
+                arguments = {
+                    key: value
+                    for key, value in arguments.items()
+                    if key in {"operation", "target", "query", "channel", "limit", "timeout_seconds"}
+                }
+            return [(call_name, arguments)]
     for match in _TOOL_CALL_PATTERN.finditer(content):
         try:
             arguments = json.loads(match.group("arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
-        calls.append((match.group("name"), dict(arguments) if isinstance(arguments, dict) else {}))
+        call = filter_call(match.group("name"), dict(arguments) if isinstance(arguments, dict) else {})
+        if call:
+            calls.append(call)
     return calls
 
 
@@ -902,6 +1337,7 @@ class PiAgentClient:
         embedding_provider: Any | None = None,
         reranker: Any | None = None,
         active_run_id: str = "",
+        scientific_agent_control: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.evidence_db = Path(evidence_db).resolve()
@@ -920,19 +1356,44 @@ class PiAgentClient:
         self.embedding_provider = embedding_provider
         self.reranker = reranker
         self.active_run_id = str(active_run_id or "").strip()
+        self._scientific_agent_control = scientific_agent_control
         self.agent_dir = self.workspace.parent / ".scansci-pi-agent"
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._process: subprocess.Popen[str] | None = None
         self._output: Queue[str | None] = Queue()
+        self._process_generation = 0
+        self._protocol_generation = 0
+        self._dispatcher: _ProtocolDispatcher | None = None
+        self._dispatch_audit: deque[dict[str, Any]] = deque(maxlen=_DISPATCH_AUDIT_CAPACITY)
         self._errors: list[str] = []
         self._stdin_lock = threading.Lock()
-        # Accumulate tool call results for self_assess introspection.
+        # Legacy direct-tool history remains available outside a run.  Active
+        # Pi turns use the request-scoped history stored in _RunContext.
         self._tool_history: list[dict[str, Any]] = []
+        self._tool_history_lock = threading.Lock()
+        self._worker_context = threading.local()
+        self._tool_executor = ThreadPoolExecutor(
+            max_workers=_TOOL_EXECUTOR_WORKERS,
+            thread_name_prefix="scansci-pi-tool",
+        )
+        self._tool_slots = threading.BoundedSemaphore(_TOOL_EXECUTOR_CAPACITY)
         self._run_lock = threading.Lock()
+        # Own process/session lifecycle transitions for the full duration of a
+        # run or management command.  Control writes intentionally use only
+        # _stdin_lock so another thread can still cancel an active run.
+        self._lifecycle_lock = threading.RLock()
         self._cancel_requested = threading.Event()
-        self._tool_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scansci-tool-")
+        self._contexts_lock = threading.Lock()
+        self._run_contexts: dict[str, _RunContext] = {}
+        self._request_generation = 0
+        self._session_command_locks_guard = threading.Lock()
+        self._session_command_locks: dict[str, threading.Lock] = {}
         self._active_request_id = ""
         self._active_session_id = ""
+        self._interaction_lock = threading.Lock()
+        self._pending_interaction_kinds: dict[str, tuple[str, str]] = {}
+        self._approval_tokens: dict[str, ApprovalToken] = {}
+        self._skill_runtimes: dict[str, ProgressiveSkillRuntime] = {}
         self._provider_key_fingerprint = ""
         self._gateway_adapter: _ManagedGatewayAdapter | None = None
         self._gateway_adapter_signature = ""
@@ -998,7 +1459,11 @@ class PiAgentClient:
         try:
             assert process.stdin is not None
             assert process.stdout is not None
-            process.stdin.write('{"type":"ping"}\n')
+            process.stdin.write(json.dumps({
+                "type": "ping",
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }) + "\n")
             process.stdin.flush()
             output: Queue[str | None] = Queue()
 
@@ -1015,18 +1480,257 @@ class PiAgentClient:
             response = json.loads(line)
             if response.get("type") != "pong":
                 raise PiRuntimeUnavailable(f"Unexpected Pi sidecar response: {response.get('type', '')}")
+            protocol = int(response.get("protocol", 0) or 0)
+            capabilities = {str(value) for value in list(response.get("capabilities", []) or [])}
+            missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
+            if protocol != _PI_PROTOCOL_VERSION or missing_features:
+                detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
+                raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
             return {
                 "ready": True,
                 "runtime": str(response.get("runtime", "pi")),
                 "version": str(response.get("version", "")),
-                "protocol": int(response.get("protocol", 0) or 0),
-                "capabilities": list(response.get("capabilities", []) or []),
+                "protocol": protocol,
+                "capabilities": sorted(capabilities),
                 "node": str(node_path),
                 "sidecar": str(script_path),
             }
         finally:
             process.kill()
             process.wait(timeout=5)
+
+    @classmethod
+    def diagnostic_tool_loop(
+        cls,
+        *,
+        workspace: str | Path,
+        evidence_db: str | Path,
+        timeout_seconds: float = 30.0,
+        task_count: int = 1,
+        dynamic_activation: bool = False,
+        include_image: bool = False,
+    ) -> dict[str, Any]:
+        """Exercise provider serialization, Pi dispatch, and one host tool.
+
+        The loopback provider is deterministic and binds only to localhost. It
+        still drives the production Node bundle and production Python tool
+        dispatcher; unlike ``runtime_status()``, this proves a complete
+        model->tool.call->tool.result->model completion cycle without needing
+        an external credential or network request.
+        """
+
+        class _DiagnosticHandler(BaseHTTPRequestHandler):
+            request_count = 0
+            target_tool = "inspect_workspace"
+            image_task_ids: set[int] = set()
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > 2_000_000:
+                    self.send_error(400)
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                except (ValueError, UnicodeDecodeError):
+                    self.send_error(400)
+                    return
+                type(self).request_count += 1
+                turn = type(self).request_count
+                phase_count = 3 if dynamic_activation else 2
+                phase = (turn - 1) % phase_count
+                if include_image:
+                    serialized = json.dumps(payload.get("messages", []), ensure_ascii=False)
+                    if "image_url" in serialized and "data:image/png" in serialized:
+                        type(self).image_task_ids.add(((turn - 1) // phase_count) + 1)
+                if dynamic_activation and phase == 0:
+                    delta = {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"diagnostic-search-tools-{turn}",
+                            "type": "function",
+                            "function": {
+                                "name": "search_tools",
+                                "arguments": json.dumps({
+                                    "names": [type(self).target_tool],
+                                    "activate": True,
+                                }),
+                            },
+                        }],
+                    }
+                    finish = "tool_calls"
+                elif (dynamic_activation and phase == 1) or (not dynamic_activation and phase == 0):
+                    delta: dict[str, Any] = {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"diagnostic-host-tool-{turn}",
+                            "type": "function",
+                            "function": {"name": type(self).target_tool, "arguments": "{}"},
+                        }],
+                    }
+                    finish = "tool_calls"
+                else:
+                    delta = {"role": "assistant", "content": "PI_DIAGNOSTIC_TOOL_LOOP_OK"}
+                    finish = "stop"
+                chunks = [
+                    {
+                        "id": f"chatcmpl-diagnostic-{turn}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "fixture-model",
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    },
+                    {
+                        "id": f"chatcmpl-diagnostic-{turn}",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "fixture-model",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    },
+                ]
+                body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+                encoded = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        workspace_path = Path(workspace).resolve()
+        evidence_path = Path(evidence_db).resolve()
+        workspace_path.parent.mkdir(parents=True, exist_ok=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _DiagnosticHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = cls(workspace=workspace_path, evidence_db=evidence_path)
+        descriptor = descriptor_from_model_record(
+            provider_id="deterministic-loopback",
+            provider_kind="openai-compatible",
+            model_id="fixture-model",
+            model_record={
+                "context_window": "32K",
+                "capabilities": ["reasoning", "tool", *( ["vision"] if include_image else [] )],
+            },
+            api_surface="chat_completions",
+        )
+        started = time.monotonic()
+        events: list[dict[str, Any]] = []
+        mutation_evidence: list[dict[str, Any]] = []
+        count = max(1, min(int(task_count), 10))
+        image = {
+            "type": "image",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+            "mimeType": "image/png",
+        }
+        try:
+            for index in range(count):
+                target_tool = "inspect_workspace" if index % 2 == 0 else "self_assess"
+                _DiagnosticHandler.target_tool = target_tool
+                contract = compile_host_task_contract(
+                    task_mode="general",
+                    user_text="Run the bounded packaged runtime diagnostic.",
+                    available_tool_ids=[target_tool],
+                    required_tool_groups=[[target_tool]],
+                )
+                contract["allowed_tools"] = [target_tool]
+                contract["initial_tools"] = [] if dynamic_activation else [target_tool]
+                if dynamic_activation:
+                    contract["required_tool_groups"] = []
+                turn_session_id = f"diagnostic-tool-loop-session-{index + 1}" if dynamic_activation else None
+                turn_events = list(client.stream_chat(
+                    provider_kind="openai-compatible",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    api_key="diagnostic-loopback-key",
+                    model_id="fixture-model",
+                    messages=[{
+                        "role": "user",
+                        "content": f"Run diagnostic task {index + 1}/{count}, call {target_tool} once, then finish.",
+                    }],
+                    images=[image] if include_image else [],
+                    thinking_level="off",
+                    task_mode="general",
+                    task_contract=contract,
+                    model_runtime=descriptor,
+                    timeout_seconds=max(5.0, float(timeout_seconds)),
+                    session_id=turn_session_id,
+                ))
+                if dynamic_activation:
+                    searches = [
+                        event
+                        for event in turn_events
+                        if event.get("type") == "status"
+                        and event.get("status") == "tool_catalog_searched"
+                        and event.get("name") == "search_tools"
+                    ]
+                    activated = [
+                        str(name)
+                        for event in searches
+                        for name in list(dict(event.get("details", {}) or {}).get("activated", []) or [])
+                    ]
+                    target_completed = any(
+                        event.get("type") == "tool.completed" and event.get("name") == target_tool
+                        for event in turn_events
+                    )
+                    mutation_evidence.append({
+                        "turn": index + 1,
+                        "session_id": str(turn_session_id or ""),
+                        "target_tool": target_tool,
+                        "search_tools_completed": bool(searches),
+                        "target_activated": target_tool in activated,
+                        "target_completed": target_completed,
+                    })
+                events.extend(turn_events)
+        finally:
+            client.close()
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+        tool_calls = sum(1 for event in events if event.get("type") == "tool.completed")
+        done_count = sum(1 for event in events if event.get("type") == "done")
+        marker_count = sum(
+            1
+            for event in events
+            if event.get("type") == "delta"
+            and "PI_DIAGNOSTIC_TOOL_LOOP_OK" in str(event.get("content", ""))
+        )
+        fallback_count = sum(
+            1
+            for event in events
+            if "fallback" in str(event.get("type", "")).casefold()
+            or "degrad" in str(event.get("type", "")).casefold()
+            or "fallback" in str(event.get("status", "")).casefold()
+            or "degrad" in str(event.get("status", "")).casefold()
+        )
+        image_serialized_tasks = len(_DiagnosticHandler.image_task_ids) if include_image else 0
+        verified_mutations = sum(
+            1
+            for item in mutation_evidence
+            if item["search_tools_completed"] and item["target_activated"] and item["target_completed"]
+        )
+        return {
+            "ok": (
+                tool_calls == count
+                and done_count == count
+                and marker_count == count
+                and fallback_count == 0
+                and (not dynamic_activation or verified_mutations == count)
+                and (not include_image or image_serialized_tasks == count)
+            ),
+            "tool_calls": tool_calls,
+            "done": done_count == count,
+            "marker_seen": marker_count == count,
+            "fallback_count": fallback_count,
+            "provider_requests": _DiagnosticHandler.request_count,
+            "dynamic_mutations": verified_mutations if dynamic_activation else 0,
+            "mutation_evidence": mutation_evidence,
+            "image_tool_tasks": count if include_image else 0,
+            "image_serialized_tasks": image_serialized_tasks,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
 
     @classmethod
     def probe_mcp_server(
@@ -1117,51 +1821,51 @@ class PiAgentClient:
         thinking_level: str = "medium",
         task_mode: str = "general",
         task_contract: dict[str, Any] | None = None,
+        selected_skills: list[dict[str, Any]] | None = None,
+        images: list[dict[str, Any]] | None = None,
+        model_runtime: dict[str, Any] | ModelRuntimeDescriptor | None = None,
         timeout_seconds: float = 900.0,
         session_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield normalized Pi events, optionally continuing a durable session."""
 
-        messages, context_report = prune_stale_tool_results(messages)
+        if isinstance(model_runtime, ModelRuntimeDescriptor):
+            descriptor = model_runtime
+        elif isinstance(model_runtime, dict):
+            descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
+        else:
+            descriptor = descriptor_from_model_record(
+                provider_id="runtime",
+                provider_kind=provider_kind,
+                model_id=model_id,
+                model_record=None,
+                api_surface=str(api_surface or "chat_completions"),
+            )
+        if (
+            descriptor.provider_kind != str(provider_kind)
+            or descriptor.model_id != str(model_id)
+            or descriptor.api_surface != str(api_surface or "chat_completions")
+        ):
+            raise ValueError(
+                "Model runtime descriptor does not match the final provider route"
+            )
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not descriptor.supports_images:
+            raise PiMultimodalUnavailable(
+                "The selected model runtime descriptor does not support image input"
+            )
+
+        messages, stale_context_report = prune_stale_tool_results(messages)
         system_parts: list[str] = []
         conversation: list[str] = []
-        collected_images: list[dict[str, str]] = []
         for item in messages:
             role = str(item.get("role", "user")).strip().lower()
             content = item.get("content", "")
             if not isinstance(content, str):
                 if role in {"tool", "toolresult", "tool_result"}:
                     content = json.dumps(content, ensure_ascii=False, default=str)
-                elif isinstance(content, (list, tuple)):
-                    # Multimodal content blocks: extract text and image URLs
-                    text_parts: list[str] = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        block_type = str(block.get("type", "")).lower()
-                        if block_type == "text" and isinstance(block.get("text"), str):
-                            text_parts.append(str(block["text"]))
-                        elif block_type == "image_url":
-                            image_url = block.get("image_url", {})
-                            if isinstance(image_url, dict):
-                                url = str(image_url.get("url", ""))
-                                if url:
-                                    collected_images.append({
-                                        "url": url,
-                                        "detail": str(image_url.get("detail", "auto")),
-                                    })
-                        elif block_type == "image" and isinstance(block.get("source"), dict):
-                            src = block["source"]
-                            b64 = str(src.get("data", "") or src.get("base64", "") or "")
-                            media_type = str(src.get("media_type", "image/png"))
-                            if b64:
-                                collected_images.append({
-                                    "url": f"data:{media_type};base64,{b64}",
-                                    "detail": "auto",
-                                })
-                    content = " ".join(text_parts) if text_parts else "(image-only message)"
                 else:
-                    content = str(content)
+                    raise ValueError("Pi text bridge does not accept image message blocks")
             if role == "system":
                 system_parts.append(content)
             else:
@@ -1198,15 +1902,132 @@ class PiAgentClient:
             ),
             prompt,
         )
-        effective_contract = TaskContract.from_payload(
-            task_contract,
-            request=final_request,
-            task_mode=task_mode,
-        ).to_dict()
+        if task_contract is None:
+            # A direct transport caller still goes through the trusted host
+            # compiler.  In contrast, a supplied payload that omits
+            # ``allowed_tools`` remains omitted and therefore fail-closed.
+            effective_contract = compile_host_task_contract(
+                task_mode=task_mode,
+                user_text=final_request,
+            )
+        else:
+            effective_contract = TaskContract.from_payload(
+                task_contract,
+                request=final_request,
+                task_mode=task_mode,
+            ).to_dict()
+        messages, token_envelope_report = build_token_envelope(
+            messages,
+            descriptor=descriptor,
+            host_contract=effective_contract,
+        )
+        system_parts = []
+        conversation = []
+        for item in messages:
+            role = str(item.get("role", "user")).strip().lower()
+            content = item.get("content", "")
+            if not isinstance(content, str):
+                if role in {"tool", "toolresult", "tool_result"}:
+                    content = json.dumps(content, ensure_ascii=False, default=str)
+                else:
+                    raise ValueError("Pi conversation text must be separate from canonical image blocks")
+            if role == "system":
+                system_parts.append(content)
+            else:
+                conversation.append(f"[{role.upper()}]\n{content}")
+        if not conversation:
+            raise ValueError("Pi requires at least one conversational message")
+        if is_recovery:
+            prompt = final_request or "Continue the persisted ScanSci session."
+        else:
+            prompt = (
+                "Continue the following ScanSci conversation. Reply to the final USER message.\n\n"
+                + "\n\n".join(conversation)
+            )
+        context_report = {
+            **stale_context_report.to_dict(),
+            "token_envelope": token_envelope_report.to_dict(),
+            "model_runtime": {
+                "schema_version": descriptor.schema_version,
+                "context_window_tokens": descriptor.context_window_tokens,
+                "provider_input_tokens": descriptor.provider_input_tokens,
+                "input_modalities": list(descriptor.input_modalities),
+                "degraded": descriptor.degraded,
+                "degradation_reasons": list(descriptor.degradation_reasons),
+            },
+        }
         effective_base_url = self._effective_base_url(base_url=base_url, api_key=api_key)
+        skill_selection = [
+            dict(item)
+            for item in list(selected_skills or [])
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        persisted_skill_state = _persisted_skill_state(session_file) if is_recovery else {
+            "schema": SKILL_STATE_SCHEMA,
+            "loaded": [],
+        }
+        restored_by_key = {
+            f"{str(item.get('skill_id', '')).lower()}:{str(item.get('resource', 'SKILL.md') or 'SKILL.md')}": dict(item)
+            for item in list(persisted_skill_state.get("loaded", []) or [])
+            if isinstance(item, dict) and str(item.get("skill_id", "")).strip()
+        }
+        for item in skill_selection:
+            if str(item.get("status", "")) != "loaded":
+                continue
+            metadata = {
+                "skill_id": str(item.get("id", "")),
+                "resource": str(item.get("resource", "SKILL.md") or "SKILL.md"),
+                "package_hash": str(item.get("package_hash", "")),
+                "content_hash": str(item.get("content_hash", "")),
+                "provenance": str(item.get("provenance", "explicit") or "explicit"),
+                "bytes": int(item.get("bytes", 0) or 0),
+            }
+            restored_by_key[f"{metadata['skill_id'].lower()}:{metadata['resource']}"] = metadata
+        restored_skill_state = {
+            "schema": SKILL_STATE_SCHEMA,
+            "loaded": list(restored_by_key.values()),
+        }
+        priority_ids = [
+            str(item.get("id", ""))
+            for item in skill_selection
+            if str(item.get("provenance", "")) in {"explicit", "inferred"}
+        ]
+        priority_ids.extend(
+            str(item.get("skill_id", ""))
+            for item in list(persisted_skill_state.get("loaded", []) or [])
+            if isinstance(item, dict)
+        )
+        skill_runtime = ProgressiveSkillRuntime(
+            self.workspace,
+            restored_state=restored_skill_state,
+            priority_ids=priority_ids,
+        )
+        self._skill_runtimes[request_id] = skill_runtime
+        registered_tools = sorted({
+            "ask_user",
+            "search_tools",
+            "submit_plan",
+            *[str(name) for name in list(effective_contract.get("allowed_tools", []) or []) if str(name)],
+        })
+        required_initial = {
+            str(name)
+            for group in list(effective_contract.get("required_tool_groups", []) or [])
+            if isinstance(group, (list, tuple, set, frozenset))
+            for name in group
+            if str(name)
+        }
+        active_tools = sorted({
+            "ask_user",
+            "search_tools",
+            "submit_plan",
+            *[str(name) for name in list(effective_contract.get("initial_tools", []) or []) if str(name)],
+            *required_initial,
+        } & set(registered_tools))
         tool_set = {
             "mcp_servers": [str(item.get("id", "")) for item in self._enabled_mcp_servers() if isinstance(item, dict)],
             "disabled_tools": self._disabled_artifact_tools(),
+            "registered_tools": registered_tools,
+            "active_tools": active_tools,
         }
         contract_shape = {
             key: effective_contract.get(key)
@@ -1215,6 +2036,7 @@ class PiAgentClient:
                 "allowed_tools", "pause_policy", "success_criteria",
             )
         }
+        contract_shape["model_runtime"] = descriptor.to_dict()
         prefix_shape = build_prefix_shape(
             provider=provider_kind,
             model=model_id,
@@ -1226,8 +2048,11 @@ class PiAgentClient:
         )
         start_message = {
             "type": "run.start",
+            "pi_protocol_version": _PI_PROTOCOL_VERSION,
+            "required_features": list(_PI_REQUIRED_FEATURES),
             "request_id": request_id,
             "session_id": logical_session_id,
+            "ephemeral_session": transient_session,
             "session_file": session_file,
             "cwd": str(self.workspace.parent),
             "agent_dir": str(self.agent_dir),
@@ -1239,13 +2064,18 @@ class PiAgentClient:
             "thinking_level": thinking_level,
             "system_prompt": "\n\n".join(system_parts),
             "prompt": prompt,
+            "images": validated_images,
+            "model_runtime": descriptor.to_dict(),
             "task_mode": task_mode,
             "mcp_servers": self._enabled_mcp_servers(),
             "disabled_tools": self._disabled_artifact_tools(),
             "task_contract": effective_contract,
-            "images": collected_images if collected_images else None,
+            "tool_set": tool_set,
             "prefix_shape": prefix_shape,
-            "context_policy": context_report.to_dict(),
+            "context_policy": context_report,
+            "skill_catalog": skill_runtime.catalog(),
+            "skill_selection": skill_selection,
+            "skill_state": skill_runtime.state(),
         }
         manifest: RunManifest | None = None
         try:
@@ -1261,7 +2091,7 @@ class PiAgentClient:
                 timeout_seconds=timeout_seconds,
                 prefix_shape=prefix_shape,
                 task_contract=effective_contract,
-                context_policy=context_report.to_dict(),
+                context_policy=context_report,
             )
         except OSError:
             # Diagnostics are valuable but must never prevent a research run.
@@ -1292,7 +2122,11 @@ class PiAgentClient:
                     if event_type in {"done", "session_stats"}:
                         stats = event.get("stats") or event.get("value")
                         if isinstance(stats, dict):
-                            manifest.record_context_stats(stats, prefix_shape=prefix_shape)
+                            runtime_prefix = stats.get("prefixShape")
+                            manifest.record_context_stats(
+                                stats,
+                                prefix_shape=runtime_prefix if isinstance(runtime_prefix, dict) else prefix_shape,
+                            )
                 yield event
             if manifest is not None:
                 manifest.finish(
@@ -1309,60 +2143,557 @@ class PiAgentClient:
                 manifest.fail(error, retryable=isinstance(error, (TimeoutError, ConnectionError)))
             raise
         finally:
+            self._skill_runtimes.pop(request_id, None)
             if transient_session:
                 self.close()
 
+    def _execute_skill_tool(
+        self,
+        request_id: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one bounded instruction-plane operation for the current request."""
+
+        runtime = self._skill_runtimes.get(str(request_id or ""))
+        if runtime is None:
+            raise PermissionError("Skill call belongs to an inactive request")
+        if name == "search_skills":
+            return runtime.search_skills(arguments.get("query", ""), arguments.get("limit", 8))
+        if name == "load_skill":
+            return runtime.load_skill(
+                arguments.get("skill_id", ""),
+                resource=arguments.get("resource"),
+                provenance=arguments.get("provenance", "model"),
+            )
+        if name == "restore_skill":
+            return runtime.restore_skill(
+                arguments.get("skill_id", ""),
+                resource=arguments.get("resource"),
+            )
+        raise PermissionError(f"Unknown Skill instruction operation: {name}")
+
     def _ensure_process(self, *, api_key: str) -> subprocess.Popen[str]:
-        fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-        if self._process is not None and self._process.poll() is None:
-            if self._provider_key_fingerprint == fingerprint:
-                return self._process
-            self.close()
-        node_path, script_path = self.runtime_paths()
-        environment = self._node_environment()
-        environment["SCANSCIPI_PROVIDER_KEY"] = api_key
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self._output = Queue()
-        self._errors = []
-        process = subprocess.Popen(
-            [str(node_path), str(script_path)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=environment,
-            creationflags=creation_flags,
-        )
-        assert process.stdin is not None
-        assert process.stdout is not None
-        assert process.stderr is not None
-        self._process = process
-        self._provider_key_fingerprint = fingerprint
+        with self._lifecycle_lock:
+            fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            if self._process is not None and self._process.poll() is None:
+                if self._provider_key_fingerprint == fingerprint:
+                    return self._process
+                self.close()
+            node_path, script_path = self.runtime_paths()
+            environment = self._node_environment()
+            environment["SCANSCIPI_PROVIDER_KEY"] = api_key
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            raw_output: Queue[str | None] = Queue()
+            error_lines: list[str] = []
+            self._output = raw_output
+            self._process_generation += 1
+            self._dispatcher = _ProtocolDispatcher(
+                raw_output,
+                generation=self._process_generation,
+                audit=self._dispatch_audit,
+            )
+            self._errors = error_lines
+            process = subprocess.Popen(
+                [str(node_path), str(script_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=environment,
+                creationflags=creation_flags,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            self._process = process
+            self._provider_key_fingerprint = fingerprint
 
-        def drain_stdout() -> None:
-            for line in process.stdout:
-                self._output.put(line)
-            self._output.put(None)
+            def drain_stdout() -> None:
+                for line in process.stdout:
+                    raw_output.put(line)
+                raw_output.put(None)
 
-        def drain_stderr() -> None:
-            for line in process.stderr:
-                if len(self._errors) < 80:
-                    self._errors.append(line.rstrip())
+            def drain_stderr() -> None:
+                for line in process.stderr:
+                    if len(error_lines) < 80:
+                        error_lines.append(line.rstrip())
 
-        threading.Thread(target=drain_stdout, daemon=True).start()
-        threading.Thread(target=drain_stderr, daemon=True).start()
-        return process
+            threading.Thread(target=drain_stdout, daemon=True).start()
+            threading.Thread(target=drain_stderr, daemon=True).start()
+            return process
+
+    def _ensure_dispatcher(self) -> _ProtocolDispatcher:
+        dispatcher = self._dispatcher
+        if dispatcher is None or dispatcher.raw_output is not self._output:
+            if self._process_generation <= 0:
+                self._process_generation = 1
+            dispatcher = _ProtocolDispatcher(
+                self._output,
+                generation=self._process_generation,
+                audit=self._dispatch_audit,
+            )
+            self._dispatcher = dispatcher
+        return dispatcher
+
+    def _ensure_protocol_negotiated(self, *, timeout_seconds: float) -> None:
+        """Fail closed before a fresh sidecar may mutate durable sessions."""
+
+        if self._protocol_generation == self._process_generation and self._process_generation > 0:
+            return
+        try:
+            event = self._await_command(
+                {
+                    "type": "ping",
+                    "command_id": uuid4().hex,
+                    "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                    "required_features": list(_PI_REQUIRED_FEATURES),
+                },
+                terminal_types={"pong"},
+                timeout_seconds=max(0.05, float(timeout_seconds)),
+                session_lock_id=f"__protocol__:{self._process_generation}",
+                timeout_message="Pi sidecar protocol handshake exceeded the timeout",
+            )
+        except Exception as error:
+            raise PiRuntimeUnavailable(
+                f"The ScanSci Pi sidecar protocol handshake failed: {error}"
+            ) from error
+        protocol = int(event.get("protocol", 0) or 0)
+        capabilities = {str(value) for value in list(event.get("capabilities", []) or [])}
+        missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
+        if protocol != _PI_PROTOCOL_VERSION or missing_features:
+            detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
+            raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
+        self._protocol_generation = self._process_generation
 
     def _write(self, message: dict[str, Any]) -> None:
         process = self._process
         if process is None or process.poll() is not None or process.stdin is None:
             raise PiRuntimeUnavailable("The ScanSci Pi sidecar is not running")
         with self._stdin_lock:
-            process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+            encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > _MAX_JSONL_LINE_BYTES:
+                raise ValueError("Pi protocol message exceeds the bounded JSONL line limit")
+            process.stdin.write(encoded + "\n")
             process.stdin.flush()
+
+    def _session_command_lock(self, session_id: str) -> threading.Lock:
+        key = str(session_id or "").strip() or "__runtime__"
+        with self._session_command_locks_guard:
+            return self._session_command_locks.setdefault(key, threading.Lock())
+
+    def _current_cancel_event(self) -> threading.Event:
+        context = getattr(self._worker_context, "run_context", None)
+        if isinstance(context, _RunContext):
+            return context.cancel_event
+        return self._cancel_requested
+
+    def _record_dispatch_audit(
+        self,
+        kind: str,
+        *,
+        request_id: str = "",
+        command_id: str = "",
+        event_type: str = "",
+        generation: int = 0,
+    ) -> None:
+        self._dispatch_audit.append({
+            "kind": str(kind)[:80],
+            "generation": int(generation or self._process_generation),
+            "type": str(event_type)[:80],
+            "request_id": str(request_id)[:80],
+            "command_id": str(command_id)[:80],
+        })
+
+    def _context_is_active(self, context: _RunContext) -> bool:
+        with self._contexts_lock:
+            return self._run_contexts.get(context.request_id) is context and context.active
+
+    @staticmethod
+    def _mark_context_cancelled(context: _RunContext) -> None:
+        # Signal workers immediately, then cross the final result-commit lock.
+        # If the commit already owns the lock it linearizes first and finishes
+        # file/wire/history consistently; otherwise the commit observes the
+        # event and is suppressed before writing to the sidecar.
+        context.cancel_event.set()
+        with context.result_commit_lock:
+            pass
+
+    def _execute_tool_worker(
+        self,
+        context: _RunContext,
+        pending: _PendingToolCall,
+    ) -> _ToolCompletion:
+        self._worker_context.run_context = context
+        try:
+            if context.cancel_event.is_set():
+                raise InterruptedError("Pi tool execution was cancelled before it started")
+            result = self._execute_tool(pending.name, dict(pending.arguments))
+            if context.cancel_event.is_set():
+                raise InterruptedError("Pi tool execution was cancelled")
+            retried = _retry_empty_search(
+                pending.name,
+                pending.arguments,
+                result,
+                executor=self._execute_tool,
+            )
+            if retried is not None:
+                result = retried
+            return _ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                result=result,
+            )
+        except Exception as error:  # noqa: BLE001 - serialized on the owning event thread
+            return _ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+        finally:
+            self._worker_context.run_context = None
+
+    def _submit_tool(self, context: _RunContext, pending: _PendingToolCall) -> None:
+        if not self._tool_slots.acquire(blocking=False):
+            context.completions.put_nowait(_ToolCompletion(
+                request_id=context.request_id,
+                generation=context.generation,
+                call_id=pending.call_id,
+                name=pending.name,
+                arguments=dict(pending.arguments),
+                parallel_safe=pending.parallel_safe,
+                error_type="RuntimeError",
+                error="Pi tool executor capacity is exhausted",
+            ))
+            return
+        try:
+            future = self._tool_executor.submit(self._execute_tool_worker, context, pending)
+        except BaseException:
+            self._tool_slots.release()
+            raise
+        with context.lock:
+            context.in_flight[pending.call_id] = future
+            if pending.parallel_safe:
+                context.parallel_in_flight += 1
+            else:
+                context.sequential_in_flight = True
+
+        def completed(done: Future[_ToolCompletion]) -> None:
+            self._tool_slots.release()
+            try:
+                completion = done.result()
+            except BaseException as error:  # pragma: no cover - worker converts ordinary failures
+                completion = _ToolCompletion(
+                    request_id=context.request_id,
+                    generation=context.generation,
+                    call_id=pending.call_id,
+                    name=pending.name,
+                    arguments=dict(pending.arguments),
+                    parallel_safe=pending.parallel_safe,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            if not self._context_is_active(context):
+                self._record_dispatch_audit(
+                    "late_tool_completion",
+                    request_id=context.request_id,
+                    event_type="tool.result",
+                    generation=context.generation,
+                )
+                return
+            try:
+                context.completions.put_nowait(completion)
+            except Full:
+                self._mark_context_cancelled(context)
+                self._record_dispatch_audit(
+                    "completion_queue_full",
+                    request_id=context.request_id,
+                    event_type="tool.result",
+                    generation=context.generation,
+                )
+
+        future.add_done_callback(completed)
+
+    def _enqueue_tool(self, context: _RunContext, pending: _PendingToolCall) -> None:
+        with context.lock:
+            if not context.active:
+                return
+            can_start = (
+                not context.sequential_in_flight
+                and not context.deferred
+                and (pending.parallel_safe or not context.in_flight)
+            )
+            if not can_start:
+                context.deferred.append(pending)
+                return
+        self._submit_tool(context, pending)
+
+    def _release_tool_lane(self, context: _RunContext, completion: _ToolCompletion) -> None:
+        to_start: list[_PendingToolCall] = []
+        with context.lock:
+            future = context.in_flight.pop(completion.call_id, None)
+            if future is not None:
+                if completion.parallel_safe:
+                    context.parallel_in_flight = max(0, context.parallel_in_flight - 1)
+                else:
+                    context.sequential_in_flight = False
+            if context.in_flight or not context.active:
+                return
+            while context.deferred:
+                pending = context.deferred.popleft()
+                to_start.append(pending)
+                if not pending.parallel_safe:
+                    break
+                if context.deferred and not context.deferred[0].parallel_safe:
+                    break
+        for pending in to_start:
+            self._submit_tool(context, pending)
+
+    def _tool_result_commit_checkpoint(
+        self,
+        _stage: str,
+        _context: _RunContext,
+        _completion: _ToolCompletion,
+    ) -> None:
+        """Test seam for deterministic cancellation at result commit phases."""
+
+    def _finish_tool_completion(
+        self,
+        context: _RunContext,
+        completion: _ToolCompletion,
+        *,
+        task_mode: str,
+    ) -> dict[str, Any] | None:
+        self._release_tool_lane(context, completion)
+        if not self._context_is_active(context) or context.cancel_event.is_set():
+            self._record_dispatch_audit(
+                "late_tool_completion",
+                request_id=context.request_id,
+                event_type="tool.result",
+                generation=context.generation,
+            )
+            return None
+        if completion.error_type:
+            public_error = str(_redact_tool_value(completion.error))[:500]
+            self._tool_result_commit_checkpoint("before_error_wire", context, completion)
+            with context.result_commit_lock:
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                self._write({
+                    "type": "tool.result",
+                    "request_id": context.request_id,
+                    "call_id": completion.call_id,
+                    "ok": False,
+                    "error": f"{completion.error_type}: {public_error}",
+                })
+                with context.history_lock:
+                    context.history.append({
+                        "name": completion.name,
+                        "status": "failed",
+                        "error": public_error[:200],
+                    })
+                self._tool_result_commit_checkpoint("after_error_wire", context, completion)
+            return {"type": "tool.failed", "name": completion.name, "error": public_error}
+
+        safe_result = _redact_tool_value(_json_safe(completion.result))
+        prepared: _PreparedToolResult | None = None
+        wire_committed = False
+        try:
+            if completion.name == "discover_papers" and isinstance(safe_result, dict):
+                prepared = self._prepare_tool_result(
+                    "discover-papers",
+                    safe_result,
+                    request_id=context.request_id,
+                    generation=context.generation,
+                    call_id=completion.call_id,
+                )
+                model_result = _compact_academic_search_result_for_model(
+                    safe_result,
+                    requested_limit=_bounded_limit(
+                        completion.arguments.get("result_limit", completion.arguments.get("limit")),
+                        default=8,
+                    ),
+                    result_reference=prepared.reference,
+                    result_bytes=prepared.encoded_bytes,
+                )
+                result_meta: dict[str, int | bool] = {
+                    "original_bytes": prepared.encoded_bytes,
+                    "model_bytes": len(json.dumps(model_result, ensure_ascii=False).encode("utf-8")),
+                    "truncated": True,
+                    "persist_full": True,
+                }
+            else:
+                model_result, result_meta = _bounded_tool_result_for_model(completion.name, safe_result)
+                if result_meta["persist_full"]:
+                    prepared = self._prepare_tool_result(
+                        completion.name,
+                        safe_result if isinstance(safe_result, dict) else {"result": safe_result},
+                        request_id=context.request_id,
+                        generation=context.generation,
+                        call_id=completion.call_id,
+                    )
+                    model_result["_full_result_reference"] = prepared.reference
+                    model_result["_persisted_bytes"] = prepared.encoded_bytes
+            if prepared is not None:
+                self._tool_result_commit_checkpoint("persist_prepared", context, completion)
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                os.replace(prepared.temporary_path, prepared.final_path)
+                self._tool_result_commit_checkpoint("result_renamed", context, completion)
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+
+            self._tool_result_commit_checkpoint("before_wire", context, completion)
+            with context.result_commit_lock:
+                if not self._context_is_active(context) or context.cancel_event.is_set():
+                    self._record_dispatch_audit(
+                        "late_tool_completion",
+                        request_id=context.request_id,
+                        event_type="tool.result",
+                        generation=context.generation,
+                    )
+                    return None
+                # This dedicated lock has no sidecar callback dependency.  It
+                # only orders cancellation against the short stdin commit.
+                self._write({
+                    "type": "tool.result",
+                    "request_id": context.request_id,
+                    "call_id": completion.call_id,
+                    "ok": True,
+                    "result": model_result,
+                })
+                wire_committed = True
+                with context.history_lock:
+                    context.history.append({
+                        "name": completion.name,
+                        "status": "ok",
+                        "result_summary": _summarize_tool_result(completion.name, model_result),
+                    })
+                self._tool_result_commit_checkpoint("after_wire", context, completion)
+        finally:
+            if prepared is not None and not wire_committed:
+                self._discard_prepared_tool_result(prepared)
+        if completion.name == "build_verified_answer" and task_mode == "verified-answer":
+            context.terminal_tool_completed = completion.name
+            self._write({
+                "type": "run.cancel",
+                "request_id": context.request_id,
+                "command_id": uuid4().hex,
+                "generation": self._process_generation,
+            })
+        return {
+            "type": "tool.completed",
+            "name": completion.name,
+            "result": model_result,
+            "result_bytes": result_meta["original_bytes"],
+            "model_result_bytes": result_meta["model_bytes"],
+            "result_truncated": result_meta["truncated"],
+        }
+
+    def _teardown_run_context(
+        self,
+        context: _RunContext,
+        dispatcher: _ProtocolDispatcher,
+        event_channel: Queue[dict[str, Any] | None],
+        *,
+        terminal_received: bool,
+        request_started: bool,
+    ) -> None:
+        self._mark_context_cancelled(context)
+        with context.lock:
+            context.active = False
+            pending_futures = list(context.in_flight.values())
+            context.deferred.clear()
+        for future in pending_futures:
+            future.cancel()
+        with self._contexts_lock:
+            if self._run_contexts.get(context.request_id) is context:
+                self._run_contexts.pop(context.request_id, None)
+
+        if request_started and not terminal_received:
+            command_id = uuid4().hex
+            try:
+                self._write({
+                    "type": "run.cancel",
+                    "request_id": context.request_id,
+                    "command_id": command_id,
+                    "generation": self._process_generation,
+                })
+            except (BrokenPipeError, OSError, PiRuntimeUnavailable):
+                pass
+            else:
+                cancel_deadline = time.monotonic() + _CANCEL_DRAIN_SECONDS
+                cancellation_settled = False
+                while time.monotonic() < cancel_deadline:
+                    remaining = cancel_deadline - time.monotonic()
+                    try:
+                        event = event_channel.get(timeout=min(0.05, max(0.001, remaining)))
+                    except Empty:
+                        process = self._process
+                        if process is not None and process.poll() is not None:
+                            break
+                        continue
+                    if event is None:
+                        break
+                    event_type = str(event.get("type", ""))
+                    if event_type in {"run.cancelled", "run.completed", "run.failed"}:
+                        cancellation_settled = True
+                        break
+                    if event_type == "run.cancel_rejected" and str(event.get("command_id", "")) == command_id:
+                        cancellation_settled = True
+                        break
+                if not cancellation_settled:
+                    self._record_dispatch_audit(
+                        "cancel_drain_timeout",
+                        request_id=context.request_id,
+                        command_id=command_id,
+                        event_type="run.cancel",
+                        generation=context.generation,
+                    )
+
+        dispatcher.unregister_request(context.request_id)
+        if self._active_request_id == context.request_id:
+            self._active_request_id = ""
+            self._active_session_id = ""
+        with self._interaction_lock:
+            self._approval_tokens.pop(context.request_id, None)
+            stale_interactions = [
+                interaction_id
+                for interaction_id, (pending_request_id, _kind) in self._pending_interaction_kinds.items()
+                if pending_request_id == context.request_id
+            ]
+            for interaction_id in stale_interactions:
+                self._pending_interaction_kinds.pop(interaction_id, None)
 
     def _run_request(
         self,
@@ -1373,152 +2704,208 @@ class PiAgentClient:
     ) -> Iterator[dict[str, Any]]:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("This Pi client already has an active run")
-        process = self._ensure_process(api_key=api_key)
         request_id = str(start_message["request_id"])
         session_id = str(start_message["session_id"])
         task_mode = str(start_message.get("task_mode", "general") or "general").strip().lower()
-        self._active_request_id = request_id
-        self._active_session_id = session_id
-        self._cancel_requested.clear()
-        self._write(start_message)
+        self._lifecycle_lock.acquire()
+        dispatcher: _ProtocolDispatcher | None = None
+        event_channel: Queue[dict[str, Any] | None] | None = None
+        context: _RunContext | None = None
+        request_started = False
+        try:
+            process = self._ensure_process(api_key=api_key)
+            dispatcher = self._ensure_dispatcher()
+            event_channel = dispatcher.register_request(request_id)
+            dispatcher.start()
+            self._request_generation += 1
+            context = _RunContext(
+                request_id=request_id,
+                session_id=session_id,
+                generation=self._request_generation,
+                supports_images="image" in set(
+                    dict(start_message.get("model_runtime", {}) or {}).get("input_modalities", [])
+                ),
+            )
+            with self._contexts_lock:
+                self._run_contexts[request_id] = context
+            self._active_request_id = request_id
+            self._active_session_id = session_id
+            self._cancel_requested = context.cancel_event
+            self._tool_history = context.history
+            request_started = True
+            self._write(start_message)
+        except BaseException:
+            try:
+                if context is not None and dispatcher is not None and event_channel is not None:
+                    self._teardown_run_context(
+                        context,
+                        dispatcher,
+                        event_channel,
+                        terminal_received=False,
+                        request_started=request_started,
+                    )
+                elif dispatcher is not None and event_channel is not None:
+                    dispatcher.unregister_request(request_id)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve the setup failure
+                self._record_dispatch_audit(
+                    "run_setup_cleanup_failed",
+                    request_id=request_id,
+                    event_type=type(cleanup_error).__name__,
+                )
+            finally:
+                self._lifecycle_lock.release()
+                self._run_lock.release()
+            raise
+        assert dispatcher is not None
+        assert event_channel is not None
+        assert context is not None
         deadline = time.monotonic() + timeout_seconds
-        terminal_tool_completed = ""
         terminal_received = False
+        task_contract = dict(start_message.get("task_contract", {}) or {})
 
         try:
             while True:
+                while True:
+                    try:
+                        completion = context.completions.get_nowait()
+                    except Empty:
+                        break
+                    public_event = self._finish_tool_completion(
+                        context,
+                        completion,
+                        task_mode=task_mode,
+                    )
+                    if public_event is not None:
+                        yield public_event
+
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("Pi Agent exceeded the request timeout")
-                try:
-                    line = self._output.get(timeout=min(1.0, remaining))
-                except Empty:
-                    if process.poll() is not None:
+                if context.pending_terminal is not None and not context.has_pending_tools():
+                    event = context.pending_terminal
+                    context.pending_terminal = None
+                else:
+                    try:
+                        routed = event_channel.get(timeout=min(0.05, remaining))
+                    except Empty:
+                        if process.poll() is not None:
+                            detail = "\n".join(self._errors[-8:])
+                            raise RuntimeError(f"Pi Agent exited unexpectedly{': ' + detail if detail else ''}")
+                        continue
+                    if routed is None:
                         detail = "\n".join(self._errors[-8:])
-                        raise RuntimeError(f"Pi Agent exited unexpectedly{': ' + detail if detail else ''}")
-                    continue
-                if line is None:
-                    detail = "\n".join(self._errors[-8:])
-                    raise RuntimeError(f"Pi Agent closed its output stream{': ' + detail if detail else ''}")
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise RuntimeError("Pi Agent returned an invalid protocol message") from error
+                        raise RuntimeError(f"Pi Agent closed its output stream{': ' + detail if detail else ''}")
+                    event = routed
 
                 event_type = str(event.get("type", ""))
                 event_request_id = str(event.get("request_id", ""))
-                if event_request_id and event_request_id != request_id:
+                if event_type == "protocol.error":
+                    raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                if event_type not in {"skill.call", "tool.call"} and event_request_id and event_request_id != request_id:
+                    continue
+                if event_type == "skill.call":
+                    call_id = str(event.get("call_id", ""))
+                    name = str(event.get("name", ""))
+                    arguments = dict(event.get("arguments", {}) or {})
+                    try:
+                        if not event_request_id or event_request_id != request_id:
+                            raise PermissionError("Skill call belongs to another request")
+                        if self._cancel_requested.is_set():
+                            raise InterruptedError("Pi Skill loading was cancelled")
+                        result = self._execute_skill_tool(request_id, name, arguments)
+                        response = {
+                            "type": "skill.result",
+                            "request_id": request_id,
+                            "call_id": call_id,
+                            "ok": True,
+                            "result": result,
+                        }
+                        if name in {"load_skill", "restore_skill"}:
+                            public = {
+                                key: value
+                                for key, value in result.items()
+                                if key != "content"
+                            }
+                            yield {"type": "skill.loaded", "name": str(result.get("skill_id", "")), "value": public}
+                        else:
+                            yield {
+                                "type": "skill.searched",
+                                "name": "search_skills",
+                                "value": {
+                                    "query": str(result.get("query", "")),
+                                    "count": int(result.get("count", 0) or 0),
+                                    "limit": int(result.get("limit", 0) or 0),
+                                    "skill_ids": [
+                                        str(item.get("id", ""))
+                                        for item in list(result.get("skills", []) or [])
+                                        if isinstance(item, dict)
+                                    ],
+                                },
+                            }
+                    except Exception as error:  # noqa: BLE001 - returned to Pi as bounded tool output
+                        public_error = str(_redact_tool_value(str(error)))[:500]
+                        response = {
+                            "type": "skill.result",
+                            "request_id": request_id,
+                            "call_id": call_id,
+                            "ok": False,
+                            "error": f"{type(error).__name__}: {public_error}",
+                        }
+                        yield {"type": "skill.failed", "name": name, "error": public_error}
+                    self._write(response)
                     continue
                 if event_type == "tool.call":
-                    # ── Parallel tool dispatch ──────────────────────────
-                    # Collect consecutive tool.call events (the Pi SDK emits
-                    # them in a burst when the model requests parallel calls)
-                    # and dispatch independent ones concurrently.
-                    def _parse_tool(evt: dict[str, Any]) -> dict[str, Any]:
-                        return {
-                            "call_id": str(evt.get("call_id", "")),
-                            "name": str(evt.get("name", "")),
-                            "arguments": dict(evt.get("arguments", {}) or {}),
-                        }
-                    def _execute_one(item: dict[str, Any]) -> dict[str, Any]:
-                        name = item["name"]
-                        arguments = item["arguments"]
-                        try:
-                            if self._cancel_requested.is_set():
-                                raise InterruptedError("Pi tool execution was cancelled")
-                            result = self._execute_tool(name, arguments)
-                            if self._cancel_requested.is_set():
-                                raise InterruptedError("Pi tool execution was cancelled")
-                            retried = _retry_empty_search(name, arguments, result, executor=self._execute_tool)
-                            if retried is not None:
-                                result = retried
-                            safe_result = _redact_tool_value(_json_safe(result))
-                            model_result, result_meta = _bounded_tool_result_for_model(name, safe_result)
-                            if result_meta["persist_full"]:
-                                result_reference, persisted_bytes = self._persist_tool_result(
-                                    name,
-                                    safe_result if isinstance(safe_result, dict) else {"result": safe_result},
-                                )
-                                model_result["_full_result_reference"] = result_reference
-                                model_result["_persisted_bytes"] = persisted_bytes
-                            return {
-                                "call_id": item["call_id"],
-                                "name": name,
-                                "ok": True,
-                                "result": model_result,
-                                "event": {
-                                    "type": "tool.completed",
-                                    "name": name,
-                                    "result": model_result,
-                                    "result_bytes": result_meta["original_bytes"],
-                                    "model_result_bytes": result_meta["model_bytes"],
-                                    "result_truncated": result_meta["truncated"],
-                                },
-                                "summary": _summarize_tool_result(name, model_result),
-                            }
-                        except Exception as error:
-                            public_error = str(_redact_tool_value(str(error)))[:500]
-                            return {
-                                "call_id": item["call_id"],
-                                "name": name,
-                                "ok": False,
-                                "error": f"{type(error).__name__}: {public_error}",
-                                "event": {"type": "tool.failed", "name": name, "error": public_error},
-                                "summary": public_error[:200],
-                            }
-                    batch = [_parse_tool(event)]
-                    # Drain any immediately available follow-up tool.call events
-                    buffered: dict[str, Any] | None = None
-                    while True:
-                        try:
-                            lookahead_line = self._output.get(timeout=0.05)
-                        except Empty:
-                            break
-                        if lookahead_line is None:
-                            break
-                        try:
-                            la_event = json.loads(lookahead_line)
-                        except json.JSONDecodeError:
-                            self._errors.append(lookahead_line.rstrip())
-                            continue
-                        if str(la_event.get("type", "")) != "tool.call":
-                            buffered = la_event
-                            break
-                        if str(la_event.get("request_id", "")) != request_id:
-                            continue
-                        batch.append(_parse_tool(la_event))
-                    # Execute: single tool runs inline, multiples run concurrently
-                    batch_outcomes: list[dict[str, Any]] = []
-                    if len(batch) == 1:
-                        batch_outcomes = [_execute_one(batch[0])]
-                    else:
-                        futures = {
-                            self._tool_executor.submit(_execute_one, item): item
-                            for item in batch
-                        }
-                        for future in as_completed(futures):
-                            batch_outcomes.append(future.result())
-                    for outcome in batch_outcomes:
-                        self._write({
-                            "type": "tool.result",
-                            "call_id": outcome["call_id"],
-                            "ok": outcome["ok"],
-                            "result": outcome.get("result"),
-                            "error": outcome.get("error"),
-                        })
-                        yield outcome["event"]
-                        self._tool_history.append({
-                            "name": outcome["name"],
-                            "status": "ok" if outcome["ok"] else "failed",
-                            "result_summary": outcome.get("summary", ""),
-                        })
-                        if outcome["name"] == "build_verified_answer" and task_mode == "verified-answer":
-                            terminal_tool_completed = outcome["name"]
-                    if buffered is not None:
-                        event = buffered
+                    call_id = str(event.get("call_id", ""))
+                    name = str(event.get("name", ""))
+                    arguments = dict(event.get("arguments", {}) or {})
+                    try:
+                        # Tool calls are executable protocol messages, so an
+                        # omitted request id is not accepted as a legacy event.
+                        # The Python host independently rechecks every bridge
+                        # call before entering the dispatcher.
+                        authorize_tool_call(
+                            tool_name=name,
+                            contract=task_contract,
+                            descriptor=builtin_capability_descriptor(name),
+                            request_id=event_request_id,
+                            active_request_id=request_id,
+                            approval_token=self._approval_tokens.get(request_id),
+                            call_count=context.authorized_call_count,
+                        )
+                        context.authorized_call_count += 1
+                        if context.cancel_event.is_set():
+                            raise InterruptedError("Pi tool execution was cancelled before it started")
+                        descriptor = builtin_capability_descriptor(name)
+                        parallel_safe = (
+                            name in _PARALLEL_SAFE_TOOL_NAMES
+                            and isinstance(descriptor, dict)
+                            and str(descriptor.get("risk_level", "")) == "read_only"
+                            and descriptor.get("idempotent") is not False
+                        )
+                        self._enqueue_tool(context, _PendingToolCall(
+                            call_id=call_id,
+                            name=name,
+                            arguments=arguments,
+                            parallel_safe=parallel_safe,
+                        ))
                         continue
-                    if terminal_tool_completed:
-                        self._write({"type": "run.cancel", "request_id": request_id})
+                    except Exception as error:  # noqa: BLE001 - error is returned to the model as tool output
+                        public_error = str(_redact_tool_value(str(error)))[:500]
+                        with context.history_lock:
+                            context.history.append({
+                                "name": name,
+                                "status": "failed",
+                                "error": public_error[:200],
+                            })
+                        response = {
+                            "type": "tool.result",
+                            "request_id": request_id,
+                            "call_id": call_id,
+                            "ok": False,
+                            "error": f"{type(error).__name__}: {public_error}",
+                        }
+                        yield {"type": "tool.failed", "name": name, "error": public_error}
+                    self._write(response)
                     continue
                 if event_type == "session.ready":
                     durable_file = str(event.get("session_file", ""))
@@ -1538,12 +2925,26 @@ class PiAgentClient:
                 elif event_type == "status.update":
                     yield {
                         "type": "status",
+                        "request_id": event_request_id or request_id,
                         "status": str(event.get("status", "")),
                         "name": str(event.get("name", "")),
                         "attempt": event.get("attempt"),
                         "error": str(event.get("error", "")),
                         "duration_ms": event.get("duration_ms"),
                         "details": dict(event.get("details", {}) or {}),
+                    }
+                elif event_type in {"subagent.started", "subagent.completed", "subagent.failed"}:
+                    yield {
+                        "type": "subagent",
+                        "event": event_type.removeprefix("subagent."),
+                        "request_id": event_request_id or request_id,
+                        "session_id": str(event.get("session_id", "")),
+                        "parent_session_id": str(event.get("parent_session_id", session_id)),
+                        "profile": str(event.get("profile", event.get("role", ""))),
+                        "role": str(event.get("role", "")),
+                        "backend": str(event.get("backend", "pi-native")),
+                        "error": str(event.get("error", "")),
+                        "tool_calls": int(event.get("tool_calls", 0) or 0),
                     }
                 elif event_type == "agent.queue_updated":
                     steering = [str(item) for item in list(event.get("steering", []) or [])]
@@ -1584,21 +2985,30 @@ class PiAgentClient:
                     accepted = event_type.endswith("_ack")
                     yield {
                         "type": "control",
+                        "command_id": str(event.get("command_id", "")),
                         "action": action,
                         "status": "accepted" if accepted else "rejected",
                         "error": str(event.get("error", "")),
                         "queued": int(event.get("queued", 0) or 0),
                     }
                 elif event_type == "interaction.requested":
+                    interaction_id = str(event.get("interaction_id", ""))
+                    interaction_kind = str(event.get("interaction_kind", ""))
+                    if interaction_id:
+                        with self._interaction_lock:
+                            self._pending_interaction_kinds[interaction_id] = (request_id, interaction_kind)
                     yield {
                         "type": "interaction",
                         "request_id": request_id,
                         "session_id": session_id,
-                        "interaction_id": str(event.get("interaction_id", "")),
-                        "interaction_kind": str(event.get("interaction_kind", "")),
+                        "interaction_id": interaction_id,
+                        "interaction_kind": interaction_kind,
                         "payload": dict(event.get("payload", {}) or {}),
                     }
                 elif event_type == "run.completed":
+                    if context.has_pending_tools():
+                        context.pending_terminal = dict(event)
+                        continue
                     terminal_received = True
                     yield {
                         "type": "done",
@@ -1609,12 +3019,12 @@ class PiAgentClient:
                     return
                 elif event_type == "run.cancelled":
                     terminal_received = True
-                    if terminal_tool_completed:
+                    if context.terminal_tool_completed:
                         yield {
                             "type": "done",
                             "stats": {},
                             "truncated": False,
-                            "terminal_tool": terminal_tool_completed,
+                            "terminal_tool": context.terminal_tool_completed,
                         }
                     else:
                         yield {"type": "cancelled", "request_id": request_id, "session_id": session_id}
@@ -1643,15 +3053,17 @@ class PiAgentClient:
                         failure=dict(event.get("failure", {}) or {}),
                     )
         finally:
-            if not terminal_received:
-                self._cancel_requested.set()
-                try:
-                    self._write({"type": "run.cancel", "request_id": request_id})
-                except (BrokenPipeError, OSError, PiRuntimeUnavailable):
-                    pass
-            self._active_request_id = ""
-            self._active_session_id = ""
-            self._run_lock.release()
+            try:
+                self._teardown_run_context(
+                    context,
+                    dispatcher,
+                    event_channel,
+                    terminal_received=terminal_received,
+                    request_started=request_started,
+                )
+            finally:
+                self._lifecycle_lock.release()
+                self._run_lock.release()
 
     @property
     def active_request_id(self) -> str:
@@ -1669,37 +3081,86 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target:
             return False
-        self._cancel_requested.set()
-        self._write({"type": "run.cancel", "request_id": target})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        self._mark_context_cancelled(context)
+        self._write({
+            "type": "run.cancel",
+            "request_id": target,
+            "command_id": uuid4().hex,
+            "generation": self._process_generation,
+        })
         return True
 
     def pause(self, request_id: str | None = None) -> bool:
-        """Pause the current turn while keeping its durable session resumable.
+        """Request cooperative abort-and-resume for the current durable turn.
 
-        The Pi sidecar currently exposes the same cooperative interruption
-        primitive as ``run.cancel``.  At this layer it is a pause operation:
-        the session and prior turn history remain intact, and the caller may
-        resume by starting the unfinished turn again.
+        The Pi sidecar exposes ``run.cancel`` as its interruption primitive.
+        This is not a suspended SDK operation: the current operation aborts,
+        while durable session history is retained so the host can explicitly
+        start a new or resumed turn.
         """
 
         return self.cancel(request_id)
 
-    def steer(self, text: str, request_id: str | None = None) -> bool:
+    def steer(
+        self,
+        text: str,
+        request_id: str | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Queue steering text into the active Pi tool loop."""
 
         target = request_id or self._active_request_id
         if not target:
             return False
-        self._write({"type": "run.steer", "request_id": target, "text": text})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not bool(getattr(context, "supports_images", False)):
+            raise PiMultimodalUnavailable("The active Pi session does not support image input")
+        self._write({
+            "type": "run.steer",
+            "request_id": target,
+            "command_id": uuid4().hex,
+            "generation": self._process_generation,
+            "text": text,
+            "images": validated_images,
+        })
         return True
 
-    def follow_up(self, text: str, request_id: str | None = None) -> bool:
+    def follow_up(
+        self,
+        text: str,
+        request_id: str | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Queue a message for the active session after its current turn."""
 
         target = request_id or self._active_request_id
         if not target or not str(text).strip():
             return False
-        self._write({"type": "run.follow_up", "request_id": target, "text": str(text).strip()})
+        with self._contexts_lock:
+            context = self._run_contexts.get(target)
+        if context is None or not context.active:
+            return False
+        validated_images = validate_pi_image_blocks(list(images or []))
+        if validated_images and not bool(getattr(context, "supports_images", False)):
+            raise PiMultimodalUnavailable("The active Pi session does not support image input")
+        self._write({
+            "type": "run.follow_up",
+            "request_id": target,
+            "command_id": uuid4().hex,
+            "generation": self._process_generation,
+            "text": str(text).strip(),
+            "images": validated_images,
+        })
         return True
 
     def respond_interaction(
@@ -1714,15 +3175,163 @@ class PiAgentClient:
         target = request_id or self._active_request_id
         if not target or not str(interaction_id).strip():
             return False
+        normalized_interaction_id = str(interaction_id).strip()
+        with self._interaction_lock:
+            pending = self._pending_interaction_kinds.get(normalized_interaction_id)
+            if pending and pending[0] == target and pending[1] == "plan":
+                token = approval_token_from_response(target, response)
+                if token is None:
+                    self._approval_tokens.pop(target, None)
+                else:
+                    self._approval_tokens[target] = token
+            if pending and pending[0] == target:
+                self._pending_interaction_kinds.pop(normalized_interaction_id, None)
         self._write(
             {
                 "type": "interaction.response",
                 "request_id": target,
-                "interaction_id": str(interaction_id).strip(),
+                "interaction_id": normalized_interaction_id,
                 "response": dict(response or {}),
             }
         )
         return True
+
+    def _await_command(
+        self,
+        message: dict[str, Any],
+        *,
+        terminal_types: set[str],
+        timeout_seconds: float,
+        session_lock_id: str,
+        timeout_message: str,
+    ) -> dict[str, Any]:
+        if str(message.get("type", "")).startswith("session."):
+            message = {
+                **message,
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }
+        command_id = str(message.get("command_id", ""))
+        if not command_id:
+            raise ValueError("Pi session commands require a command_id")
+        with self._lifecycle_lock:
+            dispatcher = self._ensure_dispatcher()
+            message = {**message, "generation": self._process_generation}
+            lock = self._session_command_lock(session_lock_id)
+            with lock:
+                channel = dispatcher.register_command(command_id)
+                dispatcher.start()
+                try:
+                    # Registration must happen before stdin write: a local sidecar
+                    # can acknowledge a command in the same scheduling quantum.
+                    self._write(message)
+                    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(timeout_message)
+                        try:
+                            event = channel.get(timeout=min(0.25, remaining))
+                        except Empty:
+                            process = self._process
+                            if process is not None and process.poll() is not None:
+                                raise RuntimeError("Pi Agent exited while awaiting a session command")
+                            continue
+                        if event is None:
+                            raise RuntimeError("Pi Agent closed while awaiting a session command")
+                        if str(event.get("type", "")) == "protocol.error":
+                            raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                        if str(event.get("type", "")) in terminal_types:
+                            self._validate_command_correlation(message, event)
+                            return dict(event)
+                finally:
+                    dispatcher.unregister_command(command_id)
+
+    @staticmethod
+    def _validate_command_correlation(message: dict[str, Any], event: dict[str, Any]) -> None:
+        expected_session = str(message.get("session_id", ""))
+        actual_session = str(event.get("session_id", ""))
+        if expected_session and actual_session != expected_session:
+            raise RuntimeError("Pi session command acknowledgement crossed session boundaries")
+        expected_source = str(message.get("source_session_id", ""))
+        actual_source = str(event.get("source_session_id", ""))
+        if expected_source and actual_source != expected_source:
+            raise RuntimeError("Pi session fork acknowledgement crossed source sessions")
+        expected_target = str(message.get("target_session_id", ""))
+        actual_target = str(event.get("target_session_id", ""))
+        if expected_target and actual_target != expected_target:
+            raise RuntimeError("Pi session fork acknowledgement crossed target sessions")
+
+    def _await_control_command(
+        self,
+        message: dict[str, Any],
+        *,
+        terminal_types: set[str],
+        timeout_seconds: float,
+        timeout_message: str,
+    ) -> dict[str, Any]:
+        """Await a non-replacing control without taking lifecycle/session locks."""
+
+        if str(message.get("type", "")).startswith("session."):
+            message = {
+                **message,
+                "pi_protocol_version": _PI_PROTOCOL_VERSION,
+                "required_features": list(_PI_REQUIRED_FEATURES),
+            }
+        command_id = str(message.get("command_id", ""))
+        if not command_id:
+            raise ValueError("Pi control commands require a command_id")
+        dispatcher = self._ensure_dispatcher()
+        message = {**message, "generation": self._process_generation}
+        channel = dispatcher.register_command(command_id)
+        dispatcher.start()
+        try:
+            self._write(message)
+            deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(timeout_message)
+                try:
+                    event = channel.get(timeout=min(0.25, remaining))
+                except Empty:
+                    process = self._process
+                    if process is not None and process.poll() is not None:
+                        raise RuntimeError("Pi Agent exited while awaiting a control command")
+                    continue
+                if event is None:
+                    raise RuntimeError("Pi Agent closed while awaiting a control command")
+                if str(event.get("type", "")) == "protocol.error":
+                    raise RuntimeError(str(event.get("error", "Pi Agent protocol error")))
+                if str(event.get("type", "")) in terminal_types:
+                    self._validate_command_correlation(message, event)
+                    return dict(event)
+        finally:
+            dispatcher.unregister_command(command_id)
+
+    def inspect_queue(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.queue.inspect", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.queue", "session.queue_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Inspecting the Pi session queue exceeded the timeout",
+        )
+
+    def clear_queue(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.queue.clear", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.queue_cleared", "session.queue_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Clearing the Pi session queue exceeded the timeout",
+        )
+
+    def abort_compaction(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        return self._await_control_command(
+            {"type": "session.compact.abort", "command_id": uuid4().hex, "session_id": str(session_id)},
+            terminal_types={"session.compact_aborted", "session.compact_abort_failed"},
+            timeout_seconds=timeout_seconds,
+            timeout_message="Aborting Pi session compaction exceeded the timeout",
+        )
 
     def compact(self, session_id: str, *, instructions: str = "", timeout_seconds: float = 180.0) -> dict[str, Any]:
         """Run Pi's native context compactor for a loaded durable session."""
@@ -1732,35 +3341,24 @@ class PiAgentClient:
         if self._process is None or self._process.poll() is not None:
             raise PiRuntimeUnavailable("Load the durable session with stream_chat before compacting it")
         command_id = uuid4().hex
-        self._write(
+        event = self._await_command(
             {
                 "type": "session.compact",
                 "command_id": command_id,
                 "session_id": session_id,
                 "instructions": instructions,
-            }
+            },
+            terminal_types={"session.compact_completed", "session.compact_failed"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=session_id,
+            timeout_message="Pi session compaction exceeded the timeout",
         )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Pi session compaction exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while compacting the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.compact_failed":
-                raise RuntimeError(str(event.get("error", "Pi compaction failed")))
-            if event.get("type") == "session.compact_completed":
-                result = dict(event.get("result", {}) or {})
-                if isinstance(event.get("stats"), dict):
-                    result["_session_stats"] = dict(event["stats"])
-                return result
+        if event.get("type") == "session.compact_failed":
+            raise RuntimeError(str(event.get("error", "Pi compaction failed")))
+        result = dict(event.get("result", {}) or {})
+        if isinstance(event.get("stats"), dict):
+            result["_session_stats"] = dict(event["stats"])
+        return result
 
     def load_session(
         self,
@@ -1770,6 +3368,9 @@ class PiAgentClient:
         base_url: str,
         api_key: str,
         model_id: str,
+        api_surface: str = "chat_completions",
+        responses_enabled: bool = False,
+        model_runtime: dict[str, Any] | ModelRuntimeDescriptor | None = None,
         thinking_level: str = "medium",
         timeout_seconds: float = 60.0,
     ) -> dict[str, Any]:
@@ -1781,54 +3382,91 @@ class PiAgentClient:
         session_file = str(self._load_session_registry().get(logical_session_id, ""))
         if not logical_session_id or not session_file or not Path(session_file).is_file():
             raise PiRuntimeUnavailable("The durable Pi session file is unavailable")
-        self._ensure_process(api_key=api_key)
-        command_id = uuid4().hex
-        self._write(
-            {
-                "type": "session.load",
-                "command_id": command_id,
-                "session_id": logical_session_id,
-                "session_file": session_file,
-                "cwd": str(self.workspace.parent),
-                "agent_dir": str(self.agent_dir),
-                "provider_kind": provider_kind,
-                "base_url": base_url,
-                "model_id": model_id,
-                "thinking_level": thinking_level,
-                "mcp_servers": self._enabled_mcp_servers(),
-                "disabled_tools": self._disabled_artifact_tools(),
-            }
-        )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Loading the Pi session exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while loading the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.load_failed":
-                raise RuntimeError(str(event.get("error", "Pi session load failed")))
-            if event.get("type") == "session.loaded":
-                return dict(event)
+        if isinstance(model_runtime, ModelRuntimeDescriptor):
+            descriptor = model_runtime
+        elif isinstance(model_runtime, dict):
+            descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
+        else:
+            descriptor = descriptor_from_model_record(
+                provider_id="runtime",
+                provider_kind=provider_kind,
+                model_id=model_id,
+                model_record=None,
+                api_surface=api_surface,
+            )
+        if (
+            descriptor.provider_kind != str(provider_kind)
+            or descriptor.model_id != str(model_id)
+            or descriptor.api_surface != str(api_surface or "chat_completions")
+        ):
+            raise ValueError(
+                "Model runtime descriptor does not match the final provider route"
+            )
+        with self._lifecycle_lock:
+            self._ensure_process(api_key=api_key)
+            self._ensure_protocol_negotiated(timeout_seconds=min(8.0, timeout_seconds))
+            command_id = uuid4().hex
+            event = self._await_command(
+                {
+                    "type": "session.load",
+                    "command_id": command_id,
+                    "session_id": logical_session_id,
+                    "session_file": session_file,
+                    "cwd": str(self.workspace.parent),
+                    "agent_dir": str(self.agent_dir),
+                    "provider_kind": provider_kind,
+                    "base_url": base_url,
+                    "model_id": model_id,
+                    "api_surface": api_surface,
+                    "responses_enabled": responses_enabled,
+                    "model_runtime": descriptor.to_dict(),
+                    "thinking_level": thinking_level,
+                    "mcp_servers": self._enabled_mcp_servers(),
+                    "disabled_tools": self._disabled_artifact_tools(),
+                },
+                terminal_types={"session.loaded", "session.load_failed"},
+                timeout_seconds=timeout_seconds,
+                session_lock_id=logical_session_id,
+                timeout_message="Loading the Pi session exceeded the timeout",
+            )
+        if event.get("type") == "session.load_failed":
+            raise RuntimeError(str(event.get("error", "Pi session load failed")))
+        return event
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(self, session_id: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
         """Unload a session while retaining its persisted JSONL file."""
 
-        if self._process is not None and self._process.poll() is None:
-            self._write({"type": "session.close", "session_id": session_id})
+        command_id = uuid4().hex
+        if self._process is None or self._process.poll() is not None:
+            return {
+                "type": "session.closed",
+                "command_id": command_id,
+                "session_id": str(session_id or ""),
+                "generation": self._process_generation,
+                "not_loaded": True,
+            }
+        event = self._await_command(
+            {
+                "type": "session.close",
+                "command_id": command_id,
+                "session_id": session_id,
+            },
+            terminal_types={"session.closed", "session.close_rejected"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=session_id,
+            timeout_message="Closing the Pi session exceeded the timeout",
+        )
+        if event.get("type") == "session.close_rejected":
+            raise RuntimeError(str(event.get("error", "Pi session close was rejected")))
+        return event
 
     def fork_session(
         self,
         source_session_id: str,
         *,
         target_session_id: str | None = None,
+        entry_id: str = "",
+        before: bool = False,
         timeout_seconds: float = 90.0,
     ) -> dict[str, Any]:
         """Fork a loaded durable Pi session into a new independently resumable session."""
@@ -1842,38 +3480,31 @@ class PiAgentClient:
         if not source_id or not target_id:
             raise ValueError("Source and target session ids are required")
         command_id = uuid4().hex
-        self._write(
+        event = self._await_command(
             {
                 "type": "session.fork",
                 "command_id": command_id,
+                "generation": self._process_generation,
                 "source_session_id": source_id,
                 "target_session_id": target_id,
-            }
+                "entry_id": str(entry_id or "").strip(),
+                "before": bool(before),
+                "full_history": not bool(str(entry_id or "").strip()),
+            },
+            terminal_types={"session.forked", "session.fork_failed"},
+            timeout_seconds=timeout_seconds,
+            session_lock_id=source_id,
+            timeout_message="Forking the Pi session exceeded the timeout",
         )
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Forking the Pi session exceeded the timeout")
-            try:
-                line = self._output.get(timeout=min(1.0, remaining))
-            except Empty:
-                continue
-            if line is None:
-                raise RuntimeError("Pi Agent closed while forking the session")
-            event = json.loads(line)
-            if str(event.get("command_id", "")) != command_id:
-                continue
-            if event.get("type") == "session.fork_failed":
-                raise PiAgentRunError(
-                    str(event.get("error", "Pi session fork failed")),
-                    failure=dict(event.get("failure", {}) or {}),
-                )
-            if event.get("type") == "session.forked":
-                durable_file = str(event.get("session_file", ""))
-                if durable_file:
-                    self._save_session_registry({target_id: durable_file})
-                return dict(event)
+        if event.get("type") == "session.fork_failed":
+            raise PiAgentRunError(
+                str(event.get("error", "Pi session fork failed")),
+                failure=dict(event.get("failure", {}) or {}),
+            )
+        durable_file = str(event.get("session_file", ""))
+        if durable_file:
+            self._save_session_registry({target_id: durable_file})
+        return event
 
     def forget_session(self, session_id: str) -> None:
         """Forget a broken session mapping without deleting its audit file.
@@ -1900,20 +3531,21 @@ class PiAgentClient:
     def close(self) -> None:
         """Stop the sidecar; persisted sessions remain recoverable."""
 
-        process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                self._write({"type": "runtime.shutdown"})
-                process.wait(timeout=3)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                process.kill()
-                process.wait(timeout=5)
-        self._process = None
-        self._provider_key_fingerprint = ""
-        if self._gateway_adapter is not None:
-            self._gateway_adapter.close()
-            self._gateway_adapter = None
-            self._gateway_adapter_signature = ""
+        with self._lifecycle_lock:
+            process = self._process
+            if process is not None and process.poll() is None:
+                try:
+                    self._write({"type": "runtime.shutdown"})
+                    process.wait(timeout=3)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    process.kill()
+                    process.wait(timeout=5)
+            self._process = None
+            self._provider_key_fingerprint = ""
+            if self._gateway_adapter is not None:
+                self._gateway_adapter.close()
+                self._gateway_adapter = None
+                self._gateway_adapter_signature = ""
 
     def __enter__(self) -> "PiAgentClient":
         return self
@@ -1955,6 +3587,9 @@ class PiAgentClient:
                         "endpoint",
                         "connector_kind",
                         "allow_write",
+                        "tool_effects",
+                        "tool_policies",
+                        "call_timeout_ms",
                         "deferred",
                         "enabled",
                         "uninstalled",
@@ -2011,12 +3646,26 @@ class PiAgentClient:
 
     def _save_session_registry(self, registry: dict[str, str]) -> None:
         path = self._registry_path()
-        temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         with _SESSION_REGISTRY_LOCK:
             latest = self._load_session_registry_unlocked()
             latest.update(registry)
-            temporary.write_text(json.dumps(latest, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, path)
+            temporary: Path | None = None
+            try:
+                with NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    prefix=".",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temporary = Path(handle.name)
+                    handle.write(json.dumps(latest, ensure_ascii=False, indent=2))
+                assert temporary is not None
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def _load_session_registry_unlocked(self) -> dict[str, str]:
         try:
@@ -2247,19 +3896,54 @@ class PiAgentClient:
             "failures": failures,
         }
 
-    def _persist_tool_result(self, tool_name: str, payload: dict[str, Any]) -> tuple[str, int]:
-        """Keep complete tool output off-model while retaining a durable task record."""
+    def _prepare_tool_result(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        *,
+        request_id: str = "",
+        generation: int = 0,
+        call_id: str = "",
+    ) -> _PreparedToolResult:
+        """Write a request-scoped temporary result without publishing it."""
 
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tool_name).strip())[:60] or "tool"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tool_name).strip())[:32] or "tool"
         result_dir = self.agent_dir / "tool-results"
         result_dir.mkdir(parents=True, exist_ok=True)
         result_id = f"{safe_name}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:12]}.json"
         result_path = result_dir / result_id
         encoded = json.dumps(_json_safe(payload), ensure_ascii=False, indent=2).encode("utf-8")
-        temporary = result_path.with_suffix(f"{result_path.suffix}.{uuid4().hex}.tmp")
-        temporary.write_bytes(encoded)
-        os.replace(temporary, result_path)
-        return str(result_path.relative_to(self.agent_dir)).replace("\\", "/"), len(encoded)
+        scope_hash = hashlib.sha256(
+            f"{request_id}\0{max(0, int(generation))}\0{call_id}".encode("utf-8")
+        ).hexdigest()[:16]
+        temporary = result_dir / f".{safe_name[:24]}-{scope_hash}-{uuid4().hex[:8]}.tmp"
+        try:
+            temporary.write_bytes(encoded)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return _PreparedToolResult(
+            temporary_path=temporary,
+            final_path=result_path,
+            reference=str(result_path.relative_to(self.agent_dir)).replace("\\", "/"),
+            encoded_bytes=len(encoded),
+        )
+
+    @staticmethod
+    def _discard_prepared_tool_result(prepared: _PreparedToolResult) -> None:
+        prepared.temporary_path.unlink(missing_ok=True)
+        prepared.final_path.unlink(missing_ok=True)
+
+    def _persist_tool_result(self, tool_name: str, payload: dict[str, Any]) -> tuple[str, int]:
+        """Keep complete tool output off-model while retaining a durable task record."""
+
+        prepared = self._prepare_tool_result(tool_name, payload)
+        try:
+            os.replace(prepared.temporary_path, prepared.final_path)
+        except BaseException:
+            self._discard_prepared_tool_result(prepared)
+            raise
+        return prepared.reference, prepared.encoded_bytes
 
     def _selected_writable_notebook_id(self, requested: str = "") -> str:
         """Resolve the notebook a Pi write action is allowed to update."""
@@ -2348,7 +4032,7 @@ class PiAgentClient:
                 workspace=self.workspace,
                 strategy=strategy,
                 timeout=timeout,
-                cancel_check=self._cancel_requested.is_set,
+                cancel_check=self._current_cancel_event().is_set,
             )
             reported_files = [
                 str(value)
@@ -2844,6 +4528,22 @@ class PiAgentClient:
         }
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name in {"subagent", "list_subagents", "collect_subagents", "cancel_subagents"}:
+            raise PermissionError("Generic subagents require the native Pi runtime")
+        if name in {
+            "delegate_scientific_agents",
+            "list_scientific_agents",
+            "collect_scientific_agents",
+            "cancel_scientific_agents",
+        }:
+            if not self.active_run_id or self._scientific_agent_control is None:
+                raise PermissionError("Scientific agent controls require a host-bound active durable run")
+            sanitized = {
+                str(key): value
+                for key, value in dict(arguments or {}).items()
+                if str(key) not in {"parent_run_id", "run_id"}
+            }
+            return self._scientific_agent_control(name, self.active_run_id, sanitized)
         if name in {"create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex"}:
             plugin_by_tool = {
                 "create_document": "documents",
@@ -2916,140 +4616,6 @@ class PiAgentClient:
                 [path for path in self.evidence_dbs if path.is_file()]
             )
             return snapshot
-        if name == "search_tools":
-            query = str(arguments.get("query", "")).strip().lower()
-            kind = str(arguments.get("kind", "all")).lower()
-            limit = _bounded_limit(arguments.get("limit"), default=10)
-            snapshot = capability_snapshot(workspace=self.workspace, evidence_db=self.evidence_db)
-            results: list[dict[str, Any]] = []
-            # Collect searchable entries: built-in capabilities + pi high-level tools
-            for cap in list(snapshot.get("capabilities", []) or []):
-                if not isinstance(cap, dict):
-                    continue
-                cap_id = str(cap.get("id", "")).lower()
-                cap_desc = str(cap.get("description", "")).lower()
-                cap_label = str(cap.get("label", "")).lower()
-                if kind not in ("tool", "all"):
-                    continue
-                if query and query not in cap_id and query not in cap_desc and query not in cap_label:
-                    continue
-                results.append({"id": cap.get("id", ""), "kind": "tool", "label": cap.get("label", ""), "description": cap.get("description", ""), "status": cap.get("status", "ready")})
-            for hi in list(snapshot.get("pi_high_level_tools", []) or []):
-                if not isinstance(hi, dict):
-                    continue
-                hi_id = str(hi.get("id", "")).lower()
-                hi_desc = str(hi.get("description", "")).lower()
-                if kind not in ("tool", "all"):
-                    continue
-                if query and query not in hi_id and query not in hi_desc:
-                    continue
-                if any(r.get("id") == hi.get("id") for r in results):
-                    continue
-                results.append({"id": hi.get("id", ""), "kind": "tool", "label": hi.get("id", ""), "description": hi.get("description", ""), "status": hi.get("status", "ready")})
-            # Available skills
-            if kind in ("skill", "all"):
-                from .skill_runtime import RESEARCH_SKILL_IDS
-                for sid in sorted(RESEARCH_SKILL_IDS):
-                    if query and query not in sid.lower():
-                        continue
-                    results.append({"id": sid, "kind": "skill", "label": sid, "description": f"Research skill: {sid}", "status": "available"})
-            # Available MCP servers
-            if kind in ("mcp", "all"):
-                for srv in list(snapshot.get("mcp_servers", []) or []):
-                    if not isinstance(srv, dict):
-                        continue
-                    srv_id = str(srv.get("id", "")).lower()
-                    srv_desc = str(srv.get("description", "")).lower()
-                    if query and query not in srv_id and query not in srv_desc:
-                        continue
-                    results.append({"id": srv.get("id", ""), "kind": "mcp", "label": srv.get("name", srv.get("id", "")), "description": srv.get("description", ""), "status": "enabled" if srv.get("enabled") else "disabled"})
-            results = results[:limit]
-            return {"query": query, "kind": kind, "count": len(results), "results": results}
-        if name == "load_skill":
-            skill_id = str(arguments.get("skill_id", "")).strip()
-            if not skill_id:
-                raise ValueError("load_skill requires a non-empty skill_id")
-            from .skill_manager import installed_skills
-            records = [item for item in installed_skills(self.workspace) if item.get("available") and item.get("enabled", True)]
-            by_id = {str(item.get("id", "")).lower(): item for item in records if item.get("id")}
-            match = by_id.get(skill_id.lower())
-            if match is None:
-                return {"skill_id": skill_id, "loaded": False, "error": f"Skill not found or not enabled: {skill_id}", "available_ids": sorted(by_id.keys())}
-            skill_file = Path(str(match.get("skill_file", "")))
-            if not skill_file.is_file():
-                return {"skill_id": skill_id, "loaded": False, "error": f"Skill file missing: {skill_file}"}
-            try:
-                instructions = skill_file.read_text(encoding="utf-8-sig", errors="replace")
-                # Truncate to a generous limit for tool-result context
-                max_chars = 16_000
-                if len(instructions) > max_chars:
-                    instructions = instructions[:max_chars] + f"\n\n[... truncated at {max_chars} chars; use a more specific skill or query for full details]"
-            except OSError as exc:
-                return {"skill_id": skill_id, "loaded": False, "error": str(exc)}
-            return {
-                "skill_id": skill_id,
-                "loaded": True,
-                "name": str(match.get("name", skill_id)),
-                "source": str(match.get("source", "")),
-                "instructions": instructions,
-                "instruction_chars": len(instructions),
-            }
-        if name == "delegate_scientific_subagent":
-            role = str(arguments.get("role", "")).strip()
-            prompt = str(arguments.get("prompt", "")).strip()
-            context = str(arguments.get("context", "")).strip()
-            if not role or not prompt:
-                raise ValueError("delegate_scientific_subagent requires role and prompt")
-            from .research_subagents import SCIENTIFIC_ROLES, structured_output_schema, validate_subagent_result
-            import asyncio
-            role_def = SCIENTIFIC_ROLES.get(role)
-            if role_def is None:
-                available = sorted(SCIENTIFIC_ROLES.keys())
-                return {"role": role, "success": False, "error": f"Unknown role: {role}", "available_roles": available}
-            # Build a constrained system prompt for the sub-agent
-            sub_system = (
-                f"You are the {role_def.label} ({role_def.role_id}) — a focused ScanSci scientific sub-agent.\n\n"
-                f"Objective: {role_def.objective}\n"
-                f"Output contract: {role_def.output_contract}\n"
-                f"You have a bounded tool budget and must return structured JSON conforming to the output schema.\n\n"
-                f"Parent task context: {context}" if context else f"Parent task context: (none)"
-            )
-            # Use the main Pi client with restricted tools and budget
-            sub_contract_raw = {
-                "goal": prompt,
-                "output_format": "structured_json",
-                "constraints": [f"Only use tools from: {', '.join(role_def.allowed_capabilities)}"],
-                "allowed_tools": list(role_def.allowed_capabilities),
-                "required_evidence": [],
-                "pause_policy": "never",
-                "autonomy": "full",
-                "risk_level": "low",
-                "success_criteria": [role_def.output_contract],
-                "initial_tool_budget": 6,
-                "max_tool_budget": 12,
-                "model_token_budget": 24_000,
-                "max_model_token_budget": 48_000,
-            }
-            # For now, return structured handoff instructing the parent model how to proceed.
-            # Full sub-agent process spawning requires the durable run infrastructure which
-            # is not directly callable from the Pi bridge. This tool provides the role
-            # contract and delegates execution to the parent model within its Pi session.
-            schema = structured_output_schema(role_def)
-            return {
-                "role": role,
-                "label": role_def.label,
-                "task_mode": role_def.task_mode,
-                "allowed_capabilities": list(role_def.allowed_capabilities),
-                "output_contract": role_def.output_contract,
-                "output_schema": schema,
-                "subagent_contract": sub_contract_raw,
-                "instruction": (
-                    f"Execute this sub-agent task within your current session using only the allowed capabilities: "
-                    f"{', '.join(role_def.allowed_capabilities)}. "
-                    f"Return results in the specified output schema format. "
-                    f"Task: {prompt}"
-                ),
-            }
         if name == "read_task_documents":
             return self._read_task_documents(arguments)
         if name == "download_and_index":
@@ -3215,6 +4781,11 @@ class PiAgentClient:
                 reranker=self.reranker,
             )
             result["search_plan"] = plan
+            if isinstance(getattr(self._worker_context, "run_context", None), _RunContext):
+                # The owning event thread publishes this complete provider payload
+                # together with its bounded model view.  A worker must not create
+                # a durable file that cancellation can strand before tool.result.
+                return result
             result_reference, result_bytes = self._persist_tool_result("discover-papers", result)
             return _compact_academic_search_result_for_model(
                 result,
@@ -3281,7 +4852,12 @@ class PiAgentClient:
                 workspace=self.workspace,
             )
         if name == "self_assess":
-            return _build_self_assessment(self._tool_history)
+            context = getattr(self._worker_context, "run_context", None)
+            if isinstance(context, _RunContext):
+                with context.history_lock:
+                    return _build_self_assessment(list(context.history))
+            with self._tool_history_lock:
+                return _build_self_assessment(list(self._tool_history))
         raise ValueError(f"Unsupported ScanSci Pi tool: {name}")
 
     def _selected_notebooks(self) -> list[dict[str, Any]]:

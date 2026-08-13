@@ -1,3 +1,4 @@
+import base64
 import json
 from dataclasses import replace
 from datetime import datetime
@@ -12,7 +13,7 @@ import pytest
 
 from scansci_html.annotation_layers import write_annotation_layer
 from scansci_html.app_update import APP_VERSION
-from scansci_html.app_settings import save_settings
+from scansci_html.app_settings import load_settings, save_settings
 from scansci_html.deep_research_evidence import build_task_fulltext_evidence
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.grounded_annotation import ground_draft_text
@@ -879,6 +880,9 @@ def test_direct_chat_jobs_are_conversation_scoped_and_keep_live_turn_controls(tm
     assert "job.queue.shift()" in script
     assert "void runDirectChatTurn(job, nextTurn)" in script
     assert 'request("/api/chat/steer"' in script
+    steer_function = script.split("async function steerDirectChat", 1)[1].split("function fallbackSteerDirectChat", 1)[0]
+    assert "turn.images.length" not in steer_function
+    assert "images: turn.images" in steer_function
     assert 'request("/api/chat/cancel"' in script
     assert 'request("/api/chat/pause"' in script
     assert "job.restartForSteer = true;" in script
@@ -924,6 +928,56 @@ def test_pause_routes_delegate_to_run_and_direct_chat_controls(tmp_path: Path, m
     assert chat_response.status == 200
     assert _payload(chat_response) == {"ok": True}
     assert calls == [("run", "run-pause-test"), ("chat", "chat-pause-test")]
+
+
+def test_chat_steer_and_follow_up_routes_forward_validated_images(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    raw = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+    )
+    data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    calls: list[tuple[str, str, list[dict[str, str]]]] = []
+
+    class ActivePi:
+        active_request_id = "active-request"
+
+        def steer(self, text, request_id, *, images):
+            calls.append(("steer", f"{request_id}:{text}", list(images)))
+            return True
+
+        def follow_up(self, text, request_id, *, images):
+            calls.append(("follow_up", f"{request_id}:{text}", list(images)))
+            return True
+
+    with app.research_agent._active_pi_lock:
+        app.research_agent._active_pi_clients["control-run"] = ActivePi()
+
+    steer = _payload(app.dispatch(
+        "POST",
+        "/api/chat/steer",
+        json.dumps({
+            "run_id": "control-run",
+            "text": "inspect this",
+            "images": [{"name": "steer.png", "data_url": data_url}],
+        }).encode("utf-8"),
+    ))
+    follow = _payload(app.dispatch(
+        "POST",
+        "/api/chat/follow-up",
+        json.dumps({
+            "run_id": "control-run",
+            "text": "compare this",
+            "images": [{"name": "follow.png", "data_url": data_url}],
+        }).encode("utf-8"),
+    ))
+
+    assert steer == {"ok": True, "image_count": 1}
+    assert follow == {"ok": True, "run_id": "control-run", "queued": True, "image_count": 1}
+    assert [kind for kind, _text, _images in calls] == ["steer", "follow_up"]
+    assert all(images[0]["type"] == "image" for _kind, _text, images in calls)
+    assert all(images[0]["mimeType"] == "image/png" for _kind, _text, images in calls)
+    assert all("data_url" not in images[0] for _kind, _text, images in calls)
 
 
 def test_freeform_task_router_keeps_general_chat_open_and_starts_explicit_public_search(tmp_path: Path, monkeypatch):
@@ -2450,13 +2504,16 @@ def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch:
     assert 'event: done\ndata: {"message":{"role":"assistant","content":"Hello","usage":{"total_tokens":7}},"model":{"provider_id":"scansci-managed","model_id":"glm-4.7-flash"}}' in body
 
 
-def test_direct_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def fake_model_stream(*_args, **_kwargs):
+def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def fake_pi_events(*_args, **_kwargs):
         yield {"type": "delta", "content": "你"}
         yield {"type": "delta", "content": "好"}
-        yield {"type": "done", "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}}
+        yield {
+            "type": "done",
+            "stats": {"tokens": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}},
+        }
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", fake_model_stream)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
@@ -2469,14 +2526,19 @@ def test_direct_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeyp
     # Short answers stay in the repetition-safety tail until validation, then
     # arrive as one canonical delta instead of exposing raw provider chunks.
     assert event_types.count("TEXT_MESSAGE_CONTENT") == 1
-    assert event_types.count("CUSTOM") == 1
+    assert {
+        str(event.get("name", ""))
+        for event in events
+        if event.get("type") == "CUSTOM"
+    } == {"usage", "session_stats"}
     assert not any(event.get("name") == "process_trace" for event in events)
     assert events[-1]["result"]["message"]["content"] == "你好"
     assert events[-1]["result"]["message"]["usage"]["total_tokens"] == 4
     assert events[-1]["result"]["message"]["trace"] == []
+    assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
 
 
-def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_image_question_with_web_tool_uses_pi_native_multimodal_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "workspace.sqlite"
     save_settings(
         workspace,
@@ -2490,6 +2552,7 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
                 "models": [{
                     "id": "vision-model",
                     "name": "Vision model",
+                    "context_window": "32K",
                     "capabilities": ["vision", "tool"],
                 }],
             }],
@@ -2502,17 +2565,22 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
         lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
     )
     monkeypatch.setattr(
-        "scansci_html.research_agent.vision_image_blocks",
-        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
     )
     observed: dict[str, object] = {}
 
-    def direct_model_stream(*_args, **kwargs):
-        observed["messages"] = kwargs["messages"]
+    def pi_model_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "tool.completed", "name": "search_web", "result": {"items": []}}
         yield {"type": "delta", "content": "图中有一条曲线。"}
-        yield {"type": "done", "usage": {"total_tokens": 8}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 8}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_model_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("vision must not use direct transport")),
+    )
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -2525,11 +2593,14 @@ def test_image_question_bypasses_text_only_pi_gate(tmp_path: Path, monkeypatch: 
     assert events[-1]["type"] == "RUN_FINISHED"
     result = events[-1]["result"]
     assert result["message"]["content"] == "图中有一条曲线。"
-    assert result["agent_runtime"]["harness"] == "direct-provider"
-    assert result["agent_runtime"]["task_mode"] == "general"
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert result["agent_runtime"]["task_mode"] != "general"
     assert result["agent_runtime"]["vision_route"]["model_id"] == "vision-model"
+    assert result["agent_runtime"]["vision_route"]["route"] == "pi-native"
     assert result["user_images"] == [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}]
-    assert isinstance(observed["messages"][-1]["content"], list)
+    assert observed["images"] == [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}]
+    assert observed["model_runtime"]["input_modalities"] == ["text", "image"]
+    assert isinstance(observed["messages"][-1]["content"], str)
 
 
 def test_image_question_replaces_scientific_system_prompt_without_dropping_image_blocks(
@@ -2562,6 +2633,10 @@ def test_image_question_replaces_scientific_system_prompt_without_dropping_image
         "scansci_html.research_agent.vision_image_blocks",
         lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
     )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
+    )
     observed: dict[str, object] = {}
 
     def direct_model_stream(*_args, **kwargs):
@@ -2570,9 +2645,11 @@ def test_image_question_replaces_scientific_system_prompt_without_dropping_image
         yield {"type": "done", "usage": {"total_tokens": 8}}
 
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    monkeypatch.setattr("scansci_html.research_agent._pi_should_run", lambda *_args: False)
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
+        "agent_harness": "legacy",
         "chat_mode": "general",
         "messages": [{"role": "user", "content": "请识别这张图"}],
         "images": [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
@@ -2635,6 +2712,10 @@ def test_image_question_falls_back_to_ocr_when_local_vision_cannot_start(
         lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
     )
     monkeypatch.setattr(
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
+    )
+    monkeypatch.setattr(
         "scansci_html.research_agent.ocr_image_blocks",
         lambda *_args, **_kwargs: {"available": True, "backend": "test-ocr", "text": "群聊截图中的文字"},
     )
@@ -2687,6 +2768,10 @@ def test_sync_image_question_retries_an_unavailable_vision_model(
         "scansci_html.research_agent.vision_image_blocks",
         lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
     )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
+    )
     runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
     original_request = runtime._direct_chat_request(
         {
@@ -2711,8 +2796,10 @@ def test_sync_image_question_retries_an_unavailable_vision_model(
         yield {"type": "done", "usage": {"total_tokens": 7}}
 
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", model_stream)
+    monkeypatch.setattr("scansci_html.research_agent._pi_should_run", lambda *_args: False)
     result = runtime.chat(
         {
+            "agent_harness": "legacy",
             "messages": [{"role": "user", "content": "请识别图片"}],
             "images": [{"name": "figure.png", "data_url": "data:image/png;base64,aGVsbG8="}],
         }
@@ -2731,10 +2818,167 @@ def test_direct_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
     monkeypatch: pytest.MonkeyPatch,
 ):
     def repeating_model_stream(*_args, **_kwargs):
-        yield {"type": "delta", "content": "这是可用的回答。\n\non on on on on on on on on on on on"}
+        yield {"type": "delta", "content": "这是可用的回答。\n\non on on on on on on on on on on on on"}
         yield {"type": "done", "usage": {"total_tokens": 20}}
 
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", repeating_model_stream)
+    monkeypatch.setattr("scansci_html.research_agent._pi_should_run", lambda *_args: False)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    events = list(runtime.chat_stream({
+        "agent_harness": "legacy",
+        "messages": [{"role": "user", "content": "用一句话解释量子纠缠。"}],
+    }))
+
+    delivered = "".join(
+        str(event.get("delta", ""))
+        for event in events
+        if event.get("type") == "TEXT_MESSAGE_CONTENT"
+    )
+    result = events[-1]["result"]
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert "on on" not in delivered
+    assert result["message"]["content"] == "这是可用的回答。"
+    assert any(item["title"] == "移除异常重复" for item in result["message"]["trace"])
+
+
+def test_synchronous_image_chat_is_pi_first_and_never_uses_direct_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(workspace, {
+        "active_model": {"provider_id": "vision-provider", "model_id": "vision-model"},
+        "providers": [{
+            "id": "vision-provider",
+            "name": "Vision provider",
+            "kind": "openai-compatible",
+            "base_url": "https://vision.example/v1",
+            "models": [{
+                "id": "vision-model",
+                "context_window": "32K",
+                "capabilities": ["reasoning", "vision", "tool"],
+            }],
+        }],
+    })
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.vision_routing.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    image = {"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}
+    monkeypatch.setattr("scansci_html.research_agent.pi_image_blocks", lambda *_args: [image])
+    observed: dict[str, object] = {}
+
+    def pi_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "delta", "content": "Pi visual answer"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("vision must not use direct transport")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    result = runtime.chat({
+        "messages": [{"role": "user", "content": "Inspect this image."}],
+        "images": [{"name": "figure.png", "data_url": "ignored"}],
+    })
+
+    assert result["message"]["content"] == "Pi visual answer"
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert observed["images"] == [image]
+    assert observed["model_runtime"]["input_modalities"] == ["text", "image"]
+
+
+def test_unsupported_image_route_declares_ocr_degradation_and_still_uses_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    text_provider = {
+        "id": "text-provider",
+        "name": "Text provider",
+        "kind": "openai-compatible",
+        "base_url": "https://text.example/v1",
+        "enabled": True,
+        "models": [{
+            "id": "text-model",
+            "context_window": "32K",
+            "capabilities": ["reasoning", "tool"],
+        }],
+    }
+    save_settings(workspace, {
+        "active_model": {"provider_id": "text-provider", "model_id": "text-model"},
+        "providers": [text_provider],
+    })
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "secret")
+    monkeypatch.setattr("scansci_html.research_agent.select_vision_route", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.select_text_route",
+        lambda *_args, **_kwargs: {
+            "provider": text_provider,
+            "provider_id": "text-provider",
+            "provider_kind": "openai-compatible",
+            "model_id": "text-model",
+        },
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "scan.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.ocr_image_blocks",
+        lambda *_args, **_kwargs: {"text": "OCR-SENTINEL", "backend": "fixture", "available": True},
+    )
+    observed: dict[str, object] = {}
+
+    def pi_stream(_client, **kwargs):
+        observed.update(kwargs)
+        yield {"type": "delta", "content": "OCR-assisted answer"}
+        yield {"type": "done", "stats": {}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("OCR route must still use Pi")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    result = runtime.chat({
+        "messages": [{"role": "user", "content": "Read this scan."}],
+        "images": [{"name": "scan.png", "data_url": "ignored"}],
+    })
+
+    assert result["message"]["content"] == "OCR-assisted answer"
+    assert result["agent_runtime"]["vision_route"]["route"] == "pi-ocr-text"
+    assert result["agent_runtime"]["vision_route"]["degraded"] is True
+    assert observed["images"] == []
+    assert observed["model_runtime"]["input_modalities"] == ["text"]
+    assert observed["model_runtime"]["degraded"] is True
+    assert "vision_input_degraded_to_ocr_text" in observed["model_runtime"]["degradation_reasons"]
+    assert "OCR-SENTINEL" in str(observed["messages"][-1]["content"])
+
+
+def test_pi_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def repeating_pi_events(*_args, **_kwargs):
+        yield {"type": "delta", "content": "这是可用的回答。\n\non on on on on on on on on on on on"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 20}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", repeating_pi_events)
     runtime = ResearchAgentRuntime(
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
@@ -2764,11 +3008,17 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     app, workspace, _evidence = _build_app(tmp_path)
     _configure_local_evidence(workspace)
 
-    def model_must_not_run(*_args, **_kwargs):
-        raise AssertionError("library-scoped chat must use the verified evidence pipeline")
+    def direct_model_must_not_run(*_args, **_kwargs):
+        raise AssertionError("library-scoped final generation must be mediated by Pi")
         yield  # pragma: no cover
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", model_must_not_run)
+    def fake_pi_events(self, _request, **_kwargs):
+        del self
+        yield {"type": "delta", "content": "Galunisertib reduced regulatory T cells after treatment.[1]"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_must_not_run)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     events = list(app.research_agent.chat_stream({
         "chat_mode": "knowledge",
         "notebook_id": "immunotherapy",
@@ -2789,6 +3039,8 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
         "search_local_evidence",
         "build_verified_answer",
     }
+    assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert events[-1]["result"]["agent_runtime"]["pi_success"] is True
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     assert "directEvidenceAnswerMarkup" in script
     assert "data-direct-evidence-answer" in script
@@ -2876,7 +3128,7 @@ def test_direct_knowledge_catalog_counts_documents_not_evidence_hits(
     assert "已统计" in script
 
 
-def test_ambiguous_knowledge_turn_uses_model_only_to_plan_catalog_query(
+def test_ambiguous_knowledge_turn_never_calls_a_model_before_verified_pi(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2908,34 +3160,131 @@ def test_ambiguous_knowledge_turn_uses_model_only_to_plan_catalog_query(
         api_key="planner-key",
         model_id="planner-model",
     )
-    observed: dict[str, object] = {}
+    direct_planner_calls: list[str] = []
+    pi_calls: list[dict[str, object]] = []
 
-    class PlannerClient:
-        def complete_json(self, messages, *, schema_name):
-            observed["messages"] = messages
-            observed["schema_name"] = schema_name
-            return {"operation": "count", "topic": "photovoltaic", "confidence": 0.93}
+    def forbidden_direct_planner(*_args, **_kwargs):
+        direct_planner_calls.append("called")
+        raise AssertionError("catalog planning must not call a model before Pi")
+
+    def fake_answer_sync(_payload):
+        return {
+            "hits": [{"evidence_id": "pv-1.s0001"}],
+            "citation_verification": {"passed": True},
+            "reader_answer": {
+                "text": "Deterministic verified fallback.[1]",
+                "citations": [{
+                    "citation_no": 1,
+                    "quote_id": "q0001",
+                    "evidence_id": "pv-1.s0001",
+                    "doc_id": "pv-1",
+                    "paper": "Photovoltaic degradation",
+                    "section": "Results",
+                    "html_anchor": "s0001",
+                    "exact_quote": "Photovoltaic evidence is present in the selected library.",
+                }],
+            },
+        }
+
+    def fake_pi_events(self, request, *, task_mode=None, session_id=None, active_run_id=""):
+        del self
+        pi_calls.append({
+            "task_mode": task_mode,
+            "session_id": session_id,
+            "active_run_id": active_run_id,
+            "messages": request.messages,
+        })
+        yield {"type": "delta", "content": "The selected library contains relevant photovoltaic evidence.[1]"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 12}}}
 
     monkeypatch.setattr(app.research_agent, "_direct_chat_request", lambda *_args, **_kwargs: planned_request)
-    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", lambda *_args, **_kwargs: PlannerClient())
-    monkeypatch.setattr(
-        app.research_agent,
-        "answer_sync",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("model planning must not use RAG")),
-    )
+    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_planner)
+    monkeypatch.setattr(app.research_agent, "answer_sync", fake_answer_sync)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
 
     events = list(app.research_agent.chat_stream(payload))
 
     message = events[-1]["result"]["message"]
-    catalog = message["reader_answer"]["catalog"]
-    assert catalog["planner"] == "model"
-    assert catalog["planner_confidence"] == pytest.approx(0.93)
-    assert catalog["document_count"] == 2
-    assert catalog["match_terms"][0] == "光伏"
-    assert observed["schema_name"] == "knowledge_catalog_route"
-    assert observed["messages"][1]["content"] == "光伏文献的覆盖情况如何？"
-    assert any(item["tool_name"] == "plan_knowledge_catalog" for item in message["trace"])
-    assert events[-1]["result"]["agent_runtime"]["harness"] == "knowledge-catalog"
+    runtime = events[-1]["result"]["agent_runtime"]
+    assert direct_planner_calls == []
+    assert len(pi_calls) == 1
+    assert pi_calls[0]["task_mode"] == "knowledge"
+    assert message["evidence_answer"] is True
+    assert message["content"].endswith("[1]")
+    assert runtime["harness"] == "pi-agent-sdk"
+    assert runtime["pi_success"] is True
+
+
+def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    settings = load_settings(workspace)
+    settings["active_model"] = {"provider_id": "fixture-provider", "model_id": "fixture-model"}
+    settings["providers"] = [{
+        "id": "fixture-provider",
+        "name": "Fixture provider",
+        "kind": "openai-compatible",
+        "base_url": "https://fixture.invalid/v1",
+        "enabled": True,
+        "models": [{"id": "fixture-model", "name": "Fixture model"}],
+    }]
+    save_settings(workspace, settings)
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "fixture-key")
+
+    direct_calls: list[str] = []
+    pi_calls: list[dict[str, object]] = []
+
+    def forbidden_direct_client(*_args, **_kwargs):
+        direct_calls.append("called")
+        raise AssertionError("fixed verified workflow must use the Pi JSON adapter")
+
+    def fake_pi_stream(self, **kwargs):
+        del self
+        pi_calls.append(dict(kwargs))
+        yield {"type": "delta", "content": '{"answer":"verified"}'}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 7}}}
+
+    def fake_answer_question(_db, _question, **options):
+        generated = options["chat_client"].complete_json(
+            [
+                {"role": "system", "content": "Return a JSON answer."},
+                {"role": "user", "content": "Use the verified evidence."},
+            ],
+            schema_name="pi_fixed_workflow_fixture",
+        )
+        assert generated == {"answer": "verified"}
+        return {
+            "answer": {"text": "verified"},
+            "reader_answer": {"text": "verified", "citations": []},
+            "citation_verification": {"passed": True},
+            "hits": [],
+            "agentic_trace": {"steps": []},
+        }
+
+    monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_client)
+    monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
+    monkeypatch.setattr("scansci_html.research_agent.answer_question", fake_answer_question)
+
+    result = app.research_agent.answer_sync({
+        "question": "What does the selected evidence show?",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "agent_harness": "fixed-workflow",
+        "task_mode": "evidence",
+    })
+
+    assert direct_calls == []
+    assert len(pi_calls) == 1
+    nested = pi_calls[0]
+    assert nested["session_id"] is None
+    assert nested["task_mode"] == "model-json"
+    assert nested["task_contract"]["schema_version"] == "scansci.task-contract.v2"
+    assert nested["task_contract"]["allowed_tools"] == []
+    assert nested["task_contract"]["initial_tools"] == []
+    assert nested["task_contract"]["allowed_mcp_servers"] == []
+    assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
 
 
 def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft(
@@ -2988,23 +3337,45 @@ def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft
             },
         }
 
-    writing_options: dict[str, object] = {}
+    writer_runtime: dict[str, object] = {}
 
-    def fake_writing_completion(*_args, **kwargs):
-        writing_options.update(kwargs)
-        return (
-            "# 光伏研究进展：基于本地资料的综述草稿\n\n"
-            "## 已有发现\n\n"
-            "现有资料表明，该方向已经形成可供进一步讨论的研究证据。[1]",
-            {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
-        )
+    def fake_pi_events(_self, chat_request, *, task_mode=None, session_id=None, active_run_id=""):
+        writer_runtime.update({
+            "messages": chat_request.messages,
+            "task_mode": task_mode,
+            "session_id": session_id,
+            "active_run_id": active_run_id,
+        })
+        yield {
+            "type": "session",
+            "session_id": "knowledge-writer-session",
+            "session_file": "writer.jsonl",
+            "resumed": True,
+        }
+        yield {
+            "type": "delta",
+            "content": (
+                "# 光伏研究进展：基于本地资料的综述草稿\n\n"
+                "## 已有发现\n\n"
+                "现有资料表明，该方向已经形成可供进一步讨论的研究证据。[1]"
+            ),
+        }
+        yield {
+            "type": "done",
+            "stats": {"tokens": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}},
+        }
 
     monkeypatch.setattr(app.research_agent, "answer_sync", fake_answer_sync)
-    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", fake_writing_completion)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Pi writer must run first")),
+    )
     events = list(app.research_agent.chat_stream({
         "chat_mode": "knowledge",
         "notebook_id": "immunotherapy",
         "notebook_ids": ["immunotherapy"],
+        "pi_session_id": "knowledge-writer-session",
         "messages": [{"role": "user", "content": "基于光伏知识库写一篇研究进展综述"}],
     }))
 
@@ -3014,7 +3385,14 @@ def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft
     assert message["reader_answer"]["citations"][0]["exact_quote"].startswith("Verified")
     assert "# 光伏研究进展" in message["content"]
     assert message["citation_verification"]["passed"] is True
-    assert events[-1]["result"]["agent_runtime"]["harness"] == "evidence-grounded-writing"
+    runtime = events[-1]["result"]["agent_runtime"]
+    assert runtime["harness"] == "pi-agent-sdk"
+    assert runtime["pi_success"] is True
+    assert runtime["task_mode"] == "knowledge"
+    assert runtime["evidence_policy"] == "grounded-writing"
+    assert runtime["session"]["resumed"] is True
+    assert runtime["task_contract"]["task_profile"]["evidence_policy"] == "strict"
+    assert any("build_verified_answer" in group for group in runtime["task_contract"]["required_tool_groups"])
     assert observed_payload["force_local_evidence"] is True
     assert observed_payload["limit"] == 20
     assert observed_payload["max_quotes"] == 12
@@ -3025,10 +3403,130 @@ def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft
     assert observed_payload["max_followup_queries"] == 0
     assert len(message["reader_answer"]["citations"]) == 2
     assert message["reader_answer"]["citations"][1]["exact_quote"].startswith("A second verified")
-    assert writing_options["use_litellm"] is False
+    assert writer_runtime["task_mode"] == "knowledge"
+    assert writer_runtime["session_id"] == "knowledge-writer-session"
+    assert "Verified photovoltaic evidence" in str(writer_runtime["messages"])
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     assert "evidence-grounded-article" in script
     assert "SCANSCI_CITATION" in script
+
+
+def test_knowledge_writer_marks_pre_generation_pi_failure_as_explicit_direct_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    _configure_local_evidence(workspace)
+    app.research_agent.answer_sync = lambda _payload: {
+        "hits": [{"evidence_id": "paper-1.s0001"}],
+        "citation_verification": {"passed": True},
+        "evidence_table": [{
+            "quote_id": "q0001",
+            "evidence_id": "paper-1.s0001",
+            "doc_id": "paper-1",
+            "paper": "Photovoltaic evidence",
+            "section": "Results",
+            "html_anchor": "s0001",
+            "exact_quote": "Verified evidence supports the synthesis.",
+        }],
+        "reader_answer": {
+            "text": "Verified evidence summary. [1]",
+            "presentation": "synthesis",
+            "citations": [],
+        },
+    }
+    pi_attempt: dict[str, object] = {}
+    direct_attempt: dict[str, object] = {}
+
+    def unavailable_pi(_self, _chat_request, **kwargs):
+        pi_attempt.update(kwargs)
+        raise RuntimeError("pi writer unavailable")
+        yield  # pragma: no cover
+
+    def direct_fallback(*_args, **kwargs):
+        direct_attempt.update(kwargs)
+        yield {
+            "type": "delta",
+            "content": "# 核验证据综述\n\n现有来源支持该综合结论。[1]",
+        }
+        yield {"type": "done", "usage": {"total_tokens": 12}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", unavailable_pi)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_fallback)
+
+    events = list(app.research_agent.chat_stream({
+        "chat_mode": "knowledge",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "pi_session_id": "knowledge-fallback-session",
+        "messages": [{"role": "user", "content": "基于当前知识库写一篇证据综述"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    runtime = result["agent_runtime"]
+    assert result["message"]["reader_answer"]["presentation"] == "article"
+    assert runtime["harness"] == "direct-provider"
+    assert runtime["pi_attempted"] is True
+    assert runtime["pi_success"] is False
+    assert runtime["compatibility_fallback"] is True
+    assert "pi writer unavailable" in runtime["compatibility_error"]
+    assert runtime["task_contract"]["task_profile"]["evidence_policy"] == "strict"
+    assert pi_attempt["session_id"] == "knowledge-fallback-session"
+    assert direct_attempt["use_litellm"] is False
+    assert any(item.get("title") == "Pi 兼容回退" for item in result["message"]["trace"])
+
+
+def test_knowledge_writer_never_direct_falls_back_after_pi_text_started(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    _configure_local_evidence(workspace)
+    monkeypatch.setattr(app.research_agent, "answer_sync", lambda _payload: {
+        "hits": [{"evidence_id": "paper-1.s0001"}],
+        "citation_verification": {"passed": True},
+        "evidence_table": [{
+            "quote_id": "q0001",
+            "evidence_id": "paper-1.s0001",
+            "doc_id": "paper-1",
+            "paper": "Photovoltaic evidence",
+            "section": "Results",
+            "html_anchor": "s0001",
+            "exact_quote": "Verified evidence survives a writer failure.",
+        }],
+        "reader_answer": {"text": "Verified evidence summary. [1]", "presentation": "synthesis"},
+    })
+
+    def partial_pi(*_args, **_kwargs):
+        yield {"type": "delta", "content": "Partial unvalidated article"}
+        raise RuntimeError("pi failed after text")
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", partial_pi)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct fallback is forbidden after Pi text starts")
+        ),
+    )
+
+    events = list(app.research_agent.chat_stream({
+        "chat_mode": "knowledge",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "messages": [{"role": "user", "content": "基于当前知识库写一篇证据综述"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    runtime = result["agent_runtime"]
+    assert runtime["harness"] == "verified-evidence-fallback"
+    assert runtime["pi_attempted"] is True
+    assert runtime["pi_success"] is False
+    assert runtime["compatibility_fallback"] is False
+    assert runtime["writing_fallback"] is True
+    assert "Verified evidence survives" in result["message"]["content"]
+    assert not any(item.get("title") == "Pi 兼容回退" for item in result["message"]["trace"])
 
 
 def test_article_writer_removes_uncited_prose_but_keeps_verified_paragraphs(tmp_path: Path):
@@ -3121,18 +3619,18 @@ def test_temporal_delivery_guard_never_labels_old_links_as_today() -> None:
     assert "以下是今天" not in guarded
 
 
-def test_plain_greeting_uses_host_classified_compact_prompt(
+def test_plain_greeting_runs_through_pi_with_empty_domain_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     observed: dict[str, object] = {}
 
-    def fake_model_stream(*_args, **kwargs):
-        observed["messages"] = kwargs["messages"]
+    def fake_pi_events(_self, chat_request, **_kwargs):
+        observed["messages"] = chat_request.messages
         yield {"type": "delta", "content": "你好！"}
-        yield {"type": "done", "usage": {"total_tokens": 3}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 3}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", fake_model_stream)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
@@ -3144,11 +3642,11 @@ def test_plain_greeting_uses_host_classified_compact_prompt(
     profile = result["agent_runtime"]["task_profile"]
     assert profile["route"] == "direct_chat"
     assert profile["cognitive_complexity"] == "low"
-    assert result["agent_runtime"]["task_contract"]["allowed_tools"] == ["agent_reach", "browser_access", "discover_papers", "search_web", "self_assess", "verify_doi"]
+    assert result["agent_runtime"]["task_contract"]["allowed_tools"] == []
+    assert result["agent_runtime"]["task_contract"]["initial_tools"] == []
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
     system = observed["messages"][0]["content"]
-    assert system.startswith("You are ScanSci, a scientific assistant.")
-    assert "HOST-OWNED TASK CONTRACT" not in system
-    assert len(system) < 900
+    assert "ScanSci" in system
 
 
 def test_managed_chat_uses_pi_agent_for_required_tools_and_reports_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3253,7 +3751,7 @@ def test_direct_chat_web_search_policy_selects_pi_tool_boundary(
         assert result["agent_runtime"]["tool_calls"] == [{"name": "discover_papers", "status": "completed"}]
 
 
-def test_explicit_web_access_skill_forces_required_pi_web_mode(
+def test_explicit_web_access_skill_does_not_override_web_search_off(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3262,21 +3760,152 @@ def test_explicit_web_access_skill_forces_required_pi_web_mode(
     def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
         observed["task_mode"] = task_mode
         observed["skills"] = [item.get("id") for item in chat_request.selected_skills]
-        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
-        yield {"type": "delta", "content": "已根据联网来源完成回答。"}
+        yield {"type": "delta", "content": "Argument structure analyzed without web access."}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
 
     monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "web_search": "auto",
-        "messages": [{"role": "user", "content": "$web-access 帮我看看今天大A的情况"}],
+        "web_search": "off",
+        "skills": ["web-access"],
+        "messages": [{
+            "role": "user",
+            "content": "Analyze the logical structure of this argument and identify assumptions.",
+        }],
     }))
 
     assert events[-1]["type"] == "RUN_FINISHED"
-    assert observed["task_mode"] == "web"
+    assert observed["task_mode"] is None
     assert "web-access" in observed["skills"]
+    assert events[-1]["result"]["agent_runtime"]["task_mode"] == "general"
+    assert events[-1]["result"]["agent_runtime"]["tool_calls"] == []
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_loaded_web_skill_does_not_expand_host_contract_or_evidence_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    observed: list[dict[str, object]] = []
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        observed.append({
+            "task_mode": task_mode,
+            "skills": [item.get("id") for item in chat_request.selected_skills],
+        })
+        if task_mode in {"web", "web-auto"}:
+            yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
+        yield {"type": "delta", "content": "Argument structure analyzed."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    def invoke(skills: list[str]) -> dict[str, object]:
+        payload = {
+            "web_search": "auto",
+            "skills": skills,
+            "messages": [{
+                "role": "user",
+                "content": "Analyze the logical structure of this argument and identify assumptions.",
+            }],
+        }
+        if entrypoint == "chat":
+            return runtime.chat(payload)
+        return list(runtime.chat_stream(payload))[-1]["result"]
+
+    baseline = invoke([])
+    with_skill = invoke(["web-access"])
+    baseline_runtime = baseline["agent_runtime"]
+    selected_runtime = with_skill["agent_runtime"]
+
+    assert "web-access" in observed[-1]["skills"]
+    assert selected_runtime["task_mode"] == baseline_runtime["task_mode"]
+    assert selected_runtime["evidence_policy"] == baseline_runtime["evidence_policy"]
+    for key in (
+        "allowed_tools", "initial_tools", "required_tool_groups", "required_evidence", "risk_level",
+    ):
+        assert selected_runtime["task_contract"].get(key) == baseline_runtime["task_contract"].get(key)
+    assert selected_runtime.get("tool_calls", []) == baseline_runtime.get("tool_calls", [])
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_dollar_skill_mention_is_excluded_from_intent_and_contract_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        yield {"type": "delta", "content": "Argument structure analyzed."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    def invoke(*, content: str, skills: list[str]) -> dict[str, object]:
+        payload = {
+            "web_search": "off",
+            "skills": skills,
+            "messages": [{"role": "user", "content": content}],
+        }
+        if entrypoint == "chat":
+            return runtime.chat(payload)
+        return list(runtime.chat_stream(payload))[-1]["result"]
+
+    baseline = invoke(
+        content="看看这个观点中有哪些隐含假设。",
+        skills=["web-access"],
+    )
+    with_mention = invoke(
+        content="$web-access 看看这个观点中有哪些隐含假设。",
+        skills=[],
+    )
+
+    baseline_runtime = baseline["agent_runtime"]
+    mention_runtime = with_mention["agent_runtime"]
+    assert mention_runtime["task_mode"] == baseline_runtime["task_mode"] == "general"
+    assert mention_runtime["evidence_policy"] == baseline_runtime["evidence_policy"]
+    for key in (
+        "allowed_tools", "initial_tools", "required_tool_groups", "required_evidence", "risk_level",
+    ):
+        assert mention_runtime["task_contract"].get(key) == baseline_runtime["task_contract"].get(key)
+
+
+def test_real_network_request_still_selects_web_after_skill_mention_is_stripped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None, **_kwargs):
+        observed["task_mode"] = task_mode
+        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
+        yield {"type": "delta", "content": "Public-web result."}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    events = list(runtime.chat_stream({
+        "web_search": "off",
+        "messages": [{
+            "role": "user",
+            "content": "$web-access 请在公开网络搜索今天的科技新闻。",
+        }],
+    }))
+
+    assert observed["task_mode"] == "web"
+    assert events[-1]["result"]["agent_runtime"]["task_mode"] == "web"
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
         {"name": "search_web", "status": "completed"}
     ]
@@ -3325,6 +3954,20 @@ def test_inferred_academic_search_skill_requires_a_real_search(
     def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
         observed["task_mode"] = task_mode
         observed["skills"] = [item.get("id") for item in chat_request.selected_skills]
+        observed["skill_records"] = [dict(item) for item in chat_request.selected_skills]
+        yield {
+            "type": "skill.loaded",
+            "name": "nature-academic-search",
+            "value": {
+                "skill_id": "nature-academic-search",
+                "resource": "SKILL.md",
+                "source": "builtin:nature-academic-search",
+                "package_hash": "sha256:" + ("a" * 64),
+                "content_hash": "sha256:" + ("b" * 64),
+                "provenance": "inferred",
+                "bytes": 123,
+            },
+        }
         yield {"type": "tool.completed", "name": "discover_papers", "result": {"count": 2}}
         yield {"type": "delta", "content": "已完成公开学术检索。"}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
@@ -3340,6 +3983,15 @@ def test_inferred_academic_search_skill_requires_a_real_search(
     assert events[-1]["type"] == "RUN_FINISHED"
     assert observed["task_mode"] == "web"
     assert observed["skills"] == ["nature-academic-search"]
+    assert observed["skill_records"][0]["provenance"] == "inferred"
+    assert observed["skill_records"][0]["status"] == "hint"
+    skill_event = next(event for event in events if event.get("name") == "skill_runtime")
+    assert skill_event["value"]["type"] == "skill.loaded"
+    assert skill_event["value"]["value"]["provenance"] == "inferred"
+    assert "content" not in skill_event["value"]["value"]
+    runtime_skills = events[-1]["result"]["agent_runtime"]["skills"]
+    assert runtime_skills[0]["provenance"] == "inferred"
+    assert runtime_skills[-1]["value"]["content_hash"] == "sha256:" + ("b" * 64)
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == [
         {"name": "discover_papers", "status": "completed"}
     ]
@@ -3598,7 +4250,10 @@ def test_successful_document_summary_is_delivered_when_model_followup_fails(
     assert any(item["title"] == "直接交付任务文档结果" for item in result["message"]["trace"])
 
 
-def test_synchronous_plain_chat_uses_bounded_direct_transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_synchronous_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     observed: dict[str, object] = {}
 
     def direct_transport(*_args, **kwargs):
@@ -3610,7 +4265,7 @@ def test_synchronous_plain_chat_uses_bounded_direct_transport(tmp_path: Path, mo
     monkeypatch.setattr(
         runtime,
         "_complete_with_pi",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("plain chat must not start Pi")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
     )
 
     result = runtime.chat({"messages": [{"role": "user", "content": "Explain the workflow."}]})
@@ -3618,6 +4273,8 @@ def test_synchronous_plain_chat_uses_bounded_direct_transport(tmp_path: Path, mo
     assert result["message"]["content"] == "Direct synchronous reply"
     assert result["message"]["usage"]["total_tokens"] == 5
     assert result["agent_runtime"]["harness"] == "direct-provider"
+    assert result["agent_runtime"]["compatibility_fallback"] is True
+    assert "pi unavailable" in result["agent_runtime"]["compatibility_error"]
     assert observed["max_tokens"] == 1024
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
@@ -3635,7 +4292,7 @@ def test_scientific_rewrite_removes_unsupported_causal_absolutes():
     assert "可能影响因素之一" in repaired
 
 
-def test_streaming_plain_chat_skips_pi_and_uses_bounded_direct_transport(
+def test_streaming_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3649,7 +4306,7 @@ def test_streaming_plain_chat_skips_pi_and_uses_bounded_direct_transport(
     monkeypatch.setattr(
         ResearchAgentRuntime,
         "_pi_model_events",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("plain chat must not start Pi")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
     )
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
@@ -3660,11 +4317,63 @@ def test_streaming_plain_chat_skips_pi_and_uses_bounded_direct_transport(
     result = events[-1]["result"]
     assert result["message"]["content"] == "Direct compatibility reply"
     assert result["agent_runtime"]["harness"] == "direct-provider"
-    assert result["agent_runtime"]["compatibility_fallback"] is False
+    assert result["agent_runtime"]["compatibility_fallback"] is True
+    assert "pi unavailable" in result["agent_runtime"]["compatibility_error"]
     assert observed["max_tokens"] == 1024
     assert observed["max_continuations"] == 0
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
+def test_pi_pre_effect_direct_fallback_materializes_explicit_skill_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def direct_completion(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        return "Direct fallback reply", {"total_tokens": 3}
+
+    def direct_stream(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        yield {"type": "delta", "content": "Direct fallback reply"}
+        yield {"type": "done", "usage": {"total_tokens": 3}}
+
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_completion)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_stream)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    if entrypoint == "chat":
+        monkeypatch.setattr(
+            runtime,
+            "_complete_with_pi",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
+        )
+        result = runtime.chat({
+            "web_search": "off",
+            "skills": ["web-access"],
+            "messages": [{"role": "user", "content": "Analyze the assumptions in this argument."}],
+        })
+    else:
+        monkeypatch.setattr(
+            ResearchAgentRuntime,
+            "_pi_model_events",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
+        )
+        result = list(runtime.chat_stream({
+            "web_search": "off",
+            "skills": ["web-access"],
+            "messages": [{"role": "user", "content": "Analyze the assumptions in this argument."}],
+        }))[-1]["result"]
+
+    assert result["agent_runtime"]["compatibility_fallback"] is True
+    fallback_text = json.dumps(observed["messages"], ensure_ascii=False)
+    assert fallback_text.count("# web-access Skill") == 1
 
 
 def test_explicit_structured_writing_receives_a_completion_budget_and_safe_continuation() -> None:
@@ -3734,7 +4443,7 @@ def test_structured_direct_output_rejects_terminal_marker_after_only_repeated_wo
     assert removed_loop is True
 
 
-def test_structured_direct_stream_buffers_and_delivers_only_the_validated_answer(
+def test_structured_pi_stream_buffers_and_delivers_only_the_validated_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3743,11 +4452,11 @@ def test_structured_direct_stream_buffers_and_delivers_only_the_validated_answer
         for index in range(1, 7)
     )
 
-    def direct_events(*_args, **_kwargs):
+    def pi_events(*_args, **_kwargs):
         yield {"type": "delta", "content": completed_body + "\n\non on on on on on on on on"}
-        yield {"type": "done", "usage": {"total_tokens": 9}, "truncated": True}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}, "truncated": True}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -3768,7 +4477,7 @@ def test_structured_direct_stream_buffers_and_delivers_only_the_validated_answer
     assert any(item["title"] == "完成性校验" for item in result["message"]["trace"])
 
 
-def test_structured_direct_stream_retries_an_unrelated_gateway_reply_before_delivery(
+def test_structured_pi_stream_retries_an_unrelated_gateway_reply_before_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3778,16 +4487,16 @@ def test_structured_direct_stream_retries_an_unrelated_gateway_reply_before_deli
     )
     calls: list[list[dict[str, object]]] = []
 
-    def direct_events(*_args, **kwargs):
-        calls.append(list(kwargs["messages"]))
+    def pi_events(_self, chat_request, **_kwargs):
+        calls.append(list(chat_request.messages))
         if len(calls) == 1:
             yield {"type": "delta", "content": "I am ScanSci. How can I help you today?"}
-            yield {"type": "done", "usage": {"total_tokens": 9}}
+            yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
             return
         yield {"type": "delta", "content": completed_body + "\n\n【回答完毕】"}
-        yield {"type": "done", "usage": {"total_tokens": 90}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 90}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -3809,7 +4518,7 @@ def test_structured_direct_stream_retries_an_unrelated_gateway_reply_before_deli
     assert any(message["role"] == "system" and "generic greeting" in message["content"] for message in calls[1])
 
 
-def test_structured_direct_stream_can_repair_twice_before_delivery(
+def test_structured_pi_stream_can_repair_twice_before_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3819,16 +4528,16 @@ def test_structured_direct_stream_can_repair_twice_before_delivery(
     ) + "\n\n【回答完毕】"
     calls: list[list[dict[str, object]]] = []
 
-    def direct_events(*_args, **kwargs):
-        calls.append(list(kwargs["messages"]))
+    def pi_events(_self, chat_request, **_kwargs):
+        calls.append(list(chat_request.messages))
         if len(calls) < 3:
             yield {"type": "delta", "content": "I am ScanSci. How can I help you today?"}
-            yield {"type": "done", "usage": {"total_tokens": 9}}
+            yield {"type": "done", "stats": {"tokens": {"total_tokens": 9}}}
             return
         yield {"type": "delta", "content": completed_body}
-        yield {"type": "done", "usage": {"total_tokens": 90}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 90}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -3849,7 +4558,7 @@ def test_structured_direct_stream_can_repair_twice_before_delivery(
     assert "final automatic repair attempt" in calls[2][-2]["content"]
 
 
-def test_structured_direct_stream_repairs_prose_checks_into_explicit_checklist_items(
+def test_structured_pi_stream_repairs_prose_checks_into_explicit_checklist_items(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3867,13 +4576,13 @@ def test_structured_direct_stream_repairs_prose_checks_into_explicit_checklist_i
     ) + "\n\n【回答完毕】"
     calls: list[list[dict[str, object]]] = []
 
-    def direct_events(*_args, **kwargs):
-        calls.append(list(kwargs["messages"]))
+    def pi_events(_self, chat_request, **_kwargs):
+        calls.append(list(chat_request.messages))
         content = prose_sections if len(calls) == 1 else checklist_sections
         yield {"type": "delta", "content": content}
-        yield {"type": "done", "usage": {"total_tokens": 90}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 90}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -3905,20 +4614,19 @@ def test_direct_chat_knows_scansci_identity_and_loads_an_explicit_skill(tmp_path
     assert "ScanSci | 搜索科学" in system
     assert "当前底层模型为 glm-4.7-flash" in system
     assert "写作模式" in system
-    assert '<selected_skill id="good-question">' in system
-    assert "## 好问题卡" in system
-    assert "分别写 H1、H2、H3" in system
-    assert "必须能在 14 天内完成" in system
-    assert "一年、季度或完整项目" in system
-    assert "不要写回归公式" in system
-    assert "可观察数据图形或结果模式" in system
-    assert "零效应、混杂、反向关系或测量偏差" in system
-    assert "观察性数据不得被写成已识别的因果效应" in system
-    assert "不得只靠 p 值" in system
-    assert "references/platt-strong-inference.md" not in system
-    assert len(system) < 8_000
+    assert '<selected_skill id="good-question" provenance="explicit"' in system
+    assert 'package_hash="sha256:' in system
+    assert 'content_hash="sha256:' in system
+    assert 'resource="SKILL.md"' in system
+    assert "## 好问题卡" not in system
+    assert "Load reference cards on demand" not in system
+    assert len(system.encode("utf-8")) < 256 * 1024
     assert chat_request.chat_mode == "writing"
     assert [item["id"] for item in chat_request.selected_skills] == ["good-question"]
+    assert chat_request.selected_skills[0]["provenance"] == "explicit"
+    assert chat_request.selected_skills[0]["status"] == "loaded"
+    assert chat_request.selected_skills[0]["resource"] == "SKILL.md"
+    assert str(chat_request.selected_skills[0]["content_hash"]).startswith("sha256:")
 
 
 def test_good_question_output_is_cleaned_and_must_be_a_complete_card():
@@ -4025,15 +4733,15 @@ def test_runtime_identity_bypasses_optional_or_forced_web_tools(
     assert result["agent_runtime"]["task_mode"] == "general"
 
 
-def test_auto_web_mode_does_not_block_direct_model_conversation(
+def test_auto_web_mode_routes_model_conversation_through_pi(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def direct_stream(*_args, **_kwargs):
+    def pi_events(*_args, **_kwargs):
         yield {"type": "delta", "content": "这是普通回答。"}
-        yield {"type": "done", "usage": {"total_tokens": 5}}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 5}}}
 
-    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_stream)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -4044,6 +4752,7 @@ def test_auto_web_mode_does_not_block_direct_model_conversation(
 
     assert events[-1]["type"] == "RUN_FINISHED"
     assert events[-1]["result"]["message"]["content"] == "这是普通回答。"
+    assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
     assert events[-1]["result"]["agent_runtime"]["task_mode"] == "web-auto"
 
 
@@ -4061,7 +4770,14 @@ def test_explicit_web_request_overrides_the_global_off_toggle(tmp_path: Path):
 
 def test_auto_web_mode_keeps_explicit_current_search_as_a_required_tool(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    def pi_events(*_args, **_kwargs):
+        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
+        yield {"type": "delta", "content": "Pi web answer"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 5}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
@@ -4070,15 +4786,28 @@ def test_auto_web_mode_keeps_explicit_current_search_as_a_required_tool(
         "messages": [{"role": "user", "content": "检索近期的 RAG 研究"}],
     }))
 
-    assert events[-1]["type"] == "RUN_ERROR"
-    assert "不支持 Pi 工具循环" in events[-1]["failure"]["detail"]
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert result["agent_runtime"]["task_mode"] == "web"
+    assert result["agent_runtime"]["tool_calls"] == [
+        {"name": "search_web", "status": "completed"}
+    ]
 
 
-def test_direct_chat_failure_emits_run_error_instead_of_hanging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_pi_fallback_failure_emits_explicit_trace_and_run_error_instead_of_hanging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     def failed_model_stream(*_args, **_kwargs):
         raise RuntimeError("provider unavailable")
         yield  # pragma: no cover
 
+    monkeypatch.setattr(
+        ResearchAgentRuntime,
+        "_pi_model_events",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pi unavailable")),
+    )
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", failed_model_stream)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
@@ -4088,6 +4817,12 @@ def test_direct_chat_failure_emits_run_error_instead_of_hanging(tmp_path: Path, 
 
     assert events[-1]["type"] == "RUN_ERROR"
     assert events[-1]["code"] == "chat_failed"
+    assert any(
+        item.get("title") == "Pi 兼容回退"
+        for event in events
+        if event.get("type") == "CUSTOM" and event.get("name") == "process_trace"
+        for item in list(event.get("value", []) or [])
+    )
 
 
 def test_notebook_webapp_stores_document_service_keys_via_dedicated_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

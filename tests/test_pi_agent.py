@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import deque
 import json
+import os
+import subprocess
 from pathlib import Path
+from queue import Empty, Queue
 import threading
 import time
 from types import SimpleNamespace
@@ -19,8 +23,67 @@ from scansci_html.pi_agent import (
     _parse_text_tool_intents,
     _redact_tool_value,
 )
+from scansci_html.research_agent import _PiBackedChatJsonClient
 from scansci_html.research_runs import ResearchRunStore, StageSpec
 from scansci_html.workspace import initialize_notebook
+
+
+_TASK_CONTRACT_V2 = {"schema_version": "scansci.task-contract.v2", "version": 2}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path-length regression")
+def test_session_registry_atomic_write_survives_a_near_limit_windows_path(tmp_path: Path) -> None:
+    workspace_root = tmp_path
+    placeholder = workspace_root / ".scansci-pi-agent" / "sessions.json"
+    padding = 250 - len(str(placeholder)) - 1
+    assert 0 < padding < 240
+    workspace_root /= "x" * padding
+    workspace = workspace_root / "workspace.sqlite"
+    assert len(str(workspace.parent / ".scansci-pi-agent" / "sessions.json")) == 250
+    client = PiAgentClient(workspace=workspace, evidence_db=workspace_root / "evidence.sqlite")
+
+    client._save_session_registry({"session-long-path": "session.jsonl"})
+
+    registry_path = workspace_root / ".scansci-pi-agent" / "sessions.json"
+    assert json.loads(registry_path.read_text(encoding="utf-8")) == {
+        "session-long-path": "session.jsonl",
+    }
+    assert not list(registry_path.parent.glob("*.tmp"))
+
+
+def test_session_registry_atomic_staging_does_not_overwrite_a_peer_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    registry_path = tmp_path / ".scansci-pi-agent" / "sessions.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    peer = registry_path.parent / ".deadbeef.tmp"
+    peer.write_text("peer-owned", encoding="utf-8")
+    monkeypatch.setattr(
+        pi_agent,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": "deadbeef" + ("0" * 24)})(),
+    )
+
+    client._save_session_registry({"session-collision": "session.jsonl"})
+
+    assert peer.read_text(encoding="utf-8") == "peer-owned"
+    assert json.loads(registry_path.read_text(encoding="utf-8")) == {
+        "session-collision": "session.jsonl",
+    }
+
+
+def test_session_registry_atomic_staging_is_cleaned_when_serialization_fails(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    with pytest.raises(TypeError):
+        client._save_session_registry({"session-invalid": object()})  # type: ignore[dict-item]
+
+    registry_dir = tmp_path / ".scansci-pi-agent"
+    assert not list(registry_dir.glob("*.tmp"))
 
 
 def test_disabling_zotero_plugin_removes_native_zotero_tools_from_pi(tmp_path: Path) -> None:
@@ -874,6 +937,316 @@ class _OpenAIToolLoopHandler(BaseHTTPRequestHandler):
         return
 
 
+class _OpenAIProgressiveSkillHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_load_skill",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"good-question"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": f"skill-turn-{turn}"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIRepeatedSkillHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn <= 5:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": f"call_load_skill_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"good-question"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": "deduplicated-skill-complete"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-repeated-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-repeated-skill-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIResumeBudgetHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        turn = len(type(self).request_payloads)
+        if turn == 2:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_search_after_restore",
+                    "type": "function",
+                    "function": {
+                        "name": "search_skills",
+                        "arguments": '{"query":"safe-64","limit":8}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        elif turn == 3:
+            delta = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_load_after_restore",
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "arguments": '{"skill_id":"safe-64","resource":"one.md"}',
+                    },
+                }],
+            }
+            finish = "tool_calls"
+        else:
+            delta = {"role": "assistant", "content": f"resume-budget-turn-{turn}"}
+            finish = "stop"
+        chunks = [
+            {
+                "id": f"chatcmpl-resume-budget-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-resume-budget-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIExplicitSkillPreloadHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).request_payloads.append(payload)
+        chunks = [
+            {
+                "id": "chatcmpl-explicit-preload",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "explicit-preload-complete"},
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "id": "chatcmpl-explicit-preload",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OpenAIJsonHandler(_OpenAIStreamHandler):
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        chunks = [
+            {
+                "id": "chatcmpl-json",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": '{"value":"ephemeral"}'},
+                    "finish_reason": None,
+                }],
+            },
+            {
+                "id": "chatcmpl-json",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _OpenAIPlanDefaultDenyHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        turn = len(type(self).request_payloads)
+        if turn == 1:
+            call = {
+                "index": 0,
+                "id": "call_plan",
+                "type": "function",
+                "function": {
+                    "name": "submit_plan",
+                    "arguments": json.dumps({
+                        "summary": "Download one paper",
+                        "steps": [{"id": "download", "title": "Download"}],
+                    }),
+                },
+            }
+            finish = "tool_calls"
+            delta = {"role": "assistant", "tool_calls": [call]}
+        elif turn == 2:
+            call = {
+                "index": 0,
+                "id": "call_download",
+                "type": "function",
+                "function": {
+                    "name": "download_and_index",
+                    "arguments": '{"identifiers":["10.1/denied"]}',
+                },
+            }
+            finish = "tool_calls"
+            delta = {"role": "assistant", "tool_calls": [call]}
+        else:
+            finish = "stop"
+            delta = {"role": "assistant", "content": "Plan was not approved."}
+        chunks = [
+            {
+                "id": f"chatcmpl-plan-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-plan-{turn}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
 class _OpenAIDeferredWebHandler(BaseHTTPRequestHandler):
     request_payloads: list[dict[str, object]] = []
 
@@ -1118,7 +1491,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
     assert status["ready"] is True
     assert status["runtime"] == "pi"
     assert status["version"] == "0.80.10"
-    assert status["protocol"] == 3
+    assert status["protocol"] == 7
     assert {
         "multi_session",
         "ask_user",
@@ -1126,7 +1499,184 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
         "follow_up",
         "structured_recovery",
         "session_fork",
+        "task_contract_v2",
+        "host_tool_authorization",
+        "structured_mcp_effects",
+        "current_request_context",
+        "progressive_skills",
+        "model_runtime_descriptor",
+        "token_envelope",
+        "multimodal_turns",
+        "deferred_mcp_v2",
+        "mcp_effect_audit_v1",
+        "mcp_run_cache_v1",
     }.issubset(set(status["capabilities"]))
+
+
+def test_python_host_rejects_protocol_v6_sidecar_without_deferred_mcp_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node, _current_sidecar = PiAgentClient.runtime_paths()
+    old_sidecar = tmp_path / "old-pi-sidecar.mjs"
+    old_sidecar.write_text(
+        """
+import * as readline from "node:readline";
+const capabilities = [
+  "task_contract_v2",
+  "explicit_empty_leases",
+  "host_tool_authorization",
+  "structured_mcp_effects",
+  "current_request_context",
+  "dynamic_tools",
+];
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  const required = Array.isArray(message.required_features) ? message.required_features : [];
+  process.stdout.write(JSON.stringify({
+    type: "pong",
+    runtime: "pi",
+    version: "old-fixture",
+    protocol: 6,
+    capabilities,
+    negotiated_features: required.filter((feature) => capabilities.includes(feature)),
+    missing_features: required.filter((feature) => !capabilities.includes(feature)),
+  }) + "\\n");
+});
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        PiAgentClient,
+        "runtime_paths",
+        staticmethod(lambda: (node, old_sidecar)),
+    )
+
+    with pytest.raises(pi_agent.PiRuntimeUnavailable, match="protocol=6"):
+        PiAgentClient.runtime_status()
+
+
+def test_pi_sidecar_rejects_incompatible_protocol_before_starting_a_run() -> None:
+    node, sidecar = PiAgentClient.runtime_paths()
+    process = subprocess.Popen(
+        [str(node), str(sidecar)],
+        env=PiAgentClient._node_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps({
+            "type": "run.start",
+            "pi_protocol_version": 3,
+            "required_features": ["task_contract_v2"],
+            "request_id": "protocol-mismatch",
+            "session_id": "protocol-mismatch",
+        }) + "\n")
+        process.stdin.flush()
+        response = json.loads(process.stdout.readline())
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+    assert response["type"] == "run.failed"
+    assert response["failure"]["code"] == "protocol_incompatible"
+    assert response["failure"]["protocol"] == 3
+
+
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        {},
+        {"schema_version": "scansci.task-contract.v999"},
+        {"schema_version": "scansci.task-contract.v999", "version": 999},
+        {"version": 999},
+        {"schema_version": "scansci.task-contract.v1", "version": 2},
+        {"schema_version": "scansci.task-contract.v2", "version": {"major": 2}},
+    ],
+)
+def test_pi_sidecar_invalid_contract_version_exposes_no_domain_tools(
+    tmp_path: Path,
+    invalid_contract: dict[str, object],
+) -> None:
+    _OpenAIStreamHandler.request_payload = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    node, sidecar = PiAgentClient.runtime_paths()
+    environment = PiAgentClient._node_environment()
+    environment["SCANSCIPI_PROVIDER_KEY"] = "fixture-key"
+    process = subprocess.Popen(
+        [str(node), str(sidecar)],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps({
+            "type": "run.start",
+            "pi_protocol_version": 7,
+            "required_features": list(pi_agent._PI_REQUIRED_FEATURES),
+            "request_id": "invalid-contract-version",
+            "session_id": "invalid-contract-version",
+            "cwd": str(tmp_path),
+            "agent_dir": str(tmp_path / ".agent"),
+            "provider_kind": "openai-compatible",
+            "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+            "model_id": "fixture-model",
+            "thinking_level": "off",
+            "system_prompt": "",
+            "prompt": "Answer without tools.",
+            "images": [],
+            "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing().to_dict(),
+            "task_mode": "knowledge",
+            "task_contract": {
+                **invalid_contract,
+                "allowed_tools": ["inspect_workspace"],
+                "initial_tools": ["inspect_workspace"],
+                "risk_level": "read_only",
+            },
+            "mcp_servers": [],
+            "disabled_tools": [],
+        }) + "\n")
+        process.stdin.flush()
+        while True:
+            event = json.loads(process.stdout.readline())
+            if event.get("type") in {"run.completed", "run.failed"}:
+                break
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert event["type"] == "run.completed"
+    advertised = {
+        str(dict(tool.get("function", {}) or {}).get("name", ""))
+        for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
+        if isinstance(tool, dict)
+    }
+    assert {"search_skills", "load_skill"} <= advertised
+    assert advertised <= {
+        "ask_user",
+        "search_tools",
+        "search_skills",
+        "load_skill",
+        "submit_plan",
+    }
 
 
 def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch) -> None:
@@ -1152,6 +1702,7 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
             messages=[{"role": "user", "content": "search my library"}],
             task_mode="knowledge",
             task_contract={
+                **_TASK_CONTRACT_V2,
                 "contract_id": "contract-test",
                 "risk_level": "read_only",
                 "allowed_tools": ["kb_search"],
@@ -1163,6 +1714,889 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert events[-1]["type"] == "done"
     assert captured["task_contract"]["contract_id"] == "contract-test"
     assert captured["task_contract"]["allowed_tools"] == ["kb_search"]
+    assert captured["task_contract"]["schema_version"] == "scansci.task-contract.v2"
+    assert captured["pi_protocol_version"] == 7
+    assert "host_tool_authorization" in captured["required_features"]
+    assert "ephemeral_sessions" in captured["required_features"]
+    assert captured["ephemeral_session"] is True
+
+
+def test_pi_stream_forwards_compact_skill_catalog_without_expanding_domain_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_request(start_message, *, api_key, timeout_seconds):
+        captured.update(start_message)
+        yield {"type": "done", "stats": {}, "truncated": False}
+
+    monkeypatch.setattr(client, "_run_request", fake_run_request)
+    task_contract = {
+        **_TASK_CONTRACT_V2,
+        "contract_id": "empty-skill-control-plane",
+        "risk_level": "read_only",
+        "allowed_tools": [],
+        "initial_tools": [],
+    }
+    selected = [{
+        "id": "nature-response",
+        "name": "nature-response",
+        "source": "builtin:nature-response",
+        "provenance": "inferred",
+        "status": "hint",
+        "package_hash": "sha256:fixture",
+    }]
+
+    list(client.stream_chat(
+        provider_kind="openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model_id="fixture",
+        messages=[{"role": "user", "content": "reply to reviewers"}],
+        task_mode="general",
+        task_contract=task_contract,
+        selected_skills=selected,
+        timeout_seconds=30,
+    ))
+
+    assert "progressive_skills" in captured["required_features"]
+    assert captured["task_contract"]["allowed_tools"] == []
+    assert captured["task_contract"]["initial_tools"] == []
+    assert captured["skill_selection"] == selected
+    assert 0 < len(captured["skill_catalog"]) <= 64
+    assert "search_skills" not in captured["tool_set"]["registered_tools"]
+    assert "load_skill" not in captured["tool_set"]["active_tools"]
+
+
+def test_skill_control_plane_accepts_empty_domain_lease_and_rejects_spoofed_domain_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    executed: list[tuple[str, dict[str, object]]] = []
+    written: list[dict[str, object]] = []
+    fake_process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: fake_process)
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_skill_tool",
+        lambda request_id, name, arguments: executed.append((name, dict(arguments))) or {
+            "skill_id": "fixture-skill",
+            "content": "instruction only",
+            "content_hash": "sha256:fixture",
+        },
+        raising=False,
+    )
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "request_id": "request-current",
+        "call_id": "skill-call",
+        "name": "load_skill",
+        "arguments": {"skill_id": "fixture-skill"},
+    }))
+    client._output.put(json.dumps({
+        "type": "tool.call",
+        "request_id": "request-current",
+        "call_id": "domain-spoof",
+        "name": "inspect_workspace",
+        "arguments": {},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+    contract = {
+        "schema_version": "scansci.task-contract.v2",
+        "version": 2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "risk_level": "read_only",
+        "max_tool_budget": 2,
+    }
+
+    events = list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "general",
+            "task_contract": contract,
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert executed == [("load_skill", {"skill_id": "fixture-skill"})]
+    skill_result = next(message for message in written if message.get("call_id") == "skill-call")
+    assert skill_result["type"] == "skill.result"
+    assert skill_result["ok"] is True
+    rejected = next(message for message in written if message.get("call_id") == "domain-spoof")
+    assert rejected["type"] == "tool.result"
+    assert rejected["ok"] is False
+    assert contract["allowed_tools"] == []
+    assert any(event.get("type") == "skill.loaded" for event in events)
+
+
+def test_skill_control_plane_rejects_missing_request_identity_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    executed: list[object] = []
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_skill_tool",
+        lambda *_args: executed.append(_args) or {},
+        raising=False,
+    )
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "call_id": "missing-request",
+        "name": "search_skills",
+        "arguments": {"query": "statistics"},
+    }))
+    client._output.put(json.dumps({
+        "type": "skill.call",
+        "request_id": "request-other",
+        "call_id": "wrong-request",
+        "name": "load_skill",
+        "arguments": {"skill_id": "nature-statistics"},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+
+    list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "general",
+            "task_contract": {
+                "schema_version": "scansci.task-contract.v2",
+                "allowed_tools": [],
+                "risk_level": "read_only",
+            },
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert executed == []
+    rejected = next(message for message in written if message.get("call_id") == "missing-request")
+    assert rejected["type"] == "skill.result"
+    assert rejected["ok"] is False
+    assert "request" in str(rejected["error"]).lower()
+    wrong_request = next(message for message in written if message.get("call_id") == "wrong-request")
+    assert wrong_request["type"] == "skill.result"
+    assert wrong_request["ok"] is False
+    assert wrong_request["request_id"] == "request-current"
+    assert "request" in str(wrong_request["error"]).lower()
+
+
+def test_persisted_skill_priority_reads_only_the_active_session_branch(tmp_path: Path) -> None:
+    from scansci_html.pi_agent import _persisted_skill_state
+
+    def metadata(skill_id: str) -> dict[str, object]:
+        return {
+            "skill_id": skill_id,
+            "resource": "SKILL.md",
+            "package_hash": "sha256:" + ("a" * 64),
+            "content_hash": "sha256:" + ("b" * 64),
+            "provenance": "model",
+            "bytes": 12,
+        }
+
+    session_file = tmp_path / "branched-session.jsonl"
+    records = [
+        {"type": "session", "version": 3, "id": "session-id", "cwd": str(tmp_path)},
+        {
+            "type": "custom", "id": "root", "parentId": None,
+            "customType": "scansci.skill-state.v1", "data": metadata("active-root"),
+        },
+        {"type": "message", "id": "fork", "parentId": "root", "message": {"role": "user", "content": "fork"}},
+        {
+            "type": "custom", "id": "stale", "parentId": "fork",
+            "customType": "scansci.skill-state.v1", "data": metadata("stale-branch"),
+        },
+        {"type": "message", "id": "leaf", "parentId": "fork", "message": {"role": "user", "content": "active"}},
+    ]
+    session_file.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    state = _persisted_skill_state(session_file)
+
+    assert state["schema"] == "scansci.skill-state.v1"
+    assert [item["skill_id"] for item in state["loaded"]] == ["active-root"]
+    assert all(set(item) == {
+        "skill_id", "resource", "package_hash", "content_hash", "provenance", "bytes",
+    } for item in state["loaded"])
+
+
+def test_progressive_skill_sidecar_load_resume_and_compaction_preserve_hash_and_provenance(
+    tmp_path: Path,
+) -> None:
+    _OpenAIProgressiveSkillHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIProgressiveSkillHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    common = {
+        "provider_kind": "openai-compatible",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "api_key": "fixture-key",
+        "model_id": "fixture-model",
+        "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing(
+            context_window_tokens=200 * 1024,
+        ).to_dict(),
+        "thinking_level": "off",
+        "task_mode": "general",
+        "task_contract": {
+            **_TASK_CONTRACT_V2,
+            "contract_id": "progressive-skill-empty-domain",
+            "allowed_tools": [],
+            "initial_tools": [],
+            "risk_level": "read_only",
+        },
+        "selected_skills": [{
+            "id": "good-question",
+            "provenance": "inferred",
+            "status": "hint",
+        }],
+        "timeout_seconds": 30,
+        "session_id": "progressive-skill-session",
+    }
+    first_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    first_skill_calls: list[tuple[str, str, dict[str, object]]] = []
+    first_wire_messages: list[dict[str, object]] = []
+    original_execute_skill = first_client._execute_skill_tool
+    original_first_write = first_client._write
+
+    def record_skill_call(request_id, name, arguments):
+        first_skill_calls.append((str(request_id), str(name), dict(arguments)))
+        return original_execute_skill(request_id, name, arguments)
+
+    def record_first_wire(message):
+        first_wire_messages.append(dict(message))
+        return original_first_write(message)
+
+    first_client._execute_skill_tool = record_skill_call
+    first_client._write = record_first_wire
+    try:
+        first = list(first_client.stream_chat(
+            messages=[{
+                "role": "user",
+                "content": "Use the relevant method instructions. " + ("context " * 5_000),
+            }],
+            **common,
+        ))
+        session_file = Path(str(next(event for event in first if event["type"] == "session")["session_file"]))
+        for turn in range(1, 4):
+            continuation = list(first_client.stream_chat(
+                messages=[{
+                    "role": "user",
+                    "content": f"Continue turn {turn}. " + ("context " * 5_000),
+                }],
+                **common,
+            ))
+            assert continuation[-1]["type"] == "done"
+        compacted = first_client.compact(
+            "progressive-skill-session",
+            instructions="Retain the selected Skill state.",
+            timeout_seconds=30,
+        )
+    finally:
+        first_client.close()
+
+    second_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    second_skill_calls: list[tuple[str, str, dict[str, object]]] = []
+    second_wire_messages: list[dict[str, object]] = []
+    original_second_execute_skill = second_client._execute_skill_tool
+    original_second_write = second_client._write
+
+    def record_restored_skill_call(request_id, name, arguments):
+        second_skill_calls.append((str(request_id), str(name), dict(arguments)))
+        return original_second_execute_skill(request_id, name, arguments)
+
+    def record_second_wire(message):
+        second_wire_messages.append(dict(message))
+        return original_second_write(message)
+
+    second_client._execute_skill_tool = record_restored_skill_call
+    second_client._write = record_second_wire
+    try:
+        second = list(second_client.stream_chat(
+            messages=[{"role": "user", "content": "Continue using the same method."}],
+            **common,
+        ))
+    finally:
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert compacted["summary"]
+    assert first[-1]["type"] == "done"
+    assert second[-1]["type"] == "done"
+    loaded_event = next(event for event in first if event["type"] == "skill.loaded")
+    assert loaded_event["value"]["provenance"] == "inferred"
+    assert "content" not in loaded_event["value"]
+    assert first_skill_calls == [
+        (first_skill_calls[0][0], "load_skill", {"skill_id": "good-question", "provenance": "inferred"}),
+    ]
+    first_skill_result = next(message for message in first_wire_messages if message.get("type") == "skill.result")
+    assert first_skill_result["ok"] is True
+    assert first_skill_result["request_id"] == first_skill_calls[0][0]
+    assert second_skill_calls == [
+        (second_skill_calls[0][0], "restore_skill", {
+            "skill_id": "good-question",
+            "resource": "SKILL.md",
+        }),
+    ]
+    assert any(message.get("type") == "skill.result" and message.get("ok") is True for message in second_wire_messages)
+    first_tools = {
+        item["function"]["name"]
+        for item in _OpenAIProgressiveSkillHandler.request_payloads[0]["tools"]
+    }
+    assert {"search_skills", "load_skill"} <= first_tools
+    assert "inspect_workspace" not in first_tools
+    first_inventory = first[-1]["stats"]["toolInventory"]
+    assert "search_skills" not in first_inventory["names"]
+    assert "load_skill" not in first_inventory["names"]
+    assert "search_skills" not in first_inventory["registeredNames"]
+    assert "load_skill" not in first_inventory["registeredNames"]
+    first_followup = json.dumps(_OpenAIProgressiveSkillHandler.request_payloads[1], ensure_ascii=False)
+    assert "instructions_only" in first_followup
+    assert "good-question" in first_followup
+    skill_sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    provider_skill_counts = [
+        json.dumps(payload.get("messages", []), ensure_ascii=False).count(skill_sentinel)
+        for payload in _OpenAIProgressiveSkillHandler.request_payloads
+    ]
+    assert any(count == 1 for count in provider_skill_counts)
+    assert max(provider_skill_counts) == 1, provider_skill_counts
+
+    records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
+    skill_records = [
+        record for record in records
+        if record.get("type") == "custom" and record.get("customType") == "scansci.skill-state.v1"
+    ]
+    assert skill_records
+    state_data = skill_records[-1]["data"]
+    assert set(state_data) == {
+        "skill_id", "resource", "package_hash", "content_hash", "provenance", "bytes",
+    }
+    assert state_data["provenance"] == "inferred"
+    assert str(tmp_path) not in json.dumps(state_data, ensure_ascii=False)
+    assert any(record.get("type") == "compaction" for record in records)
+
+    restored = next(
+        event for event in second
+        if event.get("type") == "status" and event.get("status") == "skill_restored"
+    )
+    assert restored["details"]["content_hash"] == state_data["content_hash"]
+    first_hash = first[-1]["stats"]["skillInventory"]["loadedHash"]
+    second_hash = second[-1]["stats"]["skillInventory"]["loadedHash"]
+    assert first_hash == second_hash
+    resumed_system = "\n".join(
+        str(message.get("content", ""))
+        for message in _OpenAIProgressiveSkillHandler.request_payloads[-1]["messages"]
+        if message.get("role") in {"system", "developer"}
+    )
+    assert '<loaded_skill id="good-question"' in resumed_system
+    assert state_data["content_hash"] in resumed_system
+    sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    assert resumed_system.count(sentinel) == 1
+
+
+def test_repeated_skill_load_transmits_content_and_custom_state_once(tmp_path: Path) -> None:
+    _OpenAIRepeatedSkillHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIRepeatedSkillHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    wire_messages: list[dict[str, object]] = []
+    original_write = client._write
+
+    def record_wire(message):
+        wire_messages.append(dict(message))
+        return original_write(message)
+
+    client._write = record_wire
+    try:
+        events = list(client.stream_chat(
+            messages=[{"role": "user", "content": "Load the method once and reuse it."}],
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "repeated-skill-empty-domain",
+                "allowed_tools": [],
+                "initial_tools": [],
+                "risk_level": "read_only",
+            },
+            selected_skills=[{
+                "id": "good-question",
+                "provenance": "inferred",
+                "status": "hint",
+            }],
+            timeout_seconds=30,
+            session_id="repeated-skill-session",
+        ))
+        session_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    skill_results = [message for message in wire_messages if message.get("type") == "skill.result"]
+    assert len(skill_results) == 5
+    assert all(message.get("ok") is True for message in skill_results)
+    assert "content" in skill_results[0]["result"]
+    assert all(message["result"].get("already_loaded") is True for message in skill_results[1:])
+    assert all("content" not in message["result"] for message in skill_results[1:])
+
+    final_messages = _OpenAIRepeatedSkillHandler.request_payloads[-1]["messages"]
+    tool_messages = [message for message in final_messages if message.get("role") == "tool"]
+    load_results = [message for message in tool_messages if "good-question" in str(message.get("content", ""))]
+    assert len(load_results) == 5
+    assert sum('"instructions"' in str(message.get("content", "")) for message in load_results) == 1
+
+    records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
+    custom_records = [
+        record for record in records
+        if record.get("type") == "custom" and record.get("customType") == "scansci.skill-state.v1"
+    ]
+    assert len(custom_records) == 1
+
+
+def test_explicit_skill_body_appears_once_in_first_provider_request(tmp_path: Path) -> None:
+    from scansci_html.agent_context import build_agent_system_context
+    from scansci_html.skill_runtime import resolve_skill_selection
+
+    user_text = "Help me sharpen a research question."
+    selection = resolve_skill_selection(
+        {"skills": ["good-question"]},
+        [{"role": "user", "content": user_text}],
+    )
+    system_context, selected = build_agent_system_context(
+        tmp_path / "workspace.sqlite",
+        model_id="fixture-model",
+        provider_name="fixture-provider",
+        chat_mode="general",
+        selected_ids=list(selection.selected_ids),
+        selection=selection,
+    )
+    assert selected[0]["status"] == "loaded"
+
+    _OpenAIExplicitSkillPreloadHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIExplicitSkillPreloadHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    try:
+        events = list(client.stream_chat(
+            messages=[
+                {"role": "system", "content": system_context},
+                {"role": "user", "content": user_text},
+            ],
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            # This test verifies single-channel Skill injection, not the
+            # fail-closed 32K policy for an unknown tokenizer.  The selected
+            # Skill plus the host system contract is intentionally larger than
+            # that unknown-model byte upper bound.
+            model_runtime=pi_agent.ModelRuntimeDescriptor.for_testing(
+                context_window_tokens=200 * 1024,
+            ).to_dict(),
+            thinking_level="off",
+            task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "explicit-skill-single-channel",
+                "allowed_tools": [],
+                "initial_tools": [],
+                "risk_level": "read_only",
+            },
+            selected_skills=selected,
+            timeout_seconds=30,
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert events[-1]["stats"]["skillInventory"]["selected"] == 1
+    assert events[-1]["stats"]["skillInventory"]["ids"] == ["good-question"]
+    first_payload = _OpenAIExplicitSkillPreloadHandler.request_payloads[0]
+    provider_text = "\n".join(str(message.get("content", "")) for message in first_payload["messages"])
+    sentinel = "Help a researcher turn a vague interest, literature gap, rough idea"
+    assert provider_text.count(sentinel) == 1
+
+
+def test_restart_restores_out_of_catalog_skill_without_spending_model_skill_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import scansci_html.agent_skill_tools as agent_skill_tools
+    import scansci_html.pi_agent as pi_agent_module
+
+    records: list[dict[str, object]] = []
+    for index in range(65):
+        identifier = f"safe-{index:02d}"
+        package = tmp_path / "skills" / identifier
+        package.mkdir(parents=True)
+        skill_file = package / "SKILL.md"
+        skill_file.write_text(f"# {identifier}\n", encoding="utf-8")
+        records.append({
+            "id": identifier,
+            "name": identifier,
+            "description": f"bounded fixture {identifier}",
+            "enabled": True,
+            "available": True,
+            "builtin": True,
+            "source_type": "builtin",
+            "source": "ScanSci",
+            "package_path": str(package),
+            "skill_file": str(skill_file),
+        })
+    target = records[-1]
+    target_package = Path(str(target["package_path"]))
+    (target_package / "one.md").write_text("# one\n", encoding="utf-8")
+    (target_package / "two.md").write_text("# two\n", encoding="utf-8")
+
+    seed_runtime = agent_skill_tools.ProgressiveSkillRuntime(
+        tmp_path / "workspace.sqlite",
+        records=records,
+        priority_ids=["safe-64"],
+    )
+    selected_skills = []
+    for resource in ("SKILL.md", "one.md", "two.md"):
+        loaded = seed_runtime.load_skill("safe-64", resource=resource, provenance="explicit")
+        selected_skills.append({
+            "id": loaded["skill_id"],
+            "name": "safe-64",
+            "source": loaded["source"],
+            "provenance": "explicit",
+            "status": "loaded",
+            "resource": loaded["resource"],
+            "package_hash": loaded["package_hash"],
+            "content_hash": loaded["content_hash"],
+            "bytes": loaded["bytes"],
+        })
+
+    real_runtime = agent_skill_tools.ProgressiveSkillRuntime
+
+    def limited_runtime(*args, **kwargs):
+        kwargs["max_instruction_calls"] = 2
+        return real_runtime(*args, **kwargs)
+
+    monkeypatch.setattr(agent_skill_tools, "installed_skills", lambda _workspace: records)
+    monkeypatch.setattr(pi_agent_module, "ProgressiveSkillRuntime", limited_runtime)
+    _OpenAIResumeBudgetHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIResumeBudgetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    common = {
+        "provider_kind": "openai-compatible",
+        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+        "api_key": "fixture-key",
+        "model_id": "fixture-model",
+        "thinking_level": "off",
+        "task_mode": "general",
+        "task_contract": {
+            **_TASK_CONTRACT_V2,
+            "contract_id": "restore-budget-empty-domain",
+            "allowed_tools": [],
+            "initial_tools": [],
+            "risk_level": "read_only",
+        },
+        "timeout_seconds": 30,
+        "session_id": "restore-budget-session",
+    }
+    first_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    first_calls: list[tuple[str, dict[str, object]]] = []
+    first_wire: list[dict[str, object]] = []
+    original_first_execute = first_client._execute_skill_tool
+    original_first_write = first_client._write
+
+    def record_first_execute(request_id, name, arguments):
+        first_calls.append((str(name), dict(arguments)))
+        return original_first_execute(request_id, name, arguments)
+
+    def record_first_wire(message):
+        first_wire.append(dict(message))
+        return original_first_write(message)
+
+    first_client._execute_skill_tool = record_first_execute
+    first_client._write = record_first_wire
+    try:
+        first = list(first_client.stream_chat(
+            messages=[{"role": "user", "content": "Seed the explicit method state."}],
+            selected_skills=selected_skills,
+            **common,
+        ))
+    finally:
+        first_client.close()
+
+    second_client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    second_calls: list[tuple[str, dict[str, object]]] = []
+    second_wire: list[dict[str, object]] = []
+    original_execute = second_client._execute_skill_tool
+    original_write = second_client._write
+
+    def record_execute(request_id, name, arguments):
+        second_calls.append((str(name), dict(arguments)))
+        return original_execute(request_id, name, arguments)
+
+    def record_wire(message):
+        second_wire.append(dict(message))
+        return original_write(message)
+
+    second_client._execute_skill_tool = record_execute
+    second_client._write = record_wire
+    try:
+        second = list(second_client.stream_chat(
+            messages=[{"role": "user", "content": "Continue with no composer Skill selection."}],
+            selected_skills=[],
+            **common,
+        ))
+    finally:
+        second_client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    first_start = next(message for message in first_wire if message.get("type") == "run.start")
+    assert len(first_start["skill_state"]["loaded"]) == 3, first_start["skill_state"]
+    first_loaded = first[-1]["stats"]["skillInventory"]["loaded"]
+    second_loaded = second[-1]["stats"]["skillInventory"]["loaded"]
+    assert len(first_loaded) == 3, {
+        "calls": first_calls,
+        "skill_results": [message for message in first_wire if message.get("type") == "skill.result"],
+        "start": next((message for message in first_wire if message.get("type") == "run.start"), {}),
+        "events": [event for event in first if str(event.get("type", "")).startswith("skill")],
+    }
+    assert second_loaded == first_loaded
+    assert second[-1]["stats"]["skillInventory"]["loadedHash"] == first[-1]["stats"]["skillInventory"]["loadedHash"]
+    assert [name for name, _args in second_calls[:3]] == ["restore_skill"] * 3
+    assert [name for name, _args in second_calls[-2:]] == ["search_skills", "load_skill"]
+    all_skill_results = [message for message in second_wire if message.get("type") == "skill.result"]
+    assert len(all_skill_results) == 5
+    model_results = all_skill_results[-2:]
+    assert len(model_results) == 2
+    assert all(message.get("ok") is True for message in model_results)
+    assert model_results[-1]["result"]["already_loaded"] is True
+
+    start = next(message for message in second_wire if message.get("type") == "run.start")
+    catalog = start["skill_catalog"]
+    assert len(catalog) == 64
+    assert len(json.dumps(catalog, ensure_ascii=False).encode("utf-8")) <= 16 * 1024
+    assert "safe-64" in {item["id"] for item in catalog}
+    advertised = {
+        item["function"]["name"]
+        for payload in _OpenAIResumeBudgetHandler.request_payloads
+        for item in payload.get("tools", [])
+    }
+    assert {"search_skills", "load_skill"} <= advertised
+    assert "restore_skill" not in advertised
+
+
+def test_pi_backed_json_client_keeps_two_transient_sidecar_sessions_off_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIJsonHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    observed_processes: list[subprocess.Popen[str]] = []
+    original_ensure_process = PiAgentClient._ensure_process
+
+    def recording_ensure_process(self, *, api_key: str):
+        process = original_ensure_process(self, api_key=api_key)
+        observed_processes.append(process)
+        return process
+
+    monkeypatch.setattr(PiAgentClient, "_ensure_process", recording_ensure_process)
+    client = _PiBackedChatJsonClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+        provider_kind="openai-compatible",
+        provider_id="fixture-provider",
+        base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        api_key="fixture-key",
+        model="fixture-model",
+        api_surface="chat_completions",
+        responses_enabled=False,
+        role="writing",
+        timeout_seconds=30,
+    )
+    try:
+        first = client.complete_json(
+            [{"role": "user", "content": "Return the first JSON result."}],
+            schema_name="ephemeral_adapter_fixture",
+        )
+        second = client.complete_json(
+            [{"role": "user", "content": "Return the second JSON result."}],
+            schema_name="ephemeral_adapter_fixture",
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert first == second == {"value": "ephemeral"}
+    assert len(observed_processes) == 2
+    assert all(process.poll() is not None for process in observed_processes)
+    agent_dir = tmp_path / ".scansci-pi-agent"
+    registry_path = agent_dir / "sessions.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8")) if registry_path.exists() else {}
+    assert registry == {}
+    assert list((agent_dir / "sessions").glob("*.jsonl")) == []
+
+
+def test_python_bridge_reauthorizes_spoofed_tool_call_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    dispatched: list[tuple[str, dict[str, object]]] = []
+    written: list[dict[str, object]] = []
+    fake_process = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: fake_process)
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client,
+        "_execute_tool",
+        lambda name, arguments: dispatched.append((name, dict(arguments))) or {"ok": True},
+    )
+    client._output.put(json.dumps({
+        "type": "tool.call",
+        "request_id": "request-current",
+        "call_id": "spoofed-call",
+        "name": "download_and_index",
+        "arguments": {"identifiers": ["10.1/spoofed"]},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed",
+        "request_id": "request-current",
+        "stats": {},
+    }))
+
+    events = list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "request-current",
+            "session_id": "session-current",
+            "task_mode": "knowledge",
+            "task_contract": {
+                "schema_version": "scansci.task-contract.v2",
+                "allowed_tools": ["inspect_workspace"],
+                "risk_level": "read_only",
+                "max_tool_budget": 2,
+            },
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert dispatched == []
+    rejected = next(message for message in written if message.get("call_id") == "spoofed-call")
+    assert rejected["ok"] is False
+    assert "authorization" in str(rejected["error"]).lower() or "lease" in str(rejected["error"]).lower()
+    assert any(event.get("type") == "tool.failed" for event in events)
+
+
+def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) -> None:
+    _OpenAIStreamHandler.request_payload = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Do not use tools."}],
+            thinking_level="off",
+            task_mode="knowledge",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "allowed_tools": [],
+                "risk_level": "read_only",
+            },
+            timeout_seconds=30,
+            session_id="empty-lease-session",
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    advertised = {
+        str(dict(tool.get("function", {}) or {}).get("name", ""))
+        for tool in list(_OpenAIStreamHandler.request_payload.get("tools", []) or [])
+        if isinstance(tool, dict)
+    }
+    assert advertised <= {
+        "ask_user", "search_tools", "submit_plan", "search_skills", "load_skill",
+    }
+    assert {"search_skills", "load_skill"} <= advertised
+    domain_inventory = events[-1]["stats"]["toolInventory"]
+    assert "search_skills" not in domain_inventory["names"]
+    assert "load_skill" not in domain_inventory["names"]
+    assert "search_skills" not in domain_inventory["registeredNames"]
+    assert "load_skill" not in domain_inventory["registeredNames"]
 
 
 def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
@@ -1178,6 +2612,22 @@ def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
     assert _parse_text_tool_intents(
         '{"name":"build_verified_answer","arguments":"{\\"question\\":\\"q\\"}"}'
     ) == [("build_verified_answer", {"question": "q"})]
+
+
+def test_managed_gateway_adapter_normalizes_glm_legacy_tool_call_for_offered_tool() -> None:
+    content = "<tool_call>agent-reach\nquery=\u54c8\u5c14\u6ee8\u91d1\u878d\u5b66\u9662\nsource=public_web"
+
+    assert _parse_text_tool_intents(content, allowed_tool_names={"agent_reach"}) == [
+        (
+            "agent_reach",
+            {
+                "operation": "search",
+                "query": "\u54c8\u5c14\u6ee8\u91d1\u878d\u5b66\u9662",
+                "channel": "web",
+            },
+        )
+    ]
+    assert _parse_text_tool_intents(content, allowed_tool_names={"search_web"}) == []
 
 
 def test_managed_gateway_adapter_names_the_single_mandatory_tool_exactly() -> None:
@@ -1644,6 +3094,7 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
                 thinking_level="off",
                 task_mode="knowledge",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-tool-loop",
                     "autonomy": "read_only",
                     "risk_level": "read_only",
@@ -1688,6 +3139,74 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
     assert "Required tool groups (host authoritative): inspect_available_tools." in system_text
     second_messages = _OpenAIToolLoopHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "tool" for message in second_messages)
+
+
+def test_plan_approval_defaults_to_deny_without_explicit_approve(tmp_path: Path) -> None:
+    _OpenAIPlanDefaultDenyHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPlanDefaultDenyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    dispatched: list[str] = []
+    client._execute_tool = lambda name, _arguments: dispatched.append(name) or {"ok": True}  # type: ignore[method-assign]
+    events: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            events.extend(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Download one paper after approval."}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    **_TASK_CONTRACT_V2,
+                    "allowed_tools": ["download_and_index"],
+                    "risk_level": "reversible",
+                    "requires_plan": True,
+                    "initial_tool_budget": 2,
+                    "max_tool_budget": 4,
+                },
+                timeout_seconds=30,
+                session_id="default-deny-plan",
+            ))
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            errors.append(error)
+
+    consumer = threading.Thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        deadline = time.monotonic() + 10
+        interaction: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            interaction = next((item for item in events if item.get("type") == "interaction"), None)
+            if interaction is not None:
+                break
+            time.sleep(0.01)
+        assert interaction is not None
+        assert client.respond_interaction(
+            str(interaction["interaction_id"]),
+            {},
+            request_id=str(interaction["request_id"]),
+        ) is True
+        consumer.join(timeout=10)
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert not consumer.is_alive()
+    assert errors == []
+    assert "download_and_index" not in dispatched
+    assert not any(
+        event.get("type") == "tool.failed" and event.get("name") == "download_and_index"
+        for event in events
+    )
+    assert events[-1]["type"] == "done"
 
 
 def test_pi_continues_after_deferred_web_plan_until_tool_backed_final(tmp_path: Path) -> None:
@@ -1737,6 +3256,9 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    model_runtime = pi_agent.ModelRuntimeDescriptor.for_testing(
+        context_window_tokens=200 * 1024,
+    ).to_dict()
     try:
         events = list(
             client.stream_chat(
@@ -1744,10 +3266,12 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
                 api_key="fixture-key",
                 model_id="fixture-model",
+                model_runtime=model_runtime,
                 messages=[{"role": "user", "content": "a" * 100_000}],
                 thinking_level="off",
                 task_mode="web",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-web-budget",
                     "autonomy": "direct",
                     "risk_level": "read_only",
@@ -1776,7 +3300,7 @@ def test_pi_web_turn_uses_host_budget_for_large_context_and_response(tmp_path: P
     assert events[-1]["type"] == "done"
     assert len(_OpenAIPersistentHandler.request_payloads) == 1
     payload = _OpenAIPersistentHandler.request_payloads[0]
-    assert payload.get("max_tokens", payload.get("max_completion_tokens")) == 4096
+    assert payload.get("max_tokens", payload.get("max_completion_tokens")) == model_runtime["max_output_tokens"]
 
 
 def test_pi_extends_soft_model_token_lease_instead_of_failing_sound_answer(tmp_path: Path) -> None:
@@ -1795,6 +3319,7 @@ def test_pi_extends_soft_model_token_lease_instead_of_failing_sound_answer(tmp_p
                 thinking_level="off",
                 task_mode="general",
                 task_contract={
+                    **_TASK_CONTRACT_V2,
                     "contract_id": "contract-progressive-model-budget",
                     "allowed_tools": [],
                     "initial_tool_budget": 3,
@@ -1883,6 +3408,10 @@ def test_pi_session_survives_sidecar_restart(tmp_path: Path) -> None:
         server.server_close()
 
     assert session_file.is_file()
+    registry = json.loads(
+        (tmp_path / ".scansci-pi-agent" / "sessions.json").read_text(encoding="utf-8")
+    )
+    assert registry["durable-session"] == str(session_file)
     assert next(event for event in second if event["type"] == "session")["resumed"] is True
     second_messages = _OpenAIPersistentHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "user" and "first question" in str(message.get("content")) for message in second_messages)
@@ -1897,6 +3426,7 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
     thread.start()
     client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     common_contract = {
+        **_TASK_CONTRACT_V2,
         "autonomy": "direct",
         "risk_level": "none",
         "allowed_tools": [],
@@ -1942,6 +3472,101 @@ def test_pi_session_reuses_context_when_only_contract_identity_and_goal_change(t
     assert second_session["session_file"] == first_session["session_file"]
     second_messages = _OpenAIPersistentHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "assistant" and "turn-1" in str(message.get("content")) for message in second_messages)
+    second_system = "\n".join(
+        str(message.get("content", ""))
+        for message in second_messages
+        if message.get("role") in {"system", "developer"}
+    )
+    assert "session-level base prompt is invariant and grants no per-turn authority" in second_system
+    assert "Task contract turn-two: goal=second question." in second_system
+    assert "Task contract turn-one: goal=first question." not in second_system
+
+
+@pytest.mark.parametrize("grant_first", [True, False])
+def test_pi_reused_session_applies_current_mcp_lease_in_both_directions(
+    tmp_path: Path,
+    grant_first: bool,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    node, _sidecar = PiAgentClient.runtime_paths()
+    fixture = Path(__file__).parent / "fixtures" / "fake_mcp_server.mjs"
+    settings = load_settings(workspace)
+    settings["mcp_servers"] = [{
+        "id": "fixture",
+        "name": "Fixture MCP",
+        "enabled": True,
+        "transport": "stdio",
+        "command": str(node),
+        "args": f'"{fixture}"',
+        "allow_write": False,
+        "deferred": True,
+    }]
+    save_settings(workspace, settings)
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    base_contract = {
+        "schema_version": "scansci.task-contract.v2",
+        "version": 2,
+        "allowed_tools": [],
+        "initial_tools": [],
+        "risk_level": "read_only",
+        "initial_tool_budget": 2,
+        "max_tool_budget": 4,
+    }
+    done_events: list[dict[str, object]] = []
+    try:
+        for turn, granted in enumerate((grant_first, not grant_first), start=1):
+            events = list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": f"turn {turn}"}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    **base_contract,
+                    "contract_id": f"mcp-turn-{turn}",
+                    "goal": f"turn {turn}",
+                    "allowed_mcp_servers": ["fixture"] if granted else [],
+                },
+                timeout_seconds=30,
+                session_id=f"mcp-lease-{'grant' if grant_first else 'revoke'}-first",
+            ))
+            assert events[-1]["type"] == "done"
+            done_events.append(events[-1])
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert len(_OpenAIPersistentHandler.request_payloads) == 2
+    tool_names_by_turn = []
+    for payload in _OpenAIPersistentHandler.request_payloads:
+        tool_names_by_turn.append({
+            str(dict(tool.get("function", {}) or {}).get("name", ""))
+            for tool in list(payload.get("tools", []) or [])
+            if isinstance(tool, dict)
+        })
+    mcp_names = {"mcp__fixture__search", "mcp__fixture__call"}
+    # MCP definitions follow the same dynamic-tool contract as built-ins:
+    # authorization registers them, while the bootstrap surface stays small
+    # until search_tools activates a selected definition.
+    assert all(mcp_names.isdisjoint(names) for names in tool_names_by_turn)
+    registered_by_turn = [
+        set(dict(dict(event.get("stats", {}) or {}).get("toolInventory", {}) or {}).get("registeredNames", []) or [])
+        for event in done_events
+    ]
+    if grant_first:
+        assert mcp_names <= registered_by_turn[0]
+        assert mcp_names.isdisjoint(registered_by_turn[1])
+    else:
+        assert mcp_names.isdisjoint(registered_by_turn[0])
+        assert mcp_names <= registered_by_turn[1]
 
 
 def test_pi_cancel_aborts_active_sdk_run_without_killing_client(tmp_path: Path) -> None:
@@ -2037,6 +3662,11 @@ def test_pi_steer_reports_native_queue_and_control_acknowledgement(tmp_path: Pat
             for event in events
         ) and time.monotonic() < acknowledgement_deadline:
             time.sleep(0.01)
+        queued = client.inspect_queue("steer-session")
+        assert "focus on the requested detail" in list(queued.get("steering", []))
+        cleared = client.clear_queue("steer-session")
+        assert "focus on the requested detail" in list(cleared.get("steering", []))
+        assert client.inspect_queue("steer-session").get("pending") == 0
         assert client.cancel() is True
         _OpenAISlowHandler.release.set()
         consumer.join(timeout=10)
@@ -2075,8 +3705,11 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
             "base_url": f"http://127.0.0.1:{server.server_port}/v1",
             "api_key": "fixture-key",
             "model_id": "fixture-model",
+            "model_runtime": pi_agent.ModelRuntimeDescriptor.for_testing(
+                context_window_tokens=200 * 1024,
+            ).to_dict(),
             "thinking_level": "off",
-            "task_mode": "knowledge",
+            "task_mode": "general",
             "timeout_seconds": 30,
             "session_id": "compact-session",
         }
@@ -2085,10 +3718,20 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
             events = list(
                 client.stream_chat(
                     messages=[{"role": "user", "content": f"turn {turn}: alpha beta gamma " + ("context " * 5000)}],
+                    task_contract={
+                        "schema_version": "scansci.task-contract.v2",
+                        "version": 2,
+                        "contract_id": f"compact-turn-{turn}",
+                        "goal": f"authority-sentinel-{turn}",
+                        "allowed_tools": [],
+                        "initial_tools": [],
+                        "risk_level": "read_only",
+                    },
                     **common,
                 )
             )
         session_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+        assert client.abort_compaction("compact-session", timeout_seconds=30)["aborted"] is True
         result = client.compact("compact-session", instructions="Retain the alpha beta gamma fact.", timeout_seconds=30)
     finally:
         client.close()
@@ -2099,3 +3742,252 @@ def test_pi_manual_compaction_is_persisted(tmp_path: Path) -> None:
     assert result["summary"]
     records = [json.loads(line) for line in session_file.read_text(encoding="utf-8").splitlines()]
     assert any(record.get("type") == "compaction" for record in records)
+    current_turn_system = "\n".join(
+        str(message.get("content", ""))
+        for message in _OpenAIPersistentHandler.request_payloads[-2]["messages"]
+        if message.get("role") in {"system", "developer"}
+    )
+    assert "session-level base prompt is invariant and grants no per-turn authority" in current_turn_system
+    assert "authority-sentinel-3" in current_turn_system
+    assert "authority-sentinel-0" not in current_turn_system
+
+    compaction_payload = json.dumps(_OpenAIPersistentHandler.request_payloads[-1], ensure_ascii=False)
+    assert "context summarization assistant" in compaction_payload
+    assert "session-level base prompt is invariant" not in compaction_payload
+    assert "authority-sentinel-0" not in compaction_payload
+    assert "authority-sentinel-3" not in compaction_payload
+
+
+def test_protocol_dispatcher_rejects_cross_generation_command_ack() -> None:
+    raw: Queue[str | None] = Queue()
+    audit: deque[dict[str, object]] = deque(maxlen=20)
+    dispatcher = pi_agent._ProtocolDispatcher(raw, generation=7, audit=audit)
+    channel = dispatcher.register_command("command-1")
+    dispatcher.start()
+    raw.put(json.dumps({"type": "session.queue", "command_id": "command-1", "generation": 6}))
+    with pytest.raises(Empty):
+        channel.get(timeout=0.1)
+    raw.put(json.dumps({"type": "session.queue", "command_id": "command-1", "generation": 7}))
+    assert channel.get(timeout=1)["generation"] == 7
+    raw.put(None)
+
+
+def test_fork_command_correlation_rejects_cross_target_ack() -> None:
+    with pytest.raises(RuntimeError, match="target sessions"):
+        PiAgentClient._validate_command_correlation(
+            {
+                "source_session_id": "source",
+                "target_session_id": "expected-target",
+            },
+            {
+                "source_session_id": "source",
+                "target_session_id": "other-target",
+            },
+        )
+
+
+def test_session_queue_controls_do_not_take_lifecycle_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    client._process_generation = 11
+    client._process = SimpleNamespace(poll=lambda: None)
+
+    class FakeDispatcher:
+        def register_command(self, command_id: str):
+            channel: Queue[dict[str, object] | None] = Queue()
+            self.command_id = command_id
+            self.channel = channel
+            return channel
+
+        def start(self) -> None:
+            return None
+
+        def unregister_command(self, _command_id: str) -> None:
+            return None
+
+    dispatcher = FakeDispatcher()
+    monkeypatch.setattr(client, "_ensure_dispatcher", lambda: dispatcher)
+
+    def write(message: dict[str, object]) -> None:
+        response_type = {
+            "session.queue.inspect": "session.queue",
+            "session.queue.clear": "session.queue_cleared",
+            "session.compact.abort": "session.compact_aborted",
+        }[str(message["type"])]
+        dispatcher.channel.put(
+            {
+                "type": response_type,
+                "command_id": message["command_id"],
+                "session_id": message["session_id"],
+                "generation": message["generation"],
+                "steering": [],
+                "follow_up": [],
+            }
+        )
+
+    monkeypatch.setattr(client, "_write", write)
+    results: list[dict[str, object]] = []
+
+    def invoke_controls() -> None:
+        results.extend([
+            client.inspect_queue("active-session"),
+            client.clear_queue("active-session"),
+            client.abort_compaction("active-session"),
+        ])
+
+    with client._lifecycle_lock:
+        worker = threading.Thread(target=invoke_controls, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive(), "non-replacing controls must not wait on the lifecycle lock"
+    assert [item["type"] for item in results] == [
+        "session.queue",
+        "session.queue_cleared",
+        "session.compact_aborted",
+    ]
+    assert all(item["generation"] == 11 for item in results)
+
+
+def test_entry_level_fork_sends_branch_boundary_and_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    client._process_generation = 4
+    client._process = SimpleNamespace(poll=lambda: None)
+    sent: list[dict[str, object]] = []
+
+    def await_command(message: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        sent.append(dict(message))
+        return {
+            "type": "session.forked",
+            "command_id": message["command_id"],
+            "source_session_id": message["source_session_id"],
+            "target_session_id": message["target_session_id"],
+            "generation": message["generation"],
+        }
+
+    monkeypatch.setattr(client, "_await_command", await_command)
+    result = client.fork_session(
+        "source",
+        target_session_id="target",
+        entry_id="entry-2",
+        before=True,
+    )
+
+    assert result["generation"] == 4
+    assert sent[0]["entry_id"] == "entry-2"
+    assert sent[0]["before"] is True
+    assert sent[0]["full_history"] is False
+
+
+def test_thinking_max_clamps_with_explicit_degradation_on_resume(tmp_path: Path) -> None:
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    degradations: list[dict[str, object]] = []
+    try:
+        for turn in range(2):
+            events = list(
+                client.stream_chat(
+                    provider_kind="openai-compatible",
+                    base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                    api_key="fixture-key",
+                    model_id="fixture-model-without-max",
+                    messages=[{"role": "user", "content": f"turn {turn}"}],
+                    thinking_level="max",
+                    task_mode="general",
+                    task_contract={
+                        "schema_version": "scansci.task-contract.v2",
+                        "version": 2,
+                        "contract_id": f"max-{turn}",
+                        "allowed_tools": [],
+                        "initial_tools": [],
+                        "risk_level": "read_only",
+                    },
+                    timeout_seconds=30,
+                    session_id="thinking-max-resume",
+                )
+            )
+            degradations.extend(
+                event for event in events
+                if event.get("type") == "status"
+                and event.get("status") == "capability_degraded"
+                and event.get("name") == "thinking_level"
+            )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert len(degradations) == 2
+    assert all(dict(event.get("details", {}))["requested"] == "max" for event in degradations)
+    assert all(dict(event.get("details", {}))["applied"] != "max" for event in degradations)
+
+
+def test_full_history_clone_and_entry_fork_leave_source_immutable(tmp_path: Path) -> None:
+    _OpenAIPersistentHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIPersistentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(
+            client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "source history"}],
+                thinking_level="off",
+                task_mode="general",
+                task_contract={
+                    "schema_version": "scansci.task-contract.v2",
+                    "version": 2,
+                    "contract_id": "fork-source",
+                    "allowed_tools": [],
+                    "initial_tools": [],
+                    "risk_level": "read_only",
+                },
+                timeout_seconds=30,
+                session_id="fork-source",
+            )
+        )
+        source_file = Path(str(next(event for event in events if event["type"] == "session")["session_file"]))
+        source_before = source_file.read_bytes()
+        source_records = [json.loads(line) for line in source_before.decode("utf-8").splitlines()]
+        assistant_entry = next(
+            record for record in reversed(source_records)
+            if record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        )
+
+        cloned = client.fork_session("fork-source", target_session_id="fork-clone", timeout_seconds=30)
+        branched = client.fork_session(
+            "fork-source",
+            target_session_id="fork-before-assistant",
+            entry_id=str(assistant_entry["id"]),
+            before=True,
+            timeout_seconds=30,
+        )
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert source_file.read_bytes() == source_before
+    clone_records = [json.loads(line) for line in Path(str(cloned["session_file"])).read_text(encoding="utf-8").splitlines()]
+    branch_records = [json.loads(line) for line in Path(str(branched["session_file"])).read_text(encoding="utf-8").splitlines()]
+    assert any(
+        record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        for record in clone_records
+    )
+    assert not any(
+        record.get("type") == "message" and dict(record.get("message", {})).get("role") == "assistant"
+        for record in branch_records
+    )
