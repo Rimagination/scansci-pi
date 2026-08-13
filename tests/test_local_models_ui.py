@@ -9,7 +9,7 @@ def test_local_models_page_does_not_duplicate_default_capability_routing():
 
     assert 'state.activeSettings === "local-models") settingsMarkup = renderLocalModelsSettingsPage();' in app_js
     assert "function renderLocalModelsSettingsPage()" in app_js
-    assert '.replace(/<section class="local-agent-routing-card">' in app_js
+    assert "stripLegacyLocalAgentRouting(page)" in app_js
     assert 'class="local-model-detection-note"' in app_js
     assert "一个模型可以同时拥有多项能力" in app_js
     assert 'class="composer-model-note"' in app_js
