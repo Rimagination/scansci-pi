@@ -11828,7 +11828,6 @@ function renderLocalModelsSettingsPage() {
     ? `已发现 ${installed.length} 个本地模型快照；${conversationReady} 个可进入对话/视觉入口，${auxiliaryReady} 个用于检索、重排或语音。一个模型可以同时拥有多项能力，聊天下拉框只筛选当前入口可用的模型。`
     : "尚未发现本地模型快照；下载完成后点击刷新，Agent 会按能力入口自动识别。";
   return page
-    .replace(/<section class="local-agent-routing-card">[\s\S]*?<\/section>\s*/, "")
     .replace(
       '<section class="local-installed-panel">',
       `<section class="local-model-detection-note">${escapeHtml(detectionNote)}</section><section class="local-installed-panel">`,

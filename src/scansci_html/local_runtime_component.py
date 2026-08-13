@@ -365,11 +365,11 @@ class LocalRuntimeComponent:
             output = f"{completed.stdout}\n{completed.stderr}"
             supported = str(argument) in output if completed.returncode == 0 else True
         except (OSError, subprocess.SubprocessError, TypeError):
-            # A probe failure is not evidence that the flag is unsupported:
-            # test doubles and locked-down launchers may reject ``--help``.
-            # Preserve the current command in that case; only an explicit,
-            # successful help response is allowed to remove an optional flag.
-            supported = True
+            # If the probe cannot run, omit the optional flag and rely on the
+            # state-directory environment variable.  This is safer for an
+            # older or locked-down sidecar than sending an argument it may
+            # reject before the daemon can start.
+            supported = False
         self._cli_argument_support[key] = supported
         return supported
 
