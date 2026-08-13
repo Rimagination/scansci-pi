@@ -11668,7 +11668,7 @@ function localModelMarketRow(item, recommendedIds) {
 }
 
 function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
-  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.4";
+  const releaseUrl = runtime.manifest_release_url || "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0";
   if (runtime.update_required) {
     const updateAction = runtime.install_available
       ? `<button type="button" class="quiet-primary-button" data-action="install-local-runtime">${uiIcon("download")} 更新本地运行组件</button>`

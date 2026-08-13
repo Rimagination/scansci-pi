@@ -36,8 +36,8 @@ RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 RUNTIME_ROOT_ENV = "SCANSCI_LOCAL_RUNTIME_ROOT"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
-DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json"
-DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.4"
+DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json"
+DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0"
 _RUNTIME_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 8.0)
 # Loading a downloaded vision/audio model can take longer than the old fixed
 # 45-second window, especially on the first CUDA initialization.  Do not kill
@@ -276,7 +276,7 @@ class LocalRuntimeComponent:
                     ]
                 )
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            # The bundled 1.0.4 executable reads its state directory from the
+            # The bundled runtime executable reads its state directory from the
             # environment; passing the unsupported --state-dir flag exits 2.
             worker_environment = os.environ.copy()
             worker_environment["SCANSCI_LOCAL_RUNTIME_STATE_DIR"] = str(
@@ -402,7 +402,7 @@ class LocalRuntimeComponent:
     def _health_readiness(payload: dict[str, Any] | None) -> str:
         if not isinstance(payload, dict) or payload.get("_legacy_health"):
             return "ready" if isinstance(payload, dict) else "unknown"
-        # The bundled 1.0.4 lazy server reports ``status=ok`` before it loads
+        # The bundled lazy server reports ``status=ok`` before it loads
         # a snapshot.  Vision/chat models are probed separately above; other
         # model kinds do not necessarily implement chat generation, so their
         # healthy daemon status must remain sufficient for compatibility.
@@ -443,7 +443,7 @@ class LocalRuntimeComponent:
 
     @staticmethod
     def _health_needs_probe(payload: dict[str, Any] | None, wanted: str) -> bool:
-        """Identify the older lazy-loading runtime used by the 1.0.4 binary."""
+        """Identify the lazy-loading runtime used by the published binary."""
 
         if not isinstance(payload, dict) or payload.get("available") is not None:
             return False
@@ -1186,7 +1186,7 @@ class LocalRuntimeComponent:
 
         if manifest_path is not None:
             try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 raise ValueError("所选本地组件清单不是有效的 UTF-8 JSON 文件。") from error
             if not isinstance(payload, dict):
@@ -1391,7 +1391,10 @@ class LocalRuntimeComponent:
             payload = response.read(1_000_001)
         if len(payload) > 1_000_000:
             raise ValueError("组件清单过大。")
-        result = json.loads(payload.decode("utf-8"))
+        # GitHub's JSON assets may include a UTF-8 BOM (notably the stable
+        # update manifest used as a compatibility fallback).  Accept both
+        # forms so a valid channel is not reported as unavailable.
+        result = json.loads(payload.decode("utf-8-sig"))
         if not isinstance(result, dict):
             raise ValueError("组件清单必须是 JSON 对象。")
         return result

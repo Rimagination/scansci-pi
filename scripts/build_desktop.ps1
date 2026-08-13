@@ -17,7 +17,7 @@ param(
     # Keep direct/manual builds aligned with the public release contract. An
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
-    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json",
+    [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
     [string]$NodeComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     [string]$TectonicComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     # Slim channel: do not embed node.exe or tectonic.exe in the bundle.

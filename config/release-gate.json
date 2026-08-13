@@ -273,7 +273,7 @@
     "signature_required": false,
     "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
     "update_package_url": "https://github.com/Rimagination/scansci-pi/releases/download/v{version}/ScanSci-{version}-windows-x64.zip",
-    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.4/local-transformers.json",
+    "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
     "node_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     "tectonic_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
     "exclude_runtimes": true,
