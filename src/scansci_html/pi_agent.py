@@ -1114,6 +1114,9 @@ class _ManagedGatewayAdapter:
             instruction = (
                 "When a supplied function is needed, emit exactly one tool intent as "
                 '<SCANSCI_TOOL_CALL>{"name":"function_name","arguments":{}}</SCANSCI_TOOL_CALL>. '
+                "Use a function listed in the current tools schema. If the requested reader "
+                "is not listed but search_tools is listed, emit search_tools first with "
+                '{"names":["reader_name"],"activate":true}. '
                 "Do not say that tools are unavailable. After a tool result, answer normally."
             )
         if messages and messages[0].get("role") == "system":
@@ -1149,9 +1152,22 @@ class _ManagedGatewayAdapter:
         content = str(message.get("content") or "")
         if not tool_calls:
             parsed_calls: list[dict[str, Any]] = []
-            for index, (name, arguments_value) in enumerate(
-                _parse_text_tool_intents(content, allowed_tool_names=allowed_tool_names)
-            ):
+            parsed_intents = _parse_text_tool_intents(
+                content,
+                allowed_tool_names=allowed_tool_names,
+            )
+            # Text-only gateways sometimes emit the final reader directly even
+            # when the current Pi turn intentionally exposes only the dynamic
+            # ``search_tools`` activator.  Keep the host lease authoritative:
+            # turn that pseudo-call into an activation request, never into a
+            # direct execution of an inactive tool.  The runtime will validate
+            # the requested name against the contract before activating it.
+            if not parsed_intents:
+                parsed_intents = _dynamic_tool_activation_intents(
+                    content,
+                    allowed_tool_names=allowed_tool_names,
+                )
+            for index, (name, arguments_value) in enumerate(parsed_intents):
                 arguments = json.dumps(arguments_value, ensure_ascii=False, separators=(",", ":"))
                 parsed_calls.append(
                     {
@@ -1291,6 +1307,38 @@ def _parse_text_tool_intents(
         if call:
             calls.append(call)
     return calls
+
+
+def _dynamic_tool_activation_intents(
+    content: str,
+    *,
+    allowed_tool_names: set[str] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Translate an inactive reader marker into the authorized activator call.
+
+    AUTO web turns deliberately expose only ``search_tools`` at first.  A
+    text-only provider can still emit ``search_web`` directly because it does
+    not understand the difference between the registered inventory and the
+    active schema.  Asking the runtime to activate the name keeps this path
+    fail-closed: the dynamic tool performs the actual lease check.
+    """
+
+    allowed = {
+        str(name).strip().replace("-", "_")
+        for name in (allowed_tool_names or set())
+        if str(name).strip()
+    }
+    if not allowed or "search_tools" not in allowed:
+        return []
+    activation_names = list(dict.fromkeys(
+        raw_name.replace("-", "_")
+        for raw_name, _arguments in _parse_text_tool_intents(content)
+        if raw_name.replace("-", "_") not in allowed
+        and raw_name.replace("-", "_") not in {"search_tools", "ask_user", "submit_plan"}
+    ))
+    if not activation_names:
+        return []
+    return [("search_tools", {"names": activation_names[:8], "activate": True})]
 
 
 def _coerce_tool_arguments(value: Any) -> dict[str, Any] | None:

@@ -5900,7 +5900,7 @@ async function legacyAskQuestion(event, inputId) {
   byId("conversationTitle").textContent = compact(question, 80);
   applyContextPanelPreset(isDirectConversation || isStandaloneSlides ? "none" : ["writing", "deep-research"].includes(mode) ? "review" : "evidence");
   setView("conversation");
-  byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
+  byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div></div>`;
   if (["writing", "deep-research"].includes(mode)) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
   try {
     if (isDirectConversation) {
@@ -6215,7 +6215,7 @@ async function askQuestion(event, inputId) {
     renderPendingTaskFollowUp(activeRun, question, selectedSkills);
   } else {
     state.conversationAutoFollow = true;
-    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div><p class="loading-line">${isDirectConversation ? "正在生成回复…" : isStandaloneSlides ? "正在解析材料并制作可编辑 PPTX…" : "正在建立研究任务…"}</p></div>`;
+    byId("answerArea").innerHTML = `<div class="conversation-thread"><div class="user-turn"><div class="user-turn-bubble">${messageSkillTokensMarkup(selectedSkills)}${composerSourcePreviewMarkup(sourceFiles)}${composerImagePreviewMarkup(images)}${composerAudioPreviewMarkup(audio)}<p>${renderAssistantInline(question)}</p></div></div></div>`;
     followLatestConversationMessage();
   }
   if (plannedResearchDocument || (mode === "knowledge" && state.evidenceOutputMode === "review")) {
@@ -6498,16 +6498,11 @@ function renderDirectLiveControls() {
   }
   const paused = job.status === "paused" && !job.pauseRequested;
   if (!job.queue.length) {
-    // The queue is empty while the active direct response is being prepared
-    // or streamed. Keep a compact status surface visible so the user gets
-    // feedback and the composer remains clearly in a busy state.
-    const active = ["starting", "running", "retrying", "queued"].includes(String(job.status || ""));
-    const parallelCount = Math.max(0, directChatJobs.size - 1);
-    const parallelSummary = parallelCount
-      ? `<em>另有 ${parallelCount} 个对话并行</em>`
-      : "<em>可以继续输入下一条消息</em>";
-    surface.hidden = false;
-    surface.innerHTML = `<div class="direct-live-summary"><i class="direct-live-pulse ${paused ? "is-paused" : ""}" aria-hidden="true"></i><strong>${paused ? "回复已暂停" : active ? "正在生成回复" : "正在准备回复"}</strong>${parallelSummary}</div>`;
+    // Keep the composer quiet while a response is being prepared or streamed.
+    // The send control still changes to pause/resume, so no separate status
+    // banner is needed inside the dialog.
+    surface.hidden = true;
+    surface.innerHTML = "";
     form?.classList.add("has-live-direct-job");
     if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
     if (send) send.setAttribute("aria-label", paused ? "继续回复" : "发送下一条消息");

@@ -23,7 +23,7 @@ from .update_blockmap import (
 )
 
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
@@ -33,6 +33,8 @@ _DEFAULT_RELEASE_NOTES = [
         "items": [
             "修复研究检索组件可能把错误响应写成模型文件的问题。",
             "断点续传只复用已校验片段，并分别显示整组与当前模型进度。",
+            "修复托管模型输出联网工具标记时无法继续执行科技新闻搜索的问题。",
+            "精简对话输入区，生成回复时不再显示额外状态横幅。",
         ],
     },
     {

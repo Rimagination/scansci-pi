@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "version": "0.4.0",
-  "p0_objective": "发布 v0.4.0 候选：以 Pi protocol v7 和 TaskContract v2 为 fail-closed 边界，使所有模型介导任务可由 Pi 自主规划，并用 10 轴 capability report v2 证明动态工具、并行、长上下文、Skill、科研子代理、MCP、多模态、安全与可观测性。",
+  "version": "0.4.1",
+  "p0_objective": "发布 v0.4.1 修复候选：延续 v0.4.0 的 Pi protocol v7 与 TaskContract v2 fail-closed 边界，修复托管模型纯文本工具标记未执行和对话生成状态条干扰用户的问题。",
   "acceptance": [
     {
       "id": "pi-routing",

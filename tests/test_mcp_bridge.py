@@ -447,7 +447,7 @@ def test_deferred_mcp_registers_and_calls_native_remote_schema_after_search(tmp_
     assert marker.read_text(encoding="utf-8").splitlines() == [
         "connected",
         "called",
-        "client:scansci-pi@0.4.0",
+        "client:scansci-pi@0.4.1",
     ]
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     assert _DeferredNativeSchemaHandler.marker_states[2] == ["connected"]
@@ -549,7 +549,7 @@ def test_deferred_streamable_http_stays_disconnected_until_search_then_calls_nat
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     methods = marker.read_text(encoding="utf-8").splitlines()
     assert methods.count("initialize") == 1
-    assert methods.count("client:scansci-pi@0.4.0") == 1
+    assert methods.count("client:scansci-pi@0.4.1") == 1
     assert methods.count("tools/list") == 1
     assert methods.count("tools/call") == 1
     assert methods.count("called") == 1

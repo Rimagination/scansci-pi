@@ -1,4 +1,4 @@
-"""Contracts for the v0.4.0 full Pi capability P0."""
+"""Contracts for the v0.4.1 release candidate and its v0.4.0 Pi baseline."""
 
 from __future__ import annotations
 
@@ -26,13 +26,13 @@ def _json(path: str) -> dict:
     return json.loads((PROJECT_ROOT / path).read_text(encoding="utf-8"))
 
 
-def test_v040_is_the_single_p0_and_maps_exactly_to_the_task8_matrix() -> None:
+def test_v041_is_the_single_p0_and_maps_exactly_to_the_task8_matrix() -> None:
     scope = _json("config/release-scope.json")
     matrix = _json("bench/pi_capability_tasks.json")
 
     assert scope["schema_version"] == 2
-    assert scope["version"] == "0.4.0"
-    assert "v0.4.0" in scope["p0_objective"]
+    assert scope["version"] == "0.4.1"
+    assert "v0.4.1" in scope["p0_objective"]
     assert {
         item["id"]: (item["report_axis"], item["threshold"])
         for item in scope["acceptance"]

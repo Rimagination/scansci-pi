@@ -20,6 +20,7 @@ from scansci_html.pi_agent import (
     _ManagedGatewayAdapter,
     _bounded_tool_result_for_model,
     _compact_verified_answer_for_model,
+    _dynamic_tool_activation_intents,
     _parse_text_tool_intents,
     _redact_tool_value,
 )
@@ -2612,6 +2613,15 @@ def test_managed_gateway_adapter_only_parses_explicit_tool_intents() -> None:
     assert _parse_text_tool_intents(
         '{"name":"build_verified_answer","arguments":"{\\"question\\":\\"q\\"}"}'
     ) == [("build_verified_answer", {"question": "q"})]
+
+
+def test_managed_gateway_adapter_activates_inactive_reader_for_auto_web_turn() -> None:
+    content = '<SCANSCI_TOOL_CALL>{"name":"search_web","arguments":{"query":"today technology news"}}</SCANSCI_TOOL_CALL>'
+
+    assert _dynamic_tool_activation_intents(content, allowed_tool_names={"search_tools"}) == [
+        ("search_tools", {"names": ["search_web"], "activate": True})
+    ]
+    assert _dynamic_tool_activation_intents(content, allowed_tool_names={"search_web"}) == []
 
 
 def test_managed_gateway_adapter_normalizes_glm_legacy_tool_call_for_offered_tool() -> None:

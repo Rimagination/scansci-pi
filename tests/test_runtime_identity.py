@@ -19,7 +19,7 @@ from scansci_html.webapp import create_notebook_server
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PACKAGE = (PROJECT_ROOT / "src" / "scansci_html").resolve()
 PREVIEW_ENTRY = PROJECT_ROOT / "scripts" / "scansci_preview_entry.py"
-EXPECTED_RELEASE_VERSION = "0.4.0"
+EXPECTED_RELEASE_VERSION = "0.4.1"
 
 
 def test_source_and_release_version_declarations_cannot_drift() -> None:
@@ -42,7 +42,7 @@ def test_source_and_release_version_declarations_cannot_drift() -> None:
 def test_desktop_build_default_uses_the_release_identity() -> None:
     build_script = (PROJECT_ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8")
 
-    assert '[string]$Version = "0.4.0"' in build_script
+    assert '[string]$Version = "0.4.1"' in build_script
 
 
 def test_mcp_client_identity_comes_from_the_root_package_version() -> None:
